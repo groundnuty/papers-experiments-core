@@ -130,6 +130,9 @@ class Parts:
     reply_cap_unheld: Callable[[str], bool | None] = lambda model: None
     # the key the store is registered under for the attempts' liveness (`liveness.register`); None: not registered
     campaign: str | None = None
+    # the lease this campaign's one run is taken on (C41, `run_lease`), written in every record the attempts produce
+    # so that two leases' attempts of one number are told apart; None: the campaign runs on no lease
+    lease_id: int | None = None
 
 
 class AttemptRunner:
@@ -335,7 +338,7 @@ class AttemptRunner:
                 guard = AttemptSpend(p.ledger, begun.id, key, model, reserved_capped=capped, calls_logged=True)
             defects = DefectLog(p.root, key, begun.number, p.stamp, lambda: redactor_for(backend, models=p.models))
             request = RunRequest(
-                RunIdentity(key, factors, begun.number),
+                RunIdentity(key, factors, begun.number, lease_id=p.lease_id),
                 run_dir,
                 endpoint,
                 backend,

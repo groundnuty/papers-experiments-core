@@ -44,6 +44,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from expcore_onedata.sandbox import hostfacts, marks
 from expcore_onedata.sandbox.api import SandboxError
+from expcore_onedata.sandbox.caconfig import CA_CONFIG, private_file
 
 log = logging.getLogger(__name__)
 
@@ -512,12 +513,14 @@ class DockerHost:
     def make_ca(self, directory: Path, names: Sequence[str]) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         ca_key, ca_pem = directory / "ca.key", directory / "ca.pem"
-        self._openssl(
-            "req -x509 -newkey rsa:2048 -nodes -keyout {key} -out {pem} -days 2 -subj /CN=sandbox-run-ca"
-            " -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign",
-            key=ca_key,
-            pem=ca_pem,
-        )
+        with private_file(directory, CA_CONFIG, ".cnf") as config:  # no -addext: see caconfig (OpenSSL 1.1.1)
+            self._openssl(
+                "req -x509 -newkey rsa:2048 -nodes -keyout {key} -out {pem} -days 2 -subj /CN=sandbox-run-ca"
+                " -config {config}",
+                key=ca_key,
+                pem=ca_pem,
+                config=config,
+            )
         for name in names:
             key, csr, pem, ext = (directory / f"{name}.{suffix}" for suffix in ("key", "csr", "pem", "ext"))
             self._openssl(
@@ -525,7 +528,9 @@ class DockerHost:
             )
             ext.write_text(
                 f"subjectAltName=DNS:{name}\nbasicConstraints=CA:FALSE\n"
-                "keyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n",
+                "keyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n"
+                # OpenSSL 3 adds both identifiers itself (as `keyid,issuer`), 1.1.1 neither: see caconfig
+                "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n",
                 encoding="utf-8",
             )
             self._openssl(

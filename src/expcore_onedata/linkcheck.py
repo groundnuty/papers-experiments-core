@@ -112,7 +112,7 @@ post-run check aside, though the links work.
 import dataclasses
 import hashlib
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -510,14 +510,18 @@ def check_links(
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.time,
     workers: int | None = None,
+    without: Collection[str] = (),
 ) -> LinkReport:
     """Check every ordered (reader, source) pair's link with a bounded fetch of its probe; never pass what was not
     shown.
 
     `clock` and `sleep` bound and pace the waits (a test's `Ticker`), `now` dates the window on the host's epoch clock,
-    and `workers` (`WORKERS` by default) is how many pairs are prepared, fetched and evicted at once.
+    and `workers` (`WORKERS` by default) is how many pairs are prepared, fetched and evicted at once. `without` names
+    providers whose pairs are neither checked nor reported, as the run's own held target's are while its injection
+    stops that service (`health.PlatformHealth`, O90); the caller has seen that a pair remains, since with none left
+    the answer would be the vacuous pass of a federation with no pair. Every other caller leaves it empty.
     A failure of the platform is the failing pair's; any other exception is a defect and propagates."""
-    pairs = link_pairs(config.spaces, list(config.providers))
+    pairs = link_pairs(config.spaces, list(config.providers), without)
     started = now()
     if not pairs:
         detail = "no provider pair to check: every declared space is supported by the local provider alone"

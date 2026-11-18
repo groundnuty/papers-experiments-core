@@ -478,3 +478,20 @@ def test_o72_the_eleventh_fixture_pins_a_cell_that_hit_its_deadline_and_a_run_th
     assert "cell 1's deadline (survived_kill)" in record.outcome["detail"]
     assert "sweep" not in record.outcome["detail"]
     assert replay_record(record).dumps().encode("utf-8") == eleventh[0].read_bytes()
+
+
+def test_c41_the_twelfth_fixture_pins_the_lease_an_attempt_ran_on_and_the_eleven_before_it_hold_none():
+    """C41 and R03: the twelfth merge point adds one optional field to the record, `lease_id`: the fencing token of the
+    lease a run was taken on (`campaign.run_lease`), whole numbers from 1, absent for an attempt that ran on none. Its
+    fixture is the fifth's record with lease 3 written by the code of that merge; it validates and replays to its own
+    bytes (the parametrized tests above), the replay serving the lease back as it serves the instruments' output. None
+    of the eleven before it holds the key, and none is filled in with one."""
+    twelfth = [p for p in FIXTURES if p.name.startswith("12-")]
+    assert [p.name for p in twelfth] == ["12-lease-id.json"]
+    record = load_record(twelfth[0])
+    assert record.lease_id == 3
+    assert list(json.loads(twelfth[0].read_text(encoding="utf-8")))[-1] == "lease_id"
+    assert all("lease_id" not in json.loads(p.read_text(encoding="utf-8")) for p in FIXTURES if p != twelfth[0])
+    fifth = load_record(DIRECTORY / "05-reserved-capped.json")
+    assert dataclasses.replace(record, lease_id=None) == fifth
+    assert replay_record(record).lease_id == 3

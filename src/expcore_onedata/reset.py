@@ -92,7 +92,10 @@ read and every check is made on each provider that supports the space, since eac
    fulfilled status and its deletion reaching the replicating provider. It is at most one file's size per missed
    cancel, and rare; it may land after T, and is then caught by the next start's reset. The record gives `ran`, `why`
    (`requirements`, `rights` or `default`, `resetheld.py`), `held_files` and `held_source` (`"eviction plan"`),
-   `files`, `block_maps`, `listings_after_s` and the stage's seconds. It costs the wait, 20 s for files one directory
+   `files`, `block_maps`, `nominal_wait_s` (the bound from T, owed for the deepest file), `waited_s` (the seconds the
+   reset's clock counted from the space's maps reading to its occupancy reading: at least the bound, and more for a
+   space read earlier or owed less than the latest, since one wait serves every space; 0.0 when the stage is skipped),
+   `listings_after_s` and the stage's seconds. It costs the wait, 20 s for files one directory
    below the root and 5 s more per further level (the depth of the deepest file of the space, as the QoS scan saw
    it), `transfer_settle_s` for the late look, one block-map read at T per evicted (file, provider) pair of the plan
    and per (file, provider) of a removed requirement's files, once, bounded by the plan, and the occupancy's reading,
@@ -362,16 +365,21 @@ class SpaceReset:
         """Read, at one instant T, the block maps of the eviction plan's files and of the files a removed requirement
         applied to, against what the eviction and the settle left; return the instant the occupancy may be read at:
         T and `resetqos.quiet_wait_s` for the deepest file a late replication could reach. It proves that no replica of
-        the plan's files, and no occupancy growth, had landed by T, and not that nothing lands after it."""
+        the plan's files, and no occupancy growth, had landed by T, and not that nothing lands after it. T and the bound
+        are kept (`run["quiet_at"]`, the record's `nominal_wait_s`): `_quiet_sizes` records the wait the space had."""
         depth = resetheld.quiet_depth(run["affected"], run["deepest"], run["qos_rights"])
         facts = resetqos.quiet_maps(self._p, resetheld.expected_maps(run["settled"], run["evicted"]))
         wait = resetqos.quiet_wait_s(depth)
-        run["quiet"] = {**facts, "waited_s": wait}
-        return self._p.clock() + wait
+        run["quiet_at"] = self._p.clock()
+        run["quiet"] = {**facts, "nominal_wait_s": wait}
+        return run["quiet_at"] + wait
 
     def _quiet_sizes(self, run: dict[str, Any]) -> None:
         """After the wait, read the occupancy (`_holdings`) and set it against the occupancy stage's, by the files'
-        block maps summed, never by the counter (O46)."""
+        block maps summed, never by the counter (O46). `waited_s` is the seconds, by this reset's own clock, from the
+        space's maps reading (T) to the start of this reading: the one wait runs to the latest space's instant, so it is
+        at least the space's `nominal_wait_s`, and longer for a space that was read earlier or owed less."""
+        run["quiet"]["waited_s"] = round(self._p.clock() - run["quiet_at"], 3)
         run["quiet"].update(resetqos.quiet_grown(self._p, self._holdings(run), run["occupancy"]))
 
     def _quiet_look(self, run: dict[str, Any], after_s: float) -> dict[str, Any]:

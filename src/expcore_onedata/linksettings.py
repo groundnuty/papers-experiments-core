@@ -68,18 +68,26 @@ class LinkCheckSettings:
     every_s: float = 600.0
 
 
-def link_pairs(spaces: Sequence[StudySpace], order: Sequence[str]) -> tuple[tuple[str, str], ...]:
+def link_pairs(
+    spaces: Sequence[StudySpace], order: Sequence[str], without: Collection[str] = ()
+) -> tuple[tuple[str, str], ...]:
     """Every ordered (reading provider, source provider) pair whose link can carry a read of a declared space: two
     different providers that support one space in common, each as the reader of the other, in the order of
     `[providers]` (readers first, then sources). The agent's local provider reads from every other provider that
     supports a declared space, and a provider that mirrors a space reads from the others of it: replication moves data
     between any two supporters, so a link between two providers that are not the local one carries a study's reads
-    too (the live slot of 14 Nov 2026, where such a pair stayed stuck unseen)."""
+    too (the live slot of 14 Nov 2026, where such a pair stayed stuck unseen).
+
+    `without` names providers whose pairs are left out, as the readers and as the sources of a pair: the run's own held
+    target, while its injection stops that provider's service (`health.PlatformHealth`, O90). No other pair is left
+    out."""
     return tuple(
         (reader, source)
         for reader in order
         for source in order
         if reader != source
+        and reader not in without
+        and source not in without
         and any(reader in entry.support.providers and source in entry.support.providers for entry in spaces)
     )
 

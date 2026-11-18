@@ -61,6 +61,7 @@ from typing import Any
 from expcore.campaign.lock import CampaignLocked, LockMissing, LockUnavailable, ReaderLock
 from expcore.campaign.manifest import Manifest, compare_fingerprints, fingerprint_sha256
 from expcore.campaign.resume import FINGERPRINT_KEY, recorded_fingerprint
+from expcore.campaign.run_lease import RULE_LEASE
 from expcore.campaign.scheduler import STATE_FILE
 from expcore.campaign.selection import RULE_SELECTION, SelectionSpec, Spec, spec_from_json
 from expcore.campaign.selection_ledger import Pricing, Spend, released_of, spend_of, window_of
@@ -218,8 +219,14 @@ def facts_of(
         meta = _meta(query, where)
         if META_SHARD not in meta:
             raise MergeRefused(f"{where}: not a shard: its store records no {META_SHARD!r}, so it ran unsharded")
+        pinned = _json(meta, META_SHARD, where)
+        if isinstance(pinned, Mapping) and pinned.get("rule") == RULE_LEASE:
+            raise MergeRefused(
+                f"{where}: a store of a run taken on a lease (expcore-shard/5): it is merged by run, which this merge "
+                "does not do"
+            )
         try:
-            spec = spec_from_json(_json(meta, META_SHARD, where))
+            spec = spec_from_json(pinned)
         except ShardError as error:
             raise MergeRefused(f"{where}: the shard spec in its store is unusable: {error}") from None
         started = meta.get(META_STARTED)

@@ -11,7 +11,8 @@ defend against deliberate concealment, and they never read text inside images.
   one linear pass), and what it decodes to is classified by `_walk_decoded`: text is read as text, compressed bytes
   are opened, and bytes of no recognisable kind (a digest, an identifier that only looks like base64) are read for
   their printable strings and refuse nothing. A decoded run that is not text and has a format magic of four bytes or
-  more, or a long run that looks compressed and fails to decompress, refuses the file;
+  more, or a long run that looks compressed and fails to decompress, refuses the file (a zlib stream that only
+  stops before its final block is read both ways, as far as it decompressed and as raw bytes);
 - an SQLite database (its magic header): its bytes are read raw, and the database is deserialised into memory,
   read-only, and every value read: the schema's SQL and the TEXT values of each column as text, every BLOB as a byte
   stream under the same allow list, a zlib BLOB decompressed;
@@ -140,6 +141,14 @@ class _Broken(_Refused):
     """A stream that fails to decompress (a bad CRC, a stream cut short)."""
 
 
+class _CutShort(_Broken):
+    """A zlib stream that ends before its final block, with what it decompressed before it ran out."""
+
+    def __init__(self, label: str, why: str, partial: bytes) -> None:
+        super().__init__(label, why)
+        self.partial = partial
+
+
 class _Exhausted(Exception):
     """The total budget ran out at this stream; the walk stops."""
 
@@ -222,7 +231,7 @@ def _inflate(data: bytes, label: str, budget: _Budget) -> bytes:
             raise _Exhausted(label)
         _refuse(label, f"over the cap of {MAX_STREAM_BYTES} bytes")
     if not inflater.eof:  # cut short, as opposed to data that is not deflate at all, which raises zlib.error
-        raise _Broken(label, "refused, it fails to decompress (a zlib stream cut short)")
+        raise _CutShort(label, "refused, it fails to decompress (a zlib stream cut short)", out)
     return out
 
 
@@ -387,9 +396,12 @@ def _walk_decoded(label: str, data: bytes, depth: int, budget: _Budget, *, stric
     text). Bytes that are not text are refused for a format magic of four bytes or more. Compressed bytes (a gzip,
     bzip2 or xz magic, a zip or tar archive, or a zlib header) are opened; when a long run (`strict`) fails to
     decompress it refuses the file as a failing archive member does, except a zlib header followed by data that is
-    not deflate at all, which one random run in a thousand shows by chance: those bytes are read raw. A short run is
-    never refused for a failure. Below `MAX_DEPTH`, text is read but not decoded further, and anything to open is
-    refused when strict and read raw when not.
+    not deflate at all, which one random run in a thousand shows by chance: those bytes are read raw. A zlib header
+    followed by a deflate stream that ends before its final block is read both ways: what it decompressed to before
+    it ran out is classified and scanned like any decoded run, and its raw bytes are read as for a run that is not
+    deflate at all. A stream cut short anywhere else (a file, an archive member, the BLOB of a database) still
+    refuses. A short run is never refused for a failure. Below `MAX_DEPTH`, text is read but not decoded further, and
+    anything to open is refused when strict and read raw when not.
     """
     text = _text(data)
     if text is not None:
@@ -506,7 +518,18 @@ def _walk_binary(
                 yield from _walk(f"{label}!{where}", value, depth + 1, budget, BLOB)
         return
     if not archive and _zlib(data) and origin != FILE:
-        inner = _inflate(data, f"{label}!(zlib)", budget)
+        try:
+            inner = _inflate(data, f"{label}!(zlib)", budget)
+        except _CutShort as short:
+            if origin != DECODED:  # a database's BLOB refuses the file, as a failing archive member does
+                raise
+            # A decoded run (random bytes of a digest carry a zlib header once in a thousand runs, and the bytes after
+            # it often read as a deflate stream that stops before its final block): read both ways, as what it
+            # decompressed to before it ran out, and as the raw bytes it is.
+            yield Stream(label, data, BYTES)
+            if short.partial:
+                yield from _walk_decoded(f"{label}!(zlib)", short.partial, depth + 1, budget, strict=strict)
+            return
         yield Stream(label, data, BYTES)
         if origin == DECODED:
             yield from _walk_decoded(f"{label}!(zlib)", inner, depth + 1, budget, strict=strict)

@@ -58,6 +58,7 @@ for _path in (HERE, REPO / "deploy" / "compose-federation"):  # python -I leaves
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
+import hpcexclude  # noqa: E402
 from fedlayout import Layout, checked_root  # noqa: E402
 from fedspec import DEFAULT_LAYOUT, LayoutError, Spec, load_spec  # noqa: E402
 from hpcdriver import CORE_MISMATCH, TIMEOUTS, CoreMismatch, Driver  # noqa: E402
@@ -139,6 +140,8 @@ def make_driver(
     queue_s = queue_wait_from_environment(os.environ if environ is None else environ) if agent else None
     if queue_s is not None:
         given["timeouts"] = {**TIMEOUTS, "queue": queue_s}
+    if agent:  # an up of a fleet (fleet.py names the lock its ups share): serialised reads and a bounded retry
+        given["placement_lock"] = hpcexclude.lock_from_environment(os.environ if environ is None else environ)
     return Driver(
         layout_path=layout_path,
         layout=layout,

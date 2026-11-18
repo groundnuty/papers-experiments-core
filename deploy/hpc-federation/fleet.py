@@ -12,14 +12,18 @@
 Run on the login node with the site's values exported (`set -a; . site.env; set +a`), as `hpcfed.py up` is.
 
 - up: refused past `HPC_FLEET_MAX` (the operator's maximum, which the grant and the scratch inode quota set; unset
-  refuses), by the home guard (`hpcquota.home_guard`, when the site sets its keys: the account's home past 95% of its
+  refuses, and no setting of it or of `HPC_FLEET_PARALLEL` may pass `HPC_FLEET_CEILING`, 64 unless the site sets it),
+  by the home guard (`hpcquota.home_guard`, when the site sets its keys: the account's home past 95% of its
   files or bytes, read once for the whole fleet), and past the quota by the inode guard (`hpcquota`, mandatory on
   scratch: the account's usage plus N times one federation's estimate, read once, before anything is made); then the
   fleet's directory (new: never adopted), N federations `fed-1` ... `fed-N`, each its own root `<fleet>/fed-k/root` (an
   exclusive mkdir), state file and held job, each brought up by `hpcfed.py up` in a process of its own,
-  `HPC_FLEET_PARALLEL` at a time (1 by default), and N shards. A federation whose up fails is reported and the
-  others stay up; it may hold a job until `down --member` releases it. Each federation's output is in
-  `<fleet>/logs/<label>.<up|down>.log`.
+  `HPC_FLEET_PARALLEL` at a time (1 by default), and N shards. The ups that run at once share one lock, the file
+  `<fleet>/.placement.lock`, held only around an up's first read of the account's live jobs with its submits and around
+  its second read once its jobs run, so no two federations end on one node; an up placed on another's node is released
+  and tried again, up to three times in all (`hpcdriver.PLACEMENT_ATTEMPTS`), and only the last refusal fails it. A
+  federation whose up fails is reported and the others stay up; it may hold a job until `down --member` releases it.
+  Each federation's output is in `<fleet>/logs/<label>.<up|down>.log`.
 - add: K fresh federations into the fleet, by the same rules, the maximum counting every one that may hold a job.
 - plan: each shard on a federation (`fleetplan`), written to `<fleet>/shards.toml`, and each one's srun line printed
   as `shards.py plan` prints it; refused, with nothing recorded, when the manifest's python imports a core that names
@@ -41,6 +45,7 @@ Run on the login node with the site's values exported (`set -a; . site.env; set 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -56,6 +61,7 @@ for _path in (HERE, HERE.parents[1] / "deploy" / "compose-federation"):
 
 import fleetplan  # noqa: E402
 import fleetstuck  # noqa: E402
+import hpcexclude  # noqa: E402
 import hpcfed  # noqa: E402
 import hpcquota  # noqa: E402
 import hpcstate  # noqa: E402
@@ -80,8 +86,9 @@ from hpcdriver import CORE_MISMATCH, CoreMismatch  # noqa: E402
 from hpcsettings import SettingsError, agent_limits, load_settings, site_from_environment  # noqa: E402
 from hpcslurm import Client, Runner, Slurm, SlurmError  # noqa: E402
 
-MAX_VAR, PARALLEL_VAR = "HPC_FLEET_MAX", "HPC_FLEET_PARALLEL"
-CEILING = 64  # no setting of either may pass it
+MAX_VAR, PARALLEL_VAR, CEILING_VAR = "HPC_FLEET_MAX", "HPC_FLEET_PARALLEL", "HPC_FLEET_CEILING"
+WHOLE = re.compile(r"[0-9]{1,9}")  # a count: ASCII digits only, and too few for int() to refuse a long one
+DEFAULT_CEILING, TOP_CEILING = 64, 512  # no setting of the first two may pass the ceiling; the site's key is 1 to 512
 COMMANDS = ("up", "add", "plan", "step", "step-stop", "status", "down")
 UNSAFE = set('"\\') | {chr(c) for c in range(32)} | {chr(127)}  # never in a path the fleet writes into TOML and JSON
 
@@ -121,6 +128,17 @@ def inode_guard(runner: Any, count: int, layout: Layout, site: Any, environ: Map
     return hpcquota.guard(runner, site, layout, environ, federations=count)
 
 
+def member_environ(environ: Mapping[str, str], root: Path, command: str) -> Dict[str, str]:
+    """The environment of one federation's `hpcfed.py <command>`: the site's values, and for an `up` the lock the
+    fleet's ups share (`<fleet>/.placement.lock`, the fleet's directory being the root's grandparent), which makes that
+    `up` take it around its reads of the account's live jobs and try again when it is placed on another's node. Never
+    for a `down`, and never one the operator's own environment holds."""
+    member = {name: value for name, value in environ.items() if name != hpcexclude.LOCK_VAR}
+    if command == "up":
+        member[hpcexclude.LOCK_VAR] = str(Path(root).parents[1] / hpcexclude.PLACEMENT_LOCK)
+    return member
+
+
 def hpcfed_process(environ: Mapping[str, str], run: Callable[..., Any] = subprocess.run) -> Operate:
     """Each federation's up or down as an operator runs it by hand: `hpcfed.py` under this interpreter with `-I` (no
     module of the launch directory is ever imported), from the fleet's own 0700 directory (never a shared one), in a
@@ -131,8 +149,8 @@ def hpcfed_process(environ: Mapping[str, str], run: Callable[..., Any] = subproc
                 command]  # fmt: skip
         descriptor = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
         try:
-            done = run(argv, env=dict(environ), cwd=str(Path(root).parents[1]), stdin=subprocess.DEVNULL,
-                       stdout=descriptor, stderr=subprocess.STDOUT, check=False)  # fmt: skip
+            done = run(argv, env=member_environ(environ, root, command), cwd=str(Path(root).parents[1]),
+                       stdin=subprocess.DEVNULL, stdout=descriptor, stderr=subprocess.STDOUT, check=False)  # fmt: skip
         finally:
             os.close(descriptor)
         return done.returncode, log.read_text(encoding="utf-8", errors="replace")
@@ -158,14 +176,26 @@ def last_error(printed: str) -> str:
     return "".join(c if c.isprintable() else "?" for c in said)[-300:]
 
 
+def ceiling(environ: Mapping[str, str]) -> int:
+    """`HPC_FLEET_CEILING`: the most `HPC_FLEET_MAX` and `HPC_FLEET_PARALLEL` may be, a whole number from 1 to
+    `TOP_CEILING`; `DEFAULT_CEILING` when unset or empty, so that nothing changes unless the site sets it."""
+    value = environ.get(CEILING_VAR) or ""
+    if not value:
+        return DEFAULT_CEILING
+    if not WHOLE.fullmatch(value) or not 1 <= int(value) <= TOP_CEILING:
+        raise FleetError(f"{CEILING_VAR} must be a whole number from 1 to {TOP_CEILING}")
+    return int(value)
+
+
 def setting(environ: Mapping[str, str], name: str, default: Optional[int] = None) -> int:
     value = environ.get(name) or ""
     if not value and default is not None:
         return default
     if not value:
         raise FleetError(f"{name} is not set: the operator's maximum of federations at once (site.env); refused")
-    if not value.isdigit() or not 1 <= int(value) <= CEILING:
-        raise FleetError(f"{name} must be a whole number from 1 to {CEILING}")
+    limit = ceiling(environ)
+    if not WHOLE.fullmatch(value) or not 1 <= int(value) <= limit:
+        raise FleetError(f"{name} must be a whole number from 1 to {limit} (the fleet ceiling, {CEILING_VAR})")
     return int(value)
 
 

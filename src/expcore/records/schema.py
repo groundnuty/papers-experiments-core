@@ -33,6 +33,10 @@ failure that names no target, a condition that declares none. Where a declaratio
 holds a version-3 record to its target clause (`target_rule`): the failure must name that target and the run's fault
 injector must have held it down in this attempt (`expcore.records.injections`). A record that declares no target is
 decided as before, so the clause changes nothing for a version-3 record written before it.
+Version 3 also says which lease an attempt ran on, in one more optional field of the record, `lease_id` (C41): the
+fencing token of the lease that took the run (`campaign.run_lease`), a whole number from 1. It is absent for an attempt
+that ran on no lease, which is every attempt of an unsharded campaign, a shard and a selection. Two leases of one run
+can each have an attempt of one number, so the lease id, with the run key and the attempt, names an attempt.
 Version 3 also says, in two optional fields of the totals, whether the attempt was held to the reservation R (C27):
 `reserved_capped`, the bound the budget gate reserved the run by, the value the campaign store keeps for the attempt
 (True: by the reply maximum, False: by the window), and `reply_cap_unheld`, whether the campaign had taken the
@@ -106,6 +110,7 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "redacted_paths": (list,),
         "treatment_targets": (dict,),
         "instrument_refusal": (dict,),
+        "lease_id": (int,),
     },
     "prompt": {"system": (dict,), "user": (dict,), "tools_sha256": (str,)},
     "prompt_part": {"text": (str,), "sha256": (str,), "template_sha256": (str, NONE), "slots": (dict, NONE)},
@@ -270,7 +275,7 @@ SCHEMAS: tuple[SchemaVersion, ...] = (
         f"{SCHEMA_PREFIX}3",
         added={
             "usage": ("extra", "extra_cut"),
-            "record": ("treatment_targets", "instrument_refusal"),
+            "record": ("treatment_targets", "instrument_refusal", "lease_id"),
             "outcome": ("infra_target",),
             "totals": ("reserved_capped", "reply_cap_unheld"),
             "tool_call": ("elapsed_s", "exec_check"),
@@ -278,7 +283,7 @@ SCHEMAS: tuple[SchemaVersion, ...] = (
         },
         optional={
             "usage": ("extra", "extra_cut"),
-            "record": ("treatment_targets", "instrument_refusal"),
+            "record": ("treatment_targets", "instrument_refusal", "lease_id"),
             "outcome": ("infra_target",),
             "totals": ("reserved_capped", "reply_cap_unheld"),
             "tool_call": ("elapsed_s", "exec_check"),
@@ -578,6 +583,12 @@ def _check_treatment_targets(targets: Any, kinds: list[str]) -> None:
         raise RecordError("treatment_targets: the kinds are written sorted")
 
 
+def _check_lease_id(lease_id: Any) -> None:
+    """Check the lease an attempt ran on (C41): a whole number from 1, the fencing token, never a bool or a null."""
+    if isinstance(lease_id, bool) or not isinstance(lease_id, int) or lease_id < 1:
+        raise RecordError(f"lease_id: a whole number from 1, not {lease_id!r}")
+
+
 def _check_refusal(refusal: Any) -> None:
     """Check the refusal an instrument's post-run check recorded: its keys, a namespace as plain as an instrument's, a
     kind of the registry that no condition can declare as its treatment, and a detail that is text (C31)."""
@@ -695,4 +706,6 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
         raise RecordError("redacted_paths: a list of field paths")
     if "instrument_refusal" in body:  # optional, from version 3
         _check_refusal(body["instrument_refusal"])
+    if "lease_id" in body:  # optional, from version 3: only an attempt run on a lease has one (C41)
+        _check_lease_id(body["lease_id"])
     return version
