@@ -4,6 +4,8 @@ Every step goes through the shared launcher (`hpclaunch.Launcher`) and every cha
 store (`hpclaunch.StateStore`), written before the action it enables, so `down` finds whatever `up` reached.
 """
 
+import contextlib
+import dataclasses
 import json
 import os
 import re
@@ -11,7 +13,7 @@ import secrets
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
@@ -46,7 +48,9 @@ TIMEOUTS = {
     "step": 600.0,  # a control step: node facts, a token's mint and delivery, an export, a check
     "core": 5400.0,  # the core's phase as a step: the bootstrap, the baseline and the link check
     "cancel": 300.0,  # the held job leaving the queue after its cancel
+    "leave": 120.0,  # a refused up's cancelled jobs leaving the live list, under the fleet's lock, before it is let go
 }
+PLACEMENT_ATTEMPTS = 3  # declared bound: how often an up of a fleet is tried when it is placed on another's node
 VERDICT = {"oz": "hpcop: OK zone", "op": "hpcop: OK provider"}
 FAILED = ("FINISH FAILED", "hpcop: ERROR")
 TOKEN_WAIT = "waiting for the registration token"
@@ -109,6 +113,7 @@ class Driver(Down):
     environ: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     timeouts: Dict[str, float] = field(default_factory=lambda: dict(TIMEOUTS))
     removal: Dict[str, Any] = field(default_factory=dict)  # the root's removal's file calls (hpcdown), for a stand-in
+    placement_lock: Optional[Path] = None  # an up of a fleet: the lock its ups share (hpcexclude), so a bounded retry
 
     @property
     def spec(self) -> Spec:
@@ -359,10 +364,20 @@ class Driver(Down):
         )
 
     def sandbox_allocation(
-        self, state: Mapping[str, Any], site: Site, exclude: Sequence[str] = ()
+        self, state: Mapping[str, Any], site: Site, exclude: Sequence[str] = (), after: Optional[str] = None
     ) -> Optional[Allocation]:
         """The agent's own held job under `separate` (one node of its own shape), else None. It keeps off the same
-        nodes as the services' job: an agent's sandbox never runs on a node that hosts an Onedata service."""
+        nodes as the services' job: an agent's sandbox never runs on a node that hosts an Onedata service.
+
+        `after` is the services' job, and is set (by `hold_once`, with `HPC_EXCLUSIVE_NODES=1` only) on the agent's job
+        that is submitted beside it: `--dependency=after:<that job>` (Slurm's "begin after the job starts", never
+        `afterok`, which would wait for its end), so it cannot start before the services' job does, and a services job
+        still pending in the queue does not leave the agent's node billing alone. What remains: once the services' job
+        has started, the agent's job still waits for a node of its own, and the services' job may run meanwhile; and a
+        services job cancelled before it starts (its wait failing at the queue bound) also satisfies the dependency,
+        so the agent's job may start in the seconds before the same failure cancels it (`release_held`). The
+        dependency is read back as the job is submitted (`Slurm.check_dependency`). Without exclusive nodes the agent's
+        job is submitted only once the services' job runs (`hold_once`), and carries none."""
         record, agent = state.get("sandbox"), self.settings.sandbox_node()
         if record is None or agent is None or record["placement"] != "separate":
             return None
@@ -376,6 +391,7 @@ class Driver(Down):
             time=self.settings.time,
             time_s=self.settings.time_s,
             exclude=tuple(exclude),
+            after=after,
             exclusive=site.exclusive_nodes,
         )
 
@@ -410,10 +426,7 @@ class Driver(Down):
         return digest
 
     def bring_up(self, site: Site, tree: Optional[str] = None) -> str:
-        excluded = self.other_federations_nodes()  # before anything is made: an unreadable read refuses here
-        state = self.store.create(self.initial_state(site, tree, len(excluded)))
-        self.make_storage(state)  # recorded above, made before any job exists to bill for it
-        self.hold_and_place(state, site, excluded)
+        self.hold_and_place(site, tree)
         self.node_facts()
         self.zone_up()
         self.providers_up()
@@ -424,43 +437,95 @@ class Driver(Down):
         retried = self.retried()
         return f"{out}\n{retried}\n{self.start_relay()}" if retried else f"{out}\n{self.start_relay()}"
 
-    def hold_and_place(self, state: Mapping[str, Any], site: Site, excluded: Sequence[str]) -> None:
-        """Submit this up's held jobs (the services', and under `separate` the agent's own), wait for each to run, and
-        place every role on its node. A failure anywhere from the first sbatch to the end of the placement releases
-        every held job of this up (`releasing`): none is left to start and bill with no federation.
+    def hold_and_place(self, site: Site, tree: Optional[str]) -> None:
+        """Hold this federation's jobs, running, and place every role on its node: what `up` needs before any step. An
+        up of a fleet (`placement_lock`) whose jobs run on a node another live federation holds is refused, its jobs
+        released, and is tried again, up to `PLACEMENT_ATTEMPTS` times in all, each submit excluding the nodes held by
+        then; the last refusal ends the up as it always did. An up run by hand is tried once."""
+        attempts = PLACEMENT_ATTEMPTS if self.placement_lock is not None else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return self.hold_once(site, tree, first=attempt == 1)
+            except hpcexclude.SharedNode as error:
+                if attempt == attempts or not error.released:  # a cancel that failed is down's: never resubmitted over
+                    raise
+                self.say(f"{error}; trying again ({attempt + 1} of {attempts})")
+        raise AssertionError("unreachable: the last attempt returns or raises")
+
+    def placing(self) -> Any:
+        """The fleet-wide lock around what two ups must not do at once: read the account's live jobs and submit on it,
+        and read them again once the jobs run. Waited for; none for an up run by hand. It is never held across a wait
+        and never taken inside itself (an `flock` on a descriptor of its own would deadlock the second)."""
+        if self.placement_lock is None:
+            return contextlib.nullcontext()
+        return hpcexclude.placement_lock(self.placement_lock)
+
+    @staticmethod
+    def forget_released(state: Dict[str, Any], excluded: int) -> None:
+        """A later attempt's state, as the first attempt's was before its submit: the new read's count, and no job. The
+        jobs of the attempt before were all cancelled (an up whose cancel failed is never tried again), and a state that
+        still named them would hide a job this attempt submits and dies before it records from `down`, which looks a job
+        up by name only when the state names none."""
+        state["allocation"].update(job=None, readback=None, excluded_nodes=excluded)
+        if state.get("sandbox") is not None:
+            state["sandbox"].update(job=None, component_job=None, readback=None)
+
+    def hold_once(self, site: Site, tree: Optional[str], first: bool) -> None:
+        """One attempt to hold this federation's jobs, from the first read of the account's live jobs to the placement
+        of every role. A later attempt reuses the state file, its names and its storage, forgets the released jobs
+        (`forget_released`) and records the new read's count and, as it submits, the new jobs. A failure anywhere from
+        the first sbatch to the end of the placement releases every held job of this attempt (`releasing`): none is
+        left to start and bill with no federation.
 
         Under `separate`, without `HPC_EXCLUSIVE_NODES`, the agent's job is submitted only once the services' job runs
         and its nodes are read, and `--exclude` names those nodes beside the other federations' (live, 18 Nov: the
         two jobs submitted together, and Slurm packed the agent's onto a services node, which no exclusion read before
-        the submit could name, the up's own nodes being unknown: four ups failed). The cost: the services' nodes bill
-        while the agent's job queues, which the queue bound (`HPC_QUEUE_WAIT_S`) limits. With `HPC_EXCLUSIVE_NODES=1`
-        both jobs hold whole nodes that no other job shares, so exclusivity already keeps the agent off the services'
-        nodes: the two are submitted together, as they were, and wait together. A heterogeneous job (`het`) is one
-        job, whose components Slurm gives nodes of their own: unchanged. Every held job is read back once more when
-        all of them run, as it always was: a services' job that ended during the agent's wait, and whose id Slurm
-        reused, is found then (`Slurm.checked`), not placed from a record the wait made stale."""
-        asked, alone = self.allocation(state, site, excluded), self.sandbox_allocation(state, site, excluded)
-        if site.exclusive_nodes:
-            self.say("HPC_EXCLUSIVE_NODES=1: every held job asks for whole nodes (--exclusive), and is read back as "
-                     "exclusive")  # fmt: skip
-        after = alone is not None and not site.exclusive_nodes  # the agent's job waits for the services' nodes
+        the submit could name, the up's own nodes being unknown: four ups failed). It needs no `--dependency`: the
+        services' job already runs. The cost: the services' nodes bill while the agent's job queues, which the queue
+        bound (`HPC_QUEUE_WAIT_S`) limits. With `HPC_EXCLUSIVE_NODES=1` both jobs hold whole nodes that no other job
+        shares, so exclusivity already keeps the agent off the services' nodes: the two are submitted together, the
+        agent's with `--dependency=after:<services job>` (`sandbox_allocation`), and wait together. A heterogeneous job
+        (`het`) is one job, whose components Slurm gives nodes of their own: unchanged. Every held job is read back
+        once more when all of them run, as it always was: a services' job that ended during the agent's wait, and
+        whose id Slurm reused, is found then (`Slurm.checked`), not placed from a record the wait made stale.
+
+        The fleet's lock (`placing`) is held around the first read with the services' submit (and, exclusive, the
+        agent's), around the agent's submit once the services' job runs (its exclusion is the first read's, which the
+        second read below checks), and around the second read: never across a wait, so the rest of the up runs in
+        parallel with the others'."""
         held: List[Tuple[str, Allocation]] = []
         with self.releasing(held):
-            self.submit(asked, "allocation", held)
-            if alone is not None and not after:  # exclusive nodes: the agent's own held job, exactly as the first
-                self.submit(alone, "sandbox", held)
+            with self.placing():
+                excluded = self.other_federations_nodes()  # before anything is made: an unreadable read refuses here
+                if first:
+                    state = self.store.create(self.initial_state(site, tree, len(excluded)))
+                    self.make_storage(state)  # recorded above, made before any job exists to bill for it
+                else:
+                    state = self.set(lambda s: self.forget_released(s, len(excluded)))
+                asked, alone = self.allocation(state, site, excluded), self.sandbox_allocation(state, site, excluded)
+                if site.exclusive_nodes:
+                    self.say("HPC_EXCLUSIVE_NODES=1: every held job asks for whole nodes (--exclusive), and is read "
+                             "back as exclusive")  # fmt: skip
+                self.submit(asked, "allocation", held)
+                if alone is not None and site.exclusive_nodes:
+                    # sandbox_placement = "separate", whole nodes: the agent's own held job, as the first, held until
+                    # the services' job starts (`after`): a pending services job never leaves the agent's node billing
+                    # alone
+                    self.submit(dataclasses.replace(alone, after=held[0][0]), "sandbox", held)
             self.wait_held(held)
             records = self.running_records(held)
-            if alone is not None and after:
+            if alone is not None and not site.exclusive_nodes:
                 own = self.placed_nodes(records)[0]  # the services' nodes, as the running job holds them
-                agent = replace(alone, exclude=tuple(sorted({*excluded, *own})), own=len(own))
+                agent = dataclasses.replace(alone, exclude=tuple(sorted({*excluded, *own})), own=len(own))
                 self.say(f"the services' job runs: the agent's own held job is submitted now, off its {len(own)} "
                          f"node(s) and the {len(excluded)} of other live federations")  # fmt: skip
-                self.submit(agent, "sandbox", held)
+                with self.placing():
+                    self.submit(agent, "sandbox", held)
                 self.wait_held(held[1:])
                 records = self.running_records(held)  # every held job once more: the first record is as old as the wait
             placed = self.placed_nodes(records)
-            self.keep_off_other_federations([job for job, _ in held], placed)
+            with self.placing():
+                self.keep_off_other_federations([job for job, _ in held], placed)
             self.set(lambda s: self.place(s, placed, [record for _, _, record in records]))
 
     def running_records(self, held: Sequence[Tuple[str, Allocation]]) -> List[Tuple[str, Any, Dict[str, str]]]:
@@ -478,9 +543,12 @@ class Driver(Down):
         (`release_held`), and says so: a Slurm failure ends with what was released, any other is raised as it was after
         the operator is told. An operator's Ctrl-C during a wait that may last hours is one of them. `held` grows as the
         jobs are submitted, each as soon as sbatch prints its id. With nothing left to release (one held job, cancelled
-        by its own failed wait or read-back) the failure is as it was."""
+        by its own failed wait or read-back) the failure is as it was. A `SharedNode` is as it was too: the refusal
+        that raises it has cancelled every held job itself, and said so, and an up is tried again only on that type."""
         try:
             yield
+        except hpcexclude.SharedNode:
+            raise
         except BaseException as error:
             said = self.release_held(held)
             if not said:
@@ -616,13 +684,15 @@ class Driver(Down):
         """Once the held jobs run and before any step, none of this federation's nodes may hold another live
         federation's job (a service's, or an agent's: an agent never runs beside a service): two ups that read the
         account's jobs at once both excluded nothing. One that does is refused, every held job of this up cancelled
-        by its own id, and the roles named (the zone, providers[i], the agent), never a host. `placed` is each
-        component's nodes, the services' first. Fail closed: with the jobs unreadable nothing proves the nodes are
-        this federation's own, and the release follows. A read of the account's jobs that fails or times out (a slow
-        controller, with the jobs already running) is read again, backed off, and fails only once every read has
-        failed for ten minutes (`Slurm.ride_out`); a line it cannot take apart ends it at once. Either failure
-        propagates to `releasing`, which reads each held job before it cancels it: ten minutes later a job may have
-        ended and Slurm reused its id, which a cancel by the saved id would hit."""
+        by its own id, and the roles named (the zone, providers[i], the agent), never a host (`hpcexclude.SharedNode`;
+        under a fleet, with the lock held, the cancelled jobs are first waited out of the live list, so that the next
+        up does not read them still holding the node). `placed` is each component's nodes, the services' first. Fail
+        closed: with the jobs unreadable nothing proves the nodes are this federation's own, and the release follows.
+        A read of the account's jobs that fails or times out (a slow controller, with the jobs already running) is
+        read again, backed off, and fails only once every read has failed for ten minutes (`Slurm.ride_out`); a line
+        it cannot take apart ends it at once. Either failure propagates to `releasing`, which reads each held job
+        before it cancels it: ten minutes later a job may have ended and Slurm reused its id, which a cancel by the
+        saved id would hit."""
 
         def read() -> List[str]:
             return hpcexclude.nodes_of(hpcexclude.live_jobs(self.slurm), own=jobs)
@@ -632,14 +702,37 @@ class Driver(Down):
         held += [(hpcexclude.AGENT, node) for nodes in placed[1:] for node in nodes]
         shared = [role for role, node in held if node in others]
         if shared:
-            raise SlurmError(
+            said, released = self.release_report(jobs)
+            if released and self.placement_lock is not None:
+                self.wait_unlisted(jobs)
+            raise hpcexclude.SharedNode(
                 f"{', '.join(shared)} would run on a node another live federation of this account holds, and two "
-                f"federations never share one; no service started, and {self.release(jobs)}"
+                f"federations never share one; no service started, and {said}",
+                released,
             )
+
+    def wait_unlisted(self, jobs: Sequence[str]) -> None:
+        """Wait, at most `timeouts["leave"]`, for the jobs just cancelled to leave `squeue --me`'s live list, which is
+        what the next up reads (a completing job still lists its nodes). Never an error: a list that cannot be read, or
+        jobs still there at the bound, are left to the next up's own read, which fails closed or is refused and tried
+        again."""
+        deadline = self.clock() + self.timeouts["leave"]
+        while True:
+            try:
+                listed = {job.job for job in hpcexclude.live_jobs(self.slurm)}
+            except SlurmError:
+                return
+            if not listed & set(jobs) or self.clock() >= deadline:
+                return
+            self.sleep(self.poll_s)
 
     def release(self, jobs: Sequence[str]) -> str:
         """Cancel each held job of this up by its own id, and say so; a cancel that fails is said, and `down` finishes
         it."""
+        return self.release_report(jobs)[0]
+
+    def release_report(self, jobs: Sequence[str]) -> Tuple[str, bool]:
+        """`release`, and whether every cancel went through (an up is tried again only then)."""
         failed = []
         for job in jobs:
             try:
@@ -647,8 +740,8 @@ class Driver(Down):
             except SlurmError:
                 failed.append(job)
         if failed:
-            return f"cancelling job(s) {', '.join(failed)} failed: run down to release them"
-        return f"the held job(s) {', '.join(jobs)} were cancelled"
+            return f"cancelling job(s) {', '.join(failed)} failed: run down to release them", False
+        return f"the held job(s) {', '.join(jobs)} were cancelled", True
 
     def make_storage(self, state: Mapping[str, Any]) -> None:
         """The providers' storage directories on scratch, as the state records them (hpcstorage.create); none without a
@@ -695,6 +788,7 @@ class Driver(Down):
         self.say(f"held job {job} submitted ({sum(s.nodes for s in asked.shapes())} nodes); reading back what Slurm "
                  "recorded")  # fmt: skip
         records = self.slurm.checked(job, asked, self.say)
+        self.slurm.check_dependency(job, asked, records, self.say)  # at submit time only: it is gone once the job runs
         self.set(lambda s: self.record_readback(s, key, records))
         return job
 

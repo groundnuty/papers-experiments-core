@@ -411,12 +411,14 @@ def test_o57_a_fleets_members_keep_their_services_off_the_nodes_of_the_members_a
 
 
 @needs_openssl
-def test_o57_two_members_that_raced_and_share_a_node_leave_the_later_one_refused_and_the_rest_up(
+def test_o57_two_members_that_raced_and_share_a_node_leave_the_later_one_released_and_tried_again(
     deploy, ca, tmp_path, monkeypatch
 ):
-    """O57: a fleet that raced: fed-2's job ran on a node fed-1's already held and nothing was excluded (fed-1's job
-    was pending at fed-2's first read). fed-2's up is refused and its job cancelled, as a failed member of a fleet is
-    reported, and fed-1 stays up."""
+    """O57: a fleet that raced: fed-2's job ran on a node fed-1's already held and nothing was excluded (fed-1's job was
+    pending at fed-2's first read). fed-2's up is refused and its jobs cancelled, as it was before; a fleet's up is then
+    tried again, so fed-2 submits anew keeping off fed-1's nodes, and both members end up, on nodes of their own."""
+    import json
+
     bench = make_bench(deploy, tmp_path, ca, monkeypatch)
     bench.pool = POOL
     first = bench.fake("fed-1")
@@ -430,13 +432,20 @@ def test_o57_two_members_that_raced_and_share_a_node_leave_the_later_one_refused
 
     second.me_rows = rows
     code, printed = bench.up(2)
-    assert code != 0
-    assert sorted(second.cancelled) == sorted(job_ids("fed-2"))  # its services' job and its agent's own
+    assert code == 0, printed
+    assert sorted(second.cancelled) == sorted(job_ids("fed-2"))  # the first attempt's: its services' job, its agent's
     assert first.cancelled == []
+    assert len(second.submitted) == 4  # and the second attempt's two
     log = (bench.fleet / "logs" / "fed-2.up.log").read_text(encoding="utf-8")
-    assert "zone" in log  # the member's own log has the refusal; the fleet's line is the log's last
+    assert "zone" in log  # the member's own log has the refusal, and that it was tried again
+    assert "trying again" in log
     assert names_no_node(log)
     assert names_no_node(printed)
+    held = {}
+    for label in ("fed-1", "fed-2"):
+        state = json.loads((bench.root(label) / "hpc-federation.json").read_text(encoding="utf-8"))
+        held[label] = {*state["allocation"]["nodes"], state["sandbox"]["node"]}
+    assert not held["fed-1"] & held["fed-2"]
 
 
 # -- what the guard reads, and how (a third Codex pass, 17 Nov 2026) --------------------------------------------

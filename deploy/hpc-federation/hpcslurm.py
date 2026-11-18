@@ -356,6 +356,7 @@ class Allocation:
     exclude: Tuple[
         str, ...
     ] = ()  # the nodes of other federations' live jobs (hpcexclude): each component's `--exclude`
+    after: Optional[str] = None  # the id of a job this one waits to START (`--dependency=after:`, component 0 only)
     exclusive: bool = False  # `--exclusive` on every component (HPC_EXCLUSIVE_NODES): no other job shares its nodes
     own: int = 0  # how many of `exclude` are the nodes of this federation's own services job (the agent's, `separate`)
 
@@ -369,10 +370,16 @@ class Allocation:
         cores and memory; `--wrap` stands once, in component 0's options, as sbatch builds the script once. `--exclude`
         names the same nodes in every component, so that nothing depends on Slurm passing it on, and only when there
         are nodes to name: without them the argv is what it was before the option existed. `--exclusive` follows the
-        memory of every component, likewise only when asked (Slurm propagates it to no component)."""
+        memory of every component, likewise only when asked (Slurm propagates it to no component).
+        `--dependency=after:<job>` (`after`, set only on the agent's own job, never on a job that has components) holds
+        the job until `<job>` has started or been cancelled: Slurm's "begin after the job starts" type, never
+        `afterok`, which would wait for the job to end. One argv may carry both."""
         if not all(NODE.fullmatch(node) for node in self.exclude):
             raise SlurmError("an excluded node's name is not one an sbatch argv may carry")
+        if self.after is not None and not re.fullmatch(r"[0-9]{1,12}", self.after):
+            raise SlurmError("the job this one waits to start is not one job id")
         exclude = [f"--exclude={','.join(self.exclude)}"] if self.exclude else []
+        dependency = [f"--dependency=after:{self.after}"] if self.after is not None else []
         whole = ["--exclusive"] if self.exclusive else []
         argv = [
             "sbatch",
@@ -388,6 +395,7 @@ class Allocation:
             f"--mem={self.memory_mib}M",
             *whole,
             *exclude,
+            *dependency,
             "--chdir=/",
             "--output=/dev/null",
             "--export=NONE",
@@ -703,6 +711,40 @@ class Slurm:
             raise SlurmError(f"the held job was recorded otherwise than asked ({', '.join(wrong)}); it was cancelled")
         assert records is not None
         return records
+
+    def check_dependency(
+        self,
+        job: str,
+        asked: Allocation,
+        records: Sequence[Mapping[str, str]],
+        say: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """Read back the dependency of a job just submitted (`asked.after`), at submit time only: the job's record must
+        name `after:<that job>` (Slurm adds `(unfulfilled)` while it waits), or none while that job is no longer
+        waiting, since Slurm drops a dependency once it holds. A job recorded with no dependency while the job it was to
+        wait for still waits would start with no services, so it is cancelled by its own id and the up fails. The read
+        of the job it waits for, which that asks, is a missed poll when it fails (`ride_out`: said once, read again),
+        and only a read that fails for ten minutes, or a definite answer that is no answer, leaves it unchecked and
+        cancels the job: nothing shows the dependency holds. The check is never repeated on the running job (its
+        dependency is gone by then): `checked` does not look at it."""
+        if asked.after is None:
+            return
+        recorded = records[0].get("Dependency", "")
+        if re.fullmatch(rf"after:{asked.after}(?:\([a-z]+\))?", recorded):
+            return
+        if recorded in ("", "(null)"):
+            try:
+                waited = self.ride_out(lambda: self.job(asked.after), f"the job that held job {job} waits for", say)
+            except SlurmError:  # nothing shows the dependency holds: fail closed, never leave the job free to start
+                self.cancel(job)
+                raise SlurmError(
+                    "the held job's dependency could not be checked (the job it waits for could not be read); it was "
+                    "cancelled"
+                ) from None
+            if waited is None or waited.get("JobState") not in WAITING_STATES:
+                return  # it has started (or ended), so the dependency holds: Slurm has dropped it
+        self.cancel(job)
+        raise SlurmError("the held job was recorded otherwise than asked (its dependency); it was cancelled")
 
     def readback(self, job: str, asked: Allocation) -> Dict[str, str]:
         """`checked`, reduced to the read-back's fields of component 0."""
