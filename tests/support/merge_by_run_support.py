@@ -37,13 +37,14 @@ from expcore.campaign.elastic import (
 )
 from expcore.campaign.manifest import fingerprint_sha256
 from expcore.campaign.markers import MARKER_NAME
+from expcore.campaign.merge_by_run import environment_digest
 from expcore.campaign.selection_ledger import spend_of
 from expcore.study.config import load_study
 from expcore.study.pipeline import campaign_fingerprint
 from expcore.study.selection_start import pricing_of
 
 FAR = "2099-01-01T00:00:00Z"
-ENVIRONMENT = hashlib.sha256(b"the environment every federation joined with").hexdigest()
+ENVIRONMENT = environment_digest(IDENTITY)  # what every federation joins the ledger with: its identity's digest
 HEALTHY = {"fed-a1": "site-a", "fed-a2": "site-a", "fed-b1": "site-b"}
 DOOMED = {"fed-x": "site-b", "fed-y": "site-b", "fed-z": "site-b"}
 RERUN = '\n[sensitivity]\nreruns = ["federation"]\n'

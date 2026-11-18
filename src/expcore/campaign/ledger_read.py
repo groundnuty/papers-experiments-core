@@ -15,7 +15,8 @@ their global sequence, and refuses a ledger whose tables say anything else:
 - `counted` applies today's status rule across leases (`done`, `harness_error`, `infra_exhausted` once the charged
   attempts of the run's counted leases reach `max_attempts`, else pending), with the charged attempts of the lease's
   completion;
-- `lost` of a counting lease, `expire`, a `return` of a live lease and `cancel` put the run back to pending.
+- `lost` of a counting lease, `expire`, a `return` of a live lease and `cancel` put the run back to pending;
+- a lease is settled (counted, superseded or lost) once: a second settlement of it is refused.
 
 Each run's state, latest lease and charged attempts, and each lease's final state (counted, superseded, lost) must be
 what the events give. A run's **counted lease** is then its latest lease when the run is terminal (done,
@@ -183,7 +184,12 @@ class _Replay:
         kind, lease_id, run = event["kind"], event["lease_id"], event["run_key"]
         if run is not None and run not in self.state:
             raise self.refuse(event, f"names run {run}, which the ledger does not hold")
-        detail = json.loads(event["detail"]) if event["detail"] else {}
+        try:
+            detail = json.loads(event["detail"]) if event["detail"] else {}
+        except ValueError:
+            raise self.refuse(event, "holds a detail that is not JSON") from None
+        if kind in ("counted", "superseded", "lost") and lease_id in self.settled:
+            raise self.refuse(event, f"settles a lease already settled as {self.settled[lease_id]}")
         if kind == "issue":
             if lease_id <= self.last_issued:
                 raise self.refuse(event, "issues a lease id not above every earlier one")

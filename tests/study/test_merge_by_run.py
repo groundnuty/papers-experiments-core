@@ -25,6 +25,7 @@ from expcore.campaign.interrupted_spend import COPIED_BACK_KEY
 from expcore.campaign.merge_by_run import EVIDENCE_DIR, LEASES_DIR, MERGE_BY_RUN_SCHEMA
 from expcore.campaign.shard import META_ENVIRONMENT, NOT_FINAL_FILE
 from expcore.campaign.snapshot import SNAPSHOT_FILE
+from expcore.records.record import is_record_name
 from expcore.study.config import load_study
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
@@ -266,6 +267,44 @@ def test_c43_a_ledger_whose_tables_are_not_what_its_events_give_is_refused(base,
         db.close()
     errors = refused(fleet, base, "tampered", fleet.outs(fleet.superseded), tampered)
     assert "not what its events give" in errors
+
+
+def test_c43_stores_of_another_environment_than_the_ledgers_are_refused(base, fleet):
+    """C43: every store agrees with the others, and all ran against another environment than the one the ledger
+    pinned at its first join: refused."""
+    pinned = base / "other-environment-ledger" / "ledger.sqlite"
+    pinned.parent.mkdir()
+    shutil.copyfile(fleet.ledger_file, pinned)
+    db = sqlite3.connect(pinned)
+    try:
+        db.execute("UPDATE meta SET value=? WHERE key='environment'", (hashlib.sha256(b"elsewhere").hexdigest(),))
+        db.commit()
+    finally:
+        db.close()
+    errors = refused(fleet, base, "ledger-environment", fleet.outs(fleet.superseded), pinned)
+    assert "another environment than the ledger's" in errors
+
+
+def test_c43_a_counted_store_without_its_final_record_is_refused(base, fleet):
+    """C43: the record of a counted lease's final attempt is the run's only one; a store that lost it is refused."""
+    copy = copy_campaign(fleet.counted()[0], base, "no-record")
+    for path in copy.runs.rglob("*.json"):
+        if is_record_name(path.name):
+            path.unlink()
+    outs = fleet.outs(fleet.superseded)
+    errors = refused(fleet, base, "record-missing", [str(copy.root / "out"), *outs[1:]])
+    assert "the record of a counted lease's final attempt is missing" in errors
+
+
+def test_c43_a_record_added_to_a_merged_batch_is_refused_by_the_check(base, merged, fleet):
+    """C43: the check replays exactly the counted leases' records; one no counted store accounts for is refused."""
+    copy = copy_campaign(merged, base, "stray-record")
+    first = next(path for path in sorted(copy.runs.rglob("*.json")) if is_record_name(path.name))
+    stray = first.parent.with_name("try9")
+    shutil.copytree(first.parent, stray)
+    code, errors = cli(fleet.env, "check", str(copy.runs))
+    assert code == 1
+    assert "a record no attempt of a counted lease's store accounts for" in errors
 
 
 def test_c43_a_campaign_with_a_run_not_yet_counted_is_refused(base, fleet):

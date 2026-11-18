@@ -86,7 +86,7 @@ from expcore.campaign.lock import CampaignLocked, DispatchLock, LockMissing, Loc
 from expcore.campaign.manifest import Manifest, build_fingerprint, fingerprint_sha256, shard_manifest
 from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
 from expcore.campaign.merge import MergeRefused, read_merge
-from expcore.campaign.merge_by_run import MERGE_BY_RUN_SCHEMA
+from expcore.campaign.merge_by_run import MERGE_BY_RUN_SCHEMA, require_records
 from expcore.campaign.merged import read_held, verify_merged, verify_queried
 from expcore.campaign.merged_by_run import is_by_run, read_by_run, verify_by_run
 from expcore.campaign.model_usage import usage_of_batch
@@ -819,6 +819,10 @@ def _check_merged_by_run(
     check = verify_batch(
         directory, code=code, hashed_only=[MARKER_PATTERN], environment=env, side_files=study.side_files
     )
+    try:  # the records replayed are exactly the counted leases': no evidence's, none missing
+        require_records(counted, check["replayed"])
+    except MergeRefused as error:
+        raise Refused(str(error)) from None
     check[MERGE_KEY] = {"file": MERGE_FILE, "sha256": hashlib.sha256(raw).hexdigest(), "partial": partial}
     write_check(directory, check)
     return check

@@ -17,7 +17,8 @@
    whose pinned lease names another run, another campaign or another grant than the ledger's; a store that holds any
    run but its own;
 3. stores of another campaign (the fingerprint, the core first of all, `merge.check_fingerprints`) or another
-   environment (`merge.check_environment`); a campaign whose fingerprint is not the one the ledger was made for;
+   environment (`merge.check_environment`), or than the one the ledger pinned at its first join (`environment_digest`
+   of the stores' identity); a campaign whose fingerprint is not the one the ledger was made for;
 4. **not exactly one counted lease per run:** a run of the plan that is not terminal in the ledger (it has no counted
    lease yet), a run whose counted lease's store is not given (its archive is the run's only record), a counted store
    whose run ended otherwise than the ledger says; a store of a counted or superseded lease that is not given (the
@@ -26,8 +27,10 @@
    is not given: the grant of a lost or expired one, the spend of a returned one) together above `max_usd` or a
    model's ceiling of the ledger, a store that spent more than its grant, or a spend unknown under a budget.
 
-Then each counted store passes the replay check (`study.merge_by_run`). Today's checks hold for every store given, so
-a store of another campaign or environment is refused even when it is only evidence.
+Then each counted store passes the replay check (`study.merge_by_run`), and its records are exactly those of its
+attempts (`require_records`): none it does not account for, and the record of every attempt it holds as done.
+Today's checks hold for every store given, so a store of another campaign or environment is refused even when it is
+only evidence.
 
 **Evidence.** A lease store that is not its run's counted lease is kept under `evidence/` and in merge.json's
 `evidence`, with why (`reason`): `superseded` (its completion came from a lease that was no longer the run's latest),
@@ -49,9 +52,9 @@ plan through these checks, and refuse a file that differs.
 import hashlib
 import json
 import sqlite3
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from pathlib import Path
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path, PurePath
 from typing import Any
 
 from expcore.campaign.elastic.config import micro_down, micro_up, usd_of
@@ -75,6 +78,7 @@ from expcore.campaign.shard import (
     check_identity,
 )
 from expcore.campaign.snapshot import SNAPSHOT_FILE
+from expcore.records.record import record_filename
 
 MERGE_BY_RUN_SCHEMA = "expcore-merge/2"
 LEASES_DIR = "leases"
@@ -98,6 +102,8 @@ class LeaseStore:
     runs: Mapping[str, Mapping[str, Any]]  # the factors of each run the store holds, by run key
     status: Mapping[str, str]  # the status of each run the store holds, by run key
     spend: Spend | None = None
+    # where each attempt's record lies in a batch (`<digest>/try<N>/<record file>`), with the attempt's state
+    attempts: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def name(self) -> str:
@@ -149,10 +155,17 @@ def lease_store_of(
         rows = query("SELECT run_key, factors, status FROM runs")
         runs = {row[0]: json.loads(row[1]) for row in rows}
         status = {row[0]: row[2] for row in rows}
+        attempts = {
+            f"{row[0]}/{PurePath(row[1]).name}/{record_filename(row[2], row[3])}": row[4]
+            for row in query(
+                "SELECT r.digest, a.run_dir, a.run_key, a.attempt, a.state FROM attempts a "
+                "JOIN runs r ON r.run_key = a.run_key WHERE a.run_dir IS NOT NULL ORDER BY a.id"
+            )
+        }
         spend = None if pricing is None else spend_of(query, pricing)
     except sqlite3.Error as error:
         raise MergeRefused(f"{where}: cannot read its store ({type(error).__name__}: {error})") from None
-    return LeaseStore(out, snapshot, sha256, lease, started, environment, fingerprint, runs, status, spend)
+    return LeaseStore(out, snapshot, sha256, lease, started, environment, fingerprint, runs, status, spend, attempts)
 
 
 def _lease_of(meta: Mapping[str, str], where: object) -> RunLease:
@@ -208,10 +221,42 @@ def check_by_run(ledger: LedgerFacts, stores: Sequence[LeaseStore], plan: Manife
             f"{ledger.config.fingerprint[:12]}"
         )
     check_environment(ordered)
+    _check_ledger_environment(ordered[0], ledger)
     counted = _counted(ledger, by_lease, plan)
     evidence = _evidence(ledger, by_lease, {store.lease.lease_id for store in counted})
     _check_spend(ledger, counted, evidence)
     return ByRun(tuple(counted), tuple(evidence), ledger)
+
+
+def environment_digest(identity: Mapping[str, str]) -> str:
+    """The environment a federation joins the ledger with (`elastic.Ledger.join`): the SHA-256 of its environment
+    identity's canonical JSON, the identity a lease store pins (`META_ENVIRONMENT`)."""
+    text = json.dumps(dict(identity), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _check_ledger_environment(store: LeaseStore, ledger: LedgerFacts) -> None:
+    """3: the stores' environment identity is the one the ledger pinned at its first join."""
+    if ledger.environment != environment_digest(store.environment):
+        raise MergeRefused(
+            f"{store.name}: ran against an environment whose identity has digest "
+            f"{environment_digest(store.environment)[:12]}, and the ledger pinned "
+            f"{str(ledger.environment)[:12]} at its first join: another environment than the ledger's"
+        )
+
+
+def require_records(stores: Sequence[LeaseStore], records: Iterable[str]) -> None:
+    """The records of a batch merged by run (paths relative to its `runs/`) are exactly the counted stores': each
+    lies where an attempt of one of them lies, and every attempt a store holds as done has its record. A record of an
+    evidence lease, or one a store does not account for, is refused, and so is a counted run without its record."""
+    expected = {rel: state for store in stores for rel, state in store.attempts.items()}
+    found = set(records)
+    stray = sorted(found - set(expected))
+    if stray:
+        raise MergeRefused(f"{stray[0]}: a record no attempt of a counted lease's store accounts for")
+    missing = sorted(rel for rel, state in expected.items() if state == "done" and rel not in found)
+    if missing:
+        raise MergeRefused(f"{missing[0]}: the record of a counted lease's final attempt is missing")
 
 
 def _by_lease(stores: Sequence[LeaseStore]) -> dict[int, LeaseStore]:

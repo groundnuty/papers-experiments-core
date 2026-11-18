@@ -89,6 +89,27 @@ def test_c43_a_ledger_whose_recorded_verdict_is_not_the_rules_is_refused(tmp_pat
         facts_of(tmp_path, ledger.path)
 
 
+def test_c43_a_lease_settled_twice_is_refused(tmp_path):
+    """C43: a lease whose archive never verified is lost for good; a later event counting it is refused."""
+    ledger, clock = make(tmp_path)
+    join(ledger, clock, "fed-a")
+    lease = leased(ledger, "fed-a")
+    ledger.observe_site(SITE, SiteReading(completions=(completion(lease),)))
+    assert ledger.verify_archive(lease.lease_id, None) == "lost"
+    ledger.close()
+    db = sqlite3.connect(ledger.path)
+    try:
+        db.execute(
+            "INSERT INTO events(at, kind, run_key, lease_id, detail) VALUES(?, 'counted', ?, ?, ?)",
+            (clock(), lease.run_key, lease.lease_id, '{"outcome": "done"}'),
+        )
+        db.commit()
+    finally:
+        db.close()
+    with pytest.raises(LedgerRefused, match="settles a lease already settled as lost"):
+        facts_of(tmp_path, ledger.path)
+
+
 def test_c43_a_file_that_is_not_a_ledger_is_refused(tmp_path):
     """C43: anything but a ledger's file is refused, naming it."""
     other = tmp_path / "other.sqlite"

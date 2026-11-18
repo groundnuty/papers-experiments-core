@@ -31,7 +31,7 @@ from typing import Any
 from expcore.campaign.ledger_read import LEDGER_SNAPSHOT, LedgerFacts, LedgerRefused, read_ledger, take_ledger_snapshot
 from expcore.campaign.lock import CampaignLocked, LockMissing, LockUnavailable, ReaderLock
 from expcore.campaign.merge import RUNS_DIR, MergeRefused, copy_runs, make_writable, refuse_non_empty, sha256_of
-from expcore.campaign.merge_by_run import LeaseStore, check_by_run, lease_store_of_bytes
+from expcore.campaign.merge_by_run import LeaseStore, check_by_run, lease_store_of_bytes, require_records
 from expcore.campaign.merged_by_run import lay_out_by_run
 from expcore.campaign.recovery import recover
 from expcore.campaign.scheduler import STATE_FILE
@@ -42,6 +42,7 @@ from expcore.campaign.storecopy import StoreChanged, copy_store
 from expcore.errors import study_kinds
 from expcore.provenance.codestamp import require_known
 from expcore.provenance.core_check import require_core
+from expcore.records.record import is_record_name
 from expcore.study.config import StudyConfig, find_study_root, load_study
 from expcore.study.merge import REPLAY_DIR, _refuse_inside_a_shard, _replay, refuse_earlier_form
 from expcore.study.pipeline import campaign_environment, environment_like
@@ -100,6 +101,8 @@ def _merge(
         copies = stage / REPLAY_DIR
         copies.mkdir(mode=0o700)
         staged = [_replay(study, store, code, env, copies / str(n)) for n, store in enumerate(merged.counted)]
+        for store in staged:  # its records are exactly those of its attempts: none stray, none missing
+            require_records([store], _records_in(store.out / RUNS_DIR))
         lay_out_by_run(stage, merged, staged)
         shutil.rmtree(copies)
         try:
@@ -111,6 +114,11 @@ def _merge(
             make_writable(stage)
         shutil.rmtree(stage, ignore_errors=True)
     return MergedByRun(out, len(merged.counted), len(merged.evidence))
+
+
+def _records_in(runs: Path) -> list[str]:
+    """Every record file under a `runs/` directory, by its path relative to it."""
+    return [str(path.relative_to(runs)) for path in sorted(runs.rglob("*")) if is_record_name(path.name)]
 
 
 def _ledger_of(source: Path, snapshot: Path) -> LedgerFacts:
