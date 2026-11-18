@@ -19,9 +19,10 @@ import pytest
 from fingerprint_support import standin_python
 
 SCRIPT = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation" / "shards.py"
-# Names and contents no record, archive, log or line may ever hold: each carries "zq".
-FILES = {".zqsecrets/alpha-zq/key-zq": "sk-zq-first-1111\n", ".zqkeys/beta-zq/gamma-zq/lk-zq": "lk-zq-second-2222\n"}
-MARKERS = (b"zq", b"1111", b"2222")
+# Names and contents no record, archive, log or line may ever hold: each carries "ZQ" (upper case: a random
+# directory suffix or a hex digest is lower case, so it can never hold the marker by chance).
+FILES = {".ZQsecrets/alpha-ZQ/key-ZQ": "sk-ZQ-first-1111\n", ".ZQkeys/beta-ZQ/gamma-ZQ/lk-ZQ": "lk-ZQ-second-2222\n"}
+MARKERS = (b"ZQ", b"first-1111", b"second-2222")  # never in a hex digest, an epoch or a random name
 HOME_NAMES = {"HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "APPTAINER_CONFIGDIR",
               "APPTAINER_CACHEDIR", "UV_CACHE_DIR", "PIP_CACHE_DIR", "PYTHONNOUSERSITE", "GIT_CONFIG_GLOBAL",
               "GIT_CONFIG_NOSYSTEM", "TMPDIR"}  # fmt: skip
@@ -180,42 +181,42 @@ def damaged_trees(tmp_path: Path):
     """Each way the operator's tree can be wrong, as a function that damages a good tree: (name, damage, reason)."""
 
     def link_inside(root):
-        (root / ".zqsecrets" / "alpha-zq" / "link-zq").symlink_to("key-zq")
+        (root / ".ZQsecrets" / "alpha-ZQ" / "link-ZQ").symlink_to("key-ZQ")
 
     def link_to_dir(root):
-        (root / "dirlink-zq").symlink_to(root / ".zqkeys")
+        (root / "dirlink-ZQ").symlink_to(root / ".ZQkeys")
 
     def group_readable(root):
-        (root / ".zqsecrets" / "alpha-zq" / "key-zq").chmod(0o640)
+        (root / ".ZQsecrets" / "alpha-ZQ" / "key-ZQ").chmod(0o640)
 
     def executable_file(root):
-        (root / ".zqsecrets" / "alpha-zq" / "key-zq").chmod(0o700)
+        (root / ".ZQsecrets" / "alpha-ZQ" / "key-ZQ").chmod(0o700)
 
     def open_dir(root):
-        (root / ".zqkeys").chmod(0o750)
+        (root / ".ZQkeys").chmod(0o750)
 
     def open_root(root):
         root.chmod(0o755)
 
     def fifo(root):
-        os.mkfifo(root / "fifo-zq", 0o600)
+        os.mkfifo(root / "fifo-ZQ", 0o600)
 
     def too_many(root):
         for n in range(shards_limit + 1):
-            (root / f"f{n}-zq").write_text("x")
-            (root / f"f{n}-zq").chmod(0o600)
+            (root / f"f{n}-ZQ").write_text("x")
+            (root / f"f{n}-ZQ").chmod(0o600)
 
     def too_big(root):
-        (root / "big-zq").write_bytes(b"x" * ((1 << 20) + 1))
-        (root / "big-zq").chmod(0o600)
+        (root / "big-ZQ").write_bytes(b"x" * ((1 << 20) + 1))
+        (root / "big-ZQ").chmod(0o600)
 
     def too_deep(root):
         deep = root
         for n in range(12):
-            deep = deep / f"d{n}-zq"
+            deep = deep / f"d{n}-ZQ"
             deep.mkdir(mode=0o700)
-        (deep / "k-zq").write_text("x")
-        (deep / "k-zq").chmod(0o600)
+        (deep / "k-ZQ").write_text("x")
+        (deep / "k-ZQ").chmod(0o600)
 
     shards_limit = 64
     return [("a link to a file", link_inside), ("a link to a directory", link_to_dir),
@@ -239,14 +240,14 @@ def test_o63_a_damaged_tree_refuses_plan_lines_and_step_naming_the_key_and_no_fi
         captured = capsys.readouterr()
         assert captured.out == ""
         assert "home_files" in captured.err
-        assert "zq" not in captured.err
+        assert "ZQ" not in captured.err
         assert str(tree) not in captured.err
     assert not list((tmp_path / "tmpfs").iterdir())
     capsys.readouterr()
     assert run_step(shards, step_args(tmp_path, tree), never_run) == shards.PRE_STEP_REFUSED
     err = capsys.readouterr().err
     assert "home_files" in err
-    assert "zq" not in err
+    assert "ZQ" not in err
     assert str(tree) not in err
     assert not list((tmp_path / "tmpfs").iterdir())
     assert not list((tmp_path / "results").iterdir())
@@ -258,7 +259,7 @@ def test_o63_a_tree_that_is_not_this_users_is_refused(shards, tmp_path):
     with pytest.raises(shards.ShardsError, match="home_files") as raised:
         shards.read_home_files(str(tree), uid=os.geteuid() + 1)
     assert "not this user" in str(raised.value)
-    assert "zq" not in str(raised.value)
+    assert "ZQ" not in str(raised.value)
     assert shards.read_home_files(str(tree)) is not None  # and the user's own passes
 
 
@@ -271,7 +272,7 @@ def test_o63_a_link_on_the_way_to_the_tree_is_refused_and_the_message_says_to_gi
     assert "link" in str(raised.value)
     assert "resolved" in str(raised.value)
     with pytest.raises(shards.ShardsError, match="link"):
-        shards.read_home_files(str(tmp_path / "alias" / ".zqkeys"))
+        shards.read_home_files(str(tmp_path / "alias" / ".ZQkeys"))
 
 
 @pytest.mark.parametrize("what", ["missing", "empty"])
@@ -310,7 +311,7 @@ def test_o63_the_tree_is_in_the_dispatchers_home_with_the_same_paths_modes_and_c
     assert seen["owner"]["home_files_count"] == len(FILES)
     err = capsys.readouterr().err
     assert f"{len(FILES)} file" in err
-    assert "zq" not in err
+    assert "ZQ" not in err
 
 
 def test_o63_the_core_reads_the_key_through_the_home_the_step_gave_it(shards, tmp_path, monkeypatch):
@@ -319,7 +320,7 @@ def test_o63_the_core_reads_the_key_through_the_home_the_step_gave_it(shards, tm
     from expcore.config.models import ConfigError, ModelSpec
 
     spec = ModelSpec(key="m1", backend="openai_compat", api_id="m", status="draft", base_url="http://127.0.0.1:9/v1",
-                     key_file="~/.zqsecrets/alpha-zq/key-zq", free=True)  # fmt: skip
+                     key_file="~/.ZQsecrets/alpha-ZQ/key-ZQ", free=True)  # fmt: skip
     keys = {}
 
     def run(argv, env, cwd):
@@ -336,7 +337,7 @@ def test_o63_the_core_reads_the_key_through_the_home_the_step_gave_it(shards, tm
 
     tree = key_tree(tmp_path / "with")
     assert run_step(shards, step_args(tmp_path / "with", tree), run) == 0
-    assert keys["read"] == "sk-zq-first-1111"
+    assert keys["read"] == "sk-ZQ-first-1111"
     assert run_step(shards, step_args(tmp_path / "without", None), run) == 0
     assert keys["read"] is None
 
@@ -351,12 +352,12 @@ def test_o63_the_copies_vanish_with_the_step_and_no_record_archive_or_log_holds_
     assert not seen["home"].exists()
     holds_nothing_of_the_tree(tmp_path / "results", extra=(str(tree).encode(),))
     out = capsys.readouterr()
-    assert "zq" not in out.out + out.err
+    assert "ZQ" not in out.out + out.err
     import tarfile
 
     with tarfile.open(tmp_path / "results" / "fed-a.out.tar") as archive:
         for member in archive.getmembers():
-            assert b"zq" not in member.name.encode()
+            assert b"ZQ" not in member.name.encode()
             body = archive.extractfile(member)
             assert body is None or not any(m in body.read() for m in MARKERS)
 
@@ -390,34 +391,34 @@ def test_o63_a_file_that_collides_with_the_steps_own_home_refuses_the_step_befor
 ):
     """O63: a tree whose top-level `.cache` is a FILE would sit where the step made a directory: the step is refused
     (73) before its dispatcher starts, nothing is left on the tmpfs, and the message names the key and no file."""
-    tree = key_tree(tmp_path, {".cache": "lk-zq-3333\n"})
+    tree = key_tree(tmp_path, {".cache": "lk-ZQ-3333\n"})
     capsys.readouterr()
     assert run_step(shards, step_args(tmp_path, tree), never_run) == shards.PRE_STEP_REFUSED
     err = capsys.readouterr().err
     assert "home_files" in err
-    assert "zq" not in err
+    assert "ZQ" not in err
     assert ".cache" not in err.replace("home_files", "")
     assert not list((tmp_path / "tmpfs").iterdir())
 
 
 def test_o63_a_tree_that_shares_a_directory_with_the_steps_home_is_merged(shards, tmp_path):
     """O63: a tree with `.config/<app>/key` lands beside the step's own `.config` (made 0700 first), mode 0600."""
-    tree = key_tree(tmp_path, {".config/zqapp/key-zq": "sk-zq-4444\n"})
+    tree = key_tree(tmp_path, {".config/ZQapp/key-ZQ": "sk-ZQ-4444\n"})
     run, seen = dispatcher()
     assert run_step(shards, step_args(tmp_path, tree), run) == 0
-    assert seen["files"][".config/zqapp/key-zq"] == (0o600, "sk-zq-4444\n")
+    assert seen["files"][".config/ZQapp/key-ZQ"] == (0o600, "sk-ZQ-4444\n")
     assert seen["dirs"][".config"] == 0o700
-    assert seen["dirs"][".config/zqapp"] == 0o700
+    assert seen["dirs"][".config/ZQapp"] == 0o700
 
 
 def test_o63_a_tree_that_changed_after_the_lines_were_made_is_the_tree_the_step_reads(shards, tmp_path):
     """O63: the step reads the tree itself, once, at its start: a key rotated since `lines` is the one that arrives,
     and a link planted since is refused by the step (no line pins a tree)."""
     tree = key_tree(tmp_path)
-    (tree / ".zqsecrets" / "alpha-zq" / "key-zq").write_text("sk-zq-rotated-9999\n")
+    (tree / ".ZQsecrets" / "alpha-ZQ" / "key-ZQ").write_text("sk-ZQ-rotated-9999\n")
     run, seen = dispatcher()
     assert run_step(shards, step_args(tmp_path, tree), run) == 0
-    assert seen["files"][".zqsecrets/alpha-zq/key-zq"][1] == "sk-zq-rotated-9999\n"
+    assert seen["files"][".ZQsecrets/alpha-ZQ/key-ZQ"][1] == "sk-ZQ-rotated-9999\n"
 
 
 def test_o63_the_archive_failing_leaves_no_key_in_the_directory_the_step_keeps(shards, tmp_path, monkeypatch):
@@ -434,7 +435,7 @@ def test_o63_the_archive_failing_leaves_no_key_in_the_directory_the_step_keeps(s
     kept = list((tmp_path / "tmpfs").iterdir())
     assert len(kept) == 1
     holds_nothing_of_the_tree(kept[0])
-    assert not (seen["home"] / ".zqsecrets").exists()
+    assert not (seen["home"] / ".ZQsecrets").exists()
 
 
 def test_o63_a_term_while_the_files_are_staged_removes_them_and_restores_the_handlers(shards, tmp_path, monkeypatch):
@@ -520,9 +521,9 @@ def test_o63_a_stop_that_arrives_during_the_cleanup_waits_until_the_keys_are_gon
     """O63: a staging that wrote a key and then refused a colliding file starts its cleanup; a TERM that arrives while
     the home is being removed is held back until it is gone (the step then ends as a TERM ends it), so it can never
     leave the first key on the disk."""
-    tree = key_tree(tmp_path, {".config/zq-first": "sk-zq-5555\n", ".zqmore/x-zq": "x\n", ".zzcache": "y\n"})
+    tree = key_tree(tmp_path, {".config/ZQ-first": "sk-ZQ-5555\n", ".ZQmore/x-ZQ": "x\n", ".zzcache": "y\n"})
     (tree / ".zzcache").unlink()
-    (tree / ".cache").write_text("sk-zq-collides\n")  # a file where the step's own `.cache` directory is
+    (tree / ".cache").write_text("sk-ZQ-collides\n")  # a file where the step's own `.cache` directory is
     (tree / ".cache").chmod(0o600)
     real, order = shards.remove_tree, []
 
@@ -548,7 +549,7 @@ def test_o63_the_step_removes_the_copies_explicitly_on_every_way_out(shards, tmp
     real, removed = shards.remove_tree, []
 
     def noting(path):
-        removed.append((Path(path).name, (Path(path) / ".zqsecrets").exists() or Path(path).name != "home"))
+        removed.append((Path(path).name, (Path(path) / ".ZQsecrets").exists() or Path(path).name != "home"))
         real(path)
 
     monkeypatch.setattr(shards, "remove_tree", noting)
@@ -569,7 +570,7 @@ def test_o63_the_step_removes_the_copies_explicitly_on_every_way_out(shards, tmp
     if any(name.startswith(shards.WORK_PREFIX) for name in names):
         assert names.index("home") < min(i for i, n in enumerate(names) if n.startswith(shards.WORK_PREFIX))
     for left in (tmp_path / "tmpfs").rglob("*"):
-        assert "zq" not in left.name
+        assert "ZQ" not in left.name
 
 
 def test_o63_a_tree_inside_the_study_is_refused_because_the_step_copies_the_study(shards, tmp_path, capsys):
@@ -584,7 +585,7 @@ def test_o63_a_tree_inside_the_study_is_refused_because_the_step_copies_the_stud
         assert captured.out == ""
         assert "home_files" in captured.err
         assert "overlap" in captured.err
-        assert "zq" not in captured.err
+        assert "ZQ" not in captured.err
     assert run_step(shards, step_args(tmp_path, tree), never_run) == shards.PRE_STEP_REFUSED
     assert "overlap" in capsys.readouterr().err
     assert not list((tmp_path / "tmpfs").iterdir())
@@ -701,8 +702,8 @@ def kept_with_keys(shards, tmp_path, monkeypatch, *, gone=True):
     assert owner["home_files"] is True
     start = "0" if gone else shards._start_of(os.getpid())
     (kept / "step.json").write_text(json.dumps({**owner, "start": start, "pid": owner["pid"] if gone else os.getpid()}))
-    (kept / "home" / ".zqsecrets" / "alpha-zq").mkdir(parents=True)
-    (kept / "home" / ".zqsecrets" / "alpha-zq" / "key-zq").write_text("sk-zq-left-behind\n")
+    (kept / "home" / ".ZQsecrets" / "alpha-ZQ").mkdir(parents=True)
+    (kept / "home" / ".ZQsecrets" / "alpha-ZQ" / "key-ZQ").write_text("sk-ZQ-left-behind\n")
     return kept, args
 
 
@@ -722,7 +723,7 @@ def test_o63_sweep_removes_the_keys_of_a_kept_step_directory_and_keeps_its_out(s
     assert shards.sweep(tmp_path / "tmpfs", "/fed/root") == 0
     out = capsys.readouterr()
     assert f"{kept.name} (its out/ was not archived" in out.out  # still named as kept, as before
-    assert "zq" not in out.out + out.err
+    assert "ZQ" not in out.out + out.err
     assert_keys_gone_out_kept(kept)
 
 
@@ -753,7 +754,7 @@ def test_o63_a_link_in_the_kept_homes_place_is_unlinked_never_walked(shards, tmp
     (kept / "home").symlink_to(elsewhere)
     assert shards.sweep(tmp_path / "tmpfs", "/fed/root") == 0
     assert not os.path.lexists(kept / "home")
-    assert (elsewhere / ".zqsecrets" / "alpha-zq" / "key-zq").exists()  # not followed
+    assert (elsewhere / ".ZQsecrets" / "alpha-ZQ" / "key-ZQ").exists()  # not followed
     assert (kept / "study" / "out" / "campaign.lock").exists()
 
 
@@ -762,9 +763,9 @@ def test_o63_the_keys_of_a_step_that_may_still_run_are_not_touched(shards, tmp_p
     that does not say `home_files` has no home removed."""
     kept, _ = kept_with_keys(shards, tmp_path, monkeypatch, gone=False)
     assert shards.sweep(tmp_path / "tmpfs", "/fed/root") == 0
-    assert (kept / "home" / ".zqsecrets" / "alpha-zq" / "key-zq").exists()
+    assert (kept / "home" / ".ZQsecrets" / "alpha-ZQ" / "key-ZQ").exists()
     owner = json.loads((kept / "step.json").read_text())
     del owner["home_files"]
     (kept / "step.json").write_text(json.dumps({**owner, "start": "0"}))  # the step is shown gone now
     assert shards.sweep(tmp_path / "tmpfs", "/fed/root") == 0
-    assert (kept / "home" / ".zqsecrets" / "alpha-zq" / "key-zq").exists()  # no `home_files`: not ours to remove
+    assert (kept / "home" / ".ZQsecrets" / "alpha-ZQ" / "key-ZQ").exists()  # no `home_files`: not ours to remove
