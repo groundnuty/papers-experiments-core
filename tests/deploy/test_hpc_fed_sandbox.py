@@ -610,16 +610,16 @@ def test_separate_down_finds_the_agents_job_by_its_own_name_when_its_id_never_re
     assert not rig.root.exists()
 
 
-def test_separate_agents_job_that_never_starts_is_cancelled_and_down_cancels_the_first(hpc, tmp_path, site):
-    """O57: the agent's job still pending at the queue's bound is cancelled by its id and up fails; down cancels the
-    services' job."""
+def test_separate_agents_job_that_never_starts_is_cancelled_and_so_is_the_first(hpc, tmp_path, site):
+    """O57: the agent's job still pending at the queue's bound is cancelled by its id and up fails, and the services'
+    job, running, is cancelled by its own: no held job of this up is left to bill. down finds both gone."""
     fake = FakeSlurm(job_states={"4343": "PENDING"})
     rig = Rig(hpc, tmp_path, site, placement="separate", fake=fake)
     clock = iter(range(0, 10**7, 100))
     rig.driver.slurm.clock = lambda: next(clock)
     with pytest.raises(hpc.slurm.SlurmError, match="did not start"):
         rig.up()
-    assert fake.cancelled == ["4343"]
+    assert fake.cancelled == ["4343", "4242"]
     rig.driver.down()
     assert fake.cancelled == ["4343", "4242"]
 

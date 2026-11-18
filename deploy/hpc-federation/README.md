@@ -216,15 +216,22 @@ its business, whatever it runs. It never reads or prints a node's name into a me
   `providers[i]`, `agent`), never a host. A second read that fails refuses the same way. Two ups that raced may both
   refuse: `down`, then `up` again.
 - **Too few nodes.** The exclusion can leave Slurm no node that fits the job: it stays pending, or sbatch refuses it. `up`
-  waits no longer than its queue bound (`TIMEOUTS["queue"]`, 30 minutes), cancels the job by its id and says that it
+  waits no longer than its queue bound (`TIMEOUTS["queue"]`, 30 minutes, or `HPC_QUEUE_WAIT_S` seconds when `site.env`
+  sets it: "Site configuration"), cancels the job by its id and says that it
   excluded N nodes of other live federations; a refusal by sbatch says the same, with Slurm's own words stripped of those
   nodes' names.
+- **A wait that fails releases every held job of that `up`.** Under `"separate"` the services' job and the agent's own are
+  waited for in turn, and a job that does not start in time or ends before it ran is cancelled by its wait. `up` then
+  cancels the other held job too, still queued or running, by its own id and only if it still carries the name `up`
+  gave it (Slurm reuses ids: a job of another name is never cancelled), and the failure says which were released. A cancel that fails, or a record that
+  cannot be read, is named in the failure, and `down` releases it.
 
 In a fleet each member's `up` is its own, so each reads the members already up: with `HPC_FLEET_PARALLEL` at 1 (the
 default) every member takes nodes of its own. With more at once, two members that read before either has submitted can
 land on one node, and the later one is refused (reported as a failed member, nothing left held): bring it down and add
 another (`down --member fed-k`, `add 1`).
 
+`tests/deploy/test_hpc_queue_bound.py` runs the site's bound and the release of every held job of an `up` whose wait fails.
 `tests/deploy/test_hpc_distinct_nodes.py` runs both reads against the fake Slurm (a live federation's nodes excluded
 from each component and job, an unreadable `squeue` refusing, a race refused before any step with the roles named and
 the jobs released, the queue bound's reason) and a fleet of three members on one shared pool. Not run live: what the
@@ -294,6 +301,7 @@ Copy `site.env.example` to `site.env` beside it, fill it in on the login node, a
 | `L` | a 0700 directory for the batch logs (`<scratch_root>/hpcop-logs`) |
 | `HPC_GATEPORT`, `HPC_GATEPORT_SHA256` | optional: the 443 mapper (`bundle/gateport.c`, built for the agent's SIF) and its SHA-256, read only for a template that names it (`layouts/pilot-shape-rest.toml`); both or neither |
 | `HPC_STUDY_ARTIFACTS` | optional: the directory of the study's own artifacts (its tool server's interpreter and venv, the pinned clone, the frozen manifests and its data manifests), an absolute path with no `..`, on a filesystem the login node **and** the agent's node see (`<shared_root>/studies/<study>/artifacts`). A platform template, or a space's `data_manifest` in the layout, names paths under it as `@study_artifacts@`, so a public study carries no site path; `up` refuses a template that uses the placeholder without the key, naming it. `up` also digests its tree into the render identity (O74, below); the path is never in the record. The directory must be self-contained: a link whose target leaves it refuses `up` |
+| `HPC_QUEUE_WAIT_S` | optional: the seconds `up` waits for a held job to start before it cancels it, 1800 when unset (a queue that keeps a job pending for hours needs more): a whole number from 600 to 86400, else `up` and `describe` refuse, naming the key. `down` never reads it |
 
 Node names, addresses and job ids are typed at the prompt or read from Slurm; they never go into a file of this
 repository. The optional keys of the driver, the agent's sandbox and the study's artifacts are in `site.env.example`; the four of the next
@@ -758,8 +766,8 @@ section 3).
   it), and every Python in it runs with `-I -B`; no step uses `--overlap`; a control step's srun client is ended only
   once its step is gone from `squeue -s`, and one still listed at its bound is cancelled by its own id.
 - **The site** comes from `site.env` (`HPC_ACCOUNT`, `HPC_PARTITION`, `SH`, `L`, and optionally `HPC_STEP_PATH`,
-  `HPC_NODE_TMP`, `HPCOP_PY`, `HPC_CORE_PYTHON`, `HPC_ADMIN_MAIL`, `HPC_BILLING_MEM_WEIGHT`, `HPC_STEP_NETWORK`, `HPC_STUDY_ARTIFACTS`, and the four keys of the
-  provider storage on scratch), recorded in the state file at `up` (of the storage keys, only `HPC_STORAGE_ROOT`), so `down` and the service verbs need no environment. `HPC_CORE_PYTHON` (a venv of this checkout on the
+  `HPC_NODE_TMP`, `HPCOP_PY`, `HPC_CORE_PYTHON`, `HPC_QUEUE_WAIT_S`, `HPC_ADMIN_MAIL`, `HPC_BILLING_MEM_WEIGHT`, `HPC_STEP_NETWORK`, `HPC_STUDY_ARTIFACTS`, and the four keys of the
+  provider storage on scratch), recorded in the state file at `up` (of the storage keys, only `HPC_STORAGE_ROOT`; `HPC_QUEUE_WAIT_S` is `up`'s own bound and is not recorded), so `down` and the service verbs need no environment. `HPC_CORE_PYTHON` (a venv of this checkout on the
   shared filesystem) is required with an agent's node: `down`'s sweep reaps the sandbox's runs with the core's reaper.
   **Install that venv's interpreter under the site directory** (`UV_PYTHON_INSTALL_DIR=<site dir>/python uv sync`),
   never in the account's home: every Python the driver and `shards.py` launch takes `-I -B` and writes no bytecode,
