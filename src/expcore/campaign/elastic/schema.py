@@ -43,6 +43,7 @@ CREATE TABLE leases(
   state TEXT NOT NULL,  -- issued|sent|expired|reported|counted|superseded|lost|returned|cancelled
   slot INTEGER NOT NULL DEFAULT 1,  -- 1: holds its model's cap slot
   charge_micro INTEGER NOT NULL,  -- what the budget counts for it: its grant until its spend is settled
+  charged_added INTEGER NOT NULL DEFAULT 0,  -- the charged attempts counted into its run's: a loss counts one
   verdict TEXT,  -- a completion read: counts|superseded
   completion TEXT,  -- the completion read, as JSON
   reported_at REAL, ended_at REAL);
@@ -59,6 +60,7 @@ CREATE TABLE settlements(  -- a lost lease's grant replaced by the spend read fr
   lease_id INTEGER PRIMARY KEY REFERENCES leases(id), at REAL NOT NULL,
   source TEXT NOT NULL CHECK(source IN ('root', 'pulled')),
   spend_micro INTEGER NOT NULL CHECK(spend_micro >= 0), grant_micro INTEGER NOT NULL,
+  charged INTEGER CHECK(charged >= 0),  -- the lease's charged attempts as its log gave them, NULL: not read
   CHECK(spend_micro <= grant_micro));
 CREATE TABLE ceilings(  -- the raises of the dollar ceiling, the campaign's (model NULL) or a model's
   id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, model TEXT,  -- the pinned configuration never changes

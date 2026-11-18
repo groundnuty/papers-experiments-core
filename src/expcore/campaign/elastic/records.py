@@ -226,6 +226,7 @@ class Settlement:
     source: str
     spend_micro: int
     grant_micro: int
+    charged: int | None = None  # the lease's charged attempts as its log gave them, None: not read
 
     @property
     def released_micro(self) -> int:

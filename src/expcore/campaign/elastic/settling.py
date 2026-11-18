@@ -20,12 +20,12 @@ import json
 import sqlite3
 from typing import Any
 
-from expcore.campaign.elastic import schema
+from expcore.campaign.elastic import attempts, schema
 from expcore.campaign.elastic.config import LedgerConfig
 from expcore.campaign.elastic.records import SETTLE_SOURCES, LedgerError, Settlement, SettleRefused
 
 
-def check(lease_id: Any, spend_micro: Any, source: Any) -> None:
+def check(lease_id: Any, spend_micro: Any, source: Any, attempts_charged: Any = None) -> None:
     """Refuse (ValueError) a lease id that is not a whole number from 1 (a bool is not lease 1), a spend that is not a
     whole number of micro-dollars, not below zero, or a source unknown."""
     if isinstance(lease_id, bool) or not isinstance(lease_id, int) or lease_id < 1:
@@ -36,6 +36,12 @@ def check(lease_id: Any, spend_micro: Any, source: Any) -> None:
         )
     if source not in SETTLE_SOURCES:
         raise ValueError(f"source must be one of {', '.join(SETTLE_SOURCES)}, got {source!r}")
+    if attempts_charged is not None and (
+        isinstance(attempts_charged, bool) or not isinstance(attempts_charged, int) or attempts_charged < 0
+    ):
+        raise ValueError(
+            f"attempts_charged must be a whole number of attempts, not below zero, got {attempts_charged!r}"
+        )
 
 
 def charge_of(db: sqlite3.Connection, lease_id: int, measured_micro: int) -> int:
@@ -61,7 +67,7 @@ def contradicted(db: sqlite3.Connection, now: float, lease: Any, measured_micro:
 
 
 def _as_settlement(row: Any) -> Settlement:
-    return Settlement(row["lease_id"], row["at"], row["source"], row["spend_micro"], row["grant_micro"])
+    return Settlement(row["lease_id"], row["at"], row["source"], row["spend_micro"], row["grant_micro"], row["charged"])
 
 
 def read(db: sqlite3.Connection) -> list[Settlement]:
@@ -70,7 +76,13 @@ def read(db: sqlite3.Connection) -> list[Settlement]:
 
 
 def apply(
-    db: sqlite3.Connection, config: LedgerConfig, now: float, lease_id: int, spend_micro: int, source: str
+    db: sqlite3.Connection,
+    config: LedgerConfig,
+    now: float,
+    lease_id: int,
+    spend_micro: int,
+    source: str,
+    attempts_charged: int | None = None,
 ) -> Settlement | str:
     """Settle the lease in the caller's transaction. Returns the settlement, or, for a spend above the grant, the
     reason it is refused: the failure was recorded, so the caller commits first and then raises it. Every other
@@ -84,7 +96,7 @@ def apply(
         raise LedgerError(f"lease {lease_id} was never issued by this ledger")
     done = db.execute("SELECT * FROM settlements WHERE lease_id=?", (lease_id,)).fetchone()
     if done is not None:
-        if (done["spend_micro"], done["source"]) == (spend_micro, source):
+        if (done["spend_micro"], done["source"], done["charged"]) == (spend_micro, source, attempts_charged):
             return _as_settlement(done)  # the same values again
         raise SettleRefused(
             f"lease {lease_id} is already settled at {done['spend_micro']} micro-dollars from {done['source']}: "
@@ -105,6 +117,12 @@ def apply(
             f"lease {lease_id} is {state}: only a lost lease is settled (expired with its holder proven ended, "
             "or its archive never verified)"
         )
+    most = max(0, config.max_attempts - row["attempt_base"])
+    if attempts_charged is not None and attempts_charged > most:
+        raise SettleRefused(
+            f"lease {lease_id} followed {row['attempt_base']} charged attempts of its run, so it could have charged at "
+            f"most {most} of its {config.max_attempts} attempts, not {attempts_charged}: its log is not this lease's"
+        )
     grant = row["grant_micro"]
     if spend_micro > grant:
         detail = {"grant_micro": grant, "source": source, "spend_micro": spend_micro}
@@ -122,9 +140,10 @@ def apply(
         )
     db.execute("UPDATE leases SET charge_micro=? WHERE id=?", (spend_micro, lease_id))
     db.execute(
-        "INSERT INTO settlements(lease_id, at, source, spend_micro, grant_micro) VALUES(?,?,?,?,?)",
-        (lease_id, now, source, spend_micro, grant),
+        "INSERT INTO settlements(lease_id, at, source, spend_micro, grant_micro, charged) VALUES(?,?,?,?,?,?)",
+        (lease_id, now, source, spend_micro, grant, attempts_charged),
     )
+    known = {} if attempts_charged is None else {"attempts_charged": attempts_charged}
     schema.add_event(
         db,
         now,
@@ -135,5 +154,8 @@ def apply(
         released_micro=grant - spend_micro,
         source=source,
         spend_micro=spend_micro,
+        **known,
     )
-    return Settlement(lease_id, now, source, spend_micro, grant)
+    if attempts_charged is not None:
+        attempts.set_charged(db, config, lease_id, attempts_charged)
+    return Settlement(lease_id, now, source, spend_micro, grant, attempts_charged)
