@@ -12,6 +12,7 @@ from expcore.campaign.gate import Budget
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.shard import RULE_BY_MODEL, ModelShards, ShardError, ShardSpec, micro_usd
 from expcore.campaign.shard_budget import planned_runs, reservation_usd, shard_budgets
+from expcore.campaign.shard_by_run import assign_by_run
 from expcore.campaign.shard_run import share_settings_by_model
 from expcore.config.models import Limits, ModelSpec
 from expcore.config.prices import Price
@@ -295,3 +296,17 @@ def test_c32_a_ceiling_of_the_one_priced_model_below_one_runs_reservation_is_ref
     barely = need * 1.01
     part = one_priced_parts(way, Budget(50.0, {"model-falcon": barely}))[1]["per_model_usd"]["model-falcon"]
     assert micro_usd(part) == micro_usd(barely)
+
+
+def test_c32_by_run_the_planned_runs_and_so_the_dollars_follow_the_deal_of_runs():
+    """C32: under `expcore-shard/5` a shard's planned runs are the runs the deal gives it, which a pair count would not
+    say once a model has more shards than pairs, and `max_usd` is split by them."""
+    layout = ModelShards((("model-falcon", 45), ("model-heron", 2), ("model-osprey", 2)), by="run")
+    manifest = plan()
+    dealt = assign_by_run({row.key.text: row.key.factors for row in manifest.rows}, layout)
+    runs = planned_runs(manifest, layout)
+    assert runs == {i: sum(1 for index in dealt.values() if index == i) for i in range(1, 50)}
+    assert {runs[i] for i in range(1, 46)} == {1, 2}  # 60 runs of model-falcon over 45 shards, 20 pairs
+    parts = shard_budgets(Budget(500.0), layout, manifest, MODELS, LIMITS)
+    rate = {i: Fraction(parts[i]["max_usd"]) / (runs[i] * Fraction(reserve(layout.at(i)[0]))) for i in range(1, 48)}
+    assert max(rate.values()) - min(rate.values()) < Fraction(1, 10**4)

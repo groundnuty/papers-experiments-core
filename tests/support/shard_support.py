@@ -21,7 +21,8 @@ from pathlib import Path
 import pytest
 from study_support import HEAD, Campaign, cli, copy_campaign, make_copy
 
-from expcore.campaign.shard import RULE, RULE_BY_MODEL, ShardSpec, in_shard, pair_of, partition
+from expcore.campaign.shard import RULE, ShardSpec
+from expcore.campaign.shard_by_run import owners
 from expcore.provenance.codestamp import write_stamp
 from expcore.study import pipeline
 from expcore.study.config import load_study
@@ -115,12 +116,13 @@ def run_shard(
 
 
 def keys_of_shard(root: Path, index: int, count: int = 2) -> list[str]:
-    """The run keys of shard `index`, in plan order, under the study's rule: by model when it declares `[shards]`."""
+    """The run keys of shard `index`, in plan order, under the study's rule: by model when it declares `[shards]`, by
+    pair or by run as it says."""
     study = load_study(root)
     layout = study.campaign.shards
-    spec = ShardSpec(index, count, f"shard-{index}", RULE if layout is None else RULE_BY_MODEL)
-    assignment = partition({pair_of(row.key.factors) for row in study.manifest.rows}, spec, layout)
-    return [row.key.text for row in study.manifest.rows if in_shard(row.key.factors, spec, assignment)]
+    spec = ShardSpec(index, count, f"shard-{index}", RULE if layout is None else layout.rule)
+    owner = owners({row.key.text: row.key.factors for row in study.manifest.rows}, spec, layout)
+    return [row.key.text for row in study.manifest.rows if owner.of(row.key.text, row.key.factors) == index]
 
 
 def meta_of(campaign: Campaign) -> dict[str, str]:

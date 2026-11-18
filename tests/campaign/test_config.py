@@ -204,6 +204,19 @@ def test_c32_a_shard_count_that_cannot_work_is_refused_at_load_naming_the_key(tm
     refused(tmp_path, SHARDED.replace(old, new, 1), *fragments)
 
 
+def test_c32_shards_by_run_is_declared_by_one_key_and_by_pair_is_the_layout_without_it(tmp_path):
+    """C32: `by = "run"` deals runs (`expcore-shard/5`) and enters the caps; `by = "pair"` is the default, so its caps
+    are those of a file without the key, byte for byte."""
+    by_run = load(tmp_path, SHARDED + 'by = "run"\n')
+    assert by_run.shards == ModelShards((("m-b", 2), ("m-a", 3)), by="run")
+    assert by_run.caps()["shards"] == {"per_model": [["m-b", 2], ["m-a", 3]], "by": "run"}
+    by_pair = load(tmp_path, SHARDED + 'by = "pair"\n')
+    assert by_pair.shards == load(tmp_path, SHARDED).shards
+    assert by_pair.caps() == load(tmp_path, SHARDED).caps()
+    refused(tmp_path, SHARDED + 'by = "task"\n', "[shards]", "'by'", '"pair" or "run"')
+    refused(tmp_path, SHARDED + "by = 1\n", "[shards]", "'by'")
+
+
 def test_c32_the_models_of_one_unit_are_held_to_its_cap_together(tmp_path):
     """C32: two models on one unit share its cap, so their shard counts are summed against it."""
     text = SHARDED + '\n[endpoints.m-b]\nunit = "pool"\n'  # m-b counts in pool too

@@ -26,6 +26,11 @@ SHA-256, from a start the model's hash picks), so a pair stays whole and the mod
 pair. Each such shard runs one run at a time, so a model's concurrency is its shard count. `partition` picks the
 assignment by the spec's rule; a store made under `expcore-shard/2` still resumes and merges under it.
 
+**Or by model and then by run (C32, `RULE_BY_RUN`, `expcore-shard/5`).** `by = "run"` beside `per_model` lets a model
+have any number of shards up to its runs: its runs, not its pairs, are dealt round its shards, arm by arm, so that every
+shard gets the floor or the ceiling of each arm's runs (`expcore.campaign.shard_by_run`). Without the key, or with
+`by = "pair"`, the layout, its JSON and its rule are those of `expcore-shard/3`, byte for byte.
+
 **Shares never sum past the totals (C30).** `[scheduler.unit_caps]`, `[budget] max_usd` and `per_model_usd` are
 campaign totals. Shard i of N gets `share(total, spec)`: an equal part, the remainder going to the first shards, so
 the N shares sum to the total exactly. Dollars are shared in whole micro-dollars, rounded down, so they sum to at
@@ -58,8 +63,19 @@ RULE_BY_MODEL = (
     "sha256(json [task, model, seed]), dealt round its own shards"
 )
 """The rule of a campaign that declares `[shards] per_model` (C32): every shard serves one model."""
-RULES = (RULE, RULE_BY_MODEL)
-"""The rules this core partitions by and reads back."""
+RULE_BY_RUN = (
+    "expcore-shard/5: shards by model in the declared order of [shards] per_model; per model, the runs dealt round its "
+    "own shards arm by arm, arms ranked by sha256 of their declared factor values, runs by sha256(json [task, model, "
+    "seed])"
+)
+"""The rule of a campaign that declares `[shards] per_model` with `by = "run"` (C32): every shard serves one model, and
+each of the model's arms is spread over its shards as evenly as its runs allow."""
+RULES = (RULE, RULE_BY_MODEL, RULE_BY_RUN)
+BY_MODEL_RULES = (RULE_BY_MODEL, RULE_BY_RUN)
+"""The rules under which every shard serves one model of `[shards] per_model` (C32)."""
+"""The rules this core partitions by and reads back (`expcore-shard/4` is a selection's, `campaign.selection`)."""
+BY_PAIR, BY_RUN = "pair", "run"
+"""The values of `[shards] by`: deal a model's pairs (the default, `expcore-shard/3`) or its runs (`/5`)."""
 SHARDS_CAP = "shards"
 """The key of the campaign fingerprint's caps that holds `[shards] per_model` (`ModelShards.to_json`), when declared."""
 
@@ -122,9 +138,8 @@ class ShardSpec:
                 "machine, since packages are public (--shard-label-wide also allows '.' and '_')"
             )
         if self.rule not in RULES:
-            raise ShardError(
-                f"the partition rule {self.rule!r} is not one of this core's ({RULE!r}, or {RULE_BY_MODEL!r})"
-            )
+            known = ", ".join(map(repr, RULES))
+            raise ShardError(f"the partition rule {self.rule!r} is not one of this core's: {known}")
 
     @classmethod
     def parse(cls, text: str, label: str | None = None, *, wide_label: bool = False) -> ShardSpec:
@@ -194,10 +209,12 @@ class ModelShards:
     """`[shards] per_model`: the plan's models in declared order, each with how many shards serve it (C32).
 
     The order is kept as a sequence, never as a mapping whose keys a canonical text would sort, so every host maps
-    shard i to the same model. N is the sum, at least 2; each count is at least 1.
+    shard i to the same model. N is the sum, at least 2; each count is at least 1. `by` is what is dealt among a
+    model's shards: its pairs (`BY_PAIR`, `expcore-shard/3`) or its runs (`BY_RUN`, `expcore-shard/5`).
     """
 
     per_model: tuple[tuple[str, int], ...]
+    by: str = BY_PAIR
 
     def __post_init__(self) -> None:
         """Refuse a layout no campaign can shard by."""
@@ -209,6 +226,13 @@ class ModelShards:
                 raise ShardError(f"[shards] per_model gives model {model!r} {count!r} shards, not a whole number >= 1")
         if self.count < 2:
             raise ShardError(f"[shards] per_model sums to {self.count}: a sharded campaign has at least 2 shards")
+        if self.by not in (BY_PAIR, BY_RUN):
+            raise ShardError(f"[shards] by is {BY_PAIR!r} or {BY_RUN!r}, not {self.by!r}")
+
+    @property
+    def rule(self) -> str:
+        """The partition rule of the campaign's shards: `expcore-shard/3` by pair, `/5` by run."""
+        return RULE_BY_RUN if self.by == BY_RUN else RULE_BY_MODEL
 
     @property
     def count(self) -> int:
@@ -225,16 +249,24 @@ class ModelShards:
         raise ShardError(f"shard {index!r} is not between 1 and {self.count}, the shards [shards] per_model declares")
 
     def to_json(self) -> dict[str, Any]:
-        """The layout as the campaign fingerprint keeps it, in `caps[SHARDS_CAP]`."""
-        return {"per_model": [[model, count] for model, count in self.per_model]}
+        """The layout as the campaign fingerprint keeps it, in `caps[SHARDS_CAP]`; `"by"` only when it deals runs, so a
+        layout by pair is the JSON it was before the rule by run existed."""
+        data: dict[str, Any] = {"per_model": [[model, count] for model, count in self.per_model]}
+        if self.by == BY_RUN:
+            data["by"] = BY_RUN
+        return data
 
     @classmethod
     def from_json(cls, data: Any) -> ModelShards:
-        """Read a layout back from a fingerprint, refusing any other form."""
-        entries = data.get("per_model") if isinstance(data, Mapping) and set(data) == {"per_model"} else None
+        """Read a layout back from a fingerprint, refusing any other form (`"by"` is present only as `"run"`)."""
+        keys = set(data) if isinstance(data, Mapping) else set()
+        by_run = keys == {"per_model", "by"} and data["by"] == BY_RUN
+        entries = data.get("per_model") if keys == {"per_model"} or by_run else None
         if not isinstance(entries, list) or not all(isinstance(e, list) and len(e) == 2 for e in entries):
-            raise ShardError("a fingerprint's [shards] layout is {'per_model': [[model, count], ...]}")
-        return cls(tuple((model, count) for model, count in entries))
+            raise ShardError(
+                "a fingerprint's [shards] layout is {'per_model': [[model, count], ...]}, 'by': 'run' or none"
+            )
+        return cls(tuple((model, count) for model, count in entries), BY_RUN if by_run else BY_PAIR)
 
 
 def layout_of(fingerprint: Mapping[str, Any]) -> ModelShards | None:
@@ -273,23 +305,41 @@ def partition(
     """The whole plan's assignment of pairs to shards under `spec`'s rule: `assign`, or by model with `layout`.
 
     A spec under `expcore-shard/3` needs the layout, and a count that is its sum; one under `expcore-shard/2` is
-    refused for a campaign that declares a layout, which shards by model.
+    refused for a campaign that declares a layout, which shards by model, and one of either rule beside a layout by run.
+    Runs dealt one by one (`expcore-shard/5`) have no assignment of pairs: `shard_by_run.owners` gives theirs.
     """
     if spec.rule == RULE:
         if layout is not None:
             raise ShardError(
-                "the campaign declares [shards] per_model, so its shards partition by expcore-shard/3, and this "
-                "shard was made under expcore-shard/2"
+                f"the campaign declares [shards] per_model, so its shards partition by {rule_name(layout.rule)}, and "
+                "this shard was made under expcore-shard/2"
             )
         return assign(pairs, spec.count)
+    if spec.rule != RULE_BY_MODEL:
+        raise ShardError(f"shard {spec.index} of {spec.count} partitions by {rule_name(spec.rule)}, not by pair")
+    return assign_by_model(pairs, check_layout(spec, layout))
+
+
+def rule_name(rule: str) -> str:
+    """A rule's short name, `expcore-shard/3`, as messages give it."""
+    return rule.split(":", 1)[0]
+
+
+def check_layout(spec: ShardSpec, layout: ModelShards | None) -> ModelShards:
+    """Return the layout of a shard by model (`/3` or `/5`), refusing none, another rule's, or one of another N."""
     if layout is None:
         raise ShardError(
-            f"shard {spec.index} of {spec.count} partitions by expcore-shard/3, and the campaign declares no "
+            f"shard {spec.index} of {spec.count} partitions by {rule_name(spec.rule)}, and the campaign declares no "
             "[shards] per_model"
+        )
+    if layout.rule != spec.rule:
+        raise ShardError(
+            f"the campaign's [shards] partition by {rule_name(layout.rule)}, and shard {spec.index} of {spec.count} "
+            f"was made under {rule_name(spec.rule)}"
         )
     if layout.count != spec.count:
         raise ShardError(count_mismatch(spec, layout))
-    return assign_by_model(pairs, layout)
+    return layout
 
 
 def count_mismatch(spec: ShardSpec, layout: ModelShards) -> str:
@@ -302,11 +352,11 @@ def count_mismatch(spec: ShardSpec, layout: ModelShards) -> str:
 
 
 def by_model(spec: ShardSpec, layout: ModelShards) -> ShardSpec:
-    """The command line's spec as a shard of a campaign that shards by model (`expcore-shard/3`); a count that is not
-    the layout's sum is refused."""
+    """The command line's spec as a shard of a campaign that shards by model, under the layout's rule
+    (`expcore-shard/3`, or `/5` by run); a count that is not the layout's sum is refused."""
     if spec.count != layout.count:
         raise ShardError(count_mismatch(spec, layout))
-    return spec.under(RULE_BY_MODEL)
+    return spec.under(layout.rule)
 
 
 def part(total: int, index: int, count: int, *, what: str, allow_zero: bool = False) -> int:
@@ -395,6 +445,9 @@ def check_identity(identity: Mapping[str, str]) -> dict[str, str]:
 
 
 __all__ = [
+    "BY_MODEL_RULES",
+    "BY_PAIR",
+    "BY_RUN",
     "EXPORT_KEY",
     "MERGE_FILE",
     "MERGE_SCHEMA",
@@ -406,6 +459,7 @@ __all__ = [
     "RULE",
     "RULES",
     "RULE_BY_MODEL",
+    "RULE_BY_RUN",
     "SHARDS_CAP",
     "ModelShards",
     "ShardError",
@@ -416,6 +470,7 @@ __all__ = [
     "by_model",
     "caps_shares",
     "check_identity",
+    "check_layout",
     "count_mismatch",
     "in_shard",
     "is_default_label",
@@ -425,6 +480,7 @@ __all__ = [
     "part",
     "part_usd",
     "partition",
+    "rule_name",
     "share",
     "share_usd",
     "usd_of",

@@ -22,6 +22,7 @@ from expcore.campaign.shard import (
     META_STARTED,
     RULE,
     RULE_BY_MODEL,
+    RULE_BY_RUN,
     ModelShards,
     ShardError,
     ShardSpec,
@@ -551,3 +552,18 @@ def test_c32_a_shard_by_model_holding_pairs_of_another_model_is_refused():
     refuse_unrunnable(BY_MODEL[2], {"model-falcon": 10}, units, {}, LAYOUT)
     with pytest.raises(ShardError, match=r"model model-heron.*serves model model-falcon only"):
         refuse_unrunnable(BY_MODEL[2], {"model-falcon": 10, "model-heron": 1}, units, {}, LAYOUT)
+
+
+def test_c32_a_shard_by_run_runs_one_run_at_a_time_and_holds_its_own_models_runs_only():
+    """C32: a shard of `expcore-shard/5` serves one model as a shard of `/3` does: a cap of 1 on its model's unit, and
+    a refusal of any other model's runs; a spec of the other rule does not fit the layout."""
+    layout = ModelShards(LAYOUT.per_model, by="run")
+    spec = ShardSpec(3, 3, "shard-3", RULE_BY_RUN)
+    shared, recorded = share_settings_by_model(settings(budget=None), spec, layout, "unit-f", None)
+    assert (shared.unit_caps, recorded) == ({"unit-f": 1}, {"unit_caps": {"unit-f": 1}, "budget": None})
+    units = {"model-falcon": "unit-f", "model-heron": "unit-h"}
+    refuse_unrunnable(spec, {"model-falcon": 10}, units, {}, layout)
+    with pytest.raises(ShardError, match=r"model model-heron.*serves model model-falcon only \(expcore-shard/5\)"):
+        refuse_unrunnable(spec, {"model-falcon": 10, "model-heron": 1}, units, {}, layout)
+    with pytest.raises(ShardError, match="not a shard by model"):
+        share_settings_by_model(settings(budget=None), BY_MODEL[2], layout, "unit-f", None)

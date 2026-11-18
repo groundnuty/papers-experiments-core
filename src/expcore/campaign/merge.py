@@ -22,7 +22,7 @@ replay check (`study.merge`) last:
    same core (`check_core`): a shard that ran the core at another commit is refused naming both commits, and so is
    one whose environment records the core in the other form (an earlier core recorded it by how it was installed);
 3. the shards' run sets are disjoint, and every run belongs to its shard under their rule's assignment of the whole
-   plan (`assign()`, or by model with the `[shards]` layout of their fingerprint, C32);
+   plan (`assign()`, or by model with the `[shards]` layout of their fingerprint, by pair or by run, C32);
 4. the union of the run sets is exactly the plan, so no run is missing and none is extra;
 5. each shard passes the replay check `python -m expcore check` performs on a batch;
 6. every shard records the same environment identity.
@@ -74,11 +74,9 @@ from expcore.campaign.shard import (
     NOT_FINAL_FILE,
     ShardError,
     check_identity,
-    in_shard,
     layout_of,
-    pair_of,
-    partition,
 )
+from expcore.campaign.shard_by_run import owners
 from expcore.campaign.snapshot import SNAPSHOT_FILE, AttemptsRunning, SnapshotError, take_snapshot
 from expcore.provenance.environment import core_entry, is_earlier_form
 
@@ -351,23 +349,24 @@ def _check_runs(shards: Sequence[ShardFacts], plan: Manifest) -> None:
                 raise MergeRefused(f"run {key} is in both {holder[key].name} and {shard.name}: the shards overlap")
             holder[key] = shard
     try:  # the rule the shards ran under (check 1 made it one), by model with the layout their fingerprint declares
-        assignment = partition({pair_of(row.key.factors) for row in plan.rows}, shards[0].spec, layout_of(fingerprint))
+        owners_of = owners({row.key.text: row.key.factors for row in plan.rows}, shards[0].spec, layout_of(fingerprint))
     except ShardError as error:
         raise MergeRefused(f"{shards[0].name}: its shards cannot be assigned the plan's pairs: {error}") from None
     for shard in shards:
         for key, factors in sorted(shard.runs.items()):
-            if pair_of(factors) not in assignment:
+            index = owners_of.of(key, factors)
+            if index is None:
                 raise MergeRefused(f"{shard.name}: run {key} is not in the plan")
-            if not in_shard(factors, shard.spec, assignment):
-                owner = shards[assignment[pair_of(factors)] - 1]
-                raise MergeRefused(f"{shard.name}: run {key} belongs to {owner.name}, not to this shard")
+            if index != shard.spec.index:
+                raise MergeRefused(f"{shard.name}: run {key} belongs to {shards[index - 1].name}, not to this shard")
     planned = {row.key.text: row for row in plan.rows}
     extra = sorted(set(holder) - set(planned))
     if extra:
         raise MergeRefused(f"{holder[extra[0]].name}: run {extra[0]} is not in the plan ({len(extra)} such runs)")
     missing = sorted(set(planned) - set(holder))
     if missing:
-        owner = shards[assignment[pair_of(planned[missing[0]].key.factors)] - 1]
+        row = planned[missing[0]]
+        owner = shards[owners_of.of(row.key.text, row.key.factors) - 1]
         raise MergeRefused(
             f"run {missing[0]}, which belongs to {owner.name}, is in no shard "
             f"({len(missing)} of the plan's {len(planned)} runs are missing)"

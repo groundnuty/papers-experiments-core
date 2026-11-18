@@ -1,5 +1,5 @@
 # Provenance: new
-"""The budget of a campaign that shards by model (`expcore-shard/3`, #154, C30, C32): who gets which dollars.
+"""The budget of a campaign that shards by model (`expcore-shard/3`, or `/5` by run, #154, C30, C32): who gets which.
 
 Under `expcore-shard/2` every shard runs every model, so an equal share of each ceiling is fair. Under
 `expcore-shard/3` a shard runs one model, and the models cost very different amounts, so:
@@ -29,7 +29,8 @@ from typing import Any
 from expcore.campaign.attempt_bounds import bound_usd
 from expcore.campaign.gate import Budget
 from expcore.campaign.manifest import Manifest
-from expcore.campaign.shard import ModelShards, ShardError, assign_by_model, micro_usd, pair_of, part_usd, usd_of
+from expcore.campaign.shard import ModelShards, ShardError, micro_usd, part_usd, usd_of
+from expcore.campaign.shard_by_run import shards_of_layout
 from expcore.config.models import Limits, ModelSpec
 
 _MICRO = 1_000_000
@@ -43,11 +44,12 @@ def reservation_usd(spec: ModelSpec, limits: Limits) -> float | None:
 
 
 def planned_runs(manifest: Manifest, layout: ModelShards) -> dict[int, int]:
-    """How many runs of the whole plan each shard plans under `expcore-shard/3`, by index; 0 for a shard with none."""
-    assignment = assign_by_model({pair_of(row.key.factors) for row in manifest.rows}, layout)
+    """How many runs of the whole plan each shard plans under the layout's rule (`expcore-shard/3`, or `/5` by run), by
+    index; 0 for a shard with none."""
+    assignment = shards_of_layout({row.key.text: row.key.factors for row in manifest.rows}, layout)
     runs = dict.fromkeys(range(1, layout.count + 1), 0)
-    for row in manifest.rows:
-        runs[assignment[pair_of(row.key.factors)]] += 1
+    for index in assignment.values():
+        runs[index] += 1
     return runs
 
 

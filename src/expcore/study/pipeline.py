@@ -91,7 +91,16 @@ from expcore.campaign.resume import FINGERPRINT_KEY, FingerprintMismatch, read_f
 from expcore.campaign.scheduler import STATE_FILE, RunSummary, Scheduler
 from expcore.campaign.selection import RULE_SELECTION, SelectionSpec, Spec
 from expcore.campaign.settings import SchedulerConfig
-from expcore.campaign.shard import MERGE_FILE, ModelShards, ShardError, ShardSpec, by_model, check_identity, pair_of
+from expcore.campaign.shard import (
+    BY_RUN,
+    MERGE_FILE,
+    ModelShards,
+    ShardError,
+    ShardSpec,
+    by_model,
+    check_identity,
+    pair_of,
+)
 from expcore.campaign.shard_run import (
     ShardStart,
     environment_block,
@@ -510,12 +519,12 @@ def _shard_of(
 ) -> tuple[Manifest, SchedulerConfig, ShardStart]:
     """A shard's part of the plan, its shares of the caps and the budget and the identity it runs against.
 
-    A campaign that declares `[shards] per_model` shards by model (`expcore-shard/3`, C32): the command line's spec
-    takes that rule, and its N must be the layout's sum. Every refusal is made here, before the store is opened: an N
-    that is not the sum, a shard with no run, a shard holding pairs of a model whose concurrency share is 0 (the
-    message names the model), a total smaller than the number of shards (the message names the key), a budget that
-    cannot pay for a run of every priced shard, and an environment identity that the plugin cannot give or that is
-    not names mapped to SHA-256 digests (the message names the plugin).
+    A campaign that declares `[shards] per_model` shards by model (`expcore-shard/3`, or `/5` with `by = "run"`, C32):
+    the command line's spec takes that rule, and its N must be the layout's sum. Every refusal is made here, before the
+    store is opened: an N that is not the sum, a shard with no run, a shard holding pairs of a model whose concurrency
+    share is 0 (the message names the model), a total smaller than the number of shards (the message names the key), a
+    budget that cannot pay for a run of every priced shard, and an environment identity that the plugin cannot give or
+    that is not names mapped to SHA-256 digests (the message names the plugin).
     """
     layout = study.campaign.shards
     try:
@@ -548,9 +557,10 @@ def _no_run(spec: ShardSpec, layout: ModelShards | None) -> str:
             "seed than shards; run with fewer shards"
         )
     model, k, count = layout.at(spec.index)
+    fewer = "runs" if layout.by == BY_RUN else "pairs of task, model and seed"
     return (
         f"shard {spec.index} of {spec.count} (model {model}, its shard {k} of {count}) gets no run of this plan: the "
-        f"model has fewer pairs of task, model and seed than shards; give it fewer in [shards] per_model"
+        f"model has fewer {fewer} than shards; give it fewer in [shards] per_model"
     )
 
 

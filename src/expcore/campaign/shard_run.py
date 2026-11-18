@@ -35,11 +35,11 @@ from expcore.campaign.attempts import ResumeRefused
 from expcore.campaign.manifest import fingerprint_sha256
 from expcore.campaign.selection import RULE_SELECTION, SelectionSpec, Spec, describe, resume_hint
 from expcore.campaign.shard import (
+    BY_MODEL_RULES,
     META_ENVIRONMENT,
     META_SHARD,
     META_SHARES,
     META_STARTED,
-    RULE_BY_MODEL,
     ModelShards,
     ShardError,
     ShardSpec,
@@ -47,6 +47,7 @@ from expcore.campaign.shard import (
     caps_shares,
     is_default_label,
     part,
+    rule_name,
 )
 from expcore.campaign.store import Store
 
@@ -107,14 +108,15 @@ def share_settings(settings: "SchedulerConfig", spec: ShardSpec) -> tuple["Sched
 def share_settings_by_model(
     settings: "SchedulerConfig", spec: ShardSpec, layout: ModelShards, unit: str, budget: Mapping[str, Any] | None
 ) -> tuple["SchedulerConfig", dict[str, Any]]:
-    """Shard `spec`'s settings under `expcore-shard/3` (C32), with the shares as the store and the export keep them.
+    """Shard `spec`'s settings under `expcore-shard/3` or `/5` (C32), with the shares as the store and the export keep
+    them.
 
     The shard runs one run at a time: its cap is 1 on `unit`, its model's, and it runs nothing of any other unit.
     `budget` is its part of the budget (`shard_budget.shard_budgets`), None without one. A shard whose part of
     `max_usd` is 0 runs a model that costs nothing, which no gate can hold for cost, so it runs without one: a `Budget`
     of 0 dollars holds every run.
     """
-    if spec.rule != RULE_BY_MODEL or layout.count != spec.count:
+    if spec.rule not in BY_MODEL_RULES or spec.rule != layout.rule or layout.count != spec.count:
         raise ShardError(f"shard {spec.index} of {spec.count} is not a shard by model of this layout ({spec.rule!r})")
     caps = {unit: 1}
     if settings.budget is None or budget is None:
@@ -137,15 +139,15 @@ def refuse_unrunnable(
 
     `pairs` counts the shard's pairs by model, `unit_of` gives each model's unit and `unit_caps` the campaign's totals.
     Under `expcore-shard/2` a model's share is the shard's part of its unit's cap, which is 0 for the shards past the
-    cap when the cap is below N (an uncapped unit has no share to lack); under `expcore-shard/3`, with the campaign's
-    `layout`, it is 1 for the shard's own model and 0 for every other. Raises ShardError naming the model.
+    cap when the cap is below N (an uncapped unit has no share to lack); under `expcore-shard/3` or `/5`, with the
+    campaign's `layout`, it is 1 for the shard's own model and 0 for every other. Raises ShardError naming the model.
     """
     for model, held in sorted(pairs.items()):
-        if spec.rule == RULE_BY_MODEL:
+        if spec.rule in BY_MODEL_RULES:
             serves = layout.at(spec.index)[0] if layout is not None else None
             if model == serves:
                 continue
-            why = f"shard {spec.index} serves model {serves} only (expcore-shard/3)"
+            why = f"shard {spec.index} serves model {serves} only ({rule_name(spec.rule)})"
         else:
             unit = unit_of[model]
             cap = unit_caps.get(unit)

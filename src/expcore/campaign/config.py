@@ -36,11 +36,14 @@ The file is validated when it is loaded, with messages that name the file and th
 
     [shards]                      # optional: shard by model first, `expcore-shard/3` (C32)
     per_model = { model-a = 2, model-b = 1 }
+    by = "run"                    # optional: deal each model's runs, not its pairs, `expcore-shard/5` (C32)
 
 `[shards] per_model` gives every model of the plan, in the order its shards take, how many shards serve it; N is the
 sum, at least 2, and `run --shard i/N` must give that N. Each such shard runs one run at a time, so the counts of the
 models on one unit are that unit's concurrent runs: a sum above the unit's `[scheduler.unit_caps]` cap is refused. The
 layout is in the campaign's caps, so in the fingerprint every shard shares; without the table nothing changes.
+`by = "run"` lets a model have as many shards as it has runs, each arm balanced over them (`campaign.shard_by_run`);
+`by = "pair"`, the default, is the layout without the key, byte for byte.
 
 An `[agent]` that gives no ceiling has one of 3 times `time_cap_s`. The ceiling bounds a run's whole time, waits on
 infrastructure included, and a platform that mints tokens for a run lives them as long as it (study guide, "Caps on a
@@ -56,7 +59,7 @@ from typing import Any
 from expcore.campaign.executor import Endpoint
 from expcore.campaign.gate import Budget
 from expcore.campaign.settings import SchedulerConfig
-from expcore.campaign.shard import SHARDS_CAP, ModelShards
+from expcore.campaign.shard import BY_PAIR, BY_RUN, SHARDS_CAP, ModelShards
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.config.models import Limits
 from expcore.loop.config import MALFORMED_POLICIES, AgentConfig
@@ -211,11 +214,15 @@ def _endpoints(root: Section, models: tuple[str, ...]) -> dict[str, Endpoint]:
 def _shards(
     root: Section, models: tuple[str, ...], scheduler: SchedulerConfig, endpoints: Mapping[str, Endpoint]
 ) -> ModelShards | None:
-    """`[shards] per_model`, in declared order; every model of the plan once, and no unit past its cap (C32)."""
+    """`[shards] per_model`, in declared order; every model of the plan once, and no unit past its cap; and `by`, what
+    is dealt among a model's shards (C32)."""
     if "shards" not in root.data:
         return None
     section = _table(root, "shards")
-    section.reject_unknown(["per_model"])
+    section.reject_unknown(["per_model", "by"])
+    by = section.optional_string("by") or BY_PAIR
+    if by not in (BY_PAIR, BY_RUN):
+        raise section.fail("by", f'is "{BY_PAIR}" or "{BY_RUN}": what is dealt among a model\'s shards, not {by!r}')
     if "per_model" not in section.data:
         raise section.fail("per_model", "is required: each model of the plan with how many shards serve it")
     table = Section(section.table("per_model"), root.file, "[shards.per_model]")
@@ -234,7 +241,7 @@ def _shards(
     if total < 2:
         raise section.fail("per_model", f"sums to {total}: a sharded campaign has at least 2 shards")
     _refuse_past_caps(table, counts, scheduler.unit_caps, endpoints)
-    return ModelShards(tuple(counts))
+    return ModelShards(tuple(counts), by)
 
 
 def _refuse_past_caps(
