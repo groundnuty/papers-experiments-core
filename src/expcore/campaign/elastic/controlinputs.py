@@ -179,6 +179,7 @@ class LedgerView:
     hard_term_s: float
     lost: tuple[tuple[int, str, str], ...] = ()  # (lease id, federation, state) of each lost lease not yet settled
     money: Mapping[str, object] = field(default_factory=dict)  # the ledger's `status()`, for the log and the status
+    reopenable: int = 0  # runs exhausted by a loss's conservative charge whose lost lease a settle may still reopen
 
     def leases_wanted(self) -> int:
         """How many more leases the ledger could issue now: each model of the current set below its cap with runs
@@ -222,6 +223,11 @@ def ledger_view(views: LedgerViews) -> LedgerView:
         for lease in leases
         if lease.lease_id not in settled and (lease.state == "lost" or (lease.state == "expired" and lease.proven))
     )
+    # An exhausted run is not final while a lost lease of it is unsettled: a settle that shows fewer attempts reopens
+    # it. Only a ledger with a budget settles, so only there may such a run come back.
+    exhausted = {run.run_key for run in views.runs() if run.state == "infra_exhausted"}
+    lost_ids = {lease_id for lease_id, _, _ in lost}
+    reopenable = len({lease.run_key for lease in leases if lease.lease_id in lost_ids and lease.run_key in exhausted})
     money = {"ceiling_micro": status.ceiling_micro, "committed_micro": status.committed_micro,
              "remaining_micro": status.remaining_micro, "locked_micro": status.locked_micro,
              "locked_by_state": dict(status.locked_by_state)}  # fmt: skip
@@ -238,6 +244,7 @@ def ledger_view(views: LedgerViews) -> LedgerView:
         hard_term_s=config.hard_term_s,
         lost=lost,
         money=money,
+        reopenable=reopenable if status.remaining_micro is not None else 0,
     )
 
 

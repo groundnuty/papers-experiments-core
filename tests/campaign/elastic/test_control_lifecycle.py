@@ -232,3 +232,13 @@ def test_c43_a_settle_names_a_root_only_of_the_member_holding_the_jobs_the_feder
     other = member("fed-1", jobs=("j-replacement",))
     (settle,) = of(decide(NOW, view, [(settings(), site(members=[other]))]), Settle)
     assert settle.root is None
+
+
+def test_c43_idle_federations_are_kept_for_exhausted_runs_a_pending_settle_may_reopen():
+    """C43: two runs exhausted by a loss's conservative charge, their lost leases not yet settled, may come back: of
+    three idle federations no cap lets work, only one is drained until they are settled."""
+    feds = [joined(f"fed-{n}", end_in_s=(4 + n) * HOUR) for n in (1, 2, 3)]
+    fleet = site(members=[member(f"fed-{n}") for n in (1, 2, 3)])
+    idle = {f.label: NOW - 2000 for f in feds}
+    view = ledger(federations=feds, idle_since=idle, reopenable=2)
+    assert [d.label for d in of(decide(NOW, view, [(settings(), fleet)]), Drain)] == ["site-a-fed-1"]

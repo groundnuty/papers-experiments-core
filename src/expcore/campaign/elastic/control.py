@@ -188,8 +188,9 @@ def decide(
     if need > 0:
         shared = {label: (key, room) for label, (key, room, _) in memory.items()}
         _add(need, rooms, {s.label: s.parallel_ups for s, _ in sites}, shared, decision)
-    elif need < 0:
-        _retire_idle(now, -need, ledger, sites, decision)
+    elif need + ledger.reopenable < 0:
+        # keep a federation for each exhausted run a pending settle may reopen: settle first, then retire
+        _retire_idle(now, -need - ledger.reopenable, ledger, sites, decision)
     decision.actions.sort(key=lambda action: ORDER.index(type(action)))
     return decision
 

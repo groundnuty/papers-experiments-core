@@ -51,3 +51,20 @@ def test_c43_a_dry_runs_read_only_view_reads_beside_the_driver_and_never_writes(
     ledger.close()
     reopened = Ledger.open(ledger_path(tmp_path), clock=clock)
     reopened.close()
+
+
+def test_c43_an_exhausted_run_with_an_unsettled_lost_lease_is_counted_as_one_that_may_reopen(tmp_path):
+    """C43: with one attempt allowed, a lease lost with its holder proven ended exhausts its run by the loss's charge;
+    the view counts it as reopenable until a settle showing no attempt charged reopens it."""
+    ledger, clock = make(tmp_path, runs=plan(tasks=1, conditions=("api-none",)), max_attempts=1, max_usd=30.0,
+                         grants_usd={"m1": 10.0})  # fmt: skip
+    join(ledger, clock, "fed-1")
+    lease = leased(ledger, "fed-1")
+    ledger.mark_sent(lease.lease_id)
+    ledger.prove_ended("fed-1", "terminal")
+    assert ledger.run(lease.run_key).state == "infra_exhausted"
+    assert ledger_view(ledger).reopenable == 1
+    ledger.settle(lease.lease_id, 100_000, "root", attempts_charged=0)
+    assert ledger.run(lease.run_key).state == "pending"
+    assert ledger_view(ledger).reopenable == 0
+    ledger.close()
