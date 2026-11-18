@@ -117,7 +117,7 @@ from expcore_onedata.fault_epoch import GATE_NOTE, LINKS_FAILED, LinkEpoch, Rais
 from expcore_onedata.fault_gate_heal import GateHeal, GateHeals, failed_heal_reason
 from expcore_onedata.fault_journal import HeldLock, holder_alive
 from expcore_onedata.fault_matrix import LinkMatrix
-from expcore_onedata.fault_owner import charge_of, in_progress_of, with_note
+from expcore_onedata.fault_owner import charge_of, explaining, in_progress_of, with_note
 from expcore_onedata.fault_recovery import FaultDriver, Recovery, RestoreSettling, failure
 from expcore_onedata.fault_relay import RELAY_NOTE, beat
 from expcore_onedata.fault_settings import (
@@ -437,14 +437,26 @@ class FaultGate:
         admission) the injection that attempt is itself holding down, journalled by it and seen down, is no unsettled
         injection: the run's own health reading inside its injection compares every space as usual, and its reading
         says that target is held (`healthreading`, O90). Every other open entry, another attempt's, one with no owner,
-        a failed restore of the run's own, a heal's restart, still fails the check as unsettled."""
+        a failed restore of the run's own, a heal's restart, still fails the check as unsettled. The targets it
+        explained are told to the check inside it (`fault_owner.explaining`), for the part of it that must not read
+        them as failing: the link check leaves their pairs out (`health.PlatformHealth`, O90)."""
         entries = self._recovery.entries()
+        held: list[str] = []
         if own:
             here = liveness.current()
-            entries = [entry for entry in entries if not (in_progress_of(entry, here) and self._held_down(entry))]
+            unexplained = []
+            for entry in entries:
+                if in_progress_of(entry, here) and self._held_down(entry):
+                    held.append(entry["target"])
+                else:
+                    unexplained.append(entry)
+            entries = unexplained
         if entries:
             return self._operator(_unsettled(entries))
-        return read_health(self._inner) if self._inner is not None else Health(True, "no injection is unsettled")
+        if self._inner is None:
+            return Health(True, "no injection is unsettled")
+        with explaining(held):
+            return read_health(self._inner)
 
     def _held_down(self, entry: Mapping[str, Any]) -> bool:
         """Whether a live injector still holds the entry's target down: the target's lock is held, as an injector holds
