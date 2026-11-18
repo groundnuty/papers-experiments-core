@@ -61,7 +61,7 @@ are the same text: no clock, no path and no random number enters it.
   figure with its N or `not recorded` (never 0). The shards are a check that the hosts are interchangeable, not a
   factor of the design: every figure is descriptive, no test across shards is made, and no score is shown by shard.
   Without `shards` the report is byte for byte what it was before shards existed (#154).
-- A batch merged by run (C43) gets, after the guards' sections, the balance of its runs over sites and federations
+- A batch merged by run (C45) gets, after the guards' sections, the balance of its runs over sites and federations
   and the federation-effect rerun beside the primary result (`expcore.report_balance`); no other report has either.
 - The report says under "Provenance" whether the analysis is partial, and lists the attempts left out (run key,
   attempt and reason) in a section of their own. What each number counts is stated in the report itself, beside the
@@ -1047,7 +1047,7 @@ def render_report(
     it, O56), `model_usage` what each model spent and what served and retried its requests (`campaign.model_usage`: no
     section and no provenance line without it, C39), `read_log` the read-log scan's verdicts and rerun of a batch whose
     records carry the `read_log` instrument (no section without it, S20), `balance` and `federation` the balance over
-    sites and federations and the federation-effect rerun of a batch merged by run (no section without them, C43). A
+    sites and federations and the federation-effect rerun of a batch merged by run (no section without them, C45). A
     partial analysis is described by the export (`partial`, `running_attempts`, `excluded_attempts`).
     What each number counts is stated in the report beside it. The text ends with a newline.
     """
@@ -1087,7 +1087,7 @@ def render_report(
     both = guards_lines(guards, _table, lambda r: _sensitivity(r, interval_level, left_out_label(guards)))  # O60
     seen = visibility_lines(visibility, _table, lambda r: _sensitivity(r, interval_level, HID_OR_UNKNOWN))  # O56
     scanned = read_log_lines(read_log, _table, lambda r: _sensitivity(r, interval_level, TOUCHED_THE_CHANNEL))  # S20
-    placed = balance_lines(balance, _table)  # only a batch merged by run has these two (C43)
+    placed = balance_lines(balance, _table)  # only a batch merged by run has these two (C45)
     refit = federation_lines(federation, _table, lambda r: _sensitivity(r, interval_level, FEDERATION_LEFT_OUT))
     sections = (
         _contrasts(result, interval_level)

@@ -1,5 +1,5 @@
 # Provenance: new
-"""The balance of an elastic campaign over its federations and sites (#462 step 4, C43): reported, never enforced.
+"""The balance of an elastic campaign over its federations and sites (#462 step 4, C45): reported, never enforced.
 
 A federation of an elastic fleet takes one run at a time, in the seeded order, whatever its condition, so a federation
 that ran one run of a model holds one condition of it by design. Balance is then a property of the whole campaign:

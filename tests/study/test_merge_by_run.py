@@ -1,4 +1,4 @@
-"""C43: an elastic campaign merged by run, from its ledger and its lease stores, and checked, analysed and reported.
+"""C45: an elastic campaign merged by run, from its ledger and its lease stores, and checked, analysed and reported.
 
 The fleet is the example study leased run by run through a real ledger to federations at two sites, each lease run
 for real in a store of its own (`merge_by_run_support`). The merge must take exactly one counted lease per run into the
@@ -87,8 +87,8 @@ def records(root: Path) -> dict[str, str]:
 # --- the union ------------------------------------------------------------------------------------------------------
 
 
-def test_c43_the_batch_holds_exactly_the_records_of_each_runs_counted_lease(merged, fleet):
-    """C43: runs/ is the union of the counted stores' records, one run each, and nothing of the evidence."""
+def test_c45_the_batch_holds_exactly_the_records_of_each_runs_counted_lease(merged, fleet):
+    """C45: runs/ is the union of the counted stores' records, one run each, and nothing of the evidence."""
     union: dict[str, str] = {}
     for campaign in fleet.counted():
         own = records(campaign.runs)
@@ -102,14 +102,14 @@ def test_c43_the_batch_holds_exactly_the_records_of_each_runs_counted_lease(merg
     assert document["runs"] == len(plan) == len(fleet.counted())
 
 
-def test_c43_the_merged_batch_scores_what_one_driver_of_the_whole_campaign_scores(merged, whole, fleet):
-    """C43: the analysis of the merged batch gives every run the score one driver gives it."""
+def test_c45_the_merged_batch_scores_what_one_driver_of_the_whole_campaign_scores(merged, whole, fleet):
+    """C45: the analysis of the merged batch gives every run the score one driver gives it."""
     finish(fleet.env, whole)
     assert merged.read("scores.json") == whole.read("scores.json")
 
 
-def test_c43_each_analysed_run_names_its_counted_lease_federation_and_site(merged, fleet):
-    """C43: the export carries the lease, federation and site of every run, from the ledger, and no evidence lease."""
+def test_c45_each_analysed_run_names_its_counted_lease_federation_and_site(merged, fleet):
+    """C45: the export carries the lease, federation and site of every run, from the ledger, and no evidence lease."""
     export = merged.read("export.json")
     leases = {entry["run_key"]: entry for entry in document_of(merged)["leases"]}
     entries = [e for name in ("analysed_attempts", "exhausted_runs", "unfinished_runs") for e in export[name]]
@@ -131,8 +131,8 @@ def test_c43_each_analysed_run_names_its_counted_lease_federation_and_site(merge
 # --- the evidence ---------------------------------------------------------------------------------------------------
 
 
-def test_c43_a_superseded_lease_is_evidence_with_its_spend_counted(merged, fleet):
-    """C43: its snapshot is kept under evidence/, it is never in leases/ or runs/, and its spend counts."""
+def test_c45_a_superseded_lease_is_evidence_with_its_spend_counted(merged, fleet):
+    """C45: its snapshot is kept under evidence/, it is never in leases/ or runs/, and its spend counts."""
     evidence = {entry["lease_id"]: entry for entry in document_of(merged)["evidence"]}
     entry = evidence[fleet.superseded]
     assert entry["reason"] == "superseded"
@@ -142,8 +142,8 @@ def test_c43_a_superseded_lease_is_evidence_with_its_spend_counted(merged, fleet
     assert entry["spend_usd"] is not None
 
 
-def test_c43_a_lost_lease_whose_store_came_back_running_is_settled_in_the_merges_copy(merged, fleet):
-    """C43: the evidence snapshot has the attempt interrupted and uncharged, marked copied back (its call log never
+def test_c45_a_lost_lease_whose_store_came_back_running_is_settled_in_the_merges_copy(merged, fleet):
+    """C45: the evidence snapshot has the attempt interrupted and uncharged, marked copied back (its call log never
     trusted), and the store given is not written: its attempt is still running there."""
     entry = {e["lease_id"]: e for e in document_of(merged)["evidence"]}[fleet.lost]
     assert entry["reason"] == "expired"
@@ -160,8 +160,8 @@ def test_c43_a_lost_lease_whose_store_came_back_running_is_settled_in_the_merges
     assert entry["spend_usd"] is not None
 
 
-def test_c43_a_lost_lease_that_left_nothing_is_charged_its_grant(merged, fleet):
-    """C43: no snapshot, and its spend is its grant, as the ledger charges it."""
+def test_c45_a_lost_lease_that_left_nothing_is_charged_its_grant(merged, fleet):
+    """C45: no snapshot, and its spend is its grant, as the ledger charges it."""
     entry = {e["lease_id"]: e for e in document_of(merged)["evidence"]}[fleet.vanished]
     assert (entry["reason"], entry["snapshot_sha256"], entry["started_utc"]) == ("expired", None, None)
     ledger = sqlite3.connect(fleet.ledger_file)
@@ -178,8 +178,8 @@ def test_c43_a_lost_lease_that_left_nothing_is_charged_its_grant(merged, fleet):
 # --- the analysis ---------------------------------------------------------------------------------------------------
 
 
-def test_c43_the_analysis_reports_the_balance_and_the_federation_rerun_beside_the_primary(merged):
-    """C43: analysis.json has the primary contrasts as ever, the balance and the federation rerun apart from them, and
+def test_c45_the_analysis_reports_the_balance_and_the_federation_rerun_beside_the_primary(merged):
+    """C45: analysis.json has the primary contrasts as ever, the balance and the federation rerun apart from them, and
     the report has both sections."""
     analysis = merged.read("analysis.json")
     assert analysis["contrasts"]
@@ -195,8 +195,8 @@ def test_c43_the_analysis_reports_the_balance_and_the_federation_rerun_beside_th
     assert "## Sensitivity analysis: site and federation effects" in merged.report
 
 
-def test_c43_a_merged_by_run_batch_whose_merge_json_was_edited_is_refused_by_the_check(base, merged, fleet):
-    """C43: merge.json is rebuilt from the snapshots and the ledger; a federation label changed after the merge is
+def test_c45_a_merged_by_run_batch_whose_merge_json_was_edited_is_refused_by_the_check(base, merged, fleet):
+    """C45: merge.json is rebuilt from the snapshots and the ledger; a federation label changed after the merge is
     refused, naming the field."""
     copy = copy_campaign(merged, base, "edited")
     path = copy.root / "out" / "merge.json"
@@ -211,29 +211,29 @@ def test_c43_a_merged_by_run_batch_whose_merge_json_was_edited_is_refused_by_the
 # --- each refusal ---------------------------------------------------------------------------------------------------
 
 
-def test_c43_a_run_whose_counted_store_is_missing_is_refused(base, fleet):
-    """C43: no run is missing: the store of a run's counted lease must be given."""
+def test_c45_a_run_whose_counted_store_is_missing_is_refused(base, fleet):
+    """C45: no run is missing: the store of a run's counted lease must be given."""
     outs = fleet.outs(fleet.superseded)
     errors = refused(fleet, base, "missing", outs[1:])
     assert "the store of its counted lease" in errors
 
 
-def test_c43_a_store_given_twice_is_refused(base, fleet):
-    """C43: none twice: one lease's store given twice is refused."""
+def test_c45_a_store_given_twice_is_refused(base, fleet):
+    """C45: none twice: one lease's store given twice is refused."""
     outs = fleet.outs(fleet.superseded)
     errors = refused(fleet, base, "twice", [*outs, outs[0]])
     assert "given twice" in errors
 
 
-def test_c43_a_superseded_store_left_out_is_refused(base, fleet):
-    """C43: the ledger verified a superseded lease's archive, so its store is evidence the merge keeps."""
+def test_c45_a_superseded_store_left_out_is_refused(base, fleet):
+    """C45: the ledger verified a superseded lease's archive, so its store is evidence the merge keeps."""
     errors = refused(fleet, base, "no-evidence", fleet.outs())
     assert f"lease {fleet.superseded} " in errors
     assert "give it, as the evidence it is" in errors
 
 
-def test_c43_a_store_of_another_campaign_is_refused(base, fleet):
-    """C43: a store whose fingerprint is not the others' is refused, naming it."""
+def test_c45_a_store_of_another_campaign_is_refused(base, fleet):
+    """C45: a store whose fingerprint is not the others' is refused, naming it."""
     copy = copy_campaign(fleet.counted()[0], base, "foreign")
     meta = {row["key"]: row["value"] for row in copy.sql("SELECT key, value FROM meta")}
     fingerprint = json.loads(meta["fingerprint"])
@@ -244,8 +244,8 @@ def test_c43_a_store_of_another_campaign_is_refused(base, fleet):
     assert "ran another campaign" in errors
 
 
-def test_c43_a_store_of_another_environment_is_refused(base, fleet):
-    """C43: a store that ran against another environment identity is refused, naming it."""
+def test_c45_a_store_of_another_environment_is_refused(base, fleet):
+    """C45: a store that ran against another environment identity is refused, naming it."""
     copy = copy_campaign(fleet.counted()[0], base, "elsewhere")
     other = {"layout": hashlib.sha256(b"another layout").hexdigest(), "platform": ENVIRONMENT}
     write_meta(copy.root / "out" / "state.sqlite", {META_ENVIRONMENT: json.dumps(other)})
@@ -254,8 +254,8 @@ def test_c43_a_store_of_another_environment_is_refused(base, fleet):
     assert "another environment" in errors
 
 
-def test_c43_a_ledger_whose_tables_are_not_what_its_events_give_is_refused(base, fleet):
-    """C43: the ledger is a hashed input that is never trusted: a run pointed at another lease is refused."""
+def test_c45_a_ledger_whose_tables_are_not_what_its_events_give_is_refused(base, fleet):
+    """C45: the ledger is a hashed input that is never trusted: a run pointed at another lease is refused."""
     tampered = base / "tampered-ledger" / "ledger.sqlite"
     tampered.parent.mkdir()
     shutil.copyfile(fleet.ledger_file, tampered)
@@ -269,8 +269,8 @@ def test_c43_a_ledger_whose_tables_are_not_what_its_events_give_is_refused(base,
     assert "not what its events give" in errors
 
 
-def test_c43_stores_of_another_environment_than_the_ledgers_are_refused(base, fleet):
-    """C43: every store agrees with the others, and all ran against another environment than the one the ledger
+def test_c45_stores_of_another_environment_than_the_ledgers_are_refused(base, fleet):
+    """C45: every store agrees with the others, and all ran against another environment than the one the ledger
     pinned at its first join: refused."""
     pinned = base / "other-environment-ledger" / "ledger.sqlite"
     pinned.parent.mkdir()
@@ -285,8 +285,8 @@ def test_c43_stores_of_another_environment_than_the_ledgers_are_refused(base, fl
     assert "another environment than the ledger's" in errors
 
 
-def test_c43_a_counted_store_without_its_final_record_is_refused(base, fleet):
-    """C43: the record of a counted lease's final attempt is the run's only one; a store that lost it is refused."""
+def test_c45_a_counted_store_without_its_final_record_is_refused(base, fleet):
+    """C45: the record of a counted lease's final attempt is the run's only one; a store that lost it is refused."""
     copy = copy_campaign(fleet.counted()[0], base, "no-record")
     for path in copy.runs.rglob("*.json"):
         if is_record_name(path.name):
@@ -296,8 +296,8 @@ def test_c43_a_counted_store_without_its_final_record_is_refused(base, fleet):
     assert "the record of a counted lease's final attempt is missing" in errors
 
 
-def test_c43_a_record_added_to_a_merged_batch_is_refused_by_the_check(base, merged, fleet):
-    """C43: the check replays exactly the counted leases' records; one no counted store accounts for is refused."""
+def test_c45_a_record_added_to_a_merged_batch_is_refused_by_the_check(base, merged, fleet):
+    """C45: the check replays exactly the counted leases' records; one no counted store accounts for is refused."""
     copy = copy_campaign(merged, base, "stray-record")
     first = next(path for path in sorted(copy.runs.rglob("*.json")) if is_record_name(path.name))
     stray = first.parent.with_name("try9")
@@ -307,14 +307,14 @@ def test_c43_a_record_added_to_a_merged_batch_is_refused_by_the_check(base, merg
     assert "a record no attempt of a counted lease's store accounts for" in errors
 
 
-def test_c43_a_campaign_with_a_run_not_yet_counted_is_refused(base, fleet):
-    """C43: every run of the plan must have its counted lease in the ledger."""
+def test_c45_a_campaign_with_a_run_not_yet_counted_is_refused(base, fleet):
+    """C45: every run of the plan must have its counted lease in the ledger."""
     errors = refused(fleet, base, "pending", [str(fleet.stores[fleet.superseded].root / "out")], fleet.pending_copy)
     assert "a campaign is merged by run once every run has its counted lease" in errors
 
 
-def test_c43_a_store_marked_not_final_is_refused(base, fleet):
-    """C43: a store a driver's check marked not final is refused, as a shard is."""
+def test_c45_a_store_marked_not_final_is_refused(base, fleet):
+    """C45: a store a driver's check marked not final is refused, as a shard is."""
     copy = copy_campaign(fleet.counted()[0], base, "not-final-store")
     (copy.root / "out" / NOT_FINAL_FILE).write_text(json.dumps({"reason": "a check did not pass"}), encoding="utf-8")
     outs = fleet.outs(fleet.superseded)
@@ -322,8 +322,8 @@ def test_c43_a_store_marked_not_final_is_refused(base, fleet):
     assert "marked not final" in errors
 
 
-def test_c43_a_counted_store_with_a_running_attempt_is_refused(base, fleet):
-    """C43: only a lost or expired lease's store is settled in the merge's copy; a counted one must have ended."""
+def test_c45_a_counted_store_with_a_running_attempt_is_refused(base, fleet):
+    """C45: only a lost or expired lease's store is settled in the merge's copy; a counted one must have ended."""
     copy = copy_campaign(fleet.counted()[0], base, "still-running")
     make_running(copy)
     outs = fleet.outs(fleet.superseded)

@@ -1,5 +1,5 @@
 # Provenance: new
-"""What today's readers of a merged batch need to tell a batch merged by run (C43) from a merge of shards.
+"""What today's readers of a merged batch need to tell a batch merged by run (C45) from a merge of shards.
 
 `check`, `analyze` and the verified reader import this module and nothing of the elastic ledger: the merge by run's
 checks and the ledger's reader (`campaign.merge_by_run`, `campaign.merged_by_run`, `campaign.ledger_read`) are imported

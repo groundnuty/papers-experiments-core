@@ -1,5 +1,5 @@
 # Provenance: new
-"""The elastic ledger as a merge by run reads it (#462 step 4, C43): a snapshot, its facts, and its rule recomputed.
+"""The elastic ledger as a merge by run reads it (#462 step 4, C45): a snapshot, its facts, and its rule recomputed.
 
 A merge by run never opens the ledger as the dispatcher does (`elastic.Ledger.open` takes the dispatcher's lock and
 writes beside the file). It copies the file it is given, with its -wal, into a private directory

@@ -1,5 +1,5 @@
 # Provenance: new
-"""The report's sections of a batch merged by run (#462 step 4, C43): balance, and the federation-effect rerun.
+"""The report's sections of a batch merged by run (#462 step 4, C45): balance, and the federation-effect rerun.
 
 - **Balance over sites and federations** (`campaign.balance`): per model, the planned runs of each condition by site
   and by federation, every cell written out. Descriptive: no test is made and nothing is enforced.

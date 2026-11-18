@@ -1,5 +1,5 @@
 # Provenance: new
-"""The merge of an elastic campaign by run (#462 step 4, C43): the checks, merge.json `expcore-merge/2`, the layout.
+"""The merge of an elastic campaign by run (#462 step 4, C45): the checks, merge.json `expcore-merge/2`, the layout.
 
 `python -m expcore merge OUT STORE_OUT... --ledger LEDGER` takes the campaign's ledger and the `out/` of lease stores
 (`expcore-shard/5`, one run each, `campaign.run_lease`) and writes one batch under `OUT`:

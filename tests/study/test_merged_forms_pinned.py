@@ -1,4 +1,4 @@
-"""C43: a merge of shards and one driver of the whole keep what they write, byte for byte, beside the merge by run.
+"""C45: a merge of shards and one driver of the whole keep what they write, byte for byte, beside the merge by run.
 
 The merge by run (`merge --ledger`, `expcore-merge/2`) adds its own branches to the check, the analysis, the export and
 the report. Each is taken only for a batch merged by run, so today's forms must write what they wrote before it
@@ -32,13 +32,13 @@ def pinned() -> dict[str, dict[str, str | None]]:
 
 @pytest.mark.parametrize("output", OUTPUTS)
 @pytest.mark.parametrize("form", FORMS)
-def test_c43_an_old_form_writes_what_it_wrote_before_the_merge_by_run(form, output, found, pinned):
-    """C43: merge.json, the export, analysis.json and the report of a merge of shards and of one driver."""
+def test_c45_an_old_form_writes_what_it_wrote_before_the_merge_by_run(form, output, found, pinned):
+    """C45: merge.json, the export, analysis.json and the report of a merge of shards and of one driver."""
     assert found[form][output] == pinned[form][output]
 
 
-def test_c43_the_pins_cover_both_old_forms_and_every_output(pinned):
-    """C43: a merge of shards (with its merge.json) and one driver (without one), each with all four outputs."""
+def test_c45_the_pins_cover_both_old_forms_and_every_output(pinned):
+    """C45: a merge of shards (with its merge.json) and one driver (without one), each with all four outputs."""
     assert set(pinned) == set(FORMS)
     assert all(set(pinned[form]) == set(OUTPUTS) for form in FORMS)
     assert pinned["merged-shards"]["merge.json"] is not None

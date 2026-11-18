@@ -1,4 +1,4 @@
-"""The outputs of today's merge, and of one driver, with what a clock or a host writes in them masked (C43).
+"""The outputs of today's merge, and of one driver, with what a clock or a host writes in them masked (C45).
 
 A merge by run (`merge --ledger`, `expcore-merge/2`) is a new form beside the merge of shards (`expcore-merge/1`) and
 the unmerged campaign. Its code sits beside theirs in the check, the analysis, the export and the report, so this

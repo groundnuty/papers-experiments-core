@@ -1,4 +1,4 @@
-"""Helpers for the merge by run (C43): a real ledger driving real lease stores of the example study.
+"""Helpers for the merge by run (C45): a real ledger driving real lease stores of the example study.
 
 `build_fleet` creates the campaign's ledger (`elastic.Ledger`, on a fake clock) for a copy of the example that declares
 the federation rerun, joins federations at two sites, and leases every run, one at a time, to the healthy ones: each

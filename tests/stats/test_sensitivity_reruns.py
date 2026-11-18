@@ -46,7 +46,7 @@ def load(path):
 
 
 def test_s19_the_reruns_are_named_as_the_core_runs_them():
-    """S19, S20, C43: the four guards' reruns, the one of every guard together and the federation rerun of a batch
+    """S19, S20, C45: the four guards' reruns, the one of every guard together and the federation rerun of a batch
     merged by run, in this order."""
     assert RERUNS == ("egress", "mount_guard", "process_visibility", "read_log", "any_guard", "federation")
     assert (EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY, READ_LOG, ANY_GUARD, FEDERATION) == RERUNS

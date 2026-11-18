@@ -4,7 +4,7 @@
 An analysis of a batch checked by a guard runs the preregistered analysis again without the runs the guard leaves out:
 `egress` (the egress check), `mount_guard` (the mount guard), `process_visibility` (the hidden-process check),
 `read_log` (the read-log scan, S20) and `any_guard` (without every run any guard that checked the batch leaves out,
-when two or more did). A batch merged by run (C43) runs one more, `federation`: the contrasts refit with site as a fixed
+when two or more did). A batch merged by run (C45) runs one more, `federation`: the contrasts refit with site as a fixed
 and federation as a random effect (`stats.federation_effect`), whether or not it can be computed. Which of them an
 analysis runs depends on which instruments its records carry, so a study that lists a guard on no record, or on the
 wrong runs, would otherwise get a different set of reruns than the one it meant to preregister. The preregistration
@@ -31,7 +31,7 @@ from expcore.config.loading import Section, close_match
 
 EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY, ANY_GUARD = "egress", "mount_guard", "process_visibility", "any_guard"
 READ_LOG = "read_log"
-FEDERATION = "federation"  # a batch merged by run (C43): the contrasts refit with site and federation effects
+FEDERATION = "federation"  # a batch merged by run (C45): the contrasts refit with site and federation effects
 RERUNS = (EGRESS, MOUNT_GUARD, PROCESS_VISIBILITY, READ_LOG, ANY_GUARD, FEDERATION)
 SINGLE = (
     EGRESS,
@@ -91,7 +91,7 @@ def ran_reruns(
 ) -> tuple[str, ...]:
     """The reruns an analysis would run, in the order of `RERUNS`: each guard's analysis that exists (its guard checked
     the batch, whether or not a run was left out), the one of every guard together when it exists, and the federation
-    rerun of a batch merged by run (C43), whether or not it could be computed."""
+    rerun of a batch merged by run (C45), whether or not it could be computed."""
     found = (egress, mount_guard, visibility, read_log, guards, federation)
     return tuple(name for name, analysis in zip(RERUNS, found, strict=True) if analysis is not None)
 

@@ -1,5 +1,5 @@
 # Provenance: new
-"""merge.json `expcore-merge/2`, the layout of a batch merged by run, and the batch read back (#462 step 4, C43).
+"""merge.json `expcore-merge/2`, the layout of a batch merged by run, and the batch read back (#462 step 4, C45).
 
 `by_run_document` writes merge.json for a merge by run that passed `campaign.merge_by_run.check_by_run`, and
 `lay_out_by_run` the batch: `runs/` from each run's counted lease, `leases/<id>/` and `evidence/<id>/` for the

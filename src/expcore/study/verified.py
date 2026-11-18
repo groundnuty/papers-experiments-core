@@ -18,7 +18,7 @@ that the check holds:
 
 A merged batch (`campaign.merge`) has the snapshot of each of its shards instead of one: the check records the SHA-256
 of its merge.json (`check["merge"]`), merge.json records each snapshot's, and each is read once and compared with the
-hash that names it. The records are cross-validated against all the snapshots together. A batch merged by run (C43,
+hash that names it. The records are cross-validated against all the snapshots together. A batch merged by run (C45,
 `campaign.merged_by_run`) has the snapshot of each run's counted lease, by lease id; the evidence's snapshots are no
 part of what is analysed.
 
@@ -135,7 +135,7 @@ def _load_shards(batch: Path, merge: Any, schema: FactorSchema) -> tuple[dict[in
         )
     try:
         raw = _read_verified(out, MERGE_FILE, expected)
-        by_run = is_by_run(raw)  # a merge by run (C43) keeps each counted lease's snapshot under its lease id
+        by_run = is_by_run(raw)  # a merge by run (C45) keeps each counted lease's snapshot under its lease id
         document = _read_by_run(raw) if by_run else read_merge(raw, MERGE_FILE)
     except MergeRefused as error:
         raise Unverified(str(error)) from None
@@ -163,7 +163,7 @@ def _read_by_run(raw: bytes) -> dict:
 
 
 def _entries(document: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    """The snapshots merge.json lists: a merge of shards' `shards`, a merge by run's counted `leases` (C43)."""
+    """The snapshots merge.json lists: a merge of shards' `shards`, a merge by run's counted `leases` (C45)."""
     return document["leases"] if document.get("schema") == MERGE_BY_RUN_SCHEMA else document["shards"]
 
 

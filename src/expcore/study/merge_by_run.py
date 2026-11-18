@@ -1,5 +1,5 @@
 # Provenance: new
-"""`python -m expcore merge OUT STORE_OUT... --ledger LEDGER`: an elastic campaign merged by run (#462 step 4, C43).
+"""`python -m expcore merge OUT STORE_OUT... --ledger LEDGER`: an elastic campaign merged by run (#462 step 4, C45).
 
 The study is the one above `OUT` (or `--study`). The merge snapshots the ledger it is given (`campaign.ledger_read`),
 reads every lease store's `out/` the way today's merge reads a shard's (its lock held as a reader, its store backed up
