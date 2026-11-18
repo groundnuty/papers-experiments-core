@@ -92,16 +92,19 @@ def _read(place: Path):
     return dead_store_spend(place / "study" / "out", load_study(place / "study"))
 
 
-def _later_attempt(place: Path, state: str) -> list[dict]:
+def _later_attempt(place: Path, state: str, charged: int | None = None) -> list[dict]:
     """The journal lines of a further attempt of the run, begun after the snapshot: one that ended in `state` with the
-    last attempt's counts and no call log, or (`running`) one that sent a request and never heard back."""
+    last attempt's counts and no call log (`charged`: the line's own field, none for a journal that predates it), or
+    (`running`) one that sent a request and never heard back."""
     last = [line for line in _lines(place) if line["kind"] == "attempt"][-1]
     began = {**last, "id": last["id"] + 1, "started_utc": "2099-01-01T00:00:00Z", "pid": 1}
     if state == "running":
         silent = {**began, "state": "running", "calls_sent": 0, "calls_closed": 0, "topups": 0, "topup_usd": 0.0}
         sent = {"kind": "call", "id": began["id"], "run_key": began["run_key"], "phase": "sent"}
         return [{**silent, **dict.fromkeys(("input_tokens", "output_tokens"), 0)}, {**sent, **_campaign_of(last)}]
-    return [{**began, "state": state, "calls_sent": None, "calls_closed": None}]
+    ended = {key: value for key, value in began.items() if key != "charged"}  # the copied line's field is the run's own
+    ended = {**ended, "state": state, "calls_sent": None, "calls_closed": None}
+    return [ended if charged is None else {**ended, "charged": charged}]
 
 
 def _campaign_of(line: dict) -> dict:
@@ -130,8 +133,9 @@ def test_a_store_snapshotted_mid_run_is_read_with_its_journal(base, ended):
 
 
 def test_attempts_the_snapshot_lacks_raise_the_spend_and_the_charged_attempts(base, ended):
-    """C46: An attempt begun after the snapshot, which the journal saw end as an infrastructure failure, is spend the
-    store does not hold; its kind is not journaled, so it is counted as charged (the ledger's own charge is as high)."""
+    """C46: An attempt begun after the snapshot, which an older journal (its lines carry no `charged`) saw end as an
+    infrastructure failure, is spend the store does not hold; with its kind unknown it is counted as charged (the
+    ledger's own charge is as high): a journal without the field reads as it did."""
     place = _mid_run(base, ended, "later-attempt")
     before = _read(place)
     _append(place, *_later_attempt(place, "infra_fail"))
@@ -140,6 +144,38 @@ def test_attempts_the_snapshot_lacks_raise_the_spend_and_the_charged_attempts(ba
     assert after is not None
     assert after.spend_micro > before.spend_micro
     assert after.charged_attempts == before.charged_attempts + 1
+
+
+def test_an_infra_fail_the_journal_alone_saw_end_costs_its_run_an_attempt_only_if_it_was_charged(base, ended):
+    """C46: The journal's attempt line says whether its end was charged (an infrastructure failure of a kind the key's
+    or the budget's own is not): one that ended uncharged is spend and no attempt, as the store would count it, so a
+    settle never exhausts a run one attempt early; one that ended charged is both."""
+    place = _mid_run(base, ended, "later-uncharged")
+    before = _read(place)
+    _append(place, *_later_attempt(place, "infra_fail", charged=0))
+    uncharged = _read(place)
+    assert before is not None
+    assert uncharged is not None
+    assert uncharged.spend_micro > before.spend_micro
+    assert uncharged.charged_attempts == before.charged_attempts
+    charged = _mid_run(base, ended, "later-charged")
+    _append(charged, *_later_attempt(charged, "infra_fail", charged=1))
+    found = _read(charged)
+    assert found is not None
+    assert found.spend_micro == uncharged.spend_micro
+    assert found.charged_attempts == before.charged_attempts + 1
+
+
+def test_the_journal_a_lease_run_writes_names_whether_each_attempt_was_charged(ended):
+    """C46: Each `attempt` line of a real run's journal carries the row's `charged`, as the store holds it."""
+    db = sqlite3.connect(ended / "study" / "out" / "state.sqlite")
+    try:
+        held = {row[0]: row[1] for row in db.execute("SELECT id, charged FROM attempts")}
+    finally:
+        db.close()
+    lines = [line for line in _lines(ended) if line["kind"] == "attempt"]
+    assert held
+    assert {line["id"]: line["charged"] for line in lines if line["state"] != "running"} == held
 
 
 def test_a_later_attempt_still_running_when_the_federation_was_lost_is_spend_and_not_charged(base, ended):

@@ -11,10 +11,12 @@ holds that the store lacks (the store's own journal: its rows are matched by id,
 charged by its journaled call log or its bound, and each top-up and probe at its dollars; the spend is then the budget
 gate's own figure (`selection_ledger.spend_of`) over the reconciled copy.
 
-**Charged attempts.** The journal does not say whether an attempt that ended infrastructure-failed was charged (its
-kind is not journaled). One the store holds ended is its row's; an attempt the journal saw end as `infra_fail` that the
-store lacks (or holds running) is counted charged, the ledger's own provisional charge being as high; any other end,
-and an attempt the journal never saw end (interrupted by the loss), is not charged.
+**Charged attempts.** One the store holds ended is its row's. An attempt that the store lacks (or holds running) and
+the journal saw end is counted as the store would: by the line's own `charged`, which the run journals with every
+`attempt` line (an infrastructure failure of a kind the key's or the budget's own is not charged). A journal written
+before the field has none, and its `infra_fail` end is then counted charged, the ledger's own provisional charge being
+as high; any other end, and an attempt the journal never saw end (interrupted by the loss, which the store's own
+recovery leaves uncharged), is not charged.
 
 **None** (the lease stays charged its grant) for a journal that is not there, has no whole header (an empty file would
 read as "nothing spent"), does not list every attempt the store holds (a short or damaged journal), is not the one the
@@ -129,7 +131,7 @@ def _read(out: Path, study: StudyConfig, raw: bytes, private: Path) -> JournalRe
             return None
         ended = {r["id"] for r in store.q("SELECT id FROM attempts WHERE state != 'running'")}
         extra = sum(  # an attempt the store lacks or holds running: only the journal says how it ended
-            1 for number, entry in journal.attempts.items() if number not in ended and entry["state"] == "infra_fail"
+            1 for number, entry in journal.attempts.items() if number not in ended and _charged(entry)
         )
         now = dt.datetime.now(dt.UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
         recover(store, now, study.campaign.scheduler.max_attempts)
@@ -141,6 +143,13 @@ def _read(out: Path, study: StudyConfig, raw: bytes, private: Path) -> JournalRe
     finally:
         store.close()
     return _figure(out, copied, private, pricing, extra)
+
+
+def _charged(entry: Any) -> bool:
+    """Whether the journal's last line of an attempt is an end that cost its run an attempt: its `charged`, or, in a
+    journal written before the field, an `infra_fail` end."""
+    charged = entry.get("charged")
+    return entry["state"] == "infra_fail" if charged is None else entry["state"] != "running" and bool(charged)
 
 
 def _figure(out: Path, copied: Path, private: Path, pricing: Any, extra: int) -> JournalRead | None:
