@@ -95,7 +95,16 @@ what it bills (above), which this problem does not need.
   other live federations; an sbatch refusal says the same, the nodes' names Slurm repeats removed. What the site's
   sbatch does is not known (a live slot sees it).
 - **A fleet** (below) is N such federations: each member's `up` reads the others' jobs, so members brought up one after
-  another take distinct nodes by this rule alone; members brought up at once may race and the later one is refused.
+  another take distinct nodes by this rule alone. Members brought up at once (`HPC_FLEET_PARALLEL` above 1) share one
+  lock, the file `<fleet>/.placement.lock` (`hpcexclude.placement_lock`), taken for each up's first read together with
+  its submits and for its second read once its jobs run, and for nothing else: the rest of every up (the services, the
+  core's phase, the link check) runs in parallel. Two members whose pending jobs end on one node are told apart by the
+  second read: the one that reads first is refused, its jobs cancelled and gone from the live list before the lock is
+  let go (a completing job still lists its nodes), and it is tried again (`hpcdriver.PLACEMENT_ATTEMPTS`, 3 in all),
+  each retry reading the jobs now held and submitting with their nodes excluded; only the last refusal fails the
+  member, as it did. An `up` run by hand takes no lock and is tried once. Two fleets of one account do not share a
+  lock: each is kept apart from the other's federations by the second read alone, and both may be refused (each is then
+  tried again).
 
 ### The agent's node: a component of its own
 
@@ -126,8 +135,12 @@ sbatch --parsable --job-name=<name> --account --partition --no-requeue --time --
 - **The fallback, should a site refuse heterogeneous jobs: `sandbox_placement = "separate"`**, a second held job for S
   alone, named `<name>-sandbox`, submitted, read back and cancelled exactly as the first, and never stopped or started:
   its gate reaches the providers over the network, as it does in a component. Its steps take its own job id. The two
-  jobs are scheduled apart, so the first can run, and bill, while the second waits (bounded as the first), and a
-  partition that allows one submitted job per user (reason 5 above) refuses the second.
+  jobs are scheduled apart, but the second is submitted to start after the first (`--dependency=after:<first>`, Slurm's
+  "begin after the job starts", never `afterok`; read back with the job), so a services job that pends in the queue no
+  longer leaves S's node billing alone. What remains: once the first runs, the first can still run, and bill, while the
+  second waits for a node of its own (bounded as the first); a first job cancelled before it started (its wait failing at
+  the bound) satisfies the dependency too, so the second may start in the seconds before the same failure cancels it;
+  and a partition that allows one submitted job per user (reason 5 above) refuses the second.
 - **On a site whose switch plugin gives each job a virtual network identifier, `separate` is the placement to start
   from** (the second live slot, 16 Nov 2026). There a heterogeneous job's steps on component 0 failed from a point on
   (`srun: error: task 0 launch failed: Error configuring interconnect`: after the zone and five providers had started,
@@ -164,7 +177,8 @@ under one record. One federation's job failing ends one shard's step, never anot
   section 11, whenever the site sets its keys) is asked once too, ahead of it, at `up` and at `add`: it has no estimate to
   multiply, so one read answers for all N, and a full home refuses the call before the fleet's directory, a slot or a job
   is made. `HPC_FLEET_PARALLEL` (1 by default) is how
-  many ups or downs run at once.
+  many ups or downs run at once. Neither setting may pass `HPC_FLEET_CEILING`, the site's own ceiling, a whole number
+  from 1 to 512 (64 when unset, so nothing changes unless the site sets it; a fleet of 66 needs it at 66 or more).
 - **One process per federation.** A federation's driver changes process-wide state (the umask its secrets are written
   under), so each `up` and `down` is `hpcfed.py` in a child of its own, with `-I`, from the fleet's 0700 directory,
   its output in `<fleet>/logs/<label>.<command>.log`. One that fails is reported; the others go on.
