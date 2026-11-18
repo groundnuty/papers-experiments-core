@@ -60,11 +60,14 @@ INFRA_PREFIX = "infrastructure: "
 
 @dataclass(frozen=True)
 class RunIdentity:
-    """Who the attempt is: the run key, the factor values it was derived from, and the attempt number."""
+    """Who the attempt is: the run key, the factor values it was derived from, and the attempt number, and, for an
+    attempt that ran on a lease (C41), the lease: two leases of one run can each have an attempt of one number, so the
+    lease id tells them apart. None for every other attempt, and then no record or export says anything of it."""
 
     run_key: str
     factors: Mapping[str, Any]
     attempt: int
+    lease_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -480,6 +483,8 @@ def _build_record(
     }
     if instrument_refusal is not None:  # optional: written only when there is one, served back by a replay
         fields["instrument_refusal"] = plain(dict(instrument_refusal))
+    if identity.lease_id is not None:  # optional: only an attempt run on a lease has one, served back by a replay (C41)
+        fields["lease_id"] = identity.lease_id
     if redactor is None:
         redactor = redactor_for(recording.inner, environ=environ, secrets=secrets, secret_env=secret_env, models=models)
     redacted, paths = redactor.structure(fields)
