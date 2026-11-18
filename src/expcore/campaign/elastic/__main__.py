@@ -2,10 +2,10 @@
 """`python -m expcore.campaign.elastic`: an operator's (or an agent's) view and lever on an elastic campaign's ledger.
 
 - `create LEDGER --study DIR --hard-term-s N [--prior-run-s N] [--max-usd N] [--cap MODEL=N]...`: make a campaign's
-  ledger from its study:
-  one run per planned (task, model, condition) in the seeded order, the fingerprint a federation joins with, the
-  study's attempt limit and one lease grant per model (`lease_grant_usd`), a lease's hard term (the study does not state
-  the platform's reset and deferral bounds, so it is given: `hard_term_s`) and, with `--max-usd`, the dollar budget.
+  ledger from its study: one run per planned (task, model, condition) in the seeded order, the fingerprint a federation
+  joins with, the study's attempt limit and one lease grant per model (`lease_grant_usd`), a lease's hard term (the
+  study does not state the platform's reset and deferral bounds, so it is given: `hard_term_s`) and, with `--max-usd`,
+  the dollar budget.
   `DIR` is the study as a federation runs it (its `platform.toml` beside `study.toml`, where the study has one). It
   refuses a ledger that exists; the ledger is closed when it is made, so a controller can open it. Each `--cap` is a
   model's starting cap on the leases it holds at once (a whole number from 1; a model not named has none), and the
@@ -21,9 +21,8 @@
 
 `status`, `raise-ceiling` and `set-cap` work on the ledger file under its own write lock and not the dispatcher's, so
 they run while a dispatcher holds the ledger, and the dispatcher's next lease reads a raise or a cap. Exit status: 0
-done, 1 refused by
-the ledger (or, for `create`, by the study: not loadable, or code that is not known), 2 a usage error or a file that is
-not a ledger.
+done, 1 refused by the ledger (or, for `create`, by the study: not loadable, or code that is not known), 2 a usage
+error or a file that is not a ledger.
 """
 
 import argparse
