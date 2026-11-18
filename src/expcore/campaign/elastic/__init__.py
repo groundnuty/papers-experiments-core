@@ -11,6 +11,7 @@ from expcore.campaign.elastic.ledger import Ledger
 from expcore.campaign.elastic.records import (
     Completion,
     CompletionConflict,
+    Demand,
     Federation,
     JoinRefused,
     Lease,
@@ -24,6 +25,7 @@ from expcore.campaign.elastic.records import (
 __all__ = [
     "Completion",
     "CompletionConflict",
+    "Demand",
     "Federation",
     "JoinRefused",
     "Lease",

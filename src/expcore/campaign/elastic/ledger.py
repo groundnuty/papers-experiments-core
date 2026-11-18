@@ -165,6 +165,18 @@ class Ledger(LedgerViews):
 
         self._transact(go)
 
+    def drain(self, label: str) -> None:
+        """The federation takes no new lease from now on; a lease it holds runs to its end and counts as any other."""
+
+        def go() -> None:
+            if self._federation_row(label)["drained_at"] is not None:
+                return
+            now = self._clock()
+            self.db.execute("UPDATE federations SET drained_at=? WHERE label=?", (now, label))
+            self._event(now, "drain", federation=label)
+
+        self._transact(go)
+
     def prove_ended(self, label: str, proof: str) -> None:
         """The federation's job is shown ended (`proof`: terminal, or cancelled by the controller): its held leases
         let go of their slots, and a lease still in flight on it expires first."""
@@ -198,6 +210,8 @@ class Ledger(LedgerViews):
         fed = self._federation_row(label)
         if fed["ended_at"] is not None:
             return Wait(f"federation {label} has ended ({fed['end_proof']})")
+        if fed["drained_at"] is not None:
+            return Wait(f"federation {label} is draining")
         held = self.db.execute("SELECT id, state FROM leases WHERE federation=? AND slot=1", (label,)).fetchone()
         if held is not None:
             return Wait(f"federation {label} holds lease {held['id']} ({held['state']})")
@@ -255,6 +269,14 @@ class Ledger(LedgerViews):
 
         self._transact(go)
 
+    def _landed(self, lease_id: int, now: float) -> None:
+        """A heartbeat shows the lease's file landed and its worker took it: an issued lease is sent, and can no
+        longer be cancelled."""
+        row = self._lease_row(lease_id)
+        if row["state"] == "issued":
+            self.db.execute("UPDATE leases SET state='sent' WHERE id=?", (lease_id,))
+            self._event(now, "sent", run_key=row["run_key"], lease_id=lease_id, by="heartbeat")
+
     def cancel(self, lease_id: int) -> None:
         """An issued lease whose file never landed: nothing ran, so nothing is charged and its run goes back."""
 
@@ -303,6 +325,7 @@ class Ledger(LedgerViews):
                     " AND (counter IS NULL OR counter < ?)",
                     (counter, now, lease_id, counter),
                 )
+                self._landed(lease_id, now)
             for label, proof in reading.ended.items():
                 self._prove(label, proof, now)
             self._sweep(now, read)

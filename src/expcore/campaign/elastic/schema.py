@@ -28,6 +28,7 @@ CREATE INDEX runs_pending ON runs(state, set_index, seq);
 CREATE TABLE federations(
   label TEXT PRIMARY KEY, site TEXT NOT NULL, job_ids TEXT NOT NULL, job_end_at REAL NOT NULL,
   kill_wait_s REAL NOT NULL, joined_at REAL NOT NULL,
+  drained_at REAL,  -- NULL: not draining, else it gets no new lease
   ended_at REAL, end_proof TEXT);  -- NULL: its job is not proven ended
 CREATE TABLE leases(
   id INTEGER PRIMARY KEY AUTOINCREMENT,  -- the fencing token: never reused, above every earlier one

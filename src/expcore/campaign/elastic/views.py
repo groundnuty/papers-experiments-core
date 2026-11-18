@@ -9,7 +9,7 @@ import sqlite3
 from typing import Any
 
 from expcore.campaign.elastic.config import PRIOR_RUNS, LedgerConfig
-from expcore.campaign.elastic.records import Federation, Lease, LedgerError, Run
+from expcore.campaign.elastic.records import Demand, Federation, Lease, LedgerError, Run
 
 _LEASE_SQL = "SELECT l.*, f.ended_at AS fed_ended FROM leases l JOIN federations f ON f.label = l.federation"
 
@@ -99,6 +99,7 @@ class LedgerViews:
                 row["job_end_at"],
                 row["kill_wait_s"],
                 row["joined_at"],
+                row["drained_at"],
                 row["ended_at"],
                 row["end_proof"],
             )
@@ -111,3 +112,12 @@ class LedgerViews:
             {**dict(row), "detail": None if row["detail"] is None else json.loads(row["detail"])}
             for row in self.db.execute("SELECT * FROM events ORDER BY seq")
         ]
+
+    def demand(self) -> Demand:
+        """The current set, its pending runs per model, and the cap slots held per model: what a controller's target
+        reads (with `config.caps`)."""
+        current = self.db.execute("SELECT MIN(set_index) FROM runs WHERE state='pending'").fetchone()[0]
+        rows = self.db.execute(
+            "SELECT model, COUNT(*) FROM runs WHERE state='pending' AND set_index=? GROUP BY model", (current,)
+        ).fetchall()
+        return Demand(set_index=current, pending=dict(rows), slots=self.slots())

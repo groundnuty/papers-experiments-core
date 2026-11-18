@@ -179,7 +179,8 @@ class Run:
 
 @dataclass(frozen=True)
 class Federation:
-    """A federation that joined: where it runs, its jobs, their recorded end and KillWait, and its proven end."""
+    """A federation that joined: where it runs, its jobs, their recorded end and KillWait, when it was drained, and its
+    proven end."""
 
     label: str
     site: str
@@ -187,5 +188,16 @@ class Federation:
     job_end_at: float
     kill_wait_s: float
     joined_at: float
+    drained_at: float | None
     ended_at: float | None
     end_proof: str | None
+
+
+@dataclass(frozen=True)
+class Demand:
+    """What a controller's target reads: the current set (None: no run is pending), its pending runs per model, and
+    the cap slots held per model (leases in flight, and expired ones whose holder is not proven ended)."""
+
+    set_index: int | None
+    pending: Mapping[str, int]
+    slots: Mapping[str, int]

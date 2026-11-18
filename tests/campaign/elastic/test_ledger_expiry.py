@@ -58,7 +58,7 @@ def test_c42_an_advancing_counter_renews_the_lease(tmp_path):
     for counter in range(1, 100):
         clock.advance(30)
         _beat(ledger, lease, counter)
-    assert ledger.lease(lease.lease_id).state == "issued"
+    assert ledger.lease(lease.lease_id).state == "sent"
 
 
 def test_c42_a_counter_that_stops_expires_its_lease_only_after_five_minutes_of_reads(tmp_path):
@@ -69,7 +69,7 @@ def test_c42_a_counter_that_stops_expires_its_lease_only_after_five_minutes_of_r
     _beat(ledger, lease, 7)
     clock.advance(299)
     _beat(ledger, lease, 7)
-    assert ledger.lease(lease.lease_id).state == "issued"
+    assert ledger.lease(lease.lease_id).state == "sent"
     clock.advance(1)
     _beat(ledger, lease, 7)
     assert ledger.lease(lease.lease_id).state == "expired"
@@ -130,7 +130,7 @@ def test_c42_a_job_that_ended_while_the_orchestrator_was_down_is_read_before_its
     clock.advance(1200)
     ledger = Ledger.open(ledger_path(tmp_path), clock=clock)
     ledger.sweep()
-    assert ledger.lease(lease.lease_id).state == "issued"
+    assert ledger.lease(lease.lease_id).state == "sent"
     assert ledger.run(lease.run_key).state == "leased"
     assert finish(ledger, lease) == "counted"
     assert ledger.federations()[0].end_proof == "walltime"
@@ -212,10 +212,10 @@ def test_c42_a_restart_reloads_every_lease_and_expires_none_until_its_site_is_re
     assert (ledger.leases(), ledger.runs(), ledger.committed_micro(), ledger.slots()) == before
     clock.advance(899)
     ledger.sweep()
-    assert {lease.state for lease in ledger.leases()} == {"issued"}
+    assert {lease.state for lease in ledger.leases()} == {"sent"}
     ledger.observe_site(SITE, SiteReading(heartbeats={still.lease_id: 1, moving.lease_id: 40}))
     assert ledger.lease(still.lease_id).state == "expired"
-    assert ledger.lease(moving.lease_id).state == "issued"
+    assert ledger.lease(moving.lease_id).state == "sent"
     assert ledger.run(still.run_key).state == "pending"
     assert_invariants(ledger)
 

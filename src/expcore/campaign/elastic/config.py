@@ -18,8 +18,9 @@ import json
 import math
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, fields
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from types import MappingProxyType
 from typing import Any
 
 from expcore.campaign.attempt_bounds import request_bound_usd
@@ -126,9 +127,8 @@ class LedgerConfig:
         for name in ("hard_term_s", "prior_run_s", "stale_s", "site_out_s"):
             object.__setattr__(self, name, _seconds(name, getattr(self, name)))
         _whole("max_attempts", self.max_attempts, 1)
-        object.__setattr__(
-            self, "caps", {_name("a capped model", m): _whole(f"caps[{m}]", c, 1) for m, c in self.caps.items()}
-        )
+        caps = {_name("a capped model", m): _whole(f"caps[{m}]", c, 1) for m, c in self.caps.items()}
+        object.__setattr__(self, "caps", MappingProxyType(caps))  # read-only: the ledger pinned them
         if self.max_usd is not None:
             object.__setattr__(self, "max_usd", _dollars("max_usd", self.max_usd))
             if self.max_usd == 0:
@@ -137,14 +137,16 @@ class LedgerConfig:
             raise ValueError("per_model_usd needs a max_usd: a model's ceiling is part of a budget")
         for name in ("per_model_usd", "grants_usd"):
             values = getattr(self, name)
-            object.__setattr__(self, name, {_name(name, m): _dollars(f"{name}[{m}]", v) for m, v in values.items()})
+            checked = {_name(name, m): _dollars(f"{name}[{m}]", v) for m, v in values.items()}
+            object.__setattr__(self, name, MappingProxyType(checked))
 
     def grant_micro(self, model: str) -> int:
         """A model's grant in micro-dollars; 0 without a budget, or for a model granted nothing."""
         return micro_up(self.grants_usd.get(model, 0.0)) if self.max_usd is not None else 0
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), sort_keys=True)
+        values = {f.name: getattr(self, f.name) for f in fields(self)}
+        return json.dumps({k: dict(v) if isinstance(v, Mapping) else v for k, v in values.items()}, sort_keys=True)
 
     @classmethod
     def from_json(cls, text: str) -> "LedgerConfig":

@@ -205,3 +205,27 @@ def test_c42_a_federation_with_another_fingerprint_or_environment_is_refused_at_
         ledger.issue("fed-2")
     assert [f.label for f in ledger.federations()] == ["fed-1"]
     assert isinstance(ledger.issue("fed-1"), Lease)
+
+
+def test_c42_a_heartbeat_shows_the_lease_file_landed_so_the_lease_can_no_longer_be_cancelled(tmp_path):
+    """C42: a dispatcher that crashed before marking a lease sent finds its heartbeat at the next read: the lease is
+    then sent, and cancelling it (which would free a grant its worker is spending) is refused."""
+    ledger, clock = make(tmp_path, max_usd=1.0, grants_usd={"m1": 1.0})
+    join(ledger, clock, "fed-1")
+    lease = leased(ledger, "fed-1")
+    clock.advance(30)
+    ledger.observe_site(SITE, SiteReading(heartbeats={lease.lease_id: 1}))
+    assert ledger.lease(lease.lease_id).state == "sent"
+    with pytest.raises(LedgerError, match="sent"):
+        ledger.cancel(lease.lease_id)
+    assert ledger.committed_micro()[0] == 1_000_000
+    assert_invariants(ledger)
+
+
+def test_c42_the_pinned_configuration_cannot_be_changed_through_the_open_ledger(tmp_path):
+    """C42: the caps, ceilings and grants a ledger was created with are read-only on the ledger that holds them."""
+    ledger, _ = make(tmp_path, caps={"m1": 1}, max_usd=10.0, per_model_usd={"m1": 5.0}, grants_usd={"m1": 1.0})
+    for name in ("caps", "per_model_usd", "grants_usd"):
+        with pytest.raises(TypeError):
+            getattr(ledger.config, name)["m1"] = 99
+    assert ledger.config.caps == {"m1": 1}
