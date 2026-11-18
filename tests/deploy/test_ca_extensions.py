@@ -12,6 +12,7 @@ import pytest
 from ca_checks import (
     DEFAULT_CONFIG_THAT_ADDS_EXTENSIONS,
     HAS_OPENSSL,
+    assert_leaf_names_its_key_and_its_issuers_key,
     assert_one_of_each_expected_extension,
     handshake,
     openssl_verifies,
@@ -47,10 +48,12 @@ def test_o92_a_made_ca_has_each_extension_once_whatever_the_default_config_adds(
 
 
 def test_o92_a_made_ca_is_a_trust_anchor_for_the_leaf_it_signed(ca_and_leaf):
-    """O92: Python's ssl store loads the CA and accepts its leaf's chain, and `openssl verify` accepts it."""
+    """O92: Python's ssl store loads the CA and accepts its leaf's chain even in strict mode, `openssl verify`
+    accepts it, and the leaf carries the key identifiers a strict client needs (1.1.1 adds none itself)."""
     ca, _, cert, key = ca_and_leaf
     handshake(ca, cert, key, DOMAIN)
     assert openssl_verifies(ca, cert)
+    assert_leaf_names_its_key_and_its_issuers_key(cert)
 
 
 def test_o92_a_made_ca_leaves_no_configuration_file_behind_and_its_key_is_private(ca_and_leaf, tmp_path):

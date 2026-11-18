@@ -64,7 +64,16 @@ def assert_one_of_each_expected_extension(ca: Path) -> None:
     found = extensions_of(ca)
     names = [name for name, _, _ in found]
     assert len(names) == len(set(names)), f"an extension is written twice: {names}"
-    assert sorted(found) == sorted(EXPECTED_CA_EXTENSIONS)
+    assert sorted(found) == sorted(EXPECTED_CA_EXTENSIONS), f"the CA's extensions are {found}"
+
+
+def assert_leaf_names_its_key_and_its_issuers_key(cert: Path) -> None:
+    """Fail unless a leaf has a subject and an authority key identifier, each once: OpenSSL 3's `x509 -CA` adds them
+    itself and 1.1.1's does not, and a strict client (Python 3.13's default) refuses a chain whose leaf has no
+    authority key identifier."""
+    names = [name for name, _, _ in extensions_of(cert)]
+    for wanted in KEY_IDENTIFIERS:
+        assert names.count(wanted) == 1, f"{wanted} appears {names.count(wanted)} times in {names}"
 
 
 def handshake(ca: Path, cert: Path, key: Path, host: str) -> None:
@@ -74,6 +83,8 @@ def handshake(ca: Path, cert: Path, key: Path, host: str) -> None:
     server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     server_context.load_cert_chain(str(cert), str(key))
     client_context = ssl.create_default_context(cafile=str(ca))
+    # Strict as Python 3.13's default is; 3.12's is not, and a run's client may be either.
+    client_context.verify_flags |= ssl.VERIFY_X509_STRICT
     assert len(client_context.get_ca_certs()) == 1, "Python's store did not load the CA"
     to_client, from_client, to_server, from_server = (ssl.MemoryBIO() for _ in range(4))
     client = client_context.wrap_bio(to_client, from_client, server_hostname=host)

@@ -45,7 +45,8 @@ def make_federation_ca(directory: Path, name: str = "federation-test-ca") -> Sim
     _openssl("req", *curve, "-keyout", str(key), "-out", str(csr), "-subj", "/CN=127.0.0.1")
     ext.write_text(
         "subjectAltName=IP:127.0.0.1\nbasicConstraints=CA:FALSE\n"
-        "keyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n",
+        "keyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n"
+        "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n",  # OpenSSL 1.1.1 adds neither (caconfig)
         encoding="utf-8",
     )
     _openssl(
