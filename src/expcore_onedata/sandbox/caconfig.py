@@ -1,3 +1,4 @@
+# Provenance: new
 """The openssl configuration a CA is made from, and the private file it is written to.
 
 `openssl req -x509` applies the `x509_extensions` section of its default configuration. OpenSSL 1.1.1 adds the
