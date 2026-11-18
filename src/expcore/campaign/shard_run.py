@@ -18,6 +18,11 @@ is computed (`share_settings`, or `share_settings_by_model` for a campaign that 
 reach it. Before any share is taken, a shard holding pairs of a model whose concurrency share is 0 is refused, naming
 the model (`refuse_unrunnable`).
 
+A run on a lease (`campaign.run_lease`, `expcore-shard/5`) pins the same facts, with the lease as its spec and one more,
+its attempt base (`META_ATTEMPT_BASE`), and is never resumed: a store holds one lease, once. Any later start of it is
+refused (`LeaseReplayed` for the same lease id, `ShardMismatch` for another lease or another form), whether or not the
+facts agree, so a replayed or a stale lease file cannot run a store a second time (`_pin_lease`).
+
 The fingerprint also holds the environment of the shard's host: its Python and the installed distributions it
 imports through, and the shards of one campaign must have one fingerprint. A host whose environment differs would be
 refused only when its shard is merged, after it ran, so `environment_block` says it as the shard starts: the
@@ -33,6 +38,7 @@ from typing import TYPE_CHECKING, Any
 
 from expcore.campaign.attempts import ResumeRefused
 from expcore.campaign.manifest import fingerprint_sha256
+from expcore.campaign.run_lease import META_ATTEMPT_BASE, RULE_LEASE, LeaseError, RunLease
 from expcore.campaign.selection import RULE_SELECTION, SelectionSpec, Spec, describe, resume_hint
 from expcore.campaign.shard import (
     META_ENVIRONMENT,
@@ -67,11 +73,15 @@ class ShardMismatch(ResumeRefused):
     """A start's shard, environment identity or shares differ from what the store recorded at its first start."""
 
 
+class LeaseReplayed(ShardMismatch):
+    """A start gives the lease id the store already ran: a lease is used once, in a store of its own."""
+
+
 @dataclass(frozen=True)
 class ShardStart:
     """A shard's start: its spec, the environment identity it reads, checked, and the shares of the caps and budget."""
 
-    spec: Spec  # a shard's, or a selection's (C38)
+    spec: Spec | RunLease  # a shard's, a selection's (C38) or a lease's (C41)
     environment: Mapping[str, str]
     shares: Mapping[str, Any]  # {"unit_caps": {unit: n}, "budget": {"max_usd": x, "per_model_usd": {...}} or None}
 
@@ -159,7 +169,32 @@ def refuse_unrunnable(
         )
 
 
-def environment_block(spec: Spec, environment: Mapping[str, Any]) -> str:
+def refuse_lease_misfit(lease: RunLease, campaign_sha256: str, settings: "SchedulerConfig") -> None:
+    """The kernel's own hold on a lease (C41), for a start that did not come through `study.lease_start`: the scheduler
+    refuses, before it opens the store, a lease issued for another campaign, a run with no attempt left, and settings
+    whose budget is not held to the grant (no budget for a grant above 0, a ceiling above the grant, a release; any
+    budget for a grant of 0). `lease_start` makes the settings that pass."""
+    lease.check_campaign(campaign_sha256)
+    lease.check_attempts_left(settings.max_attempts)
+    budget = settings.budget
+    if lease.grant_usd == 0:
+        held = budget is None
+    else:
+        held = (
+            budget is not None
+            and budget.max_usd <= lease.grant_usd
+            and budget.release_file is None
+            and budget.release_step_usd == 0
+        )
+    if not held:
+        raise LeaseError(
+            f"{lease.name} grants {lease.grant_usd:.6f} USD, and the scheduler's budget is not held to it (a budget "
+            "of at most the grant and no release for a grant above 0, none for a grant of 0): the grant is the "
+            "run's whole budget"
+        )
+
+
+def environment_block(spec: Spec | RunLease, environment: Mapping[str, Any]) -> str:
     """The environment part of the campaign fingerprint, as one block of text a shard prints as it starts.
 
     The first line gives the whole environment's SHA-256 (the digest `fingerprint_sha256` makes of the section, which
@@ -171,7 +206,9 @@ def environment_block(spec: Spec, environment: Mapping[str, Any]) -> str:
     """
     versions = environment["distributions"]
     sources = environment.get("sources", {})
-    if isinstance(spec, SelectionSpec):
+    if isinstance(spec, RunLease):
+        what, every = f"lease {spec.lease_id}", "lease"
+    elif isinstance(spec, SelectionSpec):
         what, every = spec.name, "selection"
     else:
         what, every = f"shard {spec.index} of {spec.count}", "shard"
@@ -197,6 +234,10 @@ def pin_shard(store: Store, shard: ShardStart | None, started: bool, now: str) -
     """
     rows = store.db.execute("SELECT key, value FROM meta WHERE key IN (?,?,?,?)", (*PINNED, META_STARTED)).fetchall()
     held = {row["key"]: row["value"] for row in rows}
+    recorded_rule = json.loads(held[META_SHARD]).get("rule") if META_SHARD in held else None
+    if recorded_rule == RULE_LEASE or (shard is not None and isinstance(shard.spec, RunLease)):
+        _pin_lease(store, shard, held, started, now)  # before any comparison: no start of a lease store may resume it
+        return
     if shard is None:
         if META_SHARD in held:
             recorded = json.loads(held[META_SHARD])
@@ -237,6 +278,50 @@ def pin_shard(store: Store, shard: ShardStart | None, started: bool, now: str) -
     else:
         reason = _REASONS[first].format(**recorded_spec)
     raise ShardMismatch(f"{reason}:\n  {lines}")
+
+
+def _pin_lease(store: Store, shard: ShardStart | None, held: Mapping[str, str], started: bool, now: str) -> None:
+    """The pin of a run on a lease (C41): a first start pins the lease and its attempt base; every later start of the
+    store is refused, and a lease start of a store that another form made is too. Inside the caller's transaction, so a
+    refusal leaves the store as it was."""
+    if META_SHARD in held:
+        recorded = json.loads(held[META_SHARD])
+        if recorded.get("rule") != RULE_LEASE:
+            assert shard is not None  # a store of another form, started with a lease (the caller sent a lease here)
+            raise ShardMismatch(
+                f"this store belongs to {describe(recorded)}, and this start gives {shard.spec.name}: a lease runs in "
+                "a store of its own, never one that a shard or a selection started"
+            )
+        owner = f"lease {recorded.get('lease_id')}"
+        given = None if shard is None else shard.spec
+        if not isinstance(given, RunLease):
+            what = "no lease" if given is None else describe(given.to_json())
+            raise ShardMismatch(
+                f"this store belongs to {owner} of a run taken on a lease, and this start gives {what}: a lease store "
+                "is not resumed, the run goes on a new lease, in a store of its own"
+            )
+        if given.lease_id == recorded.get("lease_id"):
+            raise LeaseReplayed(
+                f"{owner} was already started in this store (a replay): a lease is used once, and the ledger gives "
+                "a run a new lease id for each lease"
+            )
+        raise ShardMismatch(
+            f"this store belongs to {owner}, and this start gives lease {given.lease_id}: one store per lease, so a "
+            "run on a new lease goes in a store of its own"
+        )
+    assert shard is not None
+    assert isinstance(shard.spec, RunLease)
+    if started:
+        raise ShardMismatch(
+            "this store holds an unsharded campaign, and this start gives a lease: a lease runs in a store of its own "
+            "(start a new store for it)"
+        )
+    for key, text in shard.pinned().items():
+        store.db.execute("INSERT INTO meta(key,value,set_utc) VALUES(?,?,?)", (key, text, now))
+    store.db.execute("INSERT INTO meta(key,value,set_utc) VALUES(?,?,?)", (META_STARTED, now, now))
+    store.db.execute(
+        "INSERT INTO meta(key,value,set_utc) VALUES(?,?,?)", (META_ATTEMPT_BASE, str(shard.spec.attempt_base), now)
+    )
 
 
 def _wide_flag(recorded: Mapping[str, Any]) -> str:
