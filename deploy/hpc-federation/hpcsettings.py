@@ -412,6 +412,11 @@ class Site:
     # ("Error configuring interconnect") from a point on while the same steps with `no_vni` ran; the services talk over
     # TCP and need none. Empty: no option, as before.
     step_network: str = ""
+    # Every held job is submitted `--exclusive` (HPC_EXCLUSIVE_NODES=1): Slurm packs a job that asks a few cores and
+    # some memory onto a node another job holds, and a pending job has no node for another `up` to exclude, so parallel
+    # ups shared nodes (live, 18 Nov). False: the held jobs ask what they always did. Not recorded in the state file:
+    # only `up` submits, and `down` needs none of it.
+    exclusive_nodes: bool = False
 
     def to_json(self) -> dict:
         return {
@@ -509,6 +514,17 @@ def queue_wait_from_environment(environ: Mapping[str, str]) -> Optional[float]:
     return float(int(value))
 
 
+def exclusive_nodes_from_environment(environ: Mapping[str, str]) -> bool:
+    """`HPC_EXCLUSIVE_NODES`: `1` submits every held job with `--exclusive` (whole nodes), `0` or unset (or empty) does
+    not. Anything else is refused, naming the key and never the value."""
+    value = environ.get("HPC_EXCLUSIVE_NODES")
+    if not value:
+        return False
+    if value not in ("0", "1"):
+        raise SettingsError("HPC_EXCLUSIVE_NODES: must be 0 or 1")
+    return value == "1"
+
+
 def site_from_environment(environ: Mapping[str, str]) -> Site:
     """The site's values from the environment (`set -a; . site.env; set +a`); SettingsError names a missing one."""
     for key in ("HPC_ACCOUNT", "HPC_PARTITION", "SH", "L"):
@@ -535,6 +551,7 @@ def site_from_environment(environ: Mapping[str, str]) -> Site:
             admin_mail=environ.get("HPC_ADMIN_MAIL") or defaults.admin_mail,
             billing_weight=billing,
             step_network=environ.get("HPC_STEP_NETWORK") or "",
+            exclusive_nodes=exclusive_nodes_from_environment(environ),
             **{attribute: environ.get(variable) or "" for variable, attribute in OPTIONAL_VARIABLES.items()},
             storage_root=environ.get("HPC_STORAGE_ROOT") or "",
             quota_cmd=environ.get("HPC_QUOTA_CMD") or "",
