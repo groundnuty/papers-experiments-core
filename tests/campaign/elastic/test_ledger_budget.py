@@ -191,7 +191,7 @@ def _step(rng, ledger, clock, labels, memory, tmp_path):
     ]
     action = rng.choice(actions)
     if action == "settle":
-        _settle_lost(rng, ledger, truth)
+        _settle_lost(rng, ledger, clock, truth)
     elif action == "raise" and rng.random() < 0.4:
         ceilings = ledger.ceilings()
         if rng.random() < 0.7:
@@ -249,12 +249,17 @@ def _step(rng, ledger, clock, labels, memory, tmp_path):
     return ledger
 
 
-def _settle_lost(rng, ledger, truth):
-    """Settle some lost leases (expired with their holder proven ended, or their archive never verified) at their true
-    spend; one settled already is asked again with its recorded values."""
+def _settle_lost(rng, ledger, clock, truth):
+    """Settle some lost leases (expired with their holder proven ended and, if cancelled, past KillWait, or their
+    archive never verified) at their true spend; one settled already is asked again with its recorded values."""
     settled = {settlement.lease_id: settlement for settlement in ledger.settlements()}
+    federations = {federation.label: federation for federation in ledger.federations()}
     for lease in ledger.leases():
-        if not (lease.state == "lost" or (lease.state == "expired" and lease.proven)) or rng.random() < 0.5:
+        holder = federations[lease.federation]
+        cooled = holder.end_proof != "cancelled" or clock() >= holder.ended_at + holder.kill_wait_s
+        if not (lease.state == "lost" or (lease.state == "expired" and lease.proven and cooled)):
+            continue
+        if rng.random() < 0.5:
             continue
         if lease.lease_id in settled:
             ledger.settle(lease.lease_id, settled[lease.lease_id].spend_micro, settled[lease.lease_id].source)

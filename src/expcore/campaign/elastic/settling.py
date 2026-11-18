@@ -11,7 +11,8 @@ grant.
 A lease is settled once. The same spend and source again changes nothing; any other is refused. A spend above the
 lease's grant would mean its cap failed: it is refused, and the failure is kept in the log (once for each claim), so the
 lease stays charged its grant, the bound it was granted. A lease expired but not yet proven ended is not lost: its
-holder may still be spending.
+holder may still be spending. Nor is one whose job the controller cancelled until KillWait has passed, as the job may
+run on, still spending, until then.
 """
 
 import json
@@ -49,7 +50,8 @@ def apply(
     reason it is refused: the failure was recorded, so the caller commits first and then raises it. Every other
     refusal raises here (`SettleRefused`, or `LedgerError` for a lease the ledger never issued)."""
     row = db.execute(
-        "SELECT l.*, f.ended_at AS fed_ended FROM leases l JOIN federations f ON f.label = l.federation WHERE l.id=?",
+        "SELECT l.*, f.ended_at AS fed_ended, f.end_proof AS fed_proof, f.kill_wait_s AS fed_kill_wait"
+        " FROM leases l JOIN federations f ON f.label = l.federation WHERE l.id=?",
         (lease_id,),
     ).fetchone()
     if row is None:
@@ -67,6 +69,11 @@ def apply(
     state = row["state"]
     if state == "expired" and row["fed_ended"] is None:
         raise SettleRefused(f"lease {lease_id} is expired but its holder is not proven ended: it may still be spending")
+    if state == "expired" and row["fed_proof"] == "cancelled" and now < row["fed_ended"] + row["fed_kill_wait"]:
+        raise SettleRefused(
+            f"lease {lease_id}'s job was cancelled and may run on, still spending, until KillWait passes "
+            f"({row['fed_kill_wait']:g} s after the cancel): settle it then"
+        )
     if state not in ("expired", "lost"):
         raise SettleRefused(
             f"lease {lease_id} is {state}: only a lost lease is settled (expired with its holder proven ended, "

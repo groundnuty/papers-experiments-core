@@ -105,6 +105,21 @@ def test_c42_a_lease_that_is_not_lost_is_not_settled(tmp_path):
         ledger.settle(999, 0, "root")
 
 
+def test_c42_a_lease_whose_job_was_cancelled_is_settled_only_once_killwait_has_passed(tmp_path):
+    """C42: a cancelled job may run on until KillWait ends, still spending, so its lease is settled only after that
+    (the grant stays held until then); a job seen ended, or past its walltime, is settled at once."""
+    ledger, clock = make(tmp_path, **PRICED)
+    join(ledger, clock, "fed-1")  # KillWait 180 s
+    lease = leased(ledger, "fed-1")
+    ledger.prove_ended("fed-1", "cancelled")
+    clock.advance(179)
+    _refused(ledger, lease, "KillWait")
+    assert ledger.committed_micro()[0] == 1_000_000
+    clock.advance(1)
+    ledger.settle(lease.lease_id, 100_000, "root")
+    assert ledger.committed_micro()[0] == 100_000
+
+
 def test_c42_a_lease_whose_archive_never_verified_can_be_settled(tmp_path):
     """C42: a completion was read and its archive never arrived, so the lease is lost and charged its grant; its spend
     read elsewhere settles it."""
