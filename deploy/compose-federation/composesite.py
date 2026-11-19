@@ -498,8 +498,8 @@ def launch(args: argparse.Namespace) -> int:
             raise SiteError(f"{args.member}: the worker of {holder} still runs on its root; one worker per federation")
         if record is not None:
             raise SiteError(f"{args.member}: its worker of this campaign ended; it is retired, never started again")
-        if not live(root, project_of(root)) or not (root / PLATFORM).is_file():
-            raise SiteError(f"{args.member}: its federation is not up (every service running, platform.toml rendered)")
+        if not live(root, project_of(root)) or not (root / PLATFORM).is_file() or not data_verified(root):
+            raise SiteError(f"{args.member}: its federation is not up and verified (services, platform.toml, data)")
         run = here / RUN
         if run.exists():
             shutil.rmtree(run)  # no worker of this channel holds it: an earlier campaign's, or a launch that failed
@@ -628,7 +628,10 @@ def layout_of(root: Path, layout_file: Path) -> Any:
 
 def verify_data(args: argparse.Namespace) -> int:
     """The member's declared data read back against its manifests, and its marker written (`fedverify`)."""
-    print(fedverify.verify_data(layout_of(Path(args.root), Path(args.layout))))
+    root = Path(args.root)
+    if project_of(root) is not None and not root.is_symlink():
+        fedverify.invalidate(root)  # first, before any check that may fail: an earlier verdict never stands unchecked
+    print(fedverify.verify_data(layout_of(root, Path(args.layout))))
     return 0
 
 

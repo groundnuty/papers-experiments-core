@@ -635,7 +635,7 @@ def test_c51_a_member_whose_platform_declares_data_is_verified_only_by_a_marker_
     manifest.parent.mkdir()
     manifest.write_text('{"files": []}\n', encoding="utf-8")
     (root / "platform.toml").write_text(
-        '[[spaces]]\nname = "alpha"\nid = "sid-alpha"\ndata_manifest = "data-manifests/alpha.json"\n', encoding="utf-8"
+        f'[[spaces]]\nname = "alpha"\nid = "sid-alpha"\ndata_manifest = "{manifest}"\n', encoding="utf-8"
     )
     clock = FakeClock(time.time())
     ledger = new_ledger(tmp_path, clock)
@@ -663,7 +663,7 @@ def declare_data(vm: Vm, member: str = "fed-1") -> Path:
     manifest.parent.mkdir(exist_ok=True)
     write_manifest(Manifest((ManifestFile("data.bin", 4, hashlib.sha256(b"data").hexdigest()),), ()), manifest)
     (root / "platform.toml").write_text(
-        '[[spaces]]\nname = "alpha"\nid = "sid-alpha"\ndata_manifest = "data-manifests/alpha.json"\n', encoding="utf-8"
+        f'[[spaces]]\nname = "alpha"\nid = "sid-alpha"\ndata_manifest = "{manifest}"\n', encoding="utf-8"
     )
     facts = json.loads((root / "facts.json").read_text(encoding="utf-8"))
     facts["spaces"] = {"alpha": {"id": "sid-alpha"}}
@@ -687,6 +687,24 @@ def test_c52_verify_data_writes_the_marker_only_for_data_that_is_exactly_its_man
         fedverify.verify_data(layout, read=lambda space: other)
     assert not (vm.roots["fed-1"] / "data-verified.json").exists()
     assert not deploy.site.data_verified(vm.roots["fed-1"])
+    fedverify.verify_data(layout, read=lambda space: whole)
+    fedverify.invalidate(vm.roots["fed-1"])  # what reset --clean does before it empties the spaces
+    assert not deploy.site.data_verified(vm.roots["fed-1"])
+
+
+def test_c52_a_manifest_named_by_a_relative_path_is_never_verified(deploy, vm):
+    """C52: a relative data_manifest resolves against the root for the check and against the study beside the
+    platform file's copy for a run, so the two could be two manifests: it is refused, and the member never verified."""
+    import fedverify
+
+    manifest = declare_data(vm)
+    root = vm.roots["fed-1"]
+    platform = (root / "platform.toml").read_text(encoding="utf-8").replace(str(manifest), "data-manifests/alpha.json")
+    (root / "platform.toml").write_text(platform, encoding="utf-8")
+    whole = ({"data.bin": (4, hashlib.sha256(b"data").hexdigest())}, set())
+    with pytest.raises(RuntimeError, match="relative path"):
+        fedverify.verify_data(SimpleNamespace(root=root), read=lambda space: whole)
+    assert not deploy.site.data_verified(root)
 
 
 PREPARE = """

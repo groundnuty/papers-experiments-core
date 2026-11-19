@@ -84,7 +84,7 @@ from fedrest import Rest
 from fedspec import LOOPBACK, ZONE, LayoutError, Service, Spec, instance, load_spec
 from fedsupport import check_rendered_support
 from fedtools import check_artifacts, study_artifacts_from
-from fedverify import verify_data
+from fedverify import invalidate, verify_data
 
 ZONE_TIMEOUT_S = 1500.0
 PROVIDER_TIMEOUT_S = 1800.0
@@ -326,6 +326,7 @@ def reset_clean(layout: Layout) -> str:
     require_resettable(layout)
     timer = Timer()
     require_up(layout)
+    invalidate(layout.root)  # the spaces are emptied: no verdict on their data may stand (fedverify)
     study_artifacts = study_artifacts_from(os.environ)
     check_artifacts(layout.spec, study_artifacts, layout.root)
     given = (study_artifacts,) if study_artifacts else ()
@@ -366,6 +367,8 @@ def reset_replicas(layout: Layout) -> str:
 def verify(layout: Layout) -> str:
     """`verify-data`: after the study's ingest, every space the rendered platform.toml declares data for read back
     against its manifest, and the root's `data-verified.json` written only when each is exactly it (`fedverify`)."""
+    if layout.owned:
+        invalidate(layout.root)  # first, before any check that may fail: an earlier verdict never stands unchecked
     require_up(layout)
     return verify_data(layout)
 

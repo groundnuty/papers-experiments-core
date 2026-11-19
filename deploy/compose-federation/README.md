@@ -134,7 +134,10 @@ controller runs `composesite.py` here over ssh, from the site's directory with i
   (`federation.py --layout L --instance K verify-data`, or `composesite.py verify-data --root R --layout L`, which
   finds the instance from the root's mark): every declared space read back through its owner, every file's bytes
   hashed, by the HPC driver's own reader (`hpcdata.content_reader`, on this directory's bootstrap), and compared with
-  its manifest; any difference, or an id that is not `up`'s, refuses, naming the space, and removes an earlier marker.
+  its manifest; any difference, or an id that is not `up`'s, refuses, naming the space, and removes an earlier marker
+  (so does `reset --clean`, before it empties a space). A template names each manifest by an absolute path
+  (`@study_artifacts@/...` or `@hpc_root@/...`): a relative one would resolve against the root here and against the
+  study where a run loads the platform file's copy, and is never verified.
   A Compose site's `prepare` (`fleetprepare.py`, #494's hook) runs the study's ingest and then `verify-data` once per
   member while it is linked and unverified; its job id is `compose-<project>` and its end 10 years
   from now (no walltime: the ledger never proves an end the host does not enforce); the site reports no node, so nothing is ever added to it.
@@ -159,6 +162,30 @@ controller runs `composesite.py` here over ssh, from the site's directory with i
   on the controller's host, records the member retired for the campaign's channel. **No down**: the federation stays
   up for the next campaign (a new site directory and channel) or the operator's own `down`.
 - **identity**: the campaign fingerprint and environment identity a start at the member pins, read here.
+
+A site of the sites file, every path on the host (`fleetcontrol.py`'s README section for the rest). The study's
+`prepare` ingests and then verifies; `verify-data` hashes every byte, so for the main study's data (about 26 GB)
+ingest and verify together take up to about half an hour on a VM: give the bound room.
+
+```toml
+[[site]]
+label = "vm-a"
+kind = "compose"
+transport = "ssh"
+host = "vm-a"                                    # an alias of ssh_config, this host's private file
+ssh_config = "/path/here/vm-a.ssh_config"
+interpreter = "/srv/core/.venv/bin/python"       # a git checkout's venv: never a git archive copy
+deploy = "/srv/core/deploy/compose-federation"
+env_file = "/srv/site.env"
+fleet = "/srv/fleet-c1"                          # 0700, one per campaign, as the channel
+channel = "/srv/channel-c1"
+study = "/srv/study"
+home = "/srv/home"                               # 0700: the study's key tree at its models.toml paths
+layout = "/srv/layout/vm.toml"
+members = { fed-1 = "/srv/feds/expcore-fed5-1", fed-2 = "/srv/feds/expcore-fed5-2" }
+prepare = ["/srv/study-tools/ingest-and-verify", "{root}", "{layout}"]  # ends with composesite.py verify-data
+prepare_timeout_s = 3600
+```
 
 The host's core must be a git checkout or a built wheel, never a `git archive` copy: an unknown core's commit is in
 no run's fingerprint, and `elastic create`, the identity read and every run refuse it.
