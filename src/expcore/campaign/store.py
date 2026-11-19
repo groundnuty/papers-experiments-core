@@ -111,6 +111,12 @@ _ADDED_COLUMNS = (
     # JSON: the redacted snapshot of a failed instrument start or another failure that carried a diagnostic (C40); NULL: none
     ("attempts", "diagnostic", "TEXT"),
 )
+# Columns a store gets only when its first row to use one is written (B20): a store that never needs them keeps the
+# schema text it has, which the pins of the existing forms hold. A reader asks whether the column is there.
+LAZY_ATTEMPT_COLUMNS = (
+    ("deployment_ids", "TEXT"),  # JSON sorted list of the deployments the attempt's turns named; NULL: none did
+    ("deployment_switched", "INTEGER"),  # 1: the turns show more than one deployment (a turn without the id counts)
+)
 # Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
 # `outage_kind` existed, the kind of an outage was stored in `infra_kind`, so an outage-discarded attempt of such a
 # database has it there.
@@ -662,6 +668,25 @@ class Store:
         """Keep an attempt's deployment mix (B18): the JSON pairs of a fingerprint and the turns it served. Called from
         the `also` step of `finish_attempt`, it joins that transaction, so the mix stands or falls with the result."""
         self.transact(lambda: self.db.execute("UPDATE attempts SET deployments=? WHERE id=?", (mix, attempt_id)))
+
+    def record_deployment_ids(self, attempt_id: int, ids: str, switched: bool) -> None:
+        """Keep the deployments an attempt's turns named (B20): a JSON list of the distinct ids, sorted, and whether the
+        turns show more than one deployment. The two columns are not in the schema every store has: the first write adds
+        them, in the transaction of that write, so a store whose attempts name no deployment keeps its schema text byte
+        for byte, and a reader treats a missing column as none. Called from the `also` step of `finish_attempt`, it
+        joins that transaction and stands or falls with the result."""
+
+        def write() -> None:
+            have = {row["name"] for row in self.db.execute("PRAGMA table_info(attempts)").fetchall()}
+            for column, declaration in LAZY_ATTEMPT_COLUMNS:
+                if column not in have:
+                    self._add_column("attempts", column, declaration)
+            self.db.execute(
+                "UPDATE attempts SET deployment_ids=?, deployment_switched=? WHERE id=?",
+                (ids, int(switched), attempt_id),
+            )
+
+        self.transact(write)
 
     def finish_attempt(
         self, attempt_id: int, result: AttemptResult, max_attempts: int, *, also: Callable[[], None] | None = None

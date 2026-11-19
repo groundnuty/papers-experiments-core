@@ -37,6 +37,12 @@ Version 3 also says which lease an attempt ran on, in one more optional field of
 fencing token of the lease that took the run (`campaign.run_lease`), a whole number from 1. It is absent for an attempt
 that ran on no lease, which is every attempt of an unsharded campaign, a shard and a selection. Two leases of one run
 can each have an attempt of one number, so the lease id, with the run key and the attempt, names an attempt.
+Version 3 also says, in one more optional field of a turn, which deployment served its reply (B20): `deployment_id`,
+what a front named in the response header the model entry's `deployment_header` names, beside `system_fingerprint`.
+It is the last field of a turn, absent for a turn whose reply named none (never a null), and a present one is plain
+printable text of 1 to 128 characters (`expcore.models.fleetheaders`). The totals say, in one more optional field,
+when the attempt's turns show more than one deployment (`deployment_switched`, written only when true: a turn without
+the id among turns with it counts as one more; visibility only, nothing is set aside for it).
 Version 3 also says, in two optional fields of the totals, whether the attempt was held to the reservation R (C27):
 `reserved_capped`, the bound the budget gate reserved the run by, the value the campaign store keeps for the attempt
 (True: by the reply maximum, False: by the window), and `reply_cap_unheld`, whether the campaign had taken the
@@ -76,6 +82,7 @@ from expcore.errors import TARGET_LABEL, infra_kinds, is_treatable, targeted_kin
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import HarnessDefect, Outcome
 from expcore.loop.records import TOOL_STATUSES
+from expcore.models.fleetheaders import DEPLOYMENT_ID_MAX, deployment_id_ok
 from expcore.models.usage import USAGE_EXTRA_CAP, USAGE_EXTRA_NAME_MAX, usage_name_ok, usage_number_ok
 from expcore.plugin import WAIT_KINDS
 from expcore.records.injections import injected_targets
@@ -130,6 +137,7 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "retries": (list,),
         "waits_left_open": (int,),
         "infra_wait_by_kind": (dict,),
+        "deployment_id": (str,),
     },
     "neutral": {"text": (str,), "reasoning": (str, NONE), "tool_calls": (list,)},
     "neutral_call": {
@@ -211,6 +219,7 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "final_text": (str, NONE),
         "reserved_capped": (bool,),
         "reply_cap_unheld": (bool,),
+        "deployment_switched": (bool,),
     },
 }
 FAILURE_KINDS = ("infra", "context_overflow", "abandoned", "error", "cut")
@@ -275,17 +284,19 @@ SCHEMAS: tuple[SchemaVersion, ...] = (
         f"{SCHEMA_PREFIX}3",
         added={
             "usage": ("extra", "extra_cut"),
+            "turn": ("deployment_id",),
             "record": ("treatment_targets", "instrument_refusal", "lease_id"),
             "outcome": ("infra_target",),
-            "totals": ("reserved_capped", "reply_cap_unheld"),
+            "totals": ("reserved_capped", "reply_cap_unheld", "deployment_switched"),
             "tool_call": ("elapsed_s", "exec_check"),
             "exec_check": ("source_whole", "exit_status", "nonce_matched"),
         },
         optional={
             "usage": ("extra", "extra_cut"),
+            "turn": ("deployment_id",),
             "record": ("treatment_targets", "instrument_refusal", "lease_id"),
             "outcome": ("infra_target",),
-            "totals": ("reserved_capped", "reply_cap_unheld"),
+            "totals": ("reserved_capped", "reply_cap_unheld", "deployment_switched"),
             "tool_call": ("elapsed_s", "exec_check"),
             "exec_check": ("source_whole", "exit_status", "nonce_matched"),
         },
@@ -472,6 +483,8 @@ def _check_turn(turn: dict, version: str, where: str, schemas: Sequence[SchemaVe
     check_section("neutral", turn["neutral"], version, f"{where}.neutral", schemas)
     _check_list("neutral_call", turn["neutral"]["tool_calls"], version, f"{where}.neutral.tool_calls", schemas)
     check_section("usage", turn["usage"], version, f"{where}.usage", schemas)
+    if "deployment_id" in turn and not deployment_id_ok(turn["deployment_id"]):  # optional, from version 3 (B20)
+        raise RecordError(f"{where}.deployment_id: plain printable text of 1 to {DEPLOYMENT_ID_MAX} characters")
     if "extra" in turn["usage"] or "extra_cut" in turn["usage"]:  # optional, from version 3
         _check_usage_extra(turn["usage"], f"{where}.usage")
     if turn["native"].get("role") != "assistant":

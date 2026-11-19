@@ -220,8 +220,8 @@ def _digest(value: Any) -> str:
 
 def model_digest(spec: ModelSpec) -> str:
     """The digest of a model entry in the campaign fingerprint: every field of it, each key location as its placeholder
-    (K13), and its declared set of accepted fingerprints only when it declares one (B18). An entry that names no key
-    location and declares no set keeps the digest it had before either."""
+    (K13), and its declared set of accepted fingerprints and its two fleet headers only when it sets them (B18, B20).
+    An entry that names no key location, declares no set and sets no header keeps the digest it had before them."""
     return _digest(_fingerprinted(withheld_entry(spec)))
 
 
@@ -230,9 +230,15 @@ def _counted_digest(spec: ModelSpec) -> str:
     return _digest(_fingerprinted(dataclasses.asdict(spec)))
 
 
+# the keys a model entry leaves out of its digest while it sets none: each came after the first digests were taken
+_OPTIONAL_DIGEST_KEYS = ("accepted_fingerprints", "session_header", "deployment_header")
+
+
 def _fingerprinted(entry: Mapping[str, Any]) -> dict[str, Any]:
-    """A model entry as its digest takes it: without `accepted_fingerprints` when it declares none (B18)."""
-    return {k: v for k, v in entry.items() if k != "accepted_fingerprints" or v}
+    """A model entry as its digest takes it: without `accepted_fingerprints` when it declares none (B18), and without
+    `session_header` or `deployment_header` when it sets none (B20), so an entry from before them keeps its
+    digest."""
+    return {k: v for k, v in entry.items() if k not in _OPTIONAL_DIGEST_KEYS or v}
 
 
 def study_environment(study: StudyConfig | StudyIdentity) -> dict[str, Any]:

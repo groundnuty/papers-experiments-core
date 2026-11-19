@@ -294,19 +294,20 @@ V2 = SchemaVersion(
     "expcore-record/2",
     added={
         "record": ("instruments", "treatment_targets", "instrument_refusal", "lease_id"),
-        "turn": ("request_sha256",),
+        "turn": ("request_sha256", "deployment_id"),
         "tool_call": ("detail", "elapsed_s", "exec_check"),
         "usage": ("extra", "extra_cut"),  # the real table's version 3 fields, here added with this version
         "outcome": ("infra_target",),
-        "totals": ("reserved_capped", "reply_cap_unheld"),
+        "totals": ("reserved_capped", "reply_cap_unheld", "deployment_switched"),
         "exec_check": ("source_whole", "exit_status", "nonce_matched"),
     },
     config_before={"cleanup_deadline_s": 7.0},
     optional={
         "usage": ("extra", "extra_cut"),
+        "turn": ("deployment_id",),
         "record": ("treatment_targets", "instrument_refusal", "lease_id"),
         "outcome": ("infra_target",),
-        "totals": ("reserved_capped", "reply_cap_unheld"),
+        "totals": ("reserved_capped", "reply_cap_unheld", "deployment_switched"),
         "tool_call": ("elapsed_s", "exec_check"),
         "exec_check": ("source_whole", "exit_status", "nonce_matched"),
     },

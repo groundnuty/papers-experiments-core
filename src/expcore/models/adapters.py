@@ -26,6 +26,7 @@ turn as `usage_extra`, recorded only.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 import time
 from collections.abc import Awaitable, Callable
@@ -33,6 +34,7 @@ from typing import Any, Protocol
 
 from expcore.config.models import ClientSettings, Limits, ModelSpec
 from expcore.errors import InfraError
+from expcore.models.fleetheaders import clean_deployment_id, random_session_id
 from expcore.models.request_bound import PromptBound
 from expcore.models.retry import Retrier, RetryPolicy, SupportsUniform
 from expcore.models.route import public_url, sdk_version, settings_sent
@@ -103,6 +105,9 @@ class ModelTurn:
     # reads no such fields), and the record then has no field; an adapter that read a usage object gives {} and 0.
     usage_extra: dict[str, int | float] | None = None
     usage_extra_cut: int | None = None
+    # the deployment the reply's `deployment_header` named (B20, `expcore.models.fleetheaders`); None when the model sets
+    # no such header or the reply had none. Recorded only, beside the system fingerprint.
+    deployment_id: str | None = None
 
     @property
     def hit_output_limit(self) -> bool:
@@ -296,6 +301,40 @@ class OpenAICompatAdapter(_SdkBackend):
         self._client = client
         self._messages: list[dict] = []
         self._tools: list[dict] = []
+        self._session: str | None = None  # the opaque id of the attempt, when the entry sets `session_header` (B20)
+
+    @property
+    def session_header(self) -> str | None:
+        """The request header this backend sends the attempt's id in, when the model entry sets one."""
+        return self.spec.session_header
+
+    def bind_session(self, identity: str) -> None:
+        """Tell the backend which attempt it serves: the opaque id (`expcore.models.fleetheaders.session_id`) every
+        request carries in `session_header`. The scheduler calls it once the attempt has its number."""
+        self._session = identity
+
+    def _extra_headers(self) -> dict[str, Any]:
+        """The per-request header arguments of the SDK call: the session id when the entry sets a header, else none (so a
+        client is called exactly as before). A backend nobody bound, such as an admission probe's, keeps one random id
+        of its own. The id is never in the request dict, so it is no setting of the record (B15)."""
+        if self.spec.session_header is None:
+            return {}
+        if self._session is None:
+            self._session = random_session_id()
+        return {"extra_headers": {self.spec.session_header: self._session}}
+
+    async def _create(self, kw: dict[str, Any]) -> tuple[Any, str | None]:
+        """One chat completion and the deployment its reply named. With `deployment_header` set the SDK's raw-response
+        path is used to read the header; the parsed reply is the one `create` returns. Inside the retry layer, so a
+        failure of either is classified and counted as it always was."""
+        extra = self._extra_headers()
+        if self.spec.deployment_header is None:
+            return await self._client.chat.completions.create(**kw, **extra), None
+        raw = await self._client.chat.completions.with_raw_response.create(**kw, **extra)
+        parsed = raw.parse()
+        if inspect.isawaitable(parsed):
+            parsed = await parsed
+        return parsed, clean_deployment_id(raw.headers.get(self.spec.deployment_header))
 
     def info(self) -> dict[str, Any]:
         """Describe the route and what the replies reported."""
@@ -340,7 +379,7 @@ class OpenAICompatAdapter(_SdkBackend):
         """Send the conversation and return the reply; usage and the served model are noted on arrival."""
         t0 = time.monotonic()
         kw = self._request()
-        resp, retries = await self._send(lambda: self._client.chat.completions.create(**kw))
+        (resp, deployment), retries = await self._send(lambda: self._create(kw))
         usage = getattr(
             resp, "usage", None
         )  # counted the moment the reply arrives: a reply is billed even if reading it fails
@@ -396,6 +435,7 @@ class OpenAICompatAdapter(_SdkBackend):
             retries=retries,
             usage_extra=usage_extra,
             usage_extra_cut=usage_cut,
+            deployment_id=deployment,
         )
 
     def add_tool_results(self, results: list[ToolResult]) -> None:
@@ -412,7 +452,7 @@ class OpenAICompatAdapter(_SdkBackend):
         }
         if extra := self._extra_body():
             kw["extra_body"] = extra
-        resp, _ = await self.retrier.call(lambda: self._client.chat.completions.create(**kw))
+        resp, _ = await self.retrier.call(lambda: self._client.chat.completions.create(**kw, **self._extra_headers()))
         self.served.note(resp)  # what it says it ran, for info(): admission reads it for a declared set (B18)
         if not getattr(resp, "choices", None):
             raise InfraError("endpoint", "the one-token completion carried no choices")
@@ -428,7 +468,7 @@ class OpenAICompatAdapter(_SdkBackend):
         }
         if extra := self._extra_body():
             kw["extra_body"] = extra
-        resp, _ = await self.retrier.call(lambda: self._client.chat.completions.create(**kw))
+        resp, _ = await self.retrier.call(lambda: self._client.chat.completions.create(**kw, **self._extra_headers()))
         choices = getattr(resp, "choices", None)
         if not choices:
             raise InfraError("endpoint", "the probe of the reply maximum carried no choices")

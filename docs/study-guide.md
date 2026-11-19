@@ -101,6 +101,8 @@ assert statuses == {"alpha-stub": "frozen", "beta-stub": "frozen"}  # only froze
 | `prompt_cache_ttl` | - | o: `"5m"` or `"1h"` | - | the cache lifetime; without it no cache marker is sent |
 | `price` or `free` | one of the two | one of the two | one of the two | `[models.<key>.price]` ([below](#prices-and-the-budget)), or `free = true` for a model that costs nothing per token; both are refused, and a study run refuses a model with neither |
 | `accepted_fingerprints` | o | - | o | the serving fingerprints that count as one model ([below](#a-model-served-by-several-deployments)) |
+| `session_header` | o | - | - | a request header (an HTTP token) that carries one opaque id for the whole of an attempt, so a fleet's front can keep its requests together: 32 hex characters of a SHA-256 over the campaign, the run, the attempt and the lease, never the run key (B20); unset sends nothing |
+| `deployment_header` | o | - | - | a response header in which the front names the deployment that served the reply: each turn records it as `deployment_id` (an optional field of the record), and each analysed attempt's row of the export has the distinct ids as `deployment_ids` (B20); unset reads nothing |
 
 The adapter sets the request's `model`, `messages`, `tools`, `max_tokens` and `stream` itself (and on `openai_compat` `tool_choice`, `stream_options` and `seed`, from the run's seed; on `anthropic` `system` and `cache_control`), so an entry that names one in `sampling` or `extra_body` is refused. A key is read when a request is built, never when the table loads, and a message names the variable or the file and never the key (`ModelSpec.read_key`); `ModelTable.require_keys` checks at the start that every model the plan names has a readable one.
 
