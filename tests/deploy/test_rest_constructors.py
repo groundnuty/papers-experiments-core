@@ -98,8 +98,9 @@ ALLOWED: dict[tuple[str, str, str], tuple[int, str]] = {
     ),
     # -- the Compose federation
     ("deploy/compose-federation/federation.py", "up", "Rest"): (1, COMPOSE),
-    ("deploy/compose-federation/federation.py", "reset_clean", "Rest"): (1, COMPOSE),
+    ("deploy/compose-federation/federation.py", "_reset_clean", "Rest"): (1, COMPOSE),
     ("deploy/compose-federation/federation.py", "reset_replicas", "Rest"): (1, COMPOSE),
+    ("deploy/compose-federation/fedverify.py", "_verify", "Rest"): (1, f"verify-data's reader; {COMPOSE}"),
     ("deploy/compose-federation/measure_dir_distribution.py", "main", "Rest"): (1, f"a measuring script; {COMPOSE}"),
     ("deploy/compose-federation/measure_granularity_and_eviction.py", "main", "Rest"): (
         1,

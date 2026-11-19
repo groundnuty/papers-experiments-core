@@ -80,6 +80,7 @@ def up_stubbed(fed, monkeypatch, tmp_path, check):
         fed.cli, "Content", lambda boot: SimpleNamespace(reset=lambda timeout: calls.append("baseline"))
     )
     monkeypatch.setattr(fed.cli, "write_facts", lambda layout, boot: calls.append("facts") or "facts written")
+    monkeypatch.setattr(fed.cli, "write_compose_file", lambda layout: "")  # a root the stand-ins never made
 
     def links(layout, space_ids):
         calls.append("links")
