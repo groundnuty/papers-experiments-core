@@ -345,6 +345,10 @@ TOOL_SERVER_CALL_BOUND_FROM = f"{SCHEMA_PREFIX}3"
 # the record keeps, as it adds the terminal tools, and the replay judges a call by them, since the one provider of a
 # replay cannot say which tools were a tool server's.
 TOOL_SERVER_TOOLS = "tool_server_tools"
+# The same for the optional wall limit on one code cell (L18): `code_cell_bound_s` in the agent configuration, left out
+# when the study declares none, and beside it and only with it `code_cell_tools`, the tools that run code cells.
+CODE_CELL_BOUND = "code_cell_bound_s"
+CODE_CELL_TOOLS = "code_cell_tools"
 
 
 def reply_count_rule(version: str) -> bool:
@@ -626,23 +630,24 @@ def _check_configuration(config: Any, version: str, schemas: Sequence[SchemaVers
 
     `tool_server_call_bound_s` is optional in a record of version 3 or later, and unknown to an earlier one: absent when
     the study declared none, never a null, and a number above nothing and finite when it did (L17). The names of the
-    tools it reached, `tool_server_tools`, are written with it and only with it, as a list of tool names.
+    tools it reached, `tool_server_tools`, are written with it and only with it, as a list of tool names. The code
+    cell limit, `code_cell_bound_s`, and its `code_cell_tools` are the same in every respect (L18).
     """
     later = set(config_defaults(version, schemas))
-    optional = {TOOL_SERVER_CALL_BOUND, TOOL_SERVER_TOOLS}
-    allowed = ({f.name for f in dataclasses.fields(AgentConfig)} | {"terminal_tools", TOOL_SERVER_TOOLS}) - later
+    pairs = ((TOOL_SERVER_CALL_BOUND, TOOL_SERVER_TOOLS), (CODE_CELL_BOUND, CODE_CELL_TOOLS))
+    optional = {name for pair in pairs for name in pair}
+    allowed = ({f.name for f in dataclasses.fields(AgentConfig)} | {"terminal_tools"} | optional) - later
     if _number(version) < _number(TOOL_SERVER_CALL_BOUND_FROM):
         allowed -= optional
     _check_keys("agent_config", config, allowed, required=allowed - optional)
-    bound = config.get(TOOL_SERVER_CALL_BOUND)
-    if TOOL_SERVER_CALL_BOUND in config and not (_fits(bound, NUM) and bound > 0):
-        raise RecordError(
-            f"agent_config.{TOOL_SERVER_CALL_BOUND}: expected a number of seconds above nothing, got {bound!r}"
-        )
-    if (TOOL_SERVER_TOOLS in config) != (TOOL_SERVER_CALL_BOUND in config):
-        raise RecordError(f"agent_config.{TOOL_SERVER_TOOLS}: held when {TOOL_SERVER_CALL_BOUND} is, and only then")
+    for bound_key, tools_key in pairs:
+        bound = config.get(bound_key)
+        if bound_key in config and not (_fits(bound, NUM) and bound > 0):
+            raise RecordError(f"agent_config.{bound_key}: expected a number of seconds above nothing, got {bound!r}")
+        if (tools_key in config) != (bound_key in config):
+            raise RecordError(f"agent_config.{tools_key}: held when {bound_key} is, and only then")
     _check_keys("agent_config.limits", config["limits"], {f.name for f in dataclasses.fields(Limits)})
-    for key in ("terminal_tools", *([TOOL_SERVER_TOOLS] if TOOL_SERVER_TOOLS in config else [])):
+    for key in ("terminal_tools", *(k for k in (TOOL_SERVER_TOOLS, CODE_CELL_TOOLS) if k in config)):
         tools = config[key]
         if not isinstance(tools, list) or any(not isinstance(t, str) for t in tools):
             raise RecordError(f"agent_config.{key}: a list of tool names")

@@ -355,6 +355,16 @@ else:
 shutil.rmtree(bounded)
 ```
 
+### Bounding one code cell
+
+An agent's code cell is its own time, so a cell that never returns can spend a whole run: nothing short of the agent's time cap stops it. `[agent] code_cell_bound_s` in `campaign.toml` declares a wall limit on one cell, in seconds: positive and finite, and optional. Declare the same value for every arm, so the limit is part of the setting every condition runs under and not a difference between them.
+
+- A cell that runs past the limit is killed, as every cell is at its time limit, and the agent is told so as that cell's result: an error whose text says the code ran past its limit and was killed, with the output the cell printed before it. The run goes on with the agent's next turn. It is the agent's own outcome, never infrastructure, and the cell's time is charged to the agent.
+- A cell is handed the shorter of the limit and the agent's time left. A cell that reaches the time left first is cut by the loop, as it is without the key: a time cap. A limit at or above the time cap leaves every cell as it was, though it still changes the caps in the fingerprint.
+- The limit is for the code tool only. It does not touch a tool server's calls, which have their own bound (`tool_server_call_bound_s`, above), and the old `tool_call_bound_s` is still refused. Docker and Apptainer sandboxes report a killed cell the same way, so the text and the record do not depend on the backend.
+- The record's `agent_config.code_cell_bound_s` holds the limit and `agent_config.code_cell_tools` the tools it reached. A cell that outlives its kill is still infrastructure (`cell_unkillable`) and ends the run.
+- Declare it before the campaign starts: the limit is one of the campaign's caps, which are in its fingerprint, and `campaign.toml`'s hash is in it too, so a store that started without the key is not resumed with it: start a new store. A study that never declares it is unchanged, byte for byte.
+
 ### Prices and the budget
 
 A model's price is `[models.<key>.price]` in `models.toml`, in US dollars per million tokens: `input_per_mtok` and `output_per_mtok`, and optionally `cache_write_per_mtok` and `cache_read_per_mtok`, which are the input price when left out. A model the study hosts itself says `free = true` instead. With a budget, every planned model that is not free also declares its endpoint's context window, `context_tokens`, for the reason given below. `run` refuses to start or resume the campaign without it, naming `models.toml` and the model's key; checking, analysing, reporting and a package's check of a finished study do not need it.
