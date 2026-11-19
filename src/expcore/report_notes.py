@@ -231,6 +231,14 @@ DEPLOYMENT_NOTES = [
     "a recorded mix (one recovered from its outcome marker) is counted in neither column.",
 ]
 
+DECLARATION_NOTES = [
+    "The ledger's declaration log (C48): each fingerprint of a model, or `none` (its replies that carry no",
+    "fingerprint), declared when, by whom and why; models.toml's `accepted_fingerprints` are the first entries.",
+    "Nothing is ever removed. Each lease carried its model's declared set at its issue, and a reply its set did not",
+    "declare set its run aside, so an analysed run's deployments were all declared when it was leased. The deployment",
+    "is a sensitivity factor of the analysis, not part of the experiment's identity.",
+]
+
 COUNT_DEFINITIONS = [
     f"- *Kind* `{NO_KIND}`: the condition met no infrastructure failure and declares no treatment kind; every count is "
     "0.",

@@ -17,8 +17,9 @@ each with its own fingerprint, within one run. A model whose entry declares `acc
 that set instead of a fingerprint baseline: a reply served under a fingerprint of the set is the model, one under any
 other is a change as above, and a reply that carries several fingerprints is the model only when the set lists each
 of them. The served model id is checked against its baseline as before. Whether the deployments are the same model
-(the same weights, the same precision) is the study's decision; the set records it, and the campaign fingerprint
-freezes it (`expcore.study.pipeline.model_digest`). A preflight judges the same replies by the same rule:
+(the same weights, the same precision) is the study's decision; the set records it. The campaign fingerprint does not
+hold the set (C48: deployments of one checkpoint and its flags are interchangeable, so a set that grows is the same
+experiment; `expcore.study.pipeline.model_digest`). A preflight judges the same replies by the same rule:
 `expcore.models.served.judge` takes the model's set (`accepted_fingerprints=`) and both call `outside_accepted`.
 
 A declared fingerprint is confirmed by its first witness: the admission probe, or the first run with a reply that
@@ -29,6 +30,15 @@ served by another model id, or under a fingerprint outside the set, does not adm
 does not describe that endpoint. The set and its confirmations are kept in the store's meta (`ACCEPTED_META`), and
 each attempt of such a model records its deployment mix, the turns each fingerprint served (`deployment_mix`). A model
 that declares no set is checked as before, and nothing of this is written for it.
+
+A lease's declared set (C48). A run taken on a lease the elastic ledger issued carries the model's declared set at the
+lease's issue (`expcore.models.served.DeclaredSet`), and that set, not models.toml's, judges every reply, by the
+strict rule: a reply under a fingerprint it does not declare, or a reply with no fingerprint while "none" is not
+declared, is a change, even when the set is empty. Each such value is kept, once, in the store's meta
+(`UNDECLARED_META`, by model), by the run's check and by the admission probe (which refuses the model on one), and
+`undeclared` gives them: the scheduler holds the model on any (so a lease ends after the attempt that saw one, and
+never spends its run's attempts on a deployment nobody declared), and the worker reports them to the ledger, which
+pauses the model's issue until each is declared.
 """
 
 import json
@@ -37,13 +47,13 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from expcore.campaign.deployments import ACCEPTED_META
+from expcore.campaign.deployments import ACCEPTED_META, UNDECLARED_META
 from expcore.campaign.store import Store
 from expcore.config.models import ModelSpec
-from expcore.models.served import Baseline, outside_accepted, same_model
+from expcore.models.served import Baseline, DeclaredSet, outside_accepted, same_model
 from expcore.models.served import fingerprint_parts as parts  # the served module's split, kept under its old name
 
-__all__ = ["ACCEPTED_META", "META", "ServedIdentities", "parts"]
+__all__ = ["ACCEPTED_META", "META", "UNDECLARED_META", "ServedIdentities", "parts"]
 
 META = "served_baselines"
 ADMISSION_PROBE = "admission_probe"
@@ -53,9 +63,15 @@ RUN = "run"
 class ServedIdentities:
     """One baseline of served identity per model, kept in the store's meta, and the declared sets of accepted
     fingerprints with their confirmations (B18). `declared` holds the planned models' entries; those without a set
-    are ignored."""
+    are ignored, save a model `leased` gives a lease's declared set for (C48), which is judged by that set alone."""
 
-    def __init__(self, store: Store, stamp: Callable[[], str], declared: Mapping[str, ModelSpec] | None = None):
+    def __init__(
+        self,
+        store: Store,
+        stamp: Callable[[], str],
+        declared: Mapping[str, ModelSpec] | None = None,
+        leased: Mapping[str, DeclaredSet] | None = None,
+    ):
         self.store = store
         self._lock = threading.Lock()
         self._baselines: dict[str, Baseline] = {}
@@ -66,10 +82,19 @@ class ServedIdentities:
         except (ValueError, AttributeError, TypeError):
             # An unreadable record forgets the baselines: the next run sets them afresh, and that is on the record.
             store.event(stamp(), "served_baselines_unreadable", None, f"{META} cannot be read; baselines start afresh")
-        self._declared = {m: spec for m, spec in (declared or {}).items() if spec.accepted_fingerprints}
+        specs = declared or {}
+        self._leased = {m: s for m, s in (leased or {}).items() if m in specs}
+        self._declared = {m: spec for m, spec in specs.items() if spec.accepted_fingerprints or m in self._leased}
         self._accepted: dict[str, dict[str, Any]] = {}
+        self._undeclared: dict[str, list[str | None]] = _read_undeclared(store.get_meta(UNDECLARED_META))
         if self._declared:
             self._open_declared(stamp())
+
+    def undeclared(self, model: str) -> list[str | None]:
+        """What the model's replies showed that its lease's declared set does not declare, in the order first seen (a
+        fingerprint, or None: a reply that carried none); [] for a model not run on a lease's set (C48)."""
+        with self._lock:
+            return list(self._undeclared.get(model, ()))
 
     def baseline(self, model: str) -> dict[str, str | None] | None:
         """Return the baseline of a model as a dict, or None before its first reply."""
@@ -92,10 +117,17 @@ class ServedIdentities:
             before = None if known is None else known.to_dict()
             baseline = known if known is not None else Baseline()
             change = None
+            seen: list[str | None] = []
             for turn in transcript:
                 served, fingerprint = turn.get("served_model"), turn.get("system_fingerprint")
                 if spec is None:
                     found = baseline.check(served, fingerprint)
+                elif model in self._leased:  # the lease's set, by the strict rule (C48)
+                    missing = self._leased[model].undeclared(fingerprint)
+                    seen += missing
+                    found = baseline.check(served, None) or (
+                        _undeclared(self._leased[model], fingerprint) if missing else None
+                    )
                 else:  # the set replaces the fingerprint baseline; the served model keeps its own
                     found = baseline.check(served, None) or _outside(spec, fingerprint)
                 if found is not None and change is None:
@@ -104,6 +136,8 @@ class ServedIdentities:
             if after != before and (baseline.served_model or baseline.system_fingerprint):
                 self._baselines[model] = baseline  # set by this run, or learned a fingerprint it lacked
                 self._save(now)
+            if seen:
+                self._see(model, seen, now, f"run {run_key}")
             if spec is not None:
                 shown = [turn.get("system_fingerprint") for turn in transcript if _own(spec, turn.get("served_model"))]
                 self._confirm(model, [p for f in shown if f for p in parts(f)], RUN, run_key, now)
@@ -114,7 +148,9 @@ class ServedIdentities:
 
         The probe's reply is read from the backend's `info()` (`served_model_ids`, `system_fingerprints`). A reply
         served by another model id, or under a fingerprint outside the set, refuses the model. One served by the model
-        confirms the fingerprints it showed. A model that declares no set is not looked at.
+        confirms the fingerprints it showed. A model that declares no set is not looked at. Under a lease's set (C48)
+        a reply that named the model and carried no fingerprint refuses it too unless "none" is declared, and each
+        undeclared value is kept (`undeclared`).
         """
         spec = self._declared.get(model)
         if spec is None:
@@ -128,15 +164,28 @@ class ServedIdentities:
                 f"the admission probe was served by model id {', '.join(other)}, not {spec.api_id}; a fingerprint it "
                 "shows says nothing of the deployments of this model"
             )
-        outside = [f for f in fingerprints if _outside(spec, f)]
-        if outside:
-            return (
-                f"the admission probe was served under system fingerprint {outside[0]!r}, which accepted_fingerprints "
-                f"({', '.join(spec.accepted_fingerprints)}) does not list"
-            )
+        if model in self._leased:
+            declared = self._leased[model]
+            shown: list[str | None] = list(fingerprints) if fingerprints else ([None] if ids else [])
+            missing = list(dict.fromkeys(v for f in shown for v in declared.undeclared(f)))
+            if missing:
+                with self._lock:
+                    self._see(model, missing, now, ADMISSION_PROBE)
+                return (
+                    f"the admission probe was served under {_named(missing)}, which the lease's declared set "
+                    f"({_named_set(declared)}) does not declare; the ledger pauses the model until it is declared"
+                )
+        else:
+            outside = [f for f in fingerprints if _outside(spec, f)]
+            if outside:
+                return (
+                    f"the admission probe was served under system fingerprint {outside[0]!r}, which "
+                    f"accepted_fingerprints ({', '.join(spec.accepted_fingerprints)}) does not list"
+                )
         with self._lock:
             self._confirm(model, [p for f in fingerprints for p in parts(f)] if ids else [], ADMISSION_PROBE, None, now)
-            unconfirmed = [f for f in spec.accepted_fingerprints if f not in self._accepted[model]["confirmed"]]
+            accepted = self._accepted[model]["accepted"]
+            unconfirmed = [f for f in accepted if f not in self._accepted[model]["confirmed"]]
         if unconfirmed:
             self.store.event(
                 now,
@@ -182,8 +231,12 @@ class ServedIdentities:
             )
             data, kept = {}, {}
         for model, spec in self._declared.items():
-            confirmed = {f: w for f, w in kept.get(model, {}).items() if f in spec.accepted_fingerprints}
-            self._accepted[model] = {"accepted": list(spec.accepted_fingerprints), "confirmed": confirmed}
+            leased = self._leased.get(model)
+            accepted = spec.accepted_fingerprints if leased is None else leased.fingerprints
+            confirmed = {f: w for f, w in kept.get(model, {}).items() if f in accepted}
+            self._accepted[model] = {"accepted": list(accepted), "confirmed": confirmed}
+            if leased is not None and leased.none:  # the turns that carried none are the model (C48)
+                self._accepted[model]["none_declared"] = True
         self.store.put_meta(ACCEPTED_META, json.dumps({**data, **self._accepted}, sort_keys=True), now)
 
     def _confirm(self, model: str, shown: list[str], by: str, run_key: str | None, now: str) -> None:
@@ -199,6 +252,48 @@ class ServedIdentities:
         witness = "the admission probe" if by == ADMISSION_PROBE else f"run {run_key}"
         events = [("accepted_fingerprint_confirmed", model, f"{model}: {f} observed by {witness}") for f in new]
         self.store.put_meta_many({ACCEPTED_META: json.dumps(data, sort_keys=True)}, now, events)
+
+    def _see(self, model: str, values: Sequence[str | None], now: str, by: str) -> None:
+        """Keep each undeclared value not kept before, in the store's meta, with an event; call with the lock held."""
+        held = self._undeclared.setdefault(model, [])
+        new = [v for v in dict.fromkeys(values) if v not in held]
+        if not new:
+            return
+        held += new
+        text = json.dumps(self._undeclared, sort_keys=True)
+        events = [
+            ("undeclared_fingerprint_seen", model, f"{model}: {_named([v])} seen by {by}, undeclared") for v in new
+        ]
+        self.store.put_meta_many({UNDECLARED_META: text}, now, events)
+
+
+def _read_undeclared(raw: str | None) -> dict[str, list[str | None]]:
+    """The undeclared values a store kept, by model; a record that cannot be read keeps none (it is rewritten whole at
+    the next sighting)."""
+    try:
+        data = json.loads(raw) if raw else {}
+        return {str(m): [v if v is None else str(v) for v in values] for m, values in data.items()}
+    except (ValueError, AttributeError, TypeError):
+        return {}
+
+
+def _named(values: Sequence[str | None]) -> str:
+    """Undeclared values as a sentence names them."""
+    return ", ".join("no fingerprint" if v is None else f"system fingerprint {v!r}" for v in values)
+
+
+def _named_set(declared: DeclaredSet) -> str:
+    shown = [*declared.fingerprints, *(["none"] if declared.none else [])]
+    return ", ".join(shown) if shown else "nothing declared"
+
+
+def _undeclared(declared: DeclaredSet, fingerprint: str | None) -> dict[str, Any]:
+    """The change a reply is under a lease's declared set (C48)."""
+    return {
+        "system_fingerprint": fingerprint,
+        "declared_fingerprints": list(declared.fingerprints),
+        "none_declared": declared.none,
+    }
 
 
 def _own(spec: ModelSpec, served: str | None) -> bool:

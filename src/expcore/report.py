@@ -128,6 +128,7 @@ from expcore.report_notes import (
     BUDGET_HOLD_NOTES,
     CONDITION_NOTES,
     COUNT_DEFINITIONS,
+    DECLARATION_NOTES,
     DEPLOYMENT_NOTES,
     DESCRIPTIVE_NOTES,
     FAMILY_NOTES,
@@ -996,6 +997,19 @@ def _deployments(export: Mapping[str, Any]) -> list[str]:
     return ["## Deployments", "", *_table(header, rows), "", *totals, "", *DEPLOYMENT_NOTES, ""]
 
 
+def _declarations(export: Mapping[str, Any]) -> list[str]:
+    """The ledger's declaration log (C48), oldest first; nothing for an export without one (only a batch merged by
+    run from a ledger that keeps the log has it)."""
+    if "fingerprint_declarations" not in export:
+        return []
+    rows = [
+        [e["model"], "none" if e["fingerprint"] is None else e["fingerprint"], e["at_utc"], e["actor"], e["reason"]]
+        for e in export["fingerprint_declarations"]
+    ]
+    body = _table(["Model", "Fingerprint", "Declared (UTC)", "Actor", "Reason"], rows) if rows else ["None."]
+    return ["## Fingerprint declarations", "", *body, "", *DECLARATION_NOTES, ""]
+
+
 def _share(value: float | None) -> str:
     """A fraction as a percentage to four significant figures; n/a without a denominator."""
     return UNKNOWN if value is None else f"{value * 100:.4g}%"
@@ -1102,6 +1116,7 @@ def render_report(
         + placed
         + refit
         + _deployments(export)
+        + _declarations(export)
         + _left_out(left_out)
     )
     return "\n".join(lines + sections)

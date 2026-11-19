@@ -7,7 +7,9 @@ into place, so a kill during creation leaves either no ledger or a whole one.
 
 Two partial unique indexes keep the fencing rules in the file itself: a run has at most one lease in flight, and a
 federation holds at most one cap slot. A lease is settled once (`settlements`), and a ceiling only goes up
-(`ceilings`). A model's cap goes either way (`cap_changes`).
+(`ceilings`). A model's cap goes either way (`cap_changes`). A model's declared fingerprints only grow
+(`declarations`, C48): each lease keeps the set in force at its issue (`lease_sets`), and what a lease's run saw that
+its set did not declare is kept apart (`undeclared_seen`).
 """
 
 import contextlib
@@ -26,6 +28,20 @@ CAP_CHANGES_SQL = """CREATE TABLE IF NOT EXISTS cap_changes(
   id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, model TEXT NOT NULL,
   old_cap INTEGER,  -- NULL: the model had no cap
   new_cap INTEGER NOT NULL CHECK(new_cap >= 1), reason TEXT NOT NULL, actor TEXT NOT NULL)"""
+
+# The declaration log (C48, `declarations`): append-only, one row per declared fingerprint of a model, NULL for "none"
+# (a reply that carries no fingerprint). A ledger made before these tables keeps no log: its leases carry no declared
+# set, and the kernel judges them by models.toml's, as before.
+DECLARATIONS_SQL = """CREATE TABLE IF NOT EXISTS declarations(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, model TEXT NOT NULL,
+  fingerprint TEXT,  -- NULL: "none", a reply that carries no fingerprint
+  reason TEXT NOT NULL, actor TEXT NOT NULL)"""
+LEASE_SETS_SQL = """CREATE TABLE IF NOT EXISTS lease_sets(  -- the model's declared set at each lease's issue
+  lease_id INTEGER PRIMARY KEY REFERENCES leases(id), declared TEXT NOT NULL)"""
+UNDECLARED_SEEN_SQL = """CREATE TABLE IF NOT EXISTS undeclared_seen(  -- what a lease's completion or return reported
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, model TEXT NOT NULL,
+  fingerprint TEXT,  -- NULL: a reply that carried none
+  lease_id INTEGER NOT NULL REFERENCES leases(id))"""
 
 _SQL = (
     """
@@ -75,14 +91,15 @@ CREATE TABLE ceilings(  -- the raises of the dollar ceiling, the campaign's (mod
   old_micro INTEGER NOT NULL, new_micro INTEGER NOT NULL, reason TEXT NOT NULL, actor TEXT NOT NULL,
   CHECK(new_micro > old_micro));
 """
-    + CAP_CHANGES_SQL
+    + ";\n".join((CAP_CHANGES_SQL, DECLARATIONS_SQL, LEASE_SETS_SQL, UNDECLARED_SEEN_SQL))
     + ";"
 )
 
 
-def create_file(path: Path, rows: list[tuple], meta: dict[str, str]) -> None:
-    """Write a new ledger at `path` whole: its tables, its runs (run_key, seq, model, condition, set_index) and its
-    meta, under a temporary name, then renamed into place. An existing ledger is refused."""
+def create_file(path: Path, rows: list[tuple], meta: dict[str, str], declared: list[tuple] = ()) -> None:
+    """Write a new ledger at `path` whole: its tables, its runs (run_key, seq, model, condition, set_index), its meta
+    and its first declarations (at, model, fingerprint or None, reason, actor), under a temporary name, then renamed
+    into place. An existing ledger is refused."""
     if path.exists():
         raise FileExistsError(f"{path} already holds a ledger: open it instead")
     scratch = path.with_name(path.name + ".creating")
@@ -96,6 +113,13 @@ def create_file(path: Path, rows: list[tuple], meta: dict[str, str]) -> None:
                 db.execute(statement)
         db.executemany("INSERT INTO runs(run_key, seq, model, condition, set_index) VALUES(?,?,?,?,?)", rows)
         db.executemany("INSERT INTO meta(key, value) VALUES(?,?)", sorted({**meta, "schema": SCHEMA}.items()))
+        for at, model, fingerprint, reason, actor in declared:
+            found = db.execute(
+                "INSERT INTO declarations(at, model, fingerprint, reason, actor) VALUES(?,?,?,?,?)",
+                (at, model, fingerprint, reason, actor),
+            )
+            detail = json.dumps({"declaration_id": found.lastrowid, "fingerprint": fingerprint, "model": model})
+            db.execute("INSERT INTO events(at, kind, detail) VALUES(?, 'declare', ?)", (at, detail))
         db.execute("COMMIT")
     except BaseException:
         db.close()

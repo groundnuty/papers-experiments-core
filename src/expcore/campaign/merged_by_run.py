@@ -7,8 +7,11 @@ snapshots, beside the ledger snapshot. The check and the analysis believe merge.
 of the batch's snapshots and its ledger writes for the study's plan (`verify_by_run`, as `campaign.merged` does for a
 merge of shards): every snapshot and the ledger are read once and compared with the hash merge.json names, anything
 under `leases/` or `evidence/` that it does not list is refused, and the document is rebuilt through the same checks.
+merge.json also carries the ledger's declaration log (`declarations`, C48: each model's fingerprint or "none", when,
+by whom and why) when the ledger keeps one, so the analysis can see when each deployment was admitted.
 """
 
+import datetime as dt
 import hashlib
 import json
 import os
@@ -18,6 +21,7 @@ from typing import Any
 
 from expcore.campaign.by_run_layout import EVIDENCE_DIR, LEASES_DIR, MERGE_BY_RUN_SCHEMA, snapshot_rel
 from expcore.campaign.elastic.config import usd_of
+from expcore.campaign.elastic.records import Declaration
 from expcore.campaign.lease_facts import LeaseStore, lease_store_of, lease_store_of_bytes
 from expcore.campaign.ledger_read import LEDGER_SNAPSHOT, LeaseRow, LedgerFacts, LedgerRefused, read_ledger
 from expcore.campaign.manifest import Manifest, fingerprint_sha256
@@ -29,6 +33,7 @@ from expcore.campaign.shard import MERGE_FILE
 
 _DOCUMENT_KEYS = {"schema", "fingerprint", "rule", "environment_identity", "ledger_sha256", "runs", "leases"}
 _DOCUMENT_KEYS |= {"evidence", "spend", "exhausted"}
+DECLARATIONS_KEY = "declarations"  # the ledger's declaration log (C48), in a merge of a ledger that keeps one
 
 
 # --- merge.json -----------------------------------------------------------------------------------------------------
@@ -39,7 +44,9 @@ def by_run_document(merged: ByRun) -> dict[str, Any]:
     ledger, first = merged.ledger, merged.counted[0]
     totals = spend_micro(ledger, merged.counted, merged.evidence)
     settled = set(ledger.settlements)
+    logged = {} if ledger.declarations is None else {DECLARATIONS_KEY: [_declared(d) for d in ledger.declarations]}
     return {
+        **logged,
         "schema": MERGE_BY_RUN_SCHEMA,
         "fingerprint": fingerprint_sha256(first.fingerprint),
         "rule": RULE_LEASE,
@@ -58,6 +65,18 @@ def by_run_document(merged: ByRun) -> dict[str, Any]:
             },
             "locked_usd": usd_of(ledger.locked_micro),  # held as grants by unsettled leases at the snapshot
         },
+    }
+
+
+def _declared(found: Declaration) -> dict[str, Any]:
+    """One entry of the declaration log as merge.json keeps it: its fingerprint is null for "none"."""
+    return {
+        "id": found.declaration_id,
+        "at_utc": dt.datetime.fromtimestamp(found.at, dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "model": found.model,
+        "fingerprint": found.fingerprint,
+        "actor": found.actor,
+        "reason": found.reason,
     }
 
 
@@ -124,9 +143,12 @@ def read_by_run(raw: bytes, where: object) -> dict[str, Any]:
     if (
         not isinstance(document, dict)
         or document.get("schema") != MERGE_BY_RUN_SCHEMA
-        or set(document) != _DOCUMENT_KEYS
+        or set(document) - {DECLARATIONS_KEY} != _DOCUMENT_KEYS
     ):
         raise MergeRefused(f"{where}: not an {MERGE_BY_RUN_SCHEMA} merge file")
+    logged = document.get(DECLARATIONS_KEY, [])
+    if not isinstance(logged, list) or not all(isinstance(entry, dict) for entry in logged):
+        raise MergeRefused(f"{where}: its {DECLARATIONS_KEY} is not a list of the ledger's declarations")
     leases, evidence, exhausted = document["leases"], document["evidence"], document["exhausted"]
     ok = isinstance(leases, list) and isinstance(evidence, list) and bool(leases) and isinstance(exhausted, list)
     ok = ok and all(isinstance(entry, dict) and isinstance(entry.get("run_key"), str) for entry in exhausted)

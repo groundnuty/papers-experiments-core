@@ -13,7 +13,8 @@ Each tick, for each site, in this order:
    writes, shows the lease's file under its name; a settled lease whose name a tombstone holds is cancelled, since its
    file never landed and never can. A drain the watchdog asked for drains the federation in the ledger.
 4. **The reading.** When every outbox was read, the heartbeats, completions and returns go to the ledger in one
-   reading (`Ledger.observe_site`), each fenced first: a file counts only for a lease of the federation whose outbox
+   reading (`Ledger.observe_site`), with what each completion or return says its run saw undeclared (C48), each
+   fenced first: a file counts only for a lease of the federation whose outbox
    it is in, of the run the ledger leased, and of the format. A completion of a lease the ledger already read is not
    read again. A reading the ledger refuses changes nothing, and the site is swept as unread.
 5. **The archives.** For each completion read and not yet settled, its archive is pulled (`transport.fetch`) into
@@ -222,6 +223,7 @@ class Dispatcher:
                         charged=record.get("charged"),
                         spend_usd=_spend_usd(record),
                         archive_sha256=record.get("archive_sha256"),
+                        undeclared=record.get("undeclared_fingerprints", ()),
                     )
                 except (TypeError, ValueError) as error:
                     done.dropped.append(f"{label}: completion of lease {lease.lease_id}: {error}")
@@ -239,7 +241,13 @@ class Dispatcher:
                 if lease is None or record.get("run_key") != lease.run_key or lease.state not in _RETURNABLE:
                     continue
                 try:
-                    returns.append(Return(lease_id=lease.lease_id, spend_usd=_spend_usd(record)))
+                    returns.append(
+                        Return(
+                            lease_id=lease.lease_id,
+                            spend_usd=_spend_usd(record),
+                            undeclared=record.get("undeclared_fingerprints", ()),
+                        )
+                    )
                 except (TypeError, ValueError) as error:
                     done.dropped.append(f"{label}: return of lease {lease.lease_id}: {error}")
         ended = {completion.lease_id for completion in completions}
