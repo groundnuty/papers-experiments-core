@@ -1874,7 +1874,9 @@ finds the job gone and has nothing to sweep in. So every later `down` keeps the 
 operator says what was checked on that node (`--node-checked "<what was checked>"`, recorded in the state and in
 down's output, which `<fleet>/logs/<member>.down.log` keeps), a sweep that later succeeds there clears the record,
 and the elastic controller never takes such a member down again by itself (it reads `unswept` and leaves the member
-`down-failed`, its root kept; the failed down's error is in its log). The operator, in this order:
+`down-failed`, its root kept; the failed down's error is in its log). Until the operator's down it still counts
+against the site's `max_federations` (and `HPC_FLEET_MAX` in `fleet.py add`): it takes a slot, which is fail-closed
+and accepted. The operator, in this order:
 
 1. Find the node: `sandbox.node` in the root's state file (`<fleet>/fed-k/root/hpc-federation.json`).
 2. Sweep it in a short job of the study's own account on that node, from a private 0700 directory, with the core's
