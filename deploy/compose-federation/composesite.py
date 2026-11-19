@@ -10,6 +10,7 @@ command here over ssh, from the site's directory (`--fleet`, 0700, one per campa
     <python> -I -B composesite.py collect --root ROOT --into DIR
     <python> -I -B composesite.py retired --fleet F --member NAME --channel DIR [--drained]
     <python> -I -B composesite.py undrain --fleet F --member NAME
+    <python> -I -B composesite.py verify-data --root ROOT --layout FILE
 
 Each takes `--engine` after its name (the site's setting, `EXPCORE_FED_ENGINE`; docker by default). The members are
 federations the operator brought up with `federation.py up` (static members: none is ever brought up or taken down
@@ -65,7 +66,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -76,6 +76,7 @@ HPC = HERE.parent / "hpc-federation"
 if str(HERE) not in sys.path:  # `-I` leaves the script's own directory off the path
     sys.path.insert(0, str(HERE))
 
+import fedverify  # noqa: E402
 from feddocker import ENGINE_ENV, ENGINES, project_containers  # noqa: E402
 from fedlayout import ROOT_MARKER  # noqa: E402
 
@@ -84,8 +85,6 @@ WORKER_TAG = "EXPCORE_COMPOSE_WORKER"  # in every process a worker starts: what 
 WORKER_MODULE = "expcore.campaign.elastic.worker"
 PLATFORM, FACTS, LINKS = "platform.toml", "facts.json", "link-check.json"
 PIDFILE, RETIRED, RUN = "worker.json", "retired.json", "run"
-# A space's data shown to be its declared manifest: what a Compose root holds to read verified (`data_verified`).
-DATA_MARKER, DATA_FORMAT = "data-verified.json", "expcore-compose-data-verified/1"
 MEMBER = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
 GENERATION = "-g"  # a static member's later generations: <member>-g2, <member>-g3, ... (each a new ledger label)
 MAX_GENERATIONS = 9
@@ -272,40 +271,25 @@ def linked(root: Path) -> bool:
         return False
 
 
-def declared_data(root: Path) -> dict[str, tuple[Path, Any]] | None:
-    """Every space of the root's `platform.toml` that declares its data (`data_manifest`, in `[[spaces]]` or the
-    one-space form), by name: (its manifest's path, its id). None when the file cannot be read: nothing is verified."""
-    try:
-        data = tomllib.loads((root / PLATFORM).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    entries = data.get("spaces") if isinstance(data.get("spaces"), list) else [data.get("space")]
-    found = {}
-    for entry in entries:
-        if isinstance(entry, dict) and entry.get("data_manifest"):
-            path = Path(str(entry["data_manifest"]))
-            found[str(entry.get("name"))] = (path if path.is_absolute() else root / path, entry.get("id"))
-    return found
-
-
 def data_verified(root: Path) -> bool:
     """FAIL CLOSED, as an HPC member's verify-data markers are (`fleetobserve.verified`): a member's data is verified
     only when every space its platform file declares data for has an entry in the root's `data-verified.json` naming
     that space's id and the SHA-256 of its manifest as it is now. A platform file that declares no data (a probe of the
     baseline files) is verified once linked; one that cannot be read, a marker missing, of another form, of another
     manifest or another space, is not. Nothing here writes the marker: a member with data joins only once its data is
-    shown to be the manifest's."""
-    declared = declared_data(root)
+    shown to be the manifest's (`fedverify`, which `verify-data` runs: a Compose site's prepare runs it after the
+    study's ingest)."""
+    declared = fedverify.declared(root)
     if declared is None:
         return False
     if not declared:
         return True
     try:
-        marker = json.loads((root / DATA_MARKER).read_text(encoding="utf-8"))
-        spaces = marker["spaces"] if marker.get("format") == DATA_FORMAT else None
+        marker = json.loads((root / fedverify.MARKER).read_text(encoding="utf-8"))
+        spaces = marker["spaces"] if marker.get("format") == fedverify.FORMAT else None
         for name, (manifest, space_id) in declared.items():
             entry = spaces.get(name)
-            digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+            digest = fedverify.manifest_sha256(manifest)
             if (
                 not isinstance(entry, dict)
                 or entry.get("manifest_sha256") != digest
@@ -344,6 +328,9 @@ def member_view(fleet: Path, site: str, channel: str, member: str, root: Path, n
             "verified": False, "relay": "none", "relay_beat_at": None, "submitted_at": None, "started_at": None,
             "ends_at": None, "state": None, "retired": False, "launched": False}  # fmt: skip
     worker = worker_of(fleet, member, here)
+    prepare = _sibling("fleetprepare").status(fleet, member)  # the member's prepare (`fleetprepare.py`), if one ran
+    if prepare is not None:
+        view["prepare"] = prepare
     if is_retired(fleet, member, here, worker):
         return {**view, "status": "down", "retired": True}
     running, present = services_state(root, project)
@@ -621,6 +608,30 @@ def identity(args: argparse.Namespace) -> int:
     return 0
 
 
+def layout_of(root: Path, layout_file: Path) -> Any:
+    """The `fedlayout.Layout` of the member at `root`: the site's layout, as the instance the root's mark names
+    (`<project>-<K>`, `fedspec.instance`), or the layout itself when the mark names its project."""
+    from fedlayout import Layout
+    from fedspec import instance, load_spec
+
+    base, project = load_spec(layout_file), project_of(root)
+    if project == base.project:
+        return Layout(root, root.parent, base)
+    number = project[len(base.project) + 1 :] if project and project.startswith(f"{base.project}-") else ""
+    if not number.isdigit():
+        raise SiteError("the root's mark names no instance of the site's layout")
+    spec = instance(base, int(number))
+    if spec.project != project:
+        raise SiteError("the root's mark names no instance of the site's layout")
+    return Layout(root, root.parent, spec)
+
+
+def verify_data(args: argparse.Namespace) -> int:
+    """The member's declared data read back against its manifests, and its marker written (`fedverify`)."""
+    print(fedverify.verify_data(layout_of(Path(args.root), Path(args.layout))))
+    return 0
+
+
 def collect(args: argparse.Namespace) -> int:
     """The root's evidence into `--into` as a root-only copy; its manifest's SHA-256 alone on stdout."""
     shards = _sibling("shards")
@@ -686,7 +697,8 @@ def parser() -> argparse.ArgumentParser:
     commands = {"observe": ("fleet", "site", "channel"), "stop": ("fleet", "member"),
                 "launch": ("fleet", "member", "root", "federation", "channel", "study", "home"),
                 "identity": ("fleet", "root", "study"), "collect": ("root", "into"),
-                "retired": ("fleet", "member", "channel"), "undrain": ("fleet", "member")}  # fmt: skip
+                "retired": ("fleet", "member", "channel"), "undrain": ("fleet", "member"),
+                "verify-data": ("root", "layout")}  # fmt: skip
     made = {}
     for name, keys in commands.items():
         made[name] = sub.add_parser(name, parents=[common])
@@ -704,7 +716,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     os.environ[ENGINE_ENV] = args.engine  # every call to the engine, here and in feddocker, names this one
     commands: dict[str, Any] = {"launch": launch, "stop": stop, "identity": identity, "collect": collect,
-                                "retired": retired, "undrain": undrain}  # fmt: skip
+                                "retired": retired, "undrain": undrain, "verify-data": verify_data}  # fmt: skip
     try:
         if args.command == "observe":
             print(json.dumps(observe(args), sort_keys=True))

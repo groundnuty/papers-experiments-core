@@ -16,6 +16,7 @@ uv run python deploy/compose-federation/federation.py memory   # each service's 
 uv run python deploy/compose-federation/federation.py describe # the deployment's table for the day-0 report
 uv run python deploy/compose-federation/federation.py compose  # the Compose file the layout generates
 uv run python deploy/compose-federation/federation.py ca       # the host's shared CA, once (EXPCORE_FED_CA_DIR)
+uv run python deploy/compose-federation/federation.py verify-data  # after an ingest: the declared data read back
 ```
 
 Each takes `--layout PATH` for a layout other than the default; give every command of one federation the same layout.
@@ -129,8 +130,13 @@ controller runs `composesite.py` here over ssh, from the site's directory with i
   to its root, linked while its `link-check.json` says ok, and verified only when linked AND every space its
   `platform.toml` declares data for (`data_manifest`) has a marker in the root's `data-verified.json` naming the
   space's id and its manifest's SHA-256: fail closed, as an HPC member's verify-data markers are. A platform file that
-  declares no data (the baseline files) is verified once linked. No Compose command writes the marker yet (Compose has
-  no verify-data), so a member whose platform file declares data never joins; its job id is `compose-<project>` and its end 10 years
+  declares no data (the baseline files) is verified once linked. The marker is written by `verify-data`
+  (`federation.py --layout L --instance K verify-data`, or `composesite.py verify-data --root R --layout L`, which
+  finds the instance from the root's mark): every declared space read back through its owner, every file's bytes
+  hashed, by the HPC driver's own reader (`hpcdata.content_reader`, on this directory's bootstrap), and compared with
+  its manifest; any difference, or an id that is not `up`'s, refuses, naming the space, and removes an earlier marker.
+  A Compose site's `prepare` (`fleetprepare.py`, #494's hook) runs the study's ingest and then `verify-data` once per
+  member while it is linked and unverified; its job id is `compose-<project>` and its end 10 years
   from now (no walltime: the ledger never proves an end the host does not enforce); the site reports no node, so nothing is ever added to it.
 - **launch**: the elastic worker, once, detached in a session of its own, with the allowlisted environment, HOME the
   site's 0700 `home` (the study's key tree at its models.toml paths, placed by the operator: never copied), a copy of

@@ -651,3 +651,80 @@ def test_c51_a_member_whose_platform_declares_data_is_verified_only_by_a_marker_
     assert vm.view()["fed-1"].verified
     tick(deploy, vm, ledger, clock)
     assert "site-a-fed-1" in {f.label for f in ledger.federations()}
+
+
+# ------------------------------------------------------------------------------------------------ declared data
+def declare_data(vm: Vm, member: str = "fed-1") -> Path:
+    """The member's platform file declares its study space's data: a manifest of one file, `data.bin`."""
+    from expcore_onedata.importmanifest import Manifest, ManifestFile, write_manifest
+
+    root = vm.roots[member]
+    manifest = root / "data-manifests" / "alpha.json"
+    manifest.parent.mkdir(exist_ok=True)
+    write_manifest(Manifest((ManifestFile("data.bin", 4, hashlib.sha256(b"data").hexdigest()),), ()), manifest)
+    (root / "platform.toml").write_text(
+        '[[spaces]]\nname = "alpha"\nid = "sid-alpha"\ndata_manifest = "data-manifests/alpha.json"\n', encoding="utf-8"
+    )
+    facts = json.loads((root / "facts.json").read_text(encoding="utf-8"))
+    facts["spaces"] = {"alpha": {"id": "sid-alpha"}}
+    (root / "facts.json").write_text(json.dumps(facts), encoding="utf-8")
+    return manifest
+
+
+def test_c52_verify_data_writes_the_marker_only_for_data_that_is_exactly_its_manifest(deploy, vm):
+    """C52: `verify-data` reads every declared space back (here a stand-in for the owner's REST reader) and writes the
+    marker the member joins on only when each is exactly its manifest; a space with a file of other bytes refuses,
+    naming the space, and removes the marker an earlier check wrote, so a re-ingest that went wrong never keeps it."""
+    import fedverify
+
+    declare_data(vm)
+    layout = SimpleNamespace(root=vm.roots["fed-1"])
+    whole = ({"data.bin": (4, hashlib.sha256(b"data").hexdigest())}, set())
+    assert "1 space(s) hold exactly their manifests" in fedverify.verify_data(layout, read=lambda space: whole)
+    assert deploy.site.data_verified(vm.roots["fed-1"])
+    other = ({"data.bin": (4, hashlib.sha256(b"dat!").hexdigest())}, set())
+    with pytest.raises(RuntimeError, match="alpha does not hold the data its manifest declares"):
+        fedverify.verify_data(layout, read=lambda space: other)
+    assert not (vm.roots["fed-1"] / "data-verified.json").exists()
+    assert not deploy.site.data_verified(vm.roots["fed-1"])
+
+
+PREPARE = """
+import hashlib, json, sys
+root = sys.argv[1]
+digest = hashlib.sha256(open(root + "/data-manifests/alpha.json", "rb").read()).hexdigest()
+marker = {"format": "expcore-compose-data-verified/1", "spaces": {"alpha": {"space_id": "sid-alpha",
+          "manifest_sha256": digest}}}
+open(root + "/data-verified.json", "w").write(json.dumps(marker))
+open(root + "/prepare-saw-layout", "w").write(sys.argv[2])
+"""
+
+
+def test_c52_a_compose_member_with_declared_data_joins_after_its_prepare_verifies_it(deploy, vm, tmp_path):
+    """C52: a Compose site's `prepare` (#494's hook) runs once, on the host, for a member linked with its declared data
+    unverified, with `{root}` its root and `{layout}` the site's layout file; the member joins only once the marker its
+    command leaves (the study's ingest, then `composesite.py verify-data`; here a stand-in) verifies it."""
+    declare_data(vm)
+    real = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation" / "fleetprepare.py"
+    (vm.base / "hpc-federation").mkdir()
+    (vm.base / "hpc-federation" / "fleetprepare.py").write_text(
+        f"import runpy, sys\nsys.argv[0] = {str(real)!r}\nrunpy.run_path({str(real)!r}, run_name='__main__')\n",
+        encoding="utf-8",
+    )
+    (vm.base / "prepare.py").write_text(PREPARE, encoding="utf-8")
+    layout = vm.base / "layout.toml"
+    layout.write_text("# the members' layout\n", encoding="utf-8")
+    text = (vm.tmp / "sites.toml").read_text(encoding="utf-8")
+    command = f'prepare = ["{sys.executable}", "{vm.base / "prepare.py"}", "{{root}}", "{{layout}}"]'
+    (vm.tmp / "sites.toml").write_text(text + f'{command}\nprepare_timeout_s = 120\nlayout = "{layout}"\n', "utf-8")
+    vm.controller, (vm.config,) = deploy.control.load_config(vm.tmp / "sites.toml")
+    clock = FakeClock(time.time())
+    ledger = new_ledger(tmp_path, clock)
+    actions = tick(deploy, vm, ledger, clock)
+    assert [a.member for a in actions if type(a).__name__ == "Prepare"] == ["fed-1"]
+    assert [f.label for f in ledger.federations()] == ["site-a-fed-2"]  # fed-1 waits for its data
+    assert (vm.roots["fed-1"] / "prepare-saw-layout").read_text(encoding="utf-8") == str(layout)
+    assert vm.view()["fed-1"].verified
+    tick(deploy, vm, ledger, clock)
+    assert "site-a-fed-1" in {f.label for f in ledger.federations()}
+    assert not [a for a in tick(deploy, vm, ledger, clock) if type(a).__name__ == "Prepare"]  # once

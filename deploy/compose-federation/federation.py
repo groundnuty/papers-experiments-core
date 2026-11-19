@@ -84,6 +84,7 @@ from fedrest import Rest
 from fedspec import LOOPBACK, ZONE, LayoutError, Service, Spec, instance, load_spec
 from fedsupport import check_rendered_support
 from fedtools import check_artifacts, study_artifacts_from
+from fedverify import verify_data
 
 ZONE_TIMEOUT_S = 1500.0
 PROVIDER_TIMEOUT_S = 1800.0
@@ -362,6 +363,13 @@ def reset_replicas(layout: Layout) -> str:
     return "\n".join([timer.summary("reset --replicas"), *(f"{space}: {done}" for space, done in evicted.items())])
 
 
+def verify(layout: Layout) -> str:
+    """`verify-data`: after the study's ingest, every space the rendered platform.toml declares data for read back
+    against its manifest, and the root's `data-verified.json` written only when each is exactly it (`fedverify`)."""
+    require_up(layout)
+    return verify_data(layout)
+
+
 def down(layout: Layout) -> str:
     """Stop and remove the project, then empty and remove the root; refuse first, touching nothing, when the project's
     containers or networks bind another root or the root lacks this layout's mark.
@@ -452,6 +460,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": status,
         "memory": memory,
         "describe": describe,
+        "verify-data": verify,
     }
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--layout", type=Path, help="the layout file (default: federation.toml beside this script)")
@@ -459,7 +468,9 @@ def main(argv: list[str] | None = None) -> int:
     which = parser.add_mutually_exclusive_group()
     which.add_argument("--clean", action="store_true", help="reset: back to the baseline, ingested data removed")
     which.add_argument("--replicas", action="store_true", help="reset: evict the mirrors' replicas, keep all data")
-    parser.add_argument("command", choices=("up", "reset", "down", "status", "memory", "describe", "compose", "ca"))
+    parser.add_argument(
+        "command", choices=("up", "reset", "down", "status", "memory", "describe", "compose", "ca", "verify-data")
+    )
     args = parser.parse_args(argv)
     command = args.command
     try:

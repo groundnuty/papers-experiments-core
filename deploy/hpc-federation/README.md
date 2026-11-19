@@ -1814,8 +1814,11 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   `verify-copy` here and the retired record, with no `down`. A member whose worker died is proven ended (`terminal`)
   and its lost lease settles from the channel on the host as at an ssh site; once retired, a member whose root reads
   live and linked again joins as its next generation (`<member>-g2`, a new ledger label), or a member the operator
-  adds naming the same root takes it over; a member retired after a drain stays out until `composesite.py undrain`. A prepare hook has a seam (`fleetcompose.PREPARE`) and none yet. Nothing
-  of it has run live.
+  adds naming the same root takes it over; a member retired after a drain stays out until `composesite.py undrain`. A Compose site's `prepare` (with `layout`, the members' layout file
+  on the host) runs through `fleetprepare.py run --root R --layout L` (a Compose member has no fleet record), its
+  records in the site's `<fleet>/logs/` as at an HPC site; the study's command ingests and then runs `composesite.py
+  verify-data --root {root} --layout {layout}`, whose marker is what the member joins on. A member retired before it
+  ever joined (its prepare failed, say) stays out like a drained one. Nothing of it has run live.
 
 ## The elastic fleet's worker (`fleetworker.py`, `fleetidentity.py`)
 
