@@ -324,6 +324,24 @@ def test_o94_a_command_that_differs_inside_the_declared_artifacts_directory_is_r
     assert not compare_fingerprints({"platform": one}, {"platform": two}).same
 
 
+def test_o94_a_command_inside_the_clone_is_one_line_when_a_site_reaches_its_artifacts_through_a_link(tmp_path, cas):
+    """O94 (Codex round 1): the clone's role is its resolved path, the artifacts directory's its path as written. With
+    the command inside the clone and one site's directory declared through a parent that is a link, the clone's role
+    matches the command at one site only, so the declared directory is replaced first: one line at both sites."""
+    inside = [
+        platform('command = "@root@/venv/bin/server"', 'command = "@artifacts@/clone/venv/bin/server"'),
+        platform('clone = "@root@/clone"', 'clone = "@artifacts@/clone"\nartifacts = "@artifacts@"'),
+    ]
+    (tmp_path / "real").mkdir()
+    (tmp_path / "home").symlink_to(tmp_path / "real")
+    configs = []
+    for index, artifacts in enumerate((tmp_path / "site-a" / "artifacts", tmp_path / "home" / "studies" / "art")):
+        values = {**FEDERATIONS[index], "artifacts": str(artifacts)}
+        configs.append(load(edited(DOCKER, inside), tmp_path / f"fed-{index}" / "root", cas[0], values))
+    assert str(configs[1].toolserver.clone) != f"{tmp_path}/home/studies/art/clone"  # resolved through the link
+    assert configs[0].fingerprint() == configs[1].fingerprint()
+
+
 @pytest.mark.parametrize("value", ["relative/artifacts", "/", "//"])
 def test_o94_an_artifacts_directory_that_is_not_absolute_or_is_the_root_is_refused(tmp_path, cas, value):
     """O94: the declared directory is an absolute path other than the root, as the command that lies in it is."""

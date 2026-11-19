@@ -50,7 +50,8 @@ def federation_roles(config: PlatformConfig) -> list[tuple[str, str]]:
     the zone's and each provider's URL and host, each provider's, space's and fixed user's id, the link check's space
     id, the tool server's clone, the study's own directory its `artifacts` declares (as written, since the command is
     rendered from the same placeholder: two sites' paths of one directory, #451) and the platform file's directory.
-    Longest first, so a URL is replaced before its host, and a host that several roles share is the plain role `host`.
+    Longest first (the artifacts directory before all), so a URL is replaced before its host, and a host that several
+    roles share is the plain role `host`.
     A host is a role only when it has a dot or a colon (a domain name or an address): a single label (`read`) could be
     an option's own value, and two lines that differ in that value must never become one, so it is left as written,
     which can only keep two federations apart."""
@@ -81,7 +82,9 @@ def federation_roles(config: PlatformConfig) -> list[tuple[str, str]]:
     if config.toolserver is not None and config.toolserver.artifacts is not None:
         add(config.toolserver.artifacts, "artifacts")
     add(str(config.file.parent), "platform-dir")
-    return sorted(roles.items(), key=lambda item: -len(item[0]))
+    # The declared artifacts directory first: every site writes it from one placeholder, while a role inside it (the
+    # clone, resolved) may match the command at a site whose parent is a link and not at another (O94).
+    return sorted(roles.items(), key=lambda item: (item[1] != "artifacts", -len(item[0])))
 
 
 def _qualified(host: str) -> str | None:
