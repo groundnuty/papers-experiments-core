@@ -508,15 +508,17 @@ def test_c47_a_member_killed_mid_lease_is_retired_with_its_places_and_its_lease_
     assert read_ledger(data, hashlib.sha256(data).hexdigest()).unsettled(lease.run_key) == []
 
 
+@pytest.mark.parametrize(("call", "trouble"), [("tar -C", "fail"), ("echo yes", "fail"), ("echo yes", "garbage")])
 def test_c47_a_place_that_cannot_be_pulled_stops_the_retirement_before_down_and_a_retry_pulls_it_whole(
-    deploy, login, tmp_path
+    deploy, login, tmp_path, call, trouble
 ):
     """C47: the places of the member's leases are pulled after its evidence and before verify-copy and down (the
-    newest two snapshots of each place and its journal): a call that fails stops the retirement with nothing taken
+    newest two snapshots of each place and its journal): a snapshot that cannot be streamed, a directory that cannot
+    be told from one that is not there, and an answer that is not whole each stop the retirement with nothing taken
     down and no part of the places here, and the retry, over the evidence already here, pulls them whole."""
     config = dataclasses.replace(login.config, channel=tmp_path / "channels")
     lay_place(config.channel)
-    login.fake.rule("tar -C", "fail")
+    login.fake.rule(call, trouble)
     executor = login.executor(tmp_path)
     assert executor.site_steps(retire(), config) is False
     assert not (login.scripts / "downed").exists()

@@ -176,14 +176,16 @@ class SshSiteTransport:
                 shutil.rmtree(stage, ignore_errors=True)
 
     def _exists(self, site: Any, flag: str, path: str) -> bool:
-        """Whether `path` is there (`test -d` or `-f` at the site): 0 is yes and 1 is no; any other status, ssh's own
-        included, is a call that failed, never an answer."""
+        """Whether `path` is there (`test -d` or `-f` at the site). The answer is what the command prints, `yes` or
+        `no`, never a status: the command's `cd` and the sourcing of site.env fail with 1 as `test` does, and a call
+        that failed is no answer."""
         from expcore.campaign.elastic.transport import Unreachable
 
-        code, _, _ = self.run(site, ["test", flag, path], LIST_TIMEOUT_S)
-        if code not in (0, 1):
+        script = 'if test "$1" "$2"; then echo yes; else echo no; fi'
+        code, out, _ = self.run(site, ["sh", "-c", script, "sh", flag, path], LIST_TIMEOUT_S)
+        if code != 0 or out.strip() not in ("yes", "no"):
             raise Unreachable("the site's answer is not whole")
-        return code == 0
+        return out.strip() == "yes"
 
     def _names(self, site: Any, directory: str, pattern: "re.Pattern[str]") -> List[str]:
         """The names in `directory` at the site that `pattern` matches, sorted; none when it is not there."""
