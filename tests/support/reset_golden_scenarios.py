@@ -1,6 +1,7 @@
 """The reset scenarios whose records, waits and provider calls under `[placement] wait_mode = "fixed"` are pinned to the
 ones captured before the wait modes existed (`tests/data/reset-fixed-golden.json`): one space evicting files (with a
-job to cancel), one evicting a tree with the quiet check skipped, and three spaces reset as one."""
+job to cancel), one evicting a tree with the quiet check skipped, and three spaces reset as one. Every request is sent
+from one thread (`concurrency` 1), so the calls and the reads' tallies are the same on any host."""
 
 import dataclasses
 import json
@@ -64,7 +65,7 @@ def one_space(monkeypatch, tmp_path, make_client, load_config, kind: str, **sett
     config = load_config(platform_file)
     client = make_client(config, fake)
     base = load_placement(platform_file, config).settings
-    placed = dataclasses.replace(base, qos_scan="listing", **settings)
+    placed = dataclasses.replace(base, qos_scan="listing", **{"concurrency": 1, **settings})  # one thread: exact
     p = _provisioner(client, config, placed, ticker, tmp_path / "changes.jsonl")
     if kind == "files":
         tid = fake.add_transfer("replication", FILES[0], BETA_ID, scheduled=ticker.now, ended=False)
@@ -100,7 +101,7 @@ def several_spaces(monkeypatch, tmp_path, make_client, load_config, plans=None, 
     platform_file = write_platform(tmp_path, document)
     config = load_config(platform_file)
     client = make_client(config, fake)
-    placed = dataclasses.replace(load_placement(platform_file, config).settings, **settings)
+    placed = dataclasses.replace(load_placement(platform_file, config).settings, **{"concurrency": 1, **settings})
     resets = [
         SpaceReset(_provisioner(client, config, placed, ticker, tmp_path / f"{label}.jsonl", label), now=ticker.clock)
         for label in SPACE_LABELS[:COUNT]

@@ -190,7 +190,7 @@ class TransferLog:
         is this host's epoch clock, the one the run's window is on."""
         if not 1 <= page_limit <= PAGE_LIMIT or max_listed < 1:
             raise ValueError(f"a page holds 1 to {PAGE_LIMIT} ids and the listing's bound is at least one")
-        self._client, self._provisioner, self._providers, self._probe = client, provisioner, list(providers), probe
+        self._client, self._provisioner, self._providers, self._run_probe = client, provisioner, list(providers), probe
         self._page_limit, self._max_listed, self._sleep, self._now = page_limit, max_listed, sleep, now
         self._pages = 0
         self._offsets: dict[str, list[float | None]] = {}  # provider -> each listing answer's clock offset, or None
@@ -200,10 +200,19 @@ class TransferLog:
         self._deadline = math.inf  # the walk's deadline, on the provisioner's clock (`deadline_at`)
         self._durations: list[float] = []  # each observation's seconds, on the provisioner's clock
 
+    def _probe(self, read: Callable[[], Any]) -> Probed:
+        """`read` through the probes' own probe, each attempt sent only while the walk is within its deadline
+        (`require_time`, which raises WalkDeadline past it and so ends the walk)."""
+
+        def within() -> Any:
+            require_time(self._provisioner, self._deadline)
+            return read()
+
+        return self._run_probe(within)
+
     def _dated_page(self, path: str, provider: str, params: Mapping[str, Any]) -> Any:
         """Read one page of a provider's listing and keep the provider's system-clock offset its Date header gives, a
         diagnostic, since a job's times are on the global clock."""
-        require_time(self._provisioner, self._deadline)
         answer, date = self._client.get_dated(path, provider=provider, params=params, retry=ONE_ATTEMPT)
         self._offsets.setdefault(provider, []).append(offset_of(date, self._now()))
         return answer
@@ -212,7 +221,6 @@ class TransferLog:
         """Read Onezone's public current-time endpoint and keep the global clock's offset from this host, the clock a
         job's times are stamped on, with half the round trip as its uncertainty, or None when the answer cannot be read
         (the clock is then unknown)."""
-        require_time(self._provisioner, self._deadline)
         sent = self._now()
         answer, date = self._client.get_dated(ZONE_TIME_PATH, retry=ONE_ATTEMPT, anonymous=True)
         self._zone.append(zone_clock_of(answer, date, sent, self._now()))
@@ -237,12 +245,7 @@ class TransferLog:
 
     def _record(self, provider: str, tid: str) -> Any:
         """Read one job's record on a provider through the probe; raise Unreadable when it fails."""
-
-        def read() -> Any:
-            require_time(self._provisioner, self._deadline)
-            return self._client.get(f"/transfers/{tid}", provider=provider, retry=ONE_ATTEMPT)
-
-        found = self._probe(read)
+        found = self._probe(lambda: self._client.get(f"/transfers/{tid}", provider=provider, retry=ONE_ATTEMPT))
         if not found.ok:
             raise Unreadable(f"a transfer's record could not be read: {found.error}")
         return found.value
