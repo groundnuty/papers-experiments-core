@@ -133,6 +133,9 @@ def render(action: Any, site: SiteConfig, evidence: Path, ledger: Path, digest: 
     if kind == "Prepare":
         if site.prepare is None or site.settings.prepare_timeout_s is None:
             raise ValueError(f"site {site.label} declares no prepare command")
+        if fleetcompose.is_compose(site):
+            argv = fleetcompose.prepare_argv(site, action.member, site.settings.prepare_timeout_s, site.prepare)
+            return Rendered("site", (tuple(argv),))
         words = ("run", "--fleet", str(site.fleet), "--member", action.member, "--timeout",
                  repr(float(site.settings.prepare_timeout_s)), "--", *site.prepare)  # fmt: skip
         return Rendered("site", (tuple(site.script("fleetprepare.py", *words)),))
@@ -206,8 +209,11 @@ def retire_compose(action: Any, site: SiteConfig, into: Path, digest: str) -> Re
     from expcore.campaign.elastic.control import ledger_label
 
     label = action.label or ledger_label(site.label, action.member)
-    steps: List[Tuple[str, ...]] = [tuple(fleetcompose.stop_argv(site, action.member))]
-    places: List[str] = [SITE]
+    steps: List[Tuple[str, ...]] = []
+    if getattr(action, "abort_prepare", False):  # a prepare found started and never ended: ended before anything
+        steps.append(tuple(fleetcompose.abort_argv(site, action.member)))
+    steps.append(tuple(fleetcompose.stop_argv(site, action.member)))
+    places: List[str] = [SITE] * len(steps)
     if action.collect:
         there = site.fleet / COLLECTED / action.member
         steps.append(tuple(fleetcompose.collect_argv(site, action.root, str(there))))
@@ -222,7 +228,9 @@ def retire_compose(action: Any, site: SiteConfig, into: Path, digest: str) -> Re
         steps.append((sys.executable, "-I", "-B", str(HERE / "shards.py"), "verify-copy", str(into / ARCHIVES_MANIFEST),
                       str(into), "--manifest-sha256", digest))  # fmt: skip
         places.append(HERE_PLACE)
-    steps.append(tuple(fleetcompose.retired_argv(site, action.member, label, getattr(action, "drained", False))))
+    # a drained member, and one retired before it ever joined (its prepare failed, say), stay out until `undrain`
+    lasting = getattr(action, "drained", False) or action.label is None
+    steps.append(tuple(fleetcompose.retired_argv(site, action.member, label, lasting)))
     return Rendered("site", tuple(steps), places=(*places, SITE))
 
 

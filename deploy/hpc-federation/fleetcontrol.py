@@ -249,8 +249,6 @@ def compose_of(label: Any, own: Mapping[str, Any], remote: bool, dispatched: boo
         return None
     if not remote or "channel" not in own or not dispatched:
         raise ConfigError(f"site {label}: a Compose site is an ssh site with a channel, and [controller] archives")
-    if "prepare" in own:  # its members read verified once linked, so no prepare would ever be decided: never ignored
-        raise ConfigError(f"site {label}: a Compose site takes no prepare yet (its members have no data to verify)")
     try:
         return fleetcompose.compose_site(str(label), own)
     except ValueError as error:

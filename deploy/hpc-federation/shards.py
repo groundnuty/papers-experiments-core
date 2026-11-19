@@ -647,6 +647,22 @@ def pin_pass_env(plan: Plan, environ: Mapping[str, str] | None = None) -> Plan:
     return replace(plan, pass_env_pins=tuple(pins))
 
 
+def pass_env_from(names: Any, environ: Mapping[str, str] | None = None) -> tuple[tuple[str, str], ...]:
+    """The name and value of each of `names` (a settings file's `pass_env`) from `environ`, the process's own by
+    default: on a site's login node, its site.env's. By this module's name and value rules, so the elastic fleet's
+    identity read and its worker see the variables a shard step's line would carry. `ShardsError` naming the
+    variable, never its value, for a name refused or a variable unset or not a plain word or absolute path."""
+    environ = os.environ if environ is None else environ
+    found = []
+    for name in pass_env_names(list(names or ())):
+        if name not in environ:
+            raise ShardsError(f"pass_env variable {name} is not set in the site's environment")
+        if problem := pass_env_value_problem(name, environ[name]):
+            raise ShardsError(problem)
+        found.append((name, environ[name]))
+    return tuple(found)
+
+
 def pinned_pass_env(plan: Plan) -> tuple[tuple[str, str], ...]:
     """The name and value of each variable the plan declares in `pass_env`, as `pin_pass_env` read them: what a step's
     line carries as `env -i` words (`step_argv`) and what each program that builds the study's plugin at plan time is

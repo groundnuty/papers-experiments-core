@@ -3,10 +3,12 @@ EXACT step id through `squeue -s` and `sacct`, never the state file's word for i
 writes. Over a small fake of the two read commands; no cluster, no node, no step is made."""
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
-from hpc_fed_support import hpc_on_path
+from hpc_fed_support import HPC, hpc_on_path
 
 NODE = "node-private-07"  # a node's name as the state holds it: never in a reading
 FEDERATION = "fedx-3f9a"
@@ -362,3 +364,19 @@ def test_o86_the_module_holds_no_command_that_writes(hpc):
     source = Path(hpc.observe.__file__).read_text(encoding="utf-8")
     for word in ("sbatch", "scancel", "srun", "scontrol", ".save(", "hpcstate.save", "StateStore", "update("):
         assert word not in source, word
+
+
+def test_o86_the_script_runs_under_an_isolated_interpreter(tmp_path):
+    """O86: `python -I -B hpcobserve.py` finds its own modules. `-I` leaves the script's directory out of sys.path, so
+    without the script's own path entry it died on `import hpcslurm` and a watch read every service as unknown."""
+    done = subprocess.run(
+        [sys.executable, "-I", "-B", str(HPC / "hpcobserve.py"), "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=tmp_path,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "ModuleNotFoundError" not in done.stderr
+    assert "--root" in done.stdout
