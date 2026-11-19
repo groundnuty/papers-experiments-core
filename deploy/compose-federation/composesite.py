@@ -171,7 +171,7 @@ def workers_on(root: Path) -> list[int]:
     """Every process of this user that is a Compose worker's on the root, of any campaign: its environment carries a
     worker tag and the root (`worker_env`). What a launch reads where the root holds no claim (C53): a worker
     launched before claims existed holds none."""
-    tag, here = f"{WORKER_TAG}=".encode(), f"EXPCORE_FED_ROOT={root}".encode()
+    tag, key, here = os.fsencode(f"{WORKER_TAG}="), b"EXPCORE_FED_ROOT=", os.path.realpath(root)
     found = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -182,7 +182,8 @@ def workers_on(root: Path) -> list[int]:
             words = (entry / "environ").read_bytes().split(b"\0")
         except OSError:
             continue
-        if here in words and any(word.startswith(tag) for word in words):
+        roots = [os.path.realpath(os.fsdecode(word[len(key) :])) for word in words if word.startswith(key)]
+        if here in roots and any(word.startswith(tag) for word in words):  # however the root was spelled there
             found.append(int(entry.name))
     return found
 

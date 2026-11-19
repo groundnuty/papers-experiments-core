@@ -91,10 +91,22 @@ def sharing_of(table: Mapping[str, Any], site_files: Mapping[str, Any], dispatch
     for label, value in site_files.items():
         if not isinstance(value, str) or not os.path.isabs(value):
             raise ValueError(f"site {label}: shared_site_file must be an absolute path on this host")
-        files[label] = Path(os.path.realpath(value))  # one lock file whatever link names it
+        files[label] = _resolved(value, f"site {label}: shared_site_file")  # one lock whatever link names it
     if len({os.path.realpath(p) for p in files.values()}) != len(files):
         raise ValueError("two sites name one shared_site_file: each site's file is its own")
     return Sharing(siblings, dict(caps), defer, files)
+
+
+def _resolved(value: str, what: str) -> Path:
+    """The file's real path: of the file (through any link), or of its directory while it is not made yet. ValueError
+    when it cannot be resolved (a link that leads nowhere, a directory that is not there)."""
+    path = Path(value)
+    try:
+        if path.is_symlink() or path.exists():
+            return Path(os.path.realpath(path, strict=True))
+        return Path(os.path.realpath(path.parent, strict=True)) / path.name
+    except OSError:
+        raise ValueError(f"{what} cannot be resolved to a file on this host") from None
 
 
 def check_ledger(sharing: Optional[Sharing], ledger: Path) -> None:

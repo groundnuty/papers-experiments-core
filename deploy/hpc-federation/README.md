@@ -1847,7 +1847,9 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
     dark site keeps its last entry; a controller gone for good keeps counting until its operator removes its entry.
     Every controller of a file runs on this host (the lock is a local `flock`).
   A Compose federation serves one campaign's worker at a time (`deploy/compose-federation/rootclaim.py`): a member one
-  campaign retired joins whichever campaign takes it first (priority permitting), as that campaign's own member.
+  campaign retired joins whichever campaign takes it first (priority permitting), as that campaign's own member. The
+  hand-off is one way: a member its campaign retired after a drain (an idle retirement is one) stays out of that
+  campaign until its operator's `composesite.py undrain`, while another campaign may take it at once.
   None of these keys: the controller decides and logs exactly as before.
 
 ## The elastic fleet's worker (`fleetworker.py`, `fleetidentity.py`)
