@@ -1682,6 +1682,15 @@ Stop the run's collector after the agent's cell and before `finish_instruments`,
 
 What you get, with nothing else to call: once one analysed record carries the `egress` instrument, `analyze` judges every analysed run, flagged for an outside connection, an unknown log or a static-scan hit, and runs the preregistered analysis again without the flagged runs. `report.md` gains a section `## Egress (detected, not prevented)` listing them, by condition and run, with that sensitivity analysis in the tables of the primary one (a preregistration with several named Holm families or declared equivalence families gets each family's table and steps there too, and its terminal lines name each contrast's family); `analysis.json` gains `egress`, whose sensitivity analysis holds `holm_families` and `equivalence_families` as the primary analysis does; `analyze` prints a line per contrast. **A run whose log is missing or damaged, or whose record has no egress snapshot, is flagged as unknown, never counted clean.** A report without the section is a batch in which no run carried the instrument: egress was not checked, which is right on Docker hosts, whose agents have no route out, and wrong on HPC. What each field and reason means is in [`interfaces.md`](interfaces.md#egress-where-it-cannot-be-blocked-the-egress-instrument).
 
+**If your agents install packages, declare the indexes they install from** (O95). Without a declaration a `pip install` is a static-scan hit and flags the run. In campaign.toml:
+
+```toml
+[egress]
+package_indexes = ["files.pythonhosted.org", "pypi.org"]
+```
+
+A plain install from those indexes, and an http(s) URL on exactly one of their hosts, are then counted in a class of their own, `package_index`, which flags nothing, so the reruns keep such a run. An install that names another index, a requirements file, a path, a URL or a VCS requirement still flags, as do curl, wget, git clone, conda, every other URL, every network call and every outside connection in the egress log. The list is in the campaign fingerprint, so declare it before the campaign's first start: adding or changing it later is another experiment. `analyze` reads it from the fingerprint the stores recorded, never from the file.
+
 Report the primary analysis as it stands and the sensitivity analysis beside it. Neither line of detection prevents egress, and both can be passed: a statically linked program, raw system calls or io_uring pass the shim, and code that builds a name at run time passes the scan.
 
 **Run nothing else of your account on a sandbox node while runs are live: no interactive login and no other job step.** A process of your user outside the cells is outside every check: the egress shim is loaded only in the cells, and the mount guard proves only the cells, so such a process could connect anywhere, or read oneclient's environment, which holds the token, without a line in either log.

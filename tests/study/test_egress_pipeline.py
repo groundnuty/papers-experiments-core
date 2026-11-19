@@ -54,9 +54,12 @@ class _StubLog:
 '''  # fmt: skip
 
 
-def prepared(tmp_path: Path, *, egress: bool) -> Path:
+def prepared(tmp_path: Path, *, egress: bool, campaign_text: str = "") -> Path:
     study = tmp_path / "study"
     shutil.copytree(EXAMPLE, study, ignore=shutil.ignore_patterns("out", "__pycache__"))
+    if campaign_text:
+        campaign = study / "campaign.toml"
+        campaign.write_text(campaign.read_text("utf-8") + campaign_text, "utf-8")
     if egress:
         declared = study / "preregistration.toml"  # a batch the egress check covers declares its rerun (S19)
         declared.write_text(declared.read_text("utf-8") + '\n[sensitivity]\nreruns = ["egress"]\n', "utf-8")
@@ -71,8 +74,8 @@ def prepared(tmp_path: Path, *, egress: bool) -> Path:
     return study
 
 
-def checked_study(tmp_path, environment, *, egress: bool):
-    study = prepared(tmp_path, egress=egress)
+def checked_study(tmp_path, environment, *, egress: bool, campaign_text: str = ""):
+    study = prepared(tmp_path, egress=egress, campaign_text=campaign_text)
     code, stderr = cli(environment, "check", str(study / "out" / "runs"), process=True)
     assert code == 0, stderr
     return analyse_study(study)
@@ -122,3 +125,15 @@ def test_a_study_without_the_egress_instrument_has_no_egress_anywhere(tmp_path, 
     assert analysis.egress is None
     assert "egress" not in json.loads(made[ANALYSIS_FILE])
     assert b"Egress" not in made[REPORT_FILE]
+
+
+def test_o95_declared_package_indexes_reach_the_verdicts_from_the_recorded_fingerprint(tmp_path, clean_environment):
+    """O95: campaign.toml's [egress] package_indexes is in the campaign fingerprint the stores record, the analysis
+    judges under it, and an outside connection and an unknown log still flag."""
+    analysed = checked_study(
+        tmp_path, clean_environment, egress=True, campaign_text='\n[egress]\npackage_indexes = ["pypi.org"]\n'
+    )
+    assert analysed.egress.package_indexes == ("pypi.org",)
+    assert {("outside",), ("log_unknown",)} <= {run.flags for run in analysed.egress.runs}
+    summary = json.loads(output_bytes(analysed)[ANALYSIS_FILE])["egress"]
+    assert (summary["package_indexes"], summary["counts"]["package_index"]) == (["pypi.org"], 0)

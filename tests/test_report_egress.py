@@ -342,3 +342,20 @@ def test_s17_a_flat_family_sensitivity_analysis_keeps_its_analysis_json_keys():
     """S17: one flat family, and no equivalence family, gives the sensitivity analysis the keys it had before families
     were named: `left_out`, `contrasts`, `holm`."""
     assert list(_egress_summary(checked())["sensitivity"]) == ["left_out", "contrasts", "holm"]
+
+
+def test_o95_under_declared_package_indexes_the_report_summary_and_analysis_json_count_their_runs():
+    """O95: k4's only hit is a declared index's install; it is counted in its own class and is not a flagged run."""
+    hit = {"cell": 0, "kind": "package_index", "what": "pip install", "flag": False}
+    scan = {**SCAN_CLEAN, "hits": [hit], "package_indexes": ["pypi.org"], "package_index": 1}
+    egress = checked(runs=(*checked().runs[:3], verdict("k4", scan=scan)), package_indexes=("pypi.org",))
+    result = analysis(contrast("a-vs-b", "difference"))
+    report = render(result, egress=egress)
+    assert "3 of 4 analysed run(s) flagged" in report
+    assert "1 analysed run(s) installed from or named the declared package indexes (pypi.org)" in report
+    assert "egress: 3 of 4 analysed run(s) flagged (1 outside, 1 unknown log, 1 static scan); 1 package-index run(s)" \
+        in "\n".join(summary_lines(result, egress))  # fmt: skip
+    summary = _egress_summary(egress)
+    assert (summary["counts"]["package_index"], summary["package_indexes"]) == (1, ["pypi.org"])
+    assert "package_index" not in _egress_summary(checked())["counts"]
+    assert "package_indexes" not in _egress_summary(checked())

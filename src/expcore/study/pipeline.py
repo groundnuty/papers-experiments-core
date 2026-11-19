@@ -114,6 +114,7 @@ from expcore.campaign.storecopy import StoreChanged
 from expcore.config.key_locations import withheld_entry, withhold_key_locations
 from expcore.config.models import ModelSpec
 from expcore.config.platform_loads import watching_platform_loads
+from expcore.egress.package_index import recorded_package_indexes
 from expcore.egress.sensitivity import EgressAnalysis, egress_analysis
 from expcore.errors import study_kinds
 from expcore.guards import READ_LOG, GuardsAnalysis, guards_analysis
@@ -1066,6 +1067,10 @@ def _analyse_loaded(
     # the data path of each level of `data_path`, as every snapshot's campaign fingerprint records it; none when the
     # snapshots disagree, so a run the guard might not apply to is then left unknown (O75)
     data_paths = recorded_paths[0] if recorded_paths and all(p == recorded_paths[0] for p in recorded_paths) else None
+    # the package indexes the campaign declared, as every snapshot's fingerprint records them; none when they disagree,
+    # so every install then flags as it would without them (O95)
+    indexes = [recorded_package_indexes(fingerprint) for fingerprint in fingerprints]
+    package_indexes = indexes[0] if indexes and all(i == indexes[0] for i in indexes) else ()
     loaded = load_analysis_plugin(StudyContext(study, code))  # the one place a `build_analysis` is built (R17)
     plugin = loaded.plugin
     rescored = None
@@ -1099,7 +1104,7 @@ def _analyse_loaded(
         result = analyse(rows, study.prereg, absent)
     except ContrastRefused as error:  # a treatment attempt's None (S10), a failed run's None numerator (S13)
         raise Refused(str(error)) from None
-    egress = egress_analysis(runs, rows, absent, study.prereg)  # None for a batch not checked for egress (#179)
+    egress = egress_analysis(runs, rows, absent, study.prereg, package_indexes=package_indexes)  # None: not checked
     guard = mount_guard_analysis(runs, rows, absent, study.prereg, data_paths, study.data_path_factor)  # O75
     seen = visibility_analysis(runs, rows, absent, study.prereg)  # None for a batch not watched for hidden processes
     scanned = read_log_analysis(runs, rows, absent, study.prereg)  # None for a batch with no `read_log` record (S20)
@@ -1296,7 +1301,7 @@ def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
     """What `analysis.json` holds of a batch checked for egress (#179): each analysed run's verdict (its flags, its
     log's state and reasons, its outside destinations by address and port, its static-scan hits) and the sensitivity
     analysis without the flagged runs (its Holm decisions and, as the primary analysis's, its named and equivalence
-    families, S17 and S18), or why there is none."""
+    families, S17 and S18), or why there is none; and the package indexes the campaign declared, when it did (O95)."""
     sensitivity = egress.sensitivity
     return {
         "counts": egress.counts(),
@@ -1320,7 +1325,7 @@ def _egress_summary(egress: EgressAnalysis) -> dict[str, Any]:
         else {"left_out": [run.run_key for run in egress.flagged], "contrasts": sensitivity.contrasts,
               **_holm_entries(sensitivity)},
         "sensitivity_refused": egress.refused,
-    }  # fmt: skip
+    } | ({"package_indexes": list(egress.package_indexes)} if egress.package_indexes else {})  # fmt: skip
 
 
 def _mount_guard_summary(guard: MountGuardAnalysis) -> dict[str, Any]:
