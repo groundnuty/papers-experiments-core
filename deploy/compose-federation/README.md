@@ -80,9 +80,9 @@ federations on one host: project `<project>-K` (its network `<project>-K_fed`), 
 refused). Without `EXPCORE_FED_ROOT` its root is `<parent>/<project>-K`, beside the others. Give every command of one
 federation the same `--layout` and `--instance`. The default layout's three instances publish 29443-29446,
 29453-29456 and 29463-29466 on the loopback, clear of a fleet front on 29440. `memory_limit` stays a layout key: it is
-deploy-only, in no fingerprint. The main study's VM layout sets `memory_limit = "13g"` (a provider's measured peak
-under the study's reads plus 30%), two federations per 32-core, 110 GiB VM. The roots' location is the host's
-(`EXPCORE_FED_ROOT_PARENT`): a data volume where there is one, else the root disk.
+deploy-only, in no fingerprint. The main study's VM layout sets `memory_limit = "16g"` (a provider's measured peak
+under the study's reads, page cache and shared memory included, with room), two federations per 32-core, 110 GiB VM.
+The roots' location is the host's (`EXPCORE_FED_ROOT_PARENT`): a data volume where there is one, else the root disk.
 
 **The host's shared CA.** The CA's SHA-256 is in the campaign fingerprint (`[tls] ca_file`'s record), and the elastic
 ledger refuses a federation whose fingerprint is not the campaign's, so federations that each made their own CA (what
@@ -90,6 +90,17 @@ ledger refuses a federation whose fingerprint is not the campaign's, so federati
 the directory `EXPCORE_FED_CA_DIR` names (0700, outside every root; never replaced), and every `up` with the variable
 set copies its certificate into the root and signs the root's certificates with its key, which stays in that
 directory. A root that holds another CA is refused: take it down and up again.
+
+**One CA per study, on every host.** Hosts whose federations should be one declared identity (the same template, the
+same agent image id) need the same CA too: make it once (`federation.py ca` on the first host), then copy that
+directory's two files to each other host's `EXPCORE_FED_CA_DIR` over ssh stdin (a 0700 directory, both files 0600,
+never into a root) instead of running `ca` there. It is a test CA of the study's own, valid 30 days; nothing else
+trusts it.
+
+```sh
+ssh first 'tar -C "$EXPCORE_FED_CA_DIR" -cf - federation-ca.pem ca.key' | \
+  ssh other 'umask 077 && mkdir -p "$DIR" && tar -C "$DIR" -xf - && chmod 600 "$DIR"/*'   # DIR: other's EXPCORE_FED_CA_DIR
+```
 
 **The template's project names.** `@compose_project@`, `@compose_network@`, `@zone_domain@` and
 `@provider_domain.<name>@` fill a template's `[sandbox.federation]` (`network`, `zone`, `providers.<local>`) and
