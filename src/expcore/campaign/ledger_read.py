@@ -63,6 +63,7 @@ class LeaseRow:
     charge_micro: int
     completion: Mapping[str, Any] | None
     proven: bool = False  # its federation's job is proven ended
+    platform: str | None = None  # the platform its federation joined on, when the campaign declares its set (C50)
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,7 @@ class LedgerFacts:
     locked_micro: int = 0  # what unsettled leases hold as their grants (`elastic.records.Status.locked_micro`)
     contradicted: frozenset[int] = frozenset()  # leases whose settlement later evidence showed too low
     declarations: tuple[Declaration, ...] | None = None  # the declaration log (C48); None: a ledger made before it
+    environments: Mapping[str, str] = field(default_factory=dict)  # each declared platform's pinned environment (C50)
 
     def unsettled(self, run_key: str) -> list[LeaseRow]:
         """The run's leases in flight, expired, reported or lost that no settlement gave its charged attempts: any of
@@ -159,19 +161,24 @@ def read_ledger(data: bytes, sha256: str, where: object = LEDGER_SNAPSHOT) -> Le
             config = LedgerConfig.from_json(meta["config"])
             runs = {row["run_key"]: _run_row(row) for row in db.execute("SELECT * FROM runs ORDER BY seq")}
             leases = {row["id"]: _lease_row(row) for row in db.execute("SELECT * FROM leases ORDER BY id")}
+            joined_on = _platforms(db)
             events = [dict(row) for row in db.execute("SELECT * FROM events ORDER BY seq")]
             views = _Views(db, config)  # the ledger's own reads of its money and settlements, over the snapshot
             in_force, settled, locked = views.ceilings(), views.settlements(), views.status().locked_micro
             logged = views.declaration_log()
+            environments = views.platform_environments()
             proven = {lease.lease_id for lease in views.leases() if lease.proven}
         except (sqlite3.Error, KeyError, TypeError, ValueError) as error:
             raise LedgerRefused(f"{where}: cannot read the ledger ({type(error).__name__}: {error})") from None
     finally:
         db.close()
-    leases = {key: replace(lease, proven=key in proven) for key, lease in leases.items()}
+    leases = {
+        key: replace(lease, proven=key in proven, platform=joined_on.get(lease.federation))
+        for key, lease in leases.items()
+    }
     by_lease = {settlement.lease_id: settlement for settlement in settled}
     facts = LedgerFacts(sha256, config, meta.get("environment"), runs, leases, in_force, by_lease, locked)
-    facts = replace(facts, declarations=None if logged is None else tuple(logged))
+    facts = replace(facts, declarations=None if logged is None else tuple(logged), environments=environments)
     _replay(facts, events, where)
     low = frozenset(e["lease_id"] for e in events if e["kind"] in ("settle_contradicted", "cap_failed"))
     return replace(facts, contradicted=low)
@@ -183,6 +190,13 @@ class _Views(LedgerViews):
     def __init__(self, db: sqlite3.Connection, config: LedgerConfig) -> None:
         self.db = db
         self.config = config
+
+
+def _platforms(db: sqlite3.Connection) -> dict[str, str]:
+    """Each federation's platform as it joined on it (C50); none in a ledger made before the table or declaring none."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='federation_platforms'").fetchone():
+        return {}
+    return {row["label"]: row["platform"] for row in db.execute("SELECT label, platform FROM federation_platforms")}
 
 
 def _run_row(row: Any) -> RunRow:

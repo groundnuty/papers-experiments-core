@@ -81,7 +81,14 @@ from expcore.campaign.export import (
     stored_fingerprint_sha256,
     verify_export_fingerprint,
 )
-from expcore.campaign.export_join import FEDERATION_KEY, LOST_KEY_FLAG, SITE_KEY, by_run_export, join_exports
+from expcore.campaign.export_join import (
+    FEDERATION_KEY,
+    LOST_KEY_FLAG,
+    PLATFORM_KEY,
+    SITE_KEY,
+    by_run_export,
+    join_exports,
+)
 from expcore.campaign.lease import LeasePool
 from expcore.campaign.lock import CampaignLocked, DispatchLock, LockMissing, LockUnavailable, ReaderLock
 from expcore.campaign.manifest import Manifest, build_fingerprint, fingerprint_sha256, shard_manifest
@@ -154,6 +161,7 @@ from expcore.study.config import (
     shard_budgets_of,
 )
 from expcore.study.core_legacy import earlier_core_fingerprint, earlier_core_hint
+from expcore.study.declared_platforms import campaign_platform, own_sha256, require_declared
 from expcore.study.factory_version import check_factory_version
 from expcore.study.lease_start import lease_start
 from expcore.study.merged_times import timed_export, walls_of
@@ -287,7 +295,7 @@ def fingerprint_of(study: StudyConfig, plugin: StudyPlugin) -> dict[str, Any]:
         tools=plugin.tools,
         scorer_digest=plugin.scorer_digest(),
         configs=study.config_sha256,
-        platform=plugin.platform,
+        platform=campaign_platform(study.campaign.platform_fingerprints, plugin.platform),  # C50: a declared set
         backend_factory=plugin.backend_factory_identity(),
         environment=study_environment(study),
     )
@@ -317,12 +325,23 @@ def campaign_identity(path: str | os.PathLike[str]) -> tuple[dict[str, Any], dic
     federation's `platform.toml`: the campaign fingerprint a start pins (`campaign_fingerprint`) and the environment
     identity its plugin declares, which a lease store pins as `environment_identity` (`lease_start`'s own call). Nothing
     is started and no store is opened."""
+    fingerprint, environment, _ = campaign_member_identity(path)
+    return fingerprint, environment
+
+
+def campaign_member_identity(path: str | os.PathLike[str]) -> tuple[dict[str, Any], dict[str, str], str]:
+    """`campaign_identity` and the SHA-256 of the federation's own platform fingerprint beside them
+    (`declared_platforms.own_sha256`), which a campaign that declares its platforms admits at the join or refuses
+    (C50), and records as the identity each of the federation's runs ran under. A core whose commit is unknown (or
+    whose install is stale) is refused, as a run refuses it: the fingerprint holds the core's identity, so a join on it
+    would take leases no run serves."""
+    require_core("identity", allow_dirty=True)
     study = load_study(path)
     check_study(study)
     with study_kinds(study.kinds):
         code = require_known("run", study.root, study.scope, allow_dirty=False)
         plugin = load_plugin(StudyContext(study, code))
-        return fingerprint_of(study, plugin), _identity_of(study, plugin)
+        return fingerprint_of(study, plugin), _identity_of(study, plugin), own_sha256(plugin.platform)
 
 
 def run_study(
@@ -479,6 +498,8 @@ def _build(
     the study's build, which runs the study's own code (`run_built_study` watches it for platform loaders)."""
     plugin = load_plugin(StudyContext(study, code))
     check_data_path_factor(study, plugin)  # before any run: the platform reads the data path by the study's factor
+    # C50: a campaign that declares its platforms runs on one of them, or not at all
+    require_declared(study.campaign.platform_fingerprints, plugin.platform, study.campaign.source)
     leases = None if plugin.probe is None else LeasePool(out_dir(study) / "leases", plugin.lease_keys, plugin.probe)
     settings = dataclasses.replace(study.campaign.scheduler, exit_when_blocked=True)
     fingerprint = fingerprint_of(study, plugin)  # from the totals, so every shard has the whole plan's fingerprint
@@ -1193,6 +1214,7 @@ def _lost_runs(exhausted: Sequence[Mapping[str, Any]], plan: Manifest) -> dict[s
             "lease_id": entry["lease_id"],
             FEDERATION_KEY: entry["federation"],
             SITE_KEY: entry["site"],
+            **({PLATFORM_KEY: entry[PLATFORM_KEY]} if PLATFORM_KEY in entry else {}),  # C50: a declared platform
             LOST_KEY_FLAG: True,
         }
     return found

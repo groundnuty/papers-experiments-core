@@ -134,8 +134,11 @@ def check_by_run(ledger: LedgerFacts, stores: Sequence[LeaseStore], plan: Manife
             f"{fingerprint_sha256(ordered[0].fingerprint)[:12]}, and the ledger is the one of "
             f"{ledger.config.fingerprint[:12]}"
         )
-    check_environment(ordered)
-    _check_ledger_environment(ordered[0], ledger)
+    if ledger.config.platforms:  # C50: the environment is pinned, and compared, for each declared platform
+        check_platform_environments(ordered, ledger)
+    else:
+        check_environment(ordered)
+        _check_ledger_environment(ordered[0], ledger)
     counted, lost = _counted(ledger, by_lease, plan)
     evidence = _evidence(ledger, by_lease, {store.lease.lease_id for store in counted})
     for store in ordered:
@@ -186,6 +189,25 @@ def _check_ledger_environment(store: LeaseStore, ledger: LedgerFacts) -> None:
             f"{environment_digest(store.environment)[:12]}, and the ledger pinned "
             f"{str(ledger.environment)[:12]} at its first join: another environment than the ledger's"
         )
+
+
+def check_platform_environments(stores: Sequence[LeaseStore], ledger: LedgerFacts) -> None:
+    """3, with declared platforms (C50): the stores of each platform, by the platform their lease's federation joined
+    on, share one environment identity, the one the ledger pinned at the first join on that platform."""
+    groups: dict[str | None, list[LeaseStore]] = {}
+    for store in stores:
+        groups.setdefault(ledger.leases[store.lease.lease_id].platform, []).append(store)
+    for platform, group in sorted(groups.items(), key=lambda item: item[0] or ""):
+        if platform is None or platform not in ledger.config.platforms:
+            raise MergeRefused(f"{group[0].name}: its lease's federation joined on no platform the ledger declares")
+        check_environment(group)
+        pinned = ledger.environments.get(platform)
+        if pinned != environment_digest(group[0].environment):
+            raise MergeRefused(
+                f"{group[0].name}: ran against an environment whose identity has digest "
+                f"{environment_digest(group[0].environment)[:12]}, and the ledger pinned {str(pinned)[:12]} at the "
+                f"first join on its platform {platform[:12]}: another environment than the ledger's for it"
+            )
 
 
 def require_records(stores: Sequence[LeaseStore], records: Mapping[str, int | None]) -> None:

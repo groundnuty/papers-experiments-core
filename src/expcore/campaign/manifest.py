@@ -152,6 +152,12 @@ def _plain(label: str, value: Any) -> Any:
     return value
 
 
+def plain(label: str, value: Any) -> Any:
+    """A fingerprint section as plain data, as `build_fingerprint` holds it (a mapping of any kind a dict, a tuple a
+    list); PlanError naming `label` for what is not plain data."""
+    return _plain(label, value)
+
+
 def build_fingerprint(
     schema: FactorSchema,
     *,

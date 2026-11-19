@@ -9,6 +9,7 @@ import os
 import socket
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,8 +26,20 @@ MEMORY_FILES = {  # each figure's file under cgroup v2, then under v1
     "current": ("memory.current", "memory/memory.usage_in_bytes"),
     "max": ("memory.max", "memory/memory.limit_in_bytes"),
 }
+ENGINE_ENV = "EXPCORE_FED_ENGINE"  # the container engine's command; Docker's by default
+ENGINES = ("docker", "podman")  # podman has Docker's CLI and is accepted, but only docker is tested
 EXEC_TIMEOUT_S = 20.0  # a wedged service must not hang down, which reads the peaks before it stops anything
 MEMINFO = Path("/proc/meminfo")
+
+
+def engine(environ: Mapping[str, str] | None = None) -> str:
+    """The container engine's command, from `EXPCORE_FED_ENGINE` (default `docker`): every call this deploy makes to
+    the engine names it through here, so an engine with Docker's CLI replaces it in one setting. RuntimeError for one
+    that is not in `ENGINES`."""
+    value = (os.environ if environ is None else environ).get(ENGINE_ENV, "docker")
+    if value not in ENGINES:
+        raise RuntimeError(f"{ENGINE_ENV} must be one of {', '.join(ENGINES)}")
+    return value
 
 
 def gib(value: int | None) -> str:
@@ -62,18 +75,18 @@ def compose(layout: Layout, *args: str, capture: bool = False) -> str:
         file.write(render(layout.spec))
         file.flush()
         command = [
-            "docker", "compose", "--file", file.name, "--project-directory", str(HERE), "--project-name", project,
+            engine(), "compose", "--file", file.name, "--project-directory", str(HERE), "--project-name", project,
             *args,
         ]  # fmt: skip
         done = subprocess.run(command, env=env, check=False, capture_output=capture, text=True)
     if done.returncode != 0:
-        raise RuntimeError(f"docker compose {args[0]} failed with status {done.returncode}")
+        raise RuntimeError(f"{engine()} compose {args[0]} failed with status {done.returncode}")
     return done.stdout if capture else ""
 
 
 def docker_lines(*args: str) -> list[str]:
     """Run a read-only docker command and return its non-empty output lines."""
-    done = subprocess.run(["docker", *args], check=True, capture_output=True, text=True)
+    done = subprocess.run([engine(), *args], check=True, capture_output=True, text=True)
     return [line for line in done.stdout.splitlines() if line.strip()]
 
 
@@ -132,7 +145,7 @@ def require_own(layout: Layout, containers: list[Container], networks: list[Netw
 def require_images() -> None:
     """Both pinned images must already be present: nothing is ever pulled."""
     for image in IMAGES:
-        if subprocess.run(["docker", "image", "inspect", image], capture_output=True, check=False).returncode != 0:
+        if subprocess.run([engine(), "image", "inspect", image], capture_output=True, check=False).returncode != 0:
             raise RuntimeError(f"the image {image} is not present; it is never pulled here")
 
 
@@ -173,7 +186,7 @@ def cgroup_value(container: str, name: str) -> int | None:
     """One memory figure of a running container's own cgroup, in bytes, or None when it cannot be read in time."""
     try:
         done = subprocess.run(
-            ["docker", "exec", container, "cat", f"{CGROUP}/{name}"],
+            [engine(), "exec", container, "cat", f"{CGROUP}/{name}"],
             capture_output=True,
             text=True,
             check=False,

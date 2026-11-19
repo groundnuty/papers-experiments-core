@@ -34,6 +34,7 @@ from expcore.campaign.shard import MERGE_FILE
 _DOCUMENT_KEYS = {"schema", "fingerprint", "rule", "environment_identity", "ledger_sha256", "runs", "leases"}
 _DOCUMENT_KEYS |= {"evidence", "spend", "exhausted"}
 DECLARATIONS_KEY = "declarations"  # the ledger's declaration log (C48), in a merge of a ledger that keeps one
+PLATFORM_ENVIRONMENTS_KEY = "platform_environments"  # each declared platform's pinned environment digest (C50)
 
 
 # --- merge.json -----------------------------------------------------------------------------------------------------
@@ -45,6 +46,8 @@ def by_run_document(merged: ByRun) -> dict[str, Any]:
     totals = spend_micro(ledger, merged.counted, merged.evidence)
     settled = set(ledger.settlements)
     logged = {} if ledger.declarations is None else {DECLARATIONS_KEY: [_declared(d) for d in ledger.declarations]}
+    if ledger.config.platforms:  # C50: every platform's environment, as the ledger pinned it
+        logged[PLATFORM_ENVIRONMENTS_KEY] = dict(sorted(ledger.environments.items()))
     return {
         **logged,
         "schema": MERGE_BY_RUN_SCHEMA,
@@ -93,8 +96,14 @@ def _exhausted(lost: LostRun) -> dict[str, Any]:
         "lease_id": last.lease_id,
         "federation": last.federation,
         "site": last.site,
+        **_platform(last),
         "reasons": [_why_ended(lease) for lease in lost.leases],
     }
+
+
+def _platform(row: LeaseRow) -> dict[str, str]:
+    """The platform a lease's federation joined on (C50), as `platform`; nothing when the campaign declares none."""
+    return {} if row.platform is None else {"platform": row.platform}
 
 
 def _why_ended(lease: LeaseRow) -> str:
@@ -121,6 +130,7 @@ def _entry(row: LeaseRow, store: LeaseStore | None, settled: set[int]) -> dict[s
         "run_key": row.run_key,
         "federation": row.federation,
         "site": row.site,
+        **_platform(row),
         "started_utc": None if store is None else store.started_utc,
         "snapshot_sha256": None if store is None else store.snapshot_sha256,
         "spend_usd": usd_of(row.charge_micro),
@@ -143,7 +153,7 @@ def read_by_run(raw: bytes, where: object) -> dict[str, Any]:
     if (
         not isinstance(document, dict)
         or document.get("schema") != MERGE_BY_RUN_SCHEMA
-        or set(document) - {DECLARATIONS_KEY} != _DOCUMENT_KEYS
+        or set(document) - {DECLARATIONS_KEY, PLATFORM_ENVIRONMENTS_KEY} != _DOCUMENT_KEYS
     ):
         raise MergeRefused(f"{where}: not an {MERGE_BY_RUN_SCHEMA} merge file")
     logged = document.get(DECLARATIONS_KEY, [])

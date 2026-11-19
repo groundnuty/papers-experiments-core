@@ -108,6 +108,8 @@ class LedgerConfig:
     - `max_usd`, `per_model_usd`: the budget and the models' ceilings; None: no budget. `grants_usd`: each model's grant
       (`lease_grant_usd`), required for every planned model when there is a budget.
     - `stale_s`, `site_out_s`: how long a counter may be read unchanged, and how long a site may go unread.
+    - `platforms`: the platform fingerprints campaign.toml declares (C50), sorted; a federation joins on one of them.
+      Empty: none declared, and the configuration's text is what it was before the field.
     """
 
     fingerprint: str
@@ -120,6 +122,7 @@ class LedgerConfig:
     grants_usd: Mapping[str, float] = field(default_factory=dict)
     stale_s: float = STALE_S
     site_out_s: float = SITE_OUT_S
+    platforms: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.fingerprint, str) or not _HEX64.fullmatch(self.fingerprint):
@@ -139,6 +142,12 @@ class LedgerConfig:
             values = getattr(self, name)
             checked = {_name(name, m): _dollars(f"{name}[{m}]", v) for m, v in values.items()}
             object.__setattr__(self, name, MappingProxyType(checked))
+        platforms = tuple(sorted(self.platforms))
+        if not all(isinstance(p, str) and _HEX64.fullmatch(p) for p in platforms) or len(set(platforms)) != len(
+            platforms
+        ):
+            raise ValueError("platforms must be distinct platform fingerprints' SHA-256, 64 lower-case hex digits each")
+        object.__setattr__(self, "platforms", platforms)
 
     def grant_micro(self, model: str) -> int:
         """A model's grant in micro-dollars; 0 without a budget, or for a model granted nothing."""
@@ -146,11 +155,20 @@ class LedgerConfig:
 
     def to_json(self) -> str:
         values = {f.name: getattr(self, f.name) for f in fields(self)}
-        return json.dumps({k: dict(v) if isinstance(v, Mapping) else v for k, v in values.items()}, sort_keys=True)
+        if not self.platforms:  # C50: a ledger that declares none pins the text it did before the field
+            del values["platforms"]
+        return json.dumps(
+            {
+                k: dict(v) if isinstance(v, Mapping) else list(v) if isinstance(v, tuple) else v
+                for k, v in values.items()
+            },
+            sort_keys=True,
+        )
 
     @classmethod
     def from_json(cls, text: str) -> "LedgerConfig":
-        return cls(**json.loads(text))
+        values = json.loads(text)
+        return cls(**{**values, "platforms": tuple(values.get("platforms", ()))})
 
 
 def check_plan(runs: Sequence[LedgerRun], config: LedgerConfig) -> None:

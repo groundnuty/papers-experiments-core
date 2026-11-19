@@ -25,7 +25,7 @@ import os
 import re
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -312,6 +312,37 @@ def load_spec(path: Path | None = None) -> Spec:
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise LayoutError(f"{path}: is not a TOML file ({error})") from None
     return _spec(_Reader(path), data, path, hashlib.sha256(raw).hexdigest())
+
+
+INSTANCE_STRIDE = 10  # each instance's ports lie this far above the one before it's
+MAX_INSTANCE = 9
+
+
+def instance(spec: Spec, number: int) -> Spec:
+    """Instance `number` (1 to `MAX_INSTANCE`) of a layout, for several federations of one layout on one host, each its
+    own Compose project, network, domain and ports (and root, `fedlayout.root_from_environment`): project
+    `<project>-<n>`, domain `f<n>.<domain>`, every port `INSTANCE_STRIDE` higher for each instance before it, so
+    instance 1 keeps the layout's ports. The layout file, its digest and its platform template are the same for every
+    instance, so their platform files render alike (the fingerprint holds no name, port or address). A layout whose
+    ports span `INSTANCE_STRIDE` or more is refused: its instances' ports would meet."""
+    where = f"{spec.source}: --instance"
+    if isinstance(number, bool) or not isinstance(number, int) or not 1 <= number <= MAX_INSTANCE:
+        raise LayoutError(f"{where} must be a whole number from 1 to {MAX_INSTANCE}")
+    ports = [service.port for service in spec.services]
+    if max(ports) - min(ports) >= INSTANCE_STRIDE:
+        raise LayoutError(f"{where}: the layout's ports span {INSTANCE_STRIDE} or more, so its instances' would meet")
+    shift = INSTANCE_STRIDE * (number - 1)
+    if max(ports) + shift > PORTS[1]:
+        raise LayoutError(f"{where}: instance {number}'s ports would pass {PORTS[1]}")
+    project, domain = f"{spec.project}-{number}", f"f{number}.{spec.domain}"
+    if not PROJECT_NAME.fullmatch(project) or not DOMAIN_NAME.fullmatch(domain) or len(domain) > 200:
+        raise LayoutError(f"{where}: instance {number}'s project or domain is not one Compose and DNS take")
+
+    def moved(service: Service) -> Service:
+        return replace(service, port=service.port + shift, federation_domain=domain)
+
+    return replace(spec, project=project, domain=domain, zone=moved(spec.zone),
+                   providers=tuple(moved(provider) for provider in spec.providers))  # fmt: skip
 
 
 def _import(read: _Reader, table: Mapping[str, Any], key: str, has_baseline: bool, earlier: list[Space]) -> Import:

@@ -44,7 +44,8 @@ class LedgerError(RuntimeError):
 
 
 class JoinRefused(LedgerError):
-    """A federation was refused at join: another fingerprint or environment, or a label already used."""
+    """A federation was refused at join: another fingerprint or environment, a platform the campaign does not declare
+    (C50), or a label already used."""
 
 
 class CompletionConflict(LedgerError):

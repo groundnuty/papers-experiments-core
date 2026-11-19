@@ -308,6 +308,7 @@ LEASE_KEY = "lease_id"  # in an export of a batch merged by run (C45), each entr
 # store's own export names it in its run rows (`export.LEASE_KEY`)
 FEDERATION_KEY = "federation"  # each run entry's: the federation that held its counted lease, as the ledger labels it
 SITE_KEY = "site"  # each run entry's: the site of that federation, as the ledger labels it
+PLATFORM_KEY = "platform"  # each run entry's, when the campaign declares its platforms: the one it ran under (C50)
 LEASES_KEY = "leases"  # the top-level key of such an export: merge.json's list of counted leases
 LEASE_RETRIES_KEY = "lease_retries_by_kind"  # each counted lease's own retries rows, with its lease id
 LOST_KEY_FLAG = "lost_federation"  # an exhausted run's entry: true when the ledger exhausted it for its lost leases
@@ -367,4 +368,6 @@ def _leased(entry: Mapping[str, Any], placed: Mapping[int, Mapping[str, Any]], *
     lease = placed[entry[SHARD_KEY]]
     found = {key: value for key, value in entry.items() if key != SHARD_KEY}
     where = {FEDERATION_KEY: lease["federation"], SITE_KEY: lease["site"]} if place else {}
+    if place and PLATFORM_KEY in lease:
+        where[PLATFORM_KEY] = lease[PLATFORM_KEY]
     return {**found, LEASE_KEY: lease["lease_id"], **where}

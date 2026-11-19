@@ -60,7 +60,7 @@ from expcore.campaign.elastic.records import (
     SiteReading,
     Wait,
 )
-from expcore.campaign.elastic.views import LedgerViews
+from expcore.campaign.elastic.views import LedgerViews, environment_key
 from expcore.campaign.lock import DispatchLock
 
 _LABEL = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")  # an operator's label, as a shard's: never a host name or an address
@@ -160,8 +160,13 @@ class Ledger(LedgerViews):
         fingerprint: str,
         environment: str,
         kill_wait_s: float,
+        platform: str | None = None,
     ) -> None:
-        """Record a federation whose `up` finished; refuse another fingerprint or environment, or a label in use."""
+        """Record a federation whose `up` finished; refuse another fingerprint or environment, or a label in use. When
+        the campaign declares its platforms (`LedgerConfig.platforms`, C50), the federation's own (`platform`) must be
+        one of them, and is kept as the identity its runs ran under, and the environment is pinned for each platform
+        at the first join on it (`environment_key`), since a study's environment identity may hold its backend's own
+        digests; otherwise the platform is not read and the first join pins the one environment."""
         for what, name in (("federation label", label), ("site label", site)):
             if not isinstance(name, str) or not _LABEL.fullmatch(name):
                 raise ValueError(f"{what} {name!r} must be 1 to 64 of [a-z0-9-], starting with a letter or digit")
@@ -176,21 +181,34 @@ class Ledger(LedgerViews):
         def go() -> None:
             if fingerprint != self._fingerprint:
                 raise JoinRefused(f"federation {label}: its fingerprint {fingerprint!r} is not the campaign's")
-            pinned = self._meta("environment")
-            if pinned is not None and environment != pinned:
+            declared = self.config.platforms
+            if declared and platform not in declared:
                 raise JoinRefused(
-                    f"federation {label}: its environment {environment!r} is not the one pinned at the first join"
+                    f"federation {label}: its platform fingerprint {platform!r} is not one the campaign's "
+                    "platform_fingerprints declares"
+                )
+            key = environment_key(platform if declared else None)  # C50: with a set, one pin for each platform
+            pinned = self._meta(key)
+            if pinned is not None and environment != pinned:
+                which = "first join" if not declared else "first join on its platform"
+                raise JoinRefused(
+                    f"federation {label}: its environment {environment!r} is not the one pinned at the {which}"
                 )
             if self.db.execute("SELECT 1 FROM federations WHERE label=?", (label,)).fetchone():
                 raise JoinRefused(f"federation {label} has already joined: a label is used once")
             now = self._clock()
             if pinned is None:
-                self.db.execute("INSERT INTO meta(key, value) VALUES('environment', ?)", (environment,))
+                self.db.execute("INSERT INTO meta(key, value) VALUES(?, ?)", (key, environment))
             self.db.execute(
                 "INSERT INTO federations(label, site, job_ids, job_end_at, kill_wait_s, joined_at) VALUES(?,?,?,?,?,?)",
                 (label, site, json.dumps(list(job_ids)), float(job_end_at), float(kill_wait_s), now),
             )
-            self._event(now, "join", federation=label, site=site, job_end_at=job_end_at)
+            if declared:
+                self.db.execute(schema.FEDERATION_PLATFORMS_SQL)
+                self.db.execute("INSERT INTO federation_platforms(label, platform) VALUES(?,?)", (label, platform))
+                self._event(now, "join", federation=label, site=site, job_end_at=job_end_at, platform=platform)
+            else:
+                self._event(now, "join", federation=label, site=site, job_end_at=job_end_at)
 
         self._transact(go)
 

@@ -131,15 +131,20 @@ def create_ledger(
     caps: Mapping[str, int] | None = None,
 ) -> LedgerConfig:
     """Make the ledger of the study at `study` at `path` (the module's docstring); the configuration pinned in it.
-    Raises `LedgerError` for a ledger that exists or a cap on a model the study does not plan, and the study layer's
-    own errors for a study that cannot be loaded."""
+    Raises `LedgerError` for a ledger that exists or a cap on a model the study does not plan, the study layer's own
+    errors for a study that cannot be loaded, and `CoreVersionUnknown` for a core whose commit is unknown or whose
+    install is stale: the campaign fingerprint holds the core's identity, so a ledger made on it no run would serve."""
     from expcore.campaign.manifest import fingerprint_sha256
+    from expcore.provenance.core_check import require_core
     from expcore.study.config import load_study
     from expcore.study.pipeline import campaign_fingerprint
     from expcore.study.selection_start import pricing_of
 
     if path.exists():
         raise LedgerError(f"{path} already holds a ledger: it is not made again")
+    require_core(
+        "elastic create", allow_dirty=True
+    )  # an unknown core's fingerprint is no run's (a git checkout or a wheel)
     loaded = load_study(study)
     pricing = pricing_of(loaded)
     runs = ledger_runs(loaded.manifest, loaded.schema)
@@ -154,6 +159,7 @@ def create_ledger(
         max_usd=max_usd,
         caps=caps or {},
         grants_usd={model: lease_grant_usd(spec, pricing.limits) for model, spec in pricing.models.items()},
+        platforms=loaded.campaign.platform_fingerprints,
     )
     declared = {model: spec.accepted_fingerprints for model, spec in pricing.models.items()}
     Ledger.create(path, runs, config, clock=time.time, declared=declared).close()
@@ -188,6 +194,8 @@ def _status(args: argparse.Namespace) -> int:
     reader = LedgerReader(args.ledger)
     try:
         print(format_status(reader.status()))
+        for platform, environment in sorted(reader.platform_environments().items()):  # C50: one pin per platform
+            print(f"platform {platform}: environment {environment}")
     finally:
         reader.close()
     return 0
