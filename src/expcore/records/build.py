@@ -30,7 +30,7 @@ from expcore.loop.timer import AgentTimer
 from expcore.loop.toolbox import ToolBox
 from expcore.models import spend
 from expcore.models.adapters import ModelBackend, ModelTurn
-from expcore.models.fleetheaders import deployment_switched
+from expcore.models.fleetheaders import attempt_switched
 from expcore.models.route import sdk_version
 from expcore.plugin import ToolProvider, ToolSpec
 from expcore.prompt.templates import RenderedPrompt, sha256_of
@@ -215,8 +215,9 @@ def switched_totals(
     turns: Sequence[Mapping[str, Any]], schema_version: str, schemas: Sequence[SchemaVersion] = SCHEMAS
 ) -> dict[str, bool]:
     """The optional total that says the attempt's turns show more than one deployment (B20): `deployment_switched`,
-    written only when it is true (absent otherwise, and for a version that predates it), from the turns' own ids."""
-    switched = deployment_switched(turn.get("deployment_id") for turn in turns)
+    written only when it is true (absent otherwise, and for a version that predates it), from the turns' own ids and
+    system fingerprints (`attempt_switched`)."""
+    switched = attempt_switched(turns)
     if switched and "deployment_switched" in fields_of("totals", schema_version, schemas):
         return {"deployment_switched": True}
     return {}

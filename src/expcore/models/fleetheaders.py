@@ -16,7 +16,10 @@ import hashlib
 import json
 import re
 import secrets
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from typing import Any
+
+from expcore.models.served import fingerprint_parts
 
 SESSION_ID_LENGTH = 32  # hex characters
 DEPLOYMENT_ID_MAX = 128  # characters
@@ -71,6 +74,28 @@ def deployment_switched(ids: Iterable[str | None]) -> bool:
     are no switch (a model that is never served through a front). Visibility only: nothing is set aside for it."""
     seen = list(ids)
     return any(i is not None for i in seen) and len(set(seen)) > 1
+
+
+def fingerprints_switched(fingerprints: Iterable[str | None]) -> bool:
+    """Tell whether an attempt's replies show more than one system fingerprint (B20), by the rule of
+    `deployment_switched`: None, a reply that carried none, is one more value only when another reply carried one. An
+    endpoint that routes each request to one of several deployments of a model sends no deployment header, and each
+    deployment has a fingerprint of its own. A reply that carries several (joined into a mixed value) shows each."""
+    seen: list[str | None] = []
+    for fingerprint in fingerprints:
+        seen.extend(fingerprint_parts(fingerprint) if fingerprint else [None])
+    return deployment_switched(seen)
+
+
+def attempt_switched(turns: Iterable[Mapping[str, Any]]) -> bool:
+    """Tell whether an attempt's turns show more than one deployment (B20): by the ids the front named
+    (`deployment_id`) or by the system fingerprints of the replies, either one. The one definition: the record's
+    totals and the store's column (so the export) both call it, so they cannot differ. Visibility only: nothing is set
+    aside, charged differently or refused for it."""
+    turns = list(turns)
+    return deployment_switched(turn.get("deployment_id") or None for turn in turns) or fingerprints_switched(
+        turn.get("system_fingerprint") or None for turn in turns
+    )
 
 
 def deployment_id_ok(value: object) -> bool:
