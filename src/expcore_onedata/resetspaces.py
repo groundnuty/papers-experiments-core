@@ -65,7 +65,7 @@ from dataclasses import dataclass, field
 from math import isfinite
 from typing import Any
 
-from expcore_onedata import consistency, occupancy, resetheld, resetshortcut
+from expcore_onedata import consistency, occupancy, resetheld, resetshortcut, resetwaits
 from expcore_onedata.provision import ProvisionError
 from expcore_onedata.readretry import ReadRetry, recorded
 from expcore_onedata.reset import FAILURES, NOT_IN_SPACE, STAGES, ResetFailed, SpaceReset
@@ -270,6 +270,17 @@ class _Settle:
     observations: int = 0
     clean: int = 0
     fast: bool = True
+    seen_at: list[float] = field(default_factory=list)  # when each observation began, on the space's clock
+    slept: list[float] = field(default_factory=list)  # each shared wait taken after one of its observations
+
+    def wait_record(self, bound_s: float) -> dict[str, Any]:
+        """The settle's wait (`resetwaits.py`): the shortest span between two of its observations, against the bound,
+        and what the wait slept within it."""
+        # a wait follows each observation but the last, so the pairs and the waits line up
+        pairs = zip(self.seen_at, self.seen_at[1:], self.slept, strict=False)
+        spans = [(later - earlier, slept) for earlier, later, slept in pairs]
+        observed, slept = min(spans, default=(0.0, 0.0))
+        return resetwaits.entry("transfer_settle", bound_s, "observation", observed, slept, len(spans))
 
     def observed(self, active: bool) -> None:
         self.observations += 1
@@ -357,6 +368,8 @@ class SpacesReset:
         lapsed (`_lapsed`)."""
         for space in spaces:
             space.start(grant)
+            # whether this space's waits were taken once with other spaces' (`resetwaits.py`), and under which mode
+            space.record.update(shared_waits=len(spaces) > 1, wait_mode=space.p.settings.wait_mode)
         for space in spaces:
             space.verify()
         self._waits, self._walls = {}, {}
@@ -439,11 +452,14 @@ class SpacesReset:
             self._fan(pending, self._observe)
             pending = [space for space in pending if space.live and not self._settled(space)]
             if pending:
-                self._wait("transfers", max(space.p.settings.transfer_settle_s for space in pending))
+                slept = self._wait("transfers", max(space.p.settings.transfer_settle_s for space in pending))
+                for space in pending:
+                    space.settle.slept.append(slept)
 
     @staticmethod
     def _observe(space: _Space) -> None:
         settle = space.settle
+        settle.seen_at.append(space.p.clock())
         active = space.step("transfers", lambda: space.reset._observe(settle.cancelled, settle.unanswered))
         if active is not None:
             settle.observed(active)
@@ -460,7 +476,8 @@ class SpacesReset:
             cancelled = len({tid for _, tid in settle.cancelled})
             facts = {"cancelled": cancelled, "observations": settle.observations, "fast": settle.fast}
             lost = {"unanswered": len(settle.unanswered)} if settle.unanswered else {}  # cancels whose answer was lost
-            space.done("transfers", {**facts, **lost})
+            waits = {"wait_records": [settle.wait_record(space.p.settings.transfer_settle_s)]}
+            space.done("transfers", {**facts, **lost, **waits})
             return True
         if settle.exhausted:
             message = (
@@ -513,8 +530,8 @@ class SpacesReset:
         running = [space for space in running if space.live]
         if not running:
             return
-        self._wait("quiet", max(d for d in due if d is not None) - self._clock())
-        self._fan(running, lambda s: s.step("quiet", lambda: s.reset._quiet_sizes(s.run)))
+        slept = self._wait("quiet", max(d for d in due if d is not None) - self._clock())
+        self._fan(running, lambda s: s.step("quiet", lambda: s.reset._quiet_sizes(s.run, slept)))
         running = [space for space in running if space.live]
         if not running:
             return

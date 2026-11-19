@@ -65,7 +65,11 @@ read and every check is made on each provider that supports the space, since eac
    reset without an eviction plan still shows that only the owner holds data; the message states the bytes held, the
    figure allowed and the counter, per provider, and the files by position. The counter skips a provider's files only
    for one the caller declares never holds the space's bytes (`never_holds`), while it reads 0, and each disagreement
-   with the files is an event. Read before the evictions could show, the figure held evicted bytes: a reset that
+   with the files is an event. **`[placement] wait_mode = "event"`** reads the occupancy at once after the eviction
+   stage's end instead, since the files' block maps, the verdict, show an eviction and a placement at once (O46); a
+   space with a provider declared never to hold keeps the wait, which its counter's skip needs, and every counter event
+   read before the lag says so (`before_lag`). The default, `fixed`, waits as described. Read before the evictions could
+   show, the counter's figure held evicted bytes: a reset that
    allows nothing failed after a good eviction, and the quiet stage, held to that figure, passed a growth up to their
    size. The record gives `physical_bytes` (the counter), `files_bytes`, `files_read`, `events`, `waited_s` (every
    wait together), `depth`, `rounds` and `listings_after_s`.
@@ -155,6 +159,10 @@ reached, leaves the reset failed: `run` raises `ResetFailed` naming the stage, w
 a provider that does not answer is a failure, not an empty listing. Every message and every record key names the space
 and each provider by its position, never a label, a name or a path.
 
+Each fixed wait is recorded in its stage's `wait_records` (`resetwaits.py`: why, the bound, its anchor, the seconds
+observed and credited, the polls and how it ended), and each space's record says whether its waits were shared with
+other spaces' (`shared_waits`) and under which `wait_mode`.
+
 The waits happen between runs, never in an agent's time (`consistency.guard`). **Several spaces** reset as one
 through `resetspaces.SpacesReset`: the same stages for each, the waits they share taken once, and the spaces' own work
 at once; `run` is that driver with this space alone.
@@ -167,7 +175,16 @@ from contextlib import AbstractContextManager
 from functools import partial
 from typing import Any
 
-from expcore_onedata import consistency, occupancy, resetgrant, resetheld, resetqos, resetremove, resetshortcut
+from expcore_onedata import (
+    consistency,
+    occupancy,
+    resetgrant,
+    resetheld,
+    resetqos,
+    resetremove,
+    resetshortcut,
+    resetwaits,
+)
 from expcore_onedata.client import ZONE_TIME_PATH, NotSent, PlatformError, sent_unanswered
 from expcore_onedata.eviction import evict_ids, evict_tree, sum_counts
 from expcore_onedata.provision import Provisioner, ProvisionError
@@ -374,12 +391,14 @@ class SpaceReset:
         run["quiet"] = {**facts, "nominal_wait_s": wait}
         return run["quiet_at"] + wait
 
-    def _quiet_sizes(self, run: dict[str, Any]) -> None:
+    def _quiet_sizes(self, run: dict[str, Any], slept: float = 0.0) -> None:
         """After the wait, read the occupancy (`_holdings`) and set it against the occupancy stage's, by the files'
         block maps summed, never by the counter (O46). `waited_s` is the seconds, by this reset's own clock, from the
         space's maps reading (T) to the start of this reading: the one wait runs to the latest space's instant, so it is
-        at least the space's `nominal_wait_s`, and longer for a space that was read earlier or owed less."""
-        run["quiet"]["waited_s"] = round(self._p.clock() - run["quiet_at"], 3)
+        at least the space's `nominal_wait_s`, and longer for a space that was read earlier or owed less. `slept` is
+        the seconds the shared wait slept (`resetwaits.py`)."""
+        run["quiet_read_at"], run["quiet_slept"] = self._p.clock(), slept
+        run["quiet"]["waited_s"] = round(run["quiet_read_at"] - run["quiet_at"], 3)
         run["quiet"].update(resetqos.quiet_grown(self._p, self._holdings(run), run["occupancy"]))
 
     def _quiet_look(self, run: dict[str, Any], after_s: float) -> dict[str, Any]:
@@ -387,6 +406,7 @@ class SpaceReset:
         before it is listed (O07): a transfer that ran or ended since the occupancy stage's wait began fails the stage
         (O46), since an eviction there can hide a growth in the reading, and a job the occupancy stage's own look
         missed, listed late, made its figure wrong. Return the stage's record."""
+        looked_at = self._p.clock()
         moved = self._moved(run["ended_head"], self._ended_heads(), run)
         if moved:
             raise ProvisionError(
@@ -394,14 +414,28 @@ class SpaceReset:
                 "then can hide a growth in the quiet stage's reading, so it certifies nothing"
             )
         resetshortcut.require_held(run)
+        quiet = run["quiet"]
+        waits = [
+            resetwaits.entry(
+                "quiet_lag", quiet["nominal_wait_s"], "quiet_maps", quiet["waited_s"], run.get("quiet_slept", 0.0)
+            ),
+            resetwaits.entry(
+                "late_look",
+                self._p.settings.transfer_settle_s,
+                "quiet_reading",
+                looked_at - run["quiet_read_at"],
+                after_s,
+            ),
+        ]
         return {
             "ran": True,
             "why": run["why"],
             "qos_rights": run["qos_rights"],
             "held_files": len({file_id for file_id, _ in run["evicted"]}),
             "held_source": resetheld.SOURCE,
-            **run["quiet"],
+            **quiet,
             "listings_after_s": after_s,
+            "wait_records": waits,
         }
 
     # -- 2. running transfers ---------------------------------------------------------
@@ -576,6 +610,7 @@ class SpaceReset:
             if files:
                 results.append(evict_ids(self._p, files, provider, quiet=quiet, **watched))
             unanswered = sum(r.get("unanswered", 0) for r in results)  # evictions sent once, their answers lost
+            batches = max((r.get("batches", 1) for r in results), default=1)  # `[placement] evict_batch` (eviction.py)
             out[self._label(provider)] = {
                 "trees": sum(1 for entry in entries if entry.kind == "DIR"),
                 "files": sum(r["files"] for r in results),
@@ -584,6 +619,7 @@ class SpaceReset:
                 "attempts": max((r["attempts"] for r in results), default=0),
                 **sum_counts(results),
                 **({"unanswered": unanswered} if unanswered else {}),
+                **({"batches": batches} if batches > 1 else {}),
             }
         quiet()
         run["ended_head"] = self._ended_heads()
@@ -617,13 +653,26 @@ class SpaceReset:
         either, by when every job it did not see waiting or ongoing is on the ended listing the shortcut walks
         (`resetshortcut.py`): a later bound, which never weakens a check."""
         state = run.setdefault(
-            "occupancy_wait", {"anchor": run["evicted_at"], "before": run["ended_head"], "waited": 0.0, "rounds": 0}
+            "occupancy_wait",
+            {"anchor": run["evicted_at"], "before": run["ended_head"], "waited": 0.0, "rounds": 0, "waits": []},
         )
         state["rounds"] += 1
-        due = state["anchor"] + resetqos.occupancy_wait_s(max(run["deepest"], 1))
+        state["why"] = self._occupancy_why(run)
+        lag = 0.0 if state["why"] == "block_maps" else resetqos.occupancy_wait_s(max(run["deepest"], 1))
+        due = state["anchor"] + lag
         if run["reads"]["mode"] == resetshortcut.SHORTCUT and run["transfers_at"] is not None:
             due = max(due, run["transfers_at"] + self._p.settings.transfer_settle_s)
+        state["bound"] = due - state["anchor"]
         return due
+
+    def _occupancy_why(self, run: Mapping[str, Any]) -> str:
+        """Why the occupancy stage waits, by `[placement] wait_mode` (`resetwaits.py`): `occupancy_lag` under `fixed`,
+        the lag for the deepest file, as always; under `event`, none (`block_maps`), since the files' block maps, the
+        verdict, show an eviction and a placement at once (O46), unless the space has a provider declared never to hold
+        its bytes (`never_holds_counter`): its counter, which lags, is what may skip it, so the lag stays."""
+        if self._p.settings.wait_mode != "event":
+            return "occupancy_lag"
+        return "never_holds_counter" if run["never_holds"] else "block_maps"
 
     def _occupancy_read(self, run: dict[str, Any], waited: float) -> float:
         """After a wait of `waited` seconds, with no transfer running, read the occupancy (`_holdings`: each file's
@@ -634,6 +683,11 @@ class SpaceReset:
         the rest and fails the reset."""
         state = run["occupancy_wait"]
         state["waited"] += waited
+        state["read_at"] = self._p.clock()
+        anchor = "eviction_end" if state["rounds"] == 1 else "job_end"
+        state["waits"].append(
+            resetwaits.entry(state["why"], state["bound"], anchor, state["read_at"] - state["anchor"], waited)
+        )
         self._require_quiet(run)
         run["only"] = resetshortcut.narrowed(self, run)  # every round: a job that ran in the last is walked too
         state["reading"] = self._holdings(run)
@@ -645,6 +699,7 @@ class SpaceReset:
         the instant the wait counts from, and its change may not show: let it end, count the next wait from then, and
         return False, up to `OCCUPANCY_ROUNDS` waits in all, then fail."""
         state = run["occupancy_wait"]
+        state["looked_at"] = self._p.clock()
         if not self._moved(state["before"], self._ended_heads(), run):
             return True
         if state["rounds"] == OCCUPANCY_ROUNDS:
@@ -666,12 +721,22 @@ class SpaceReset:
         run["occupancy"], run["ended_head"] = reading, state["before"]  # the quiet stage looks for jobs since this wait
         resetshortcut.require_held(run)
         occupancy.judge(reading, allowed, self._label)
+        waits = list(state["waits"])
+        if after_s > 0:  # the stage's own late look, when the quiet stage is skipped
+            observed = state["looked_at"] - state["read_at"]
+            bound = self._p.settings.transfer_settle_s
+            waits.append(resetwaits.entry("late_look", bound, "occupancy_reading", observed, after_s))
+        facts = reading.facts(self._label)
+        if self._p.settings.wait_mode == "event":  # a counter read before its lag disagrees with every eviction (O46)
+            early = state["waits"][-1]["observed_s"] < resetqos.occupancy_lag_s(max(run["deepest"], 1))
+            facts["events"] = [{**event, "before_lag": early} for event in facts["events"]]
         return {
-            **reading.facts(self._label),
+            **facts,
             "waited_s": round(state["waited"], 3),
             "depth": max(run["deepest"], 1),
             "rounds": state["rounds"],
             "listings_after_s": after_s,
+            "wait_records": waits,
         }
 
     def _ended_since(self, epoch: float, cancelled: Collection[tuple[str, str]]) -> dict[str, str]:
