@@ -62,6 +62,7 @@ from expcore_onedata.placement import Range, held_bytes, merged, uncovered
 from expcore_onedata.provision import Listings, Provisioner
 from expcore_onedata.readretry import ONE_ATTEMPT
 from expcore_onedata.transferlog import DEADLINE, MAX_LISTED, PAGE_LIMIT, TransferLog, deadline_at
+from expcore_onedata.transferorder import STOP_MARGIN_S
 from expcore_onedata.transferrecord import state_of
 from expcore_onedata.transferwindow import Window, split_gained
 
@@ -273,8 +274,9 @@ class PlatformProbes:
 
     def start(self, identity: Mapping[str, Any]) -> None:
         """Read the block maps before the run; `identity` is not used, since the snapshot is of the platform's state."""
-        self._started = self._now()
+        # The mark first: an end the log notes before it was seen before the window's start, so the job is not in it.
         self._mark = self._provisioner.log_mark() if self._windowed else None
+        self._started = self._now()
         entries, self._before = self._read_maps()
         self._before_ids = {label: entry.value.file_id for label, entry in entries.items() if entry.ok}
 
@@ -285,12 +287,12 @@ class PlatformProbes:
 
     def _scheduled(self) -> tuple[list[tuple[str, str, str]], int]:
         """The transfers the provisioner scheduled that bear on the run, and how many earlier ones its log shows ended
-        before the run's start, which are left out (`Provisioner.transfers_from`); every one when the caller named its
-        own list, or when the run's start was not read."""
-        if self._mark is None:
+        before the transfer walk's cutoff, which are left out (`Provisioner.transfers_from`); every one when the caller
+        named its own list, or when the run's start was not read."""
+        if self._mark is None or self._started is None:
             return list(self._transfers()), 0
-        window = self._provisioner.transfers_from(self._mark)
-        return window, len(self._provisioner.transfers()) - len(window)
+        cutoff = self._started - self._provisioner.settings.clock_skew_allowance_s - STOP_MARGIN_S  # the walk's own
+        return self._provisioner.transfers_from(self._mark, cutoff)
 
     def _transfer_records(self, scheduled: Iterable[tuple[str, str, str]], deadline: float) -> list[dict[str, Any]]:
         """The record of each transfer in `scheduled`, each read once the walk is within `deadline` (the provisioner's

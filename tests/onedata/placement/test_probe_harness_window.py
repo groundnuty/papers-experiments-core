@@ -26,7 +26,7 @@ def ends_unnoted(monkeypatch):
     """The harness's jobs here are logged with no end noted, as by a core before `Provisioner.note_ended` or a wait
     that proved none: the probes then keep them in the harness set and read their records, which these tests are of
     (`test_probe_walk_deadline.py` has a noted end leaving a job unread)."""
-    monkeypatch.setattr(Provisioner, "note_ended", lambda self, provider, transfer_ids: None)
+    monkeypatch.setattr(Provisioner, "note_ended", lambda self, provider, records: None)
 
 
 def tracked(seeded):

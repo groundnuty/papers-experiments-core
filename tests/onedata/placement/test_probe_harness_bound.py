@@ -1,7 +1,8 @@
 """The probes read only the harness's transfers that bear on the run's window (O08, O32): the change log is kept across
 runs, and every earlier job in it read again at each run's end cost about 40 minutes a run once it held thousands. A job
-scheduled since the window's start is read, and so is an earlier one its log does not show ended before it, which may
-still run into the window; an earlier one shown ended (`Provisioner.note_ended`), such as a reset's eviction, is not."""
+scheduled since the window's start is read, and so is an earlier one unless the log noted, before the start, its end
+with a finish time before the walk's cutoff (`Provisioner.note_ended`), as a reset's evictions are; one that ended after
+the cutoff, or whose end was not noted, is read, so its absence from the listing still flags the listing."""
 
 import json
 
@@ -44,15 +45,18 @@ def record_reads(seeded, since: int = 0) -> list[str]:
 
 
 def test_o08_earlier_jobs_the_log_shows_ended_cost_the_walk_no_read(client, provisioner, seeded, ticker, tmp_path):
-    """O08: the log holds 10,000 earlier jobs shown ended before the run, one earlier job still running, and the run
-    schedules one: the walk reads none of the 10,000, and reads the other two."""
+    """O08: the log holds 10,000 earlier jobs noted ended long before the run, one noted ended 1 s before its start
+    (after the walk's cutoff), one earlier job still running, and the run schedules one: the walk reads none of the
+    10,000, and keeps and reads the other three."""
     old = [f"tid-old-{i:05d}" for i in range(EARLIER)]
     active = seeded.add_transfer("replication", PATH, BETA_ID, scheduled=ticker.now, ended=False)
+    late = seeded.add_transfer("replication", PATH, BETA_ID, scheduled=ticker.now - 1)  # ended 1 s before the run
     with open(tmp_path / "changes.jsonl", "a", encoding="utf-8") as log:  # the provisioner's log, as it writes it
-        for tid in [*old, active]:
+        for tid in [*old, active, late]:
             line = {"action": "transfer", "id": tid, "kind": "eviction", "file": "f", "provider": "beta"}
             log.write(json.dumps(line, sort_keys=True) + "\n")
-    provisioner.note_ended("beta", old)
+    provisioner.note_ended("beta", {tid: {"finishTime": 100} for tid in old})
+    provisioner.note_ended("beta", {late: {"finishTime": int(ticker.now) - 1}})
     probes = probes_of(client, provisioner, ticker, seeded)
     probes.start({})
     ticker.sleep(5)
@@ -65,7 +69,8 @@ def test_o08_earlier_jobs_the_log_shows_ended_cost_the_walk_no_read(client, prov
     assert not [tid for tid in reads if tid.startswith("tid-old-")]
     assert active in reads
     assert new in reads
-    assert {record["transfer_id"] for record in snapshot["transfers"]} == {active, new}
+    assert late in reads
+    assert {record["transfer_id"] for record in snapshot["transfers"]} == {active, late, new}
     assert snapshot["transfers_before_window"] == EARLIER
 
 

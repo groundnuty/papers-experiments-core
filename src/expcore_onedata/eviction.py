@@ -319,7 +319,7 @@ def _evict_verified(
                 watch.scheduled(tids)
             transfers += len(tids)
             done = _wait_ended(provisioner, provider, tids, watch.waits, watch.reads or provisioner.retry)
-            provisioner.note_ended(provider, list(done.records))  # their end shown: no later run's probes read them
+            provisioner.note_ended(provider, done.records)  # their end shown: a later run's probes need not read them
             if watch.ended is not None:
                 watch.ended(tids)
             for state, count in done.states().items():
