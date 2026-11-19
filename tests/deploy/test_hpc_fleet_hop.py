@@ -614,3 +614,77 @@ def test_o93_a_table_with_no_backup_is_never_probed_and_says_nothing_of_one(hop_
         time.sleep(1.0)
         assert hop.switches == 0
         assert len(ssh.started()) == 1
+
+
+def test_o93_a_stop_that_lands_while_the_failover_ends_the_primary_still_finds_its_ssh(
+    hop_module, tmp_path, monkeypatch
+):
+    """O93: the primary accepts and does not answer, and the signal that ends the step lands while the keeper is ending
+    that ssh: the keeper still holds it, so the step's cleanup kills it and the port is not left bound."""
+    ssh = Ssh(tmp_path, monkeypatch)
+
+    class Child:
+        alive, terminates = True, 0
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            self.terminates += 1
+            if self.terminates == 1:
+                raise SystemExit(143)
+
+            self.alive = False
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            self.alive = False
+
+    child, listener = Child(), socket.socket()
+
+    def popen(*args, **kwargs):
+        listener.bind(("127.0.0.1", ssh.port))  # accepts connections (the backlog) and never answers one
+        listener.listen()
+        return child
+
+    try:
+        one = keeper(hop_module, backed(ssh), popen=popen)
+        with pytest.raises(SystemExit):
+            one.start()
+        assert child.alive
+        one.stop()
+        assert not child.alive
+    finally:
+        listener.close()
+
+
+def test_o93_after_a_proven_start_the_first_runtime_probe_is_a_whole_interval_away(hop_module, tmp_path, monkeypatch):
+    """O93: the start's own probe has just answered, so two dead probes at runtime take two intervals, not one: the
+    keeper does not probe again at its first look."""
+    ssh = Ssh(tmp_path, monkeypatch, "http401")
+    with keeper(hop_module, backed(ssh), probe_s=30.0) as hop:
+        assert hop._next_probe - time.monotonic() > 25.0
+
+
+def test_o93_a_move_that_cannot_start_the_other_socket_does_not_send_the_next_start_back_to_the_dead_one(
+    hop_module, tmp_path, monkeypatch
+):
+    """O93: two dead probes end the primary's forward and starting the backup fails once: the primary is no longer
+    taken as proven, so the keeper's next start is the backup, not the primary that stopped answering."""
+    import subprocess
+
+    ssh = Ssh(tmp_path, monkeypatch, "answer_then_silent", "http401", answers=1)
+    calls = []
+
+    def popen(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise OSError("no process")
+        return subprocess.Popen(*args, **kwargs)
+
+    with keeper(hop_module, backed(ssh), popen=popen, min_interval_s=0.3) as hop:
+        assert settled(lambda: hop.restarts == 1, seconds=20)
+        assert settled(lambda: forwards(ssh) == ["/ZQ/front.sock", "/ZQ/front-b.sock"])
+        assert hop.status().startswith("fleet_hop: true (restarts: 1, fleet_hop_backup: true")

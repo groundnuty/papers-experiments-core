@@ -297,8 +297,11 @@ class HopKeeper:
                 self._begin()
                 return
             with self._lock:
-                child, self._child = self._child, None
-            kill(child)
+                child = self._child
+            kill(child)  # the keeper holds it until it is gone: a stop that lands here still finds it
+            with self._lock:
+                if self._child is child:
+                    self._child = None
         raise self._refuse()
 
     def _comes_up(self) -> bool:
@@ -317,6 +320,7 @@ class HopKeeper:
                 if answers(self._port, self._probe_timeout):
                     with self._lock:
                         self._proven = True
+                        self._next_probe = self._clock() + self._probe_s  # the next look is a whole interval away
                     return True
                 return False
             if self._clock() >= deadline:
@@ -376,6 +380,7 @@ class HopKeeper:
         socket."""
         before = self._index
         kill(child)
+        self._proven = False  # this forward is dead: if the other cannot be started now, the next start is not this one
         try:
             self._spawn((before + 1) % len(self._sockets))
         except OSError:
