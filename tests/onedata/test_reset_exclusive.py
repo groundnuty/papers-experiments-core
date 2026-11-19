@@ -177,11 +177,14 @@ def test_o11_the_shortcut_proceeds_when_a_tools_hold_ends_within_the_bound(tmp_p
     config, _, lock = federation(tmp_path)
     release = threading.Event()
     thread, landed = tool_in_thread(config, release)
+    timer_at = time.monotonic()
     threading.Timer(0.5, release.set).start()
-    with lock.held(exclusive=False, timeout_s=PROBE_S), exclusive(config, shortcut()) as grant:
-        assert grant.shortcut
-        assert landed == [None], "the tool still held the federation when the exclusive hold was granted"
-        assert grant.facts()["wait_s"] >= 0.45
+    with lock.held(exclusive=False, timeout_s=PROBE_S):
+        began = time.monotonic()  # a loaded runner can spend part of the tool's 0.5 s hold before the wait begins
+        with exclusive(config, shortcut()) as grant:
+            assert grant.shortcut
+            assert landed == [None], "the tool still held the federation when the exclusive hold was granted"
+            assert grant.facts()["wait_s"] >= 0.5 - (began - timer_at) - 0.05
     thread.join(WAIT_S)
 
 
