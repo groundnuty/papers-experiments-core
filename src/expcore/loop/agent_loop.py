@@ -239,6 +239,7 @@ class _Run:
                 retries=turn.retries,
                 waits_left_open=self._request_waits_left_open,
                 infra_wait_by_kind=self._request_waited_by_kind,
+                deployment_id=turn.deployment_id,
             )
         )
 

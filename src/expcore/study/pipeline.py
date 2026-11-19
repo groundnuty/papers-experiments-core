@@ -220,10 +220,11 @@ def _digest(value: Any) -> str:
 
 def model_digest(spec: ModelSpec) -> str:
     """The digest of a model entry in the campaign fingerprint: every field of it (its checkpoint, sampling and request
-    settings), each key location as its placeholder (K13), and never its declared set of accepted fingerprints (C48):
-    deployments of one checkpoint and its flags are interchangeable, so a set that grows is the same experiment, and an
-    elastic campaign keeps the set in its ledger's declaration log. An entry that names no key location and declares no
-    set keeps the digest it had before either; one that declares a set has the digest it would have without it."""
+    settings), each key location as its placeholder (K13), its two fleet headers only when it sets them (B20), and
+    never its declared set of accepted fingerprints (C48): deployments of one checkpoint and its flags are
+    interchangeable, so a set that grows is the same experiment, and an elastic campaign keeps the set in its ledger's
+    declaration log. An entry that names no key location and sets no header keeps the digest it had before them,
+    whatever set it declares."""
     return _digest(_fingerprinted(withheld_entry(spec)))
 
 
@@ -232,9 +233,14 @@ def _counted_digest(spec: ModelSpec) -> str:
     return _digest(_fingerprinted(dataclasses.asdict(spec)))
 
 
+# the keys a model entry leaves out of its digest while it sets none: each came after the first digests were taken
+_OPTIONAL_DIGEST_KEYS = ("session_header", "deployment_header")
+
+
 def _fingerprinted(entry: Mapping[str, Any]) -> dict[str, Any]:
-    """A model entry as its digest takes it: without `accepted_fingerprints` (C48)."""
-    return {k: v for k, v in entry.items() if k != "accepted_fingerprints"}
+    """A model entry as its digest takes it: never with `accepted_fingerprints` (C48), and without `session_header` or
+    `deployment_header` when it sets none (B20), so an entry from before them keeps its digest."""
+    return {k: v for k, v in entry.items() if k != "accepted_fingerprints" and (k not in _OPTIONAL_DIGEST_KEYS or v)}
 
 
 def study_environment(study: StudyConfig | StudyIdentity) -> dict[str, Any]:

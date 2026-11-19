@@ -13,6 +13,7 @@ import json
 from collections.abc import Callable, Collection, Iterable, Mapping
 from typing import Any
 
+from expcore.models.fleetheaders import deployment_switched
 from expcore.models.served import MIXED_FINGERPRINTS, is_mixed
 
 ACCEPTED_META = "accepted_fingerprints"  # the store's meta key of the declared sets and their confirmations
@@ -38,6 +39,19 @@ def deployment_shares(declared: Mapping[str, Any], analysed: Iterable[tuple[str,
         return [_model_shares(model, entry, by_model[model]) for model, entry in sorted(declared.items())]
     except (KeyError, TypeError, ValueError, AttributeError) as error:
         raise DeploymentsUnreadable(f"the deployment record cannot be read ({type(error).__name__}: {error})") from None
+
+
+def deployments_switched(transcript: Iterable[Mapping[str, Any]]) -> bool:
+    """Tell whether the turns of an attempt show more than one deployment (B20): a turn without the id among turns with
+    it counts as one more, all turns without it are no switch. Visibility only."""
+    return deployment_switched(turn.get("deployment_id") or None for turn in transcript)
+
+
+def deployment_ids(transcript: Iterable[Mapping[str, Any]]) -> str | None:
+    """The deployments the turns of an attempt named (`deployment_id`, B20): the distinct ids as a sorted JSON list, or
+    None when no turn named one. Unlike the fingerprint mix this is kept for any model that sets `deployment_header`."""
+    found = sorted({turn["deployment_id"] for turn in transcript if turn.get("deployment_id")})
+    return json.dumps(found) if found else None
 
 
 def fingerprint_order(accepted: Collection[str]) -> Callable[[str | None], tuple]:

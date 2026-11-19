@@ -106,3 +106,41 @@ def test_a_worker_whose_step_ends_at_once_is_no_launch(deploy, bench):
     died = lambda seconds: bench.alive.clear()  # noqa: E731
     assert deploy.fleetworker.launch(arguments(bench, settings), runner, lambda: NOW, died) == 2
     assert member(bench, "fed-1").get("worker") is None
+
+
+HOP = 'fleet_hop = { login = "h", socket = "/s", key = "/k", known_hosts = "/h", local_port = 30051 }'
+
+
+def watch_until(bench, tick: int):
+    """A launch's wait on its client that ends the client at the given look, and counts the looks."""
+    looks = []
+
+    def slept(seconds: float) -> None:
+        looks.append(seconds)
+        if len(looks) == tick:
+            bench.alive.clear()
+
+    return slept, looks
+
+
+def test_o93_a_worker_whose_hop_never_opens_ends_inside_the_launchs_longer_watch_and_is_no_launch(deploy, bench):
+    """O93: `node` waits for the hop's port before it refuses a start, longer than the usual twenty seconds, so with a
+    `fleet_hop` setting the launch watches its client for that wait too: a worker that ends forty looks in is no launch,
+    records none, and the controller's join waits instead of joining a federation with no worker."""
+    assert bench.up(2)[0] == 0
+    settings = bench.settings(HOP)
+    slept, looks = watch_until(bench, 40)
+    runner = StepRunner(bench, "fed-1")
+    assert deploy.fleetworker.launch(arguments(bench, settings), runner, lambda: NOW, slept) == 2
+    assert len(looks) == 40
+    assert member(bench, "fed-1").get("worker") is None
+
+
+def test_o93_a_launch_without_a_hop_watches_its_client_as_long_as_it_always_did(deploy, bench):
+    """O93: with no `fleet_hop` setting the watch is the usual twenty looks: the same worker, ending at the fortieth,
+    is past it and is launched."""
+    assert bench.up(2)[0] == 0
+    slept, looks = watch_until(bench, 40)
+    runner = StepRunner(bench, "fed-1")
+    assert deploy.fleetworker.launch(arguments(bench, bench.settings()), runner, lambda: NOW, slept) == 0
+    assert len(looks) == int(deploy.fleetworker.SETTLE_S)

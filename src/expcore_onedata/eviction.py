@@ -11,6 +11,13 @@ seconds a file, so hundreds of files take minutes. Here the waits are shared:
 - **Many files in parallel** (`evict_ids`). A set of files that is not one directory is evicted file by file, at most
   `[placement] concurrency` requests in flight at once (16 by default), and their transfers are waited on together.
 
+**At most `[placement] evict_batch` at once** (500 by default). A set larger than that is sent in batches, each
+batch's transfers waited on until they have ended before the next is sent, after `BATCH_PAUSE_S`: one reset that
+scheduled about 15,300 evictions in one batch OOM-killed a 10 GiB provider's op_worker on two federations (18 Nov). A
+batch that cannot be sent, or whose jobs do not end, fails the eviction as the whole set's did, and no later batch is
+sent; the block maps are verified once every batch has ended, and the record says how many batches it took (`batches`,
+only above one). A directory is still one transfer.
+
 Either way the transfers' end is a report, never evidence (O01): the files are then verified **together** on the
 block maps (`require_empty_each`), each poll reading every file not yet settled with the same bound, and a file counts
 as empty once its map shows nothing held on `[placement] consecutive_polls` polls in a row (O07). A file still holding
@@ -84,6 +91,8 @@ from expcore_onedata.readretry import ReadRetry
 from expcore_onedata.transferrecord import eviction_counters
 
 COUNTERS = ("files_processed", "files_evicted", "files_failed")  # the record's keys of `eviction_counters`, in order
+# The pause between two batches of a set's evictions (`[placement] evict_batch`), once every job of the first has ended.
+BATCH_PAUSE_S = 2.0
 log = logging.getLogger(__name__)
 # files -> (their transfer ids, the files whose eviction's answer was lost, how many evictions' answers were lost)
 Schedule = Callable[[Sequence[str]], tuple[list[str], list[str], int]]
@@ -259,6 +268,13 @@ def _sent(
         return None
 
 
+def _batches(files: list[str], batch: int | None) -> list[list[str]]:
+    """The files in batches of at most `batch`, in order; one batch, empty included, without a bound or within it."""
+    if batch is None or len(files) <= batch:
+        return [files]
+    return [files[start : start + batch] for start in range(0, len(files), batch)]
+
+
 def _evict_verified(
     provisioner: Provisioner,
     provider: str,
@@ -266,6 +282,7 @@ def _evict_verified(
     schedule: Schedule,
     quiet: Callable[[], None] | None,
     watch: _Watch,
+    batch: int | None = None,
 ) -> dict[str, Any]:
     """Schedule the evictions (`schedule` takes the files still holding bytes and returns the transfer ids, which
     `watch.scheduled` is given when set, and `watch.ended` once they have ended, with the files whose eviction's
@@ -274,25 +291,41 @@ def _evict_verified(
     file whose eviction's answer was lost (it may have been applied, O09); the last attempt waits the whole settle
     bound. Return the transfers, their end states, the last attempt's counters, the polls, the attempts and, when there
     were any, how many evictions' answers were lost (`unanswered`); raise `EvictionIncomplete` when files still hold
-    bytes then."""
-    pending, transfers, polls = list(files), 0, 0
+    bytes then. With `batch`, an attempt schedules at most that many files at once: each batch's jobs must end before
+    the next batch is sent, after `BATCH_PAUSE_S` (a batch with an eviction whose answer was lost, which has no id to
+    wait on, waits for `quiet` too: no job listed running), and the record says how many batches the largest attempt
+    took (`batches`, only above one). A batch that fails to send or to end fails the eviction as the whole set did,
+    before any later batch is sent, and the block maps are read once every batch has ended, as before."""
+    pending, transfers, polls, batches = list(files), 0, 0, 0
     states: dict[str, int] = {}
     lost: set[str] = set()  # files whose eviction went unanswered: never scheduled again
     unanswered = 0  # the evictions whose answers were lost
     for attempt in range(1, EVICTION_ATTEMPTS + 1):
         sending = [file_id for file_id in pending if file_id not in lost]
-        tids, unread, count = schedule(sending) if sending else ([], [], 0)
-        lost.update(unread)
-        unanswered += count
-        if watch.scheduled is not None:
-            watch.scheduled(tids)
-        transfers += len(tids)
-        done = _wait_ended(provisioner, provider, tids, watch.waits, watch.reads or provisioner.retry)
-        if watch.ended is not None:
-            watch.ended(tids)
-        for state, count in done.states().items():
-            states[state] = states.get(state, 0) + count
-        counts = _counted(done.records.values())  # only the last attempt's are kept: an earlier gap is what it retried
+        records: dict[str, dict[str, Any]] = {}
+        lost_here = False  # whether the last batch had an eviction whose answer was lost
+        parts = _batches(sending, batch)
+        batches = max(batches, len(parts))
+        for index, part in enumerate(parts):
+            if index:  # the last batch's jobs have all ended: a short pause, then the next
+                if lost_here and quiet is not None:  # a job whose answer was lost has no id: wait for no job listed
+                    quiet()
+                _sleep(provisioner, watch.waits, "batch_pause")(BATCH_PAUSE_S)
+            tids, unread, count = schedule(part) if part else ([], [], 0)
+            lost_here = bool(unread)
+            lost.update(unread)
+            unanswered += count
+            if watch.scheduled is not None:
+                watch.scheduled(tids)
+            transfers += len(tids)
+            done = _wait_ended(provisioner, provider, tids, watch.waits, watch.reads or provisioner.retry)
+            provisioner.note_ended(provider, done.records)  # their end shown: a later run's probes need not read them
+            if watch.ended is not None:
+                watch.ended(tids)
+            for state, count in done.states().items():
+                states[state] = states.get(state, 0) + count
+            records.update(done.records)
+        counts = _counted(records.values())  # only the last attempt's are kept: an earlier gap is what it retried
         if quiet is not None:
             quiet()  # before each round of block-map reads: a running job could still change a map
         last = attempt == EVICTION_ATTEMPTS
@@ -300,6 +333,8 @@ def _evict_verified(
         result = _converge_empty(provisioner, provider, pending, bound, watch.waits)
         polls += result.polls
         noted = {"unanswered": unanswered} if unanswered else {}
+        if batches > 1:  # recorded only for a set sent in batches: one batch is the eviction it always was
+            noted["batches"] = batches
         if result.converged:
             return {
                 "transfers": transfers,
@@ -369,7 +404,7 @@ def evict_ids(
         return [tid for tid in sent if tid is not None], lost, len(lost)
 
     watch = _Watch(scheduled, ended, waits, reads)
-    done = _evict_verified(provisioner, from_provider, ids, schedule, quiet, watch)
+    done = _evict_verified(provisioner, from_provider, ids, schedule, quiet, watch, provisioner.settings.evict_batch)
     return {"files": len(ids), **done, "empty": True, "seconds": round(provisioner.clock() - began, 3)}
 
 

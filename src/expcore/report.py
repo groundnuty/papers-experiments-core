@@ -997,6 +997,31 @@ def _deployments(export: Mapping[str, Any]) -> list[str]:
     return ["## Deployments", "", *_table(header, rows), "", *totals, "", *DEPLOYMENT_NOTES, ""]
 
 
+def _deployment_switches(export: Mapping[str, Any]) -> list[str]:
+    """For each model whose analysed attempts named a deployment (`deployment_ids`): how many did and how many switched
+    (B20); nothing for an export whose attempts named none. An attempt switched when its turns show more than one
+    deployment, a turn without the id among turns with it counting as one more (a front that overflows to another
+    service). Visibility only: a switched attempt is analysed like any other."""
+    named: dict[str, int] = {}
+    switched: dict[str, int] = {}
+    for entry in export["analysed_attempts"]:
+        if "deployment_ids" in entry:
+            model = str(entry["factors"]["model"])
+            named[model] = named.get(model, 0) + 1
+            switched[model] = switched.get(model, 0) + bool(entry.get("deployment_switched"))
+    if not named:
+        return []
+    lines = [
+        f"- {model}: {named[model]} analysed attempt(s) named a deployment, {switched[model]} switched deployment"
+        for model in sorted(named)
+    ]
+    note = (
+        "An attempt switched deployment when its turns show more than one, a turn without the deployment header among "
+        "turns with it counting as one more. It is analysed like any other."
+    )
+    return ["## Deployment switches", "", *lines, "", note, ""]
+
+
 def _declarations(export: Mapping[str, Any]) -> list[str]:
     """The ledger's declaration log (C48), oldest first; nothing for an export without one (only a batch merged by
     run from a ledger that keeps the log has it)."""
@@ -1116,6 +1141,7 @@ def render_report(
         + placed
         + refit
         + _deployments(export)
+        + _deployment_switches(export)
         + _declarations(export)
         + _left_out(left_out)
     )

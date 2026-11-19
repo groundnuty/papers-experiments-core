@@ -49,9 +49,12 @@ OPTIONAL = (
     "expect_render_identity",
     "pass_env",
     "home_files",
+    "fleet_hop",
 )  # the rest of shards.py's optional keys: the study's own guard, post-run script and expected render identity, the
 # operator's variables its dispatchers are passed (names only: `pin` reads the values) and the operator's key tree
-# (`home_files`, O63: a path, which a shard step and a worker (`fleetworker.py`) put in their dispatcher's home)
+# (`home_files`, O63: a path, which a shard step and a worker (`fleetworker.py`) put in their dispatcher's home) and the
+# hop to the group's LLM fleet (`fleet_hop`, O93: the one setting that is a table, which a shard step and a worker keep
+# open while their dispatcher runs: `fleethop.py`)
 SCRIPT = Path(__file__).resolve().parent / "shards.py"
 
 
@@ -72,12 +75,18 @@ def read_settings(path: Path) -> Dict[str, Any]:
                 shards.pass_env_names(value)
             except shards.ShardsError as error:
                 raise FleetError(str(error)) from None
+        elif key == "fleet_hop":  # a table of five values: shards.py checks it as the hop does, naming the key only
+            problem = shards._sibling("fleethop").hop_problem(value)
+            if problem:
+                raise FleetError(f"the shard setting fleet_hop {problem}")
         elif isinstance(value, bool) or not isinstance(value, (str, int, float)):
             raise FleetError(f"the shard setting {key} must be a string or a number")
     return data
 
 
 def _toml(value: Any) -> str:
+    if isinstance(value, dict):  # an inline table, its keys in order: the manifest is compared with the one made again
+        return "{ " + ", ".join(f"{key} = {_toml(value[key])}" for key in sorted(value)) + " }"
     return json.dumps(value, ensure_ascii=False) if isinstance(value, (str, list)) else repr(value)
 
 
