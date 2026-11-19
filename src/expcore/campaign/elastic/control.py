@@ -271,15 +271,17 @@ def _unjoined(
     site = settings.label
     if m.status == "down":
         return 0
-    if prepare_key(site, m.label) in busy:
-        return 1  # a prepare in flight here: nothing else is decided for the member until it ends (a no-op elsewhere)
+    flying = prepare_key(site, m.label) in busy
+    live = flying or m.prepare == "running"  # a prepare that may still be running: a retirement ends it first
     if m.status in ("failed", "down-failed") or m.ended or m.broken:
         why = f"never joined: {m.status}, its job {m.state}"
-        acts.append(Retire(site, m.label, None, m.root, False, why, m.prepare == "running"))
+        acts.append(Retire(site, m.label, None, m.root, False, why, live))  # a member that breaks mid-prepare too
         return 0
     if m.status == "up" and m.linked and m.relay == "gone":
-        acts.append(Retire(site, m.label, None, m.root, True, relay_gone(m), m.prepare == "running"))
+        acts.append(Retire(site, m.label, None, m.root, True, relay_gone(m), live))
         return 0
+    if flying:
+        return 1  # a prepare in flight here: its end is decided on a later tick, never under a live run
     if m.status != "up" or not m.linked or m.waiting:
         return 1
     if settings.prepare_timeout_s is None:
@@ -301,7 +303,8 @@ def _unjoined(
 def _prepared(settings: SiteSettings, m: Member, acts: list, busy: frozenset[str]) -> int | None:
     """A member up, linked and running at a site that declares a prepare command: 1 while its data is on its way (a
     prepare is to start), 0 when it is retired unjoined, None when it may join (verified, with no prepare against it).
-    A prepare in flight here was handled before this (`_unjoined`)."""
+    A prepare in flight here was handled before this (`_unjoined`). Such a member is never idle-retired: only
+    federations the ledger holds are (`_retire_idle`), and this one is not joined until its prepare has ended."""
     site = settings.label
     if prepare_lost_key(site, m.label) in busy:  # its call never reached the site's record, as many times as it tries
         why = "never joined: its prepare could not be started"
@@ -522,7 +525,7 @@ def _retire_idle(
             label = ledger_label(settings.label, m.label)
             fed = ledger.federations.get(label)
             if fed is None or label in drained or fed.drained_at is not None or fed.ended_at is not None:
-                continue
+                continue  # a member not in the ledger (one whose prepare runs included) is on its way, never idle
             if now >= fed.job_end_at:
                 continue  # past its recorded end: never drained
             if m.status != "up" or m.state != "RUNNING" or ledger.holding.get(label) is not None:

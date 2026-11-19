@@ -24,6 +24,7 @@ from expcore.campaign.elastic.control import (
     SiteSettings,
     SiteView,
     decide,
+    environment_digest,
     ledger_view,
     prepare_key,
     prepare_lost_key,
@@ -96,12 +97,12 @@ def member(site, label: str = "fed-1", base_id: int = 41, verified: bool = False
 class Bench:
     """A ledger, a sites file and the controller's hooks over one fake site whose sites file may name a prepare."""
 
-    def __init__(self, tmp_path: Path, deploy, site, prepare=None, timeout: float = 30.0, **site_keys) -> None:
+    def __init__(self, tmp_path: Path, deploy, site, prepare=None, timeout: float = 30.0, caps=None, **site_keys):
         self.deploy, self.site, self.tmp = deploy, site, tmp_path
         self.prepare, self.timeout, self.site_keys = prepare, timeout, site_keys
         self.clock = FakeClock(site.now)
         self.ledger = tmp_path / "out" / "ledger.sqlite"
-        Ledger.create(self.ledger, plan(tasks=2), config(), clock=self.clock).close()
+        Ledger.create(self.ledger, plan(tasks=2), config(**({"caps": caps} if caps else {})), clock=self.clock).close()
         self.log = tmp_path / "control.jsonl"
         self.printed: list = []
 
@@ -420,12 +421,41 @@ def test_c49_a_prepare_in_flight_counts_as_on_its_way_and_takes_a_verify_runs_sh
     view = SiteView("site-a", idle_nodes=70, nodes_per_federation=7, time_s=7200.0, members=(ended,))
     key = frozenset({prepare_key("site-a", "fed-1")})
     assert [type(a).__name__ for a in decide(now, ledger, [(settings, view)], frozenset()).actions] == ["Retire"]
-    assert decide(now, ledger, [(settings, view)], key).actions == []  # one operation per member at a time
+    (broken,) = decide(now, ledger, [(settings, view)], key).actions  # it ended mid-prepare: retired at once, and
+    assert (type(broken).__name__, broken.abort_prepare) == ("Retire", True)  # the retirement ends the prepare first
     orphan = Member("fed-1", "up", "/r", ("41", "42"), "NODE_FAIL", now - 3650, now - 3600, now - 60, True, False,
                     prepare="running")  # fmt: skip
     view = SiteView("site-a", idle_nodes=70, nodes_per_federation=7, time_s=7200.0, members=(orphan,))
     (retire,) = [a for a in decide(now, ledger, [(settings, view)], frozenset()).actions if a.__class__ is Retire]
     assert retire.abort_prepare is True  # a retirement under no live run of ours still ends the orphan command
+
+
+def test_c49_a_member_whose_prepare_runs_is_never_retired_as_idle_however_long_it_takes(deploy, tmp_path, site):
+    """C49: with nothing for any federation to do (the model's one slot held) and idle time long past `retire_idle_s`, a
+    member up and linked whose prepare is in flight (about 15 min for a real ingest) is still on its way: no drain, no
+    retirement, no proof; only a federation the ledger holds is ever idle-retired."""
+    bench = Bench(tmp_path, deploy, site, prepare=study(), caps={"m1": 1})
+    holder = Ledger.open(bench.ledger, clock=bench.clock)
+    holder.join("site-a-fed-9", site="site-a", job_ids=("91",), job_end_at=site.now + 9000, fingerprint=FINGERPRINT,
+                environment=environment_digest(IDENTITY), kill_wait_s=180.0)  # fmt: skip
+    holder.mark_sent(holder.issue("site-a-fed-9").lease_id)  # the one slot of the capped model is taken
+    holder.close()
+    views = read_only(bench.ledger)
+    try:
+        ledger = ledger_view(views)
+    finally:
+        views.close()
+    now = site.now
+    preparing = Member("fed-1", "up", "/r", ("41", "42"), "RUNNING", now - 3650, now - 3600, now + 40_000, True, False,
+                       prepare="running")  # fmt: skip
+    settings = SiteSettings("site-a", 7, 1e12, 47.0, retire_idle_s=600.0, prepare_timeout_s=1800.0)
+    view = SiteView("site-a", idle_nodes=70, nodes_per_federation=7, time_s=7200.0, members=(preparing,))
+    key = frozenset({prepare_key("site-a", "fed-1")})
+    assert ledger.leases_wanted() == 0
+    for later in (0, 1200, 7200):
+        decision = decide(now + later, ledger, [(settings, view)], key)
+        assert decision.actions == []
+        assert decision.targets["site-a"]["available"] == 1
 
 
 def test_c49_with_no_prepare_declared_nothing_changes_and_the_site_files_pair_prepare_with_its_bound(

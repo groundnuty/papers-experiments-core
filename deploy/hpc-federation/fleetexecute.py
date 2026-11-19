@@ -19,7 +19,9 @@ process.
 - **Never `--discard-evidence`, never `scancel`.** A down goes through `fleet.py`, whose `hpcfed.py down` refuses a
   root with evidence not collected (its gate), and cancels only the jobs that member's up recorded, by id.
 - **One operation per site and per member at a time.** An add (one per site) and a retirement (one per member) run in
-  the background; until each ends its key is busy, and the decision gives that site no add and that member nothing.
+  the background; until each ends its key is busy, and the decision gives that site no add and that member nothing. A
+  member's prepare has a key of its own (it still counts as on its way); a member that ends or breaks while its prepare
+  runs is retired at once, and the retirement begins by ending the prepare.
 - **A member's prepare** (`fleetprepare.py`, when the site names `prepare`): one call at the site per member, the
   study's own command bounded and logged there; the controller's log keeps its outcome, exit status, times and
   duration, never its output, argv or a path. A retirement of a member found with a prepare started and never ended

@@ -1713,7 +1713,8 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   a study's data, so a site whose layout ingests data names the study's own command, and the controller runs it for
   each member that is up, linked and running with its data unverified: once, on the site's login node, through the
   site's transport (the ssh prefix with `env_file` at an ssh site, local otherwise), from the site's deploy directory,
-  one at a time for a member. It is an argv list (`prepare = ["uv", "run", ..., "--root", "{root}"]`): `{root}` in a word
+  one at a time for a member. It is an argv list (`prepare = ["uv", "run", ..., "--root", "{root}"]` with `prepare_timeout_s = 1800`: a real ingest
+  takes about 15 minutes, its steps launched into the member's held agent job, so allow twice that): `{root}` in a word
   is the member's federation root and `{layout}` the fleet's layout file, replaced by a plain text replace by
   `fleetprepare.py` from the fleet's record (no other placeholder; other braces are kept); `prepare_timeout_s` bounds it
   (required with `prepare`, refused without it). The core never reads what the command does. `fleetprepare.py` claims
@@ -1730,10 +1731,13 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   never ended, with no run of this controller's, is failed (the controller that started it died, or its call dropped):
   the member is retired the same way, after `fleetprepare.py abort` ends the command's process group (only while the
   process there has the start tick the record names), unless the member already reads verified, which joins. A member
-  whose prepare is in flight is still counted as on its way (no extra add for it), and takes `verify_mb` of the login
+  whose prepare is in flight is still counted as on its way (no extra add for it), is never idle-retired (only a
+  federation the ledger holds is; this one joins only after its prepare), and, if its jobs end or break meanwhile, is
+  retired at once, the retirement beginning by ending the prepare's process group. It takes `verify_mb` of the login
   node's memory: that is the figure a member up, linked and unverified takes already (and a member keeps taking it while
-  its prepare still runs after it left its marker), so a prepare needs no figure of its own; raise `verify_mb` where the
-  ingest is heavier than a verify-data run. A prepare call that fails with no outcome (the wrapper cannot run or make
+  its prepare still runs after it left its marker), so a prepare needs no figure of its own; the default 1024 is far
+  above the login-node peak of a real prepare (about 106 MB), so lower `verify_mb` where the login node's budget is
+  tight. A prepare call that fails with no outcome (the wrapper cannot run or make
   its files) is asked again on the next tick, up to three calls, and then the member is retired. The prepares are
   counted against the login node's memory, not gated by it: members that link in one tick start theirs together, up to
   `parallel_ups` of them. A prepare that always fails loops add, prepare, retire, bounded only by `allowance_units`. The controller's log keeps the member, the outcome, the
