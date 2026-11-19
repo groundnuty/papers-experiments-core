@@ -829,3 +829,17 @@ def test_c54_a_down_after_one_left_the_node_unswept_keeps_the_root_until_the_ope
     assert f"down: --node-checked: the agent's node not swept by down; the operator checked: {checked}" in printed
     assert f"the operator checked: {checked}; recorded in the state file" in capsys.readouterr().err
     assert not rig.root.exists()
+
+
+def test_c54_a_down_that_fails_elsewhere_still_prints_what_the_agents_node_sweep_said(hpc, tmp_path, site, capsys):
+    """C54: the agent's node was swept but another part of the down could not be verified (here every service's
+    teardown failed), so down raises with the root kept: the sweep's own report (what it removed and kept, the
+    worker's directory with the staged keys among them) still reaches down's output, the down log, before the raise."""
+    fake = FakeSlurm(teardown_rc=1)
+    rig = Rig(hpc, tmp_path, site, "separate", fake)
+    rig.up()
+    with pytest.raises(RuntimeError, match="could not be verified clean"):
+        rig.driver.down()
+    assert len(fake.sweeps) == 1
+    assert "shards: sweep: 0 step directory(ies) removed; kept: none" in capsys.readouterr().err
+    assert rig.root.exists()

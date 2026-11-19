@@ -243,6 +243,8 @@ class Down:
         if relay_unstopped and not self.relay_stopped():  # its client is ended now: checked again, never read before
             unverified.append("the fault relay")
         if unverified:
+            if swept:  # what the sweeps removed and kept reaches the down log even when down raises
+                self.say(swept)
             self.set(lambda s: s.update(phase="down"))
             then = f"{UNSWEPT_REMEDY}, then run down again with --node-checked" if unswept else "run down again"
             raise RuntimeError(
