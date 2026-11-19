@@ -73,6 +73,7 @@ from expcore.campaign.markers import AttemptResult, write_marker
 from expcore.campaign.no_request import EVENT as ZERO_EVENT
 from expcore.campaign.no_request import REASON as ZERO_REASON
 from expcore.campaign.no_request import settle_unsent
+from expcore.campaign.session_bind import bind_session
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.start_diagnostic import WITHHELD_ERROR, snapshot_of
 from expcore.campaign.store import Store
@@ -330,6 +331,7 @@ class AttemptRunner:
         # checks more, never less.
         decided = p.reserved_capped(key)
         begun, run_dir = self._begin(row, lease, admission=admission, reserved_capped=decided)
+        bind_session(backend, p.store, key, begun.number, p.lease_id)  # F01: the opaque id of this attempt, if sent
         live = contextlib.nullcontext() if p.campaign is None else liveness.running(p.campaign, begun.id)
         with live:  # the attempt is live from its row to its result: the executor and the post-run check inside it
             guard = None

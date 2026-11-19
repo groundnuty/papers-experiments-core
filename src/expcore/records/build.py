@@ -261,7 +261,7 @@ def turn_entry(
 ) -> dict[str, Any]:
     """Return one model turn as the record keeps it: the neutral and the native message, and what surrounded them."""
     turn = captured.turn
-    return {
+    entry = {
         "index": index,
         "neutral": {
             "text": turn.text,
@@ -281,6 +281,9 @@ def turn_entry(
         "waits_left_open": loop_turn.waits_left_open,
         "infra_wait_by_kind": plain(loop_turn.infra_wait_by_kind),
     }
+    if loop_turn.deployment_id is not None and "deployment_id" in fields_of("turn", schema_version):
+        entry["deployment_id"] = loop_turn.deployment_id  # optional, last: written only when the reply named one (F02)
+    return entry
 
 
 def route_entry(info: Mapping[str, Any], settings: Mapping[str, Any]) -> dict[str, Any]:

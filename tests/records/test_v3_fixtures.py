@@ -495,3 +495,23 @@ def test_c41_the_twelfth_fixture_pins_the_lease_an_attempt_ran_on_and_the_eleven
     fifth = load_record(DIRECTORY / "05-reserved-capped.json")
     assert dataclasses.replace(record, lease_id=None) == fifth
     assert replay_record(record).lease_id == 3
+
+
+def test_f02_the_thirteenth_fixture_pins_the_deployment_a_turn_names_and_the_twelve_before_it_hold_none():
+    """F02 and R03: the thirteenth merge point adds one optional field to a turn, `deployment_id`: the deployment a
+    front named in the reply's header, the last field of the turn, absent for a turn whose reply named none. Its fixture
+    is the fifth's record with a name on its second turn, written by the code of that merge; it validates and replays
+    to its own bytes (the parametrized tests above). None of the twelve before it holds the key, and none is filled in
+    with one."""
+    thirteenth = [p for p in FIXTURES if p.name.startswith("13-")]
+    assert [p.name for p in thirteenth] == ["13-deployment-id.json"]
+    record = load_record(thirteenth[0])
+    assert ["deployment_id" in turn for turn in record.transcript] == [False, True]
+    assert list(record.transcript[1])[-1] == "deployment_id"
+    earlier = [json.loads(p.read_text(encoding="utf-8")) for p in FIXTURES if p != thirteenth[0]]
+    assert all("deployment_id" not in turn for body in earlier for turn in body["transcript"])
+    fifth = load_record(DIRECTORY / "05-reserved-capped.json")
+    bare = [{k: v for k, v in turn.items() if k != "deployment_id"} for turn in record.transcript]
+    assert dataclasses.replace(record, transcript=bare) == fifth
+    named = [turn.get("deployment_id") for turn in replay_record(record).transcript]
+    assert named == [None, record.transcript[1]["deployment_id"]]

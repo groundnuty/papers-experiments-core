@@ -115,13 +115,14 @@ def test_R02_version_three_marks_the_fields_it_adds_optional_and_no_older_versio
     """R02: until v0.1.0 an extension of version 3 is additive, so a field it adds is optional: a record of version 3
     written before the field existed lacks it, and is valid. Version 3 adds the extra usage fields, the target of a
     fault, the outcome's and the declared ones, the refusal of an instrument's post-run check, the lease an attempt ran
-    on (C41), the two totals that
+    on (C41), the deployment that served a turn's reply (F02), the two totals that
     say whether the attempt was held to the reservation R, the elapsed time of a tool call, and a code tool's check of
     the exec that ran the call's program (O55), each fact of which is optional too."""
     from expcore.records import schema as rules
 
     assert SCHEMAS[-1].optional == {
         "usage": ("extra", "extra_cut"),
+        "turn": ("deployment_id",),
         "record": ("treatment_targets", "instrument_refusal", "lease_id"),
         "outcome": ("infra_target",),
         "totals": ("reserved_capped", "reply_cap_unheld"),
@@ -138,7 +139,7 @@ def test_R02_version_three_marks_the_fields_it_adds_optional_and_no_older_versio
     assert rules.optional_in("tool_call", "expcore-record/2") == frozenset()
     assert rules.optional_in("record", "expcore-record/2") == rules.optional_in("outcome", "expcore-record/2") == set()
     assert rules.optional_in("usage", "expcore-record/2") == frozenset()
-    assert rules.optional_in("turn", "expcore-record/3") == frozenset()
+    assert rules.optional_in("turn", "expcore-record/3") == {"deployment_id"}
 
 
 def test_R02_a_current_record_may_lack_the_extra_usage_fields_or_hold_either_alone_and_an_older_one_may_not_hold_any():

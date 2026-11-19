@@ -34,6 +34,7 @@ class TurnRecord:
     retries: tuple[dict[str, Any], ...] = ()
     waits_left_open: int = 0  # waits on infrastructure the request left open; the loop closed them when it returned
     infra_wait_by_kind: dict[str, float] = field(default_factory=dict)  # seconds the request waited, by kind (L04)
+    deployment_id: str | None = None  # the deployment the reply's header named (F02); None: left out of the record
 
 
 @dataclass
