@@ -1777,7 +1777,10 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   the account's default Slurm account may be another project's) and `settings` (the shard settings file on the login
   node, which the worker's launch and the identity read there use; required when `[controller]` names `settings`). Everything the controller does at the site is one ssh call, each with
   `-o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=20 -o ServerAliveCountMax=3` and never a setting that
-  weakens host-key checking, the remote command `cd <fleet> && set -a && . <env_file> && set +a && exec <argv>` with
+  weakens host-key checking (a site may name `ssh_config`, an absolute path to a private 0600 ssh config file of this
+  host's, uncommitted, holding its alias, key, known hosts or jump host: the call is then `ssh -F <file> -o
+  StrictHostKeyChecking=yes ...`, and ssh reads the command line's options before any file, so the file cannot weaken
+  the checking; a file that is missing, a link, or readable by others is refused), the remote command `cd <fleet> && set -a && . <env_file> && set +a && exec <argv>` with
   every word quoted (a login shell that is not POSIX cannot use `env_file`), each call killed with its process group
   at its bound: the read (`observe`), `fleet.py up`/`add`/`down`, `collect`, the worker's launch, the identity read
   (`fleetidentity.py read`) and the dispatcher's exchange and archive pulls. A call that fails or times out is the
@@ -1796,6 +1799,23 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   `spend.jsonl`; each snapshot is verified in turn, newest first, and the lease settles at the journal's spend. A call
   that fails or times out reads nothing that tick: the lease stays charged its grant and is read again next tick, never
   taken for a place with nothing in it. Nothing of it has run live.
+
+- **A Compose site** (`kind = "compose"`, `fleetcompose.py`): a host whose federations its operator brought up with
+  `deploy/compose-federation/federation.py --instance K up` (on the host's shared CA, so all have one fingerprint), its
+  static members. It is an ssh site (`host`, `interpreter`, `env_file`, and `deploy` the host's
+  `deploy/compose-federation`) with a `channel`, `fleet` (the site's 0700 directory on the host), `members` (a table of
+  member labels and their roots), `study` and `home` (the workers' HOME, holding the study's key tree, placed by the
+  operator) on the host, and optionally `engine` (a member has no walltime: its recorded end is 10 years out).
+  `[controller]` names `archives`, and `study` (this host's copy, for a lost lease's settle) where it names no
+  `settings`. No site's label may begin with another's and a dash (`<site>-<member>` would name two members alike). `max_federations` and `warm_pool` default to
+  the members' count, so no member is drained for idling, and nothing is ever added. Each command runs
+  `composesite.py` there (its README section, "A Compose site of the elastic fleet"): the read; a join's identity read
+  and worker launch; a retirement's stop (the worker proven gone: no process of it left), collect, pull, places pull,
+  `verify-copy` here and the retired record, with no `down`. A member whose worker died is proven ended (`terminal`)
+  and its lost lease settles from the channel on the host as at an ssh site; once retired, a member whose root reads
+  live and linked again joins as its next generation (`<member>-g2`, a new ledger label), or a member the operator
+  adds naming the same root takes it over; a member retired after a drain stays out until `composesite.py undrain`. A prepare hook has a seam (`fleetcompose.PREPARE`) and none yet. Nothing
+  of it has run live.
 
 ## The elastic fleet's worker (`fleetworker.py`, `fleetidentity.py`)
 

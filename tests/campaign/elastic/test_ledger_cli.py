@@ -190,3 +190,22 @@ def test_c42_create_writes_the_starting_caps_and_refuses_a_model_the_study_does_
         assert (dict(reader.config.caps), reader.caps(), reader.status().caps) == (chosen, chosen, chosen)
     finally:
         reader.close()
+
+
+def test_c51_create_and_the_identity_read_refuse_a_core_whose_commit_is_unknown(tmp_path, capsys, clean_environment):
+    """C51: a core copied without its git checkout or build identity (what `git archive` leaves) has an unknown
+    commit, and the campaign fingerprint holds the core's identity: `create` and the identity read refuse it, naming
+    why, rather than make a ledger and joins no lease run would serve (each run refuses that core)."""
+    from expcore.provenance import core_identity
+    from expcore.provenance.core_check import CoreVersionUnknown
+
+    study = make_copy(tmp_path, "study")
+    unknown = core_identity.CoreIdentity("unknown", None, True, "0" * 64, "none", "no git checkout of the core")
+    path = ledger_path(tmp_path)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(core_identity, "current", lambda: unknown)
+        assert main(["create", str(path), "--study", str(study), "--hard-term-s", "3600"]) == 1
+        assert "the core's commit is unknown" in capsys.readouterr().err
+        assert not path.exists()
+        with pytest.raises(CoreVersionUnknown, match="commit is unknown"):
+            campaign_identity(study)

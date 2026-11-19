@@ -57,6 +57,7 @@ import argparse
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -70,6 +71,7 @@ for _path in (HERE, HERE.parents[1] / "deploy" / "compose-federation"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
+import fleetcompose  # noqa: E402
 from fleetexecute import (  # noqa: E402
     Executor,
     Log,
@@ -84,9 +86,11 @@ from fleetexecute import (  # noqa: E402
 )
 
 COMMANDS = ("observe", "control", "drain", "ended", "join", "settle")
-CONTROLLER_KEYS = ("evidence", "interval_s", "log", "archives", "settings")
-SITE_KEYS = ("fleet", "transport", "interpreter", "deploy", "channel", "host", "env_file", "settings", "prepare")
-SSH_ONLY_KEYS = ("host", "env_file", "settings")
+CONTROLLER_KEYS = ("evidence", "interval_s", "log", "archives", "settings", "study")
+SITE_KEYS = ("fleet", "transport", "interpreter", "deploy", "channel", "host", "env_file", "settings", "prepare",
+             "kind", "ssh_config", *fleetcompose.KEYS)  # fmt: skip
+KINDS = ("hpc", fleetcompose.KIND)
+SSH_ONLY_KEYS = ("host", "env_file", "settings", "ssh_config")
 DISPATCH_S = 30.0  # `elastic.dispatch.TICK_S`: with a dispatcher the loop goes round this often
 TRANSPORTS = ("local", "ssh")
 OBSERVE_TIMEOUT_S = 600.0
@@ -103,6 +107,7 @@ class Controller:
     log: Optional[Path] = None
     archives: Optional[Path] = None  # where the dispatcher keeps the archives it pulls: set, it runs in this loop
     settings: Optional[Path] = None  # the shard settings (`fleetplan.read_settings`): the study, python and home_files
+    study: Optional[Path] = None  # the study here, where no shard settings are named (a Compose site's campaign)
 
 
 @dataclass
@@ -159,8 +164,9 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
     log = _absolute(table["log"], "[controller] log") if "log" in table else None
     archives = _absolute(table["archives"], "[controller] archives") if "archives" in table else None
     manifest = _absolute(table["settings"], "[controller] settings") if "settings" in table else None
+    study = _absolute(table["study"], "[controller] study") if "study" in table else None
     controller = Controller(
-        _absolute(table["evidence"], "[controller] evidence"), float(interval), log, archives, manifest
+        _absolute(table["evidence"], "[controller] evidence"), float(interval), log, archives, manifest, study
     )
     sites = []
     for entry in data.get("site") or []:
@@ -169,6 +175,9 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
         if own.get("transport", "local") not in TRANSPORTS:
             raise ConfigError(f"site {entry.get('label')}: transport must be one of {', '.join(TRANSPORTS)}")
         remote = own.get("transport", "local") == "ssh"
+        compose = compose_of(entry.get("label"), own, remote, archives is not None)
+        if compose is not None:
+            fleetcompose.settings_defaults(entry, compose)
         if not remote:
             entry.setdefault("login_node", "local")  # every local site's commands run here: one login node, one cgroup
         try:
@@ -181,14 +190,20 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
         python = own.get("interpreter", sys.executable)
         host = env_file = shard_settings = None
         if remote:
-            host, env_file, shard_settings = ssh_site(settings.label, own, manifest is not None)
+            host, env_file, shard_settings = ssh_site(settings.label, own, manifest is not None and compose is None)
             python = str(_absolute(python, f"site {settings.label}: interpreter"))
         elif any(key in own for key in SSH_ONLY_KEYS):
             raise ConfigError(f"site {settings.label}: {', '.join(SSH_ONLY_KEYS)} belong to an ssh site")
+        config = private_file(own["ssh_config"], f"site {settings.label}: ssh_config") if "ssh_config" in own else None
         sites.append(SiteConfig(settings, fleet, own.get("transport", "local"), python, deploy, channel, host,
-                                env_file, shard_settings, prepare))  # fmt: skip
+                                env_file, shard_settings, prepare, compose, config))  # fmt: skip
     if not sites or len({s.label for s in sites}) != len(sites):
         raise ConfigError("the sites file needs at least one [[site]], each label once")
+    labels = [s.label for s in sites]
+    if any(other.startswith(f"{label}-") for label in labels for other in labels):
+        # a member's ledger label is `<site>-<member>`: two sites one of which begins with the other and a dash could
+        # name one federation twice (a-b's c and a's b-c), and one's read prove the other's end
+        raise ConfigError("a site's label may not begin with another site's label and a dash")
     channels = [s.channel is not None for s in sites]
     if (archives is None and any(channels)) or (archives is not None and not all(channels)):
         raise ConfigError("[controller] archives and every site's channel go together: the dispatcher serves each "
@@ -196,6 +211,39 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
     if len({fleet_identity(s.fleet, s.host) for s in sites}) != len(sites):
         raise ConfigError("two sites name one fleet directory: each fleet is one site's, read and acted on once")
     return controller, sites
+
+
+def private_file(value: Any, what: str) -> str:
+    """An absolute path to a regular file of this user that no group or other can read or write (an ssh config file:
+    it names the key and the known hosts), never a link."""
+    path = _absolute(value, what)
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise ConfigError(f"{what} is not there") from None
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ConfigError(f"{what} must be a regular file of this user of mode 0600, not a link")
+    return str(path)
+
+
+def compose_of(label: Any, own: Mapping[str, Any], remote: bool, dispatched: bool) -> Optional[Any]:
+    """A `kind = "compose"` site's own keys (`fleetcompose.compose_site`), or None for an HPC site, which may name none
+    of them. A Compose site is an ssh site with a channel (its workers take leases through it)."""
+    kind = own.get("kind", "hpc")
+    if kind not in KINDS:
+        raise ConfigError(f"site {label}: kind must be one of {', '.join(KINDS)}")
+    if kind != fleetcompose.KIND:
+        if any(key in own for key in fleetcompose.KEYS):
+            raise ConfigError(f"site {label}: {', '.join(fleetcompose.KEYS)} belong to a Compose site")
+        return None
+    if not remote or "channel" not in own or not dispatched:
+        raise ConfigError(f"site {label}: a Compose site is an ssh site with a channel, and [controller] archives")
+    if "prepare" in own:  # its members read verified once linked, so no prepare would ever be decided: never ignored
+        raise ConfigError(f"site {label}: a Compose site takes no prepare yet (its members have no data to verify)")
+    try:
+        return fleetcompose.compose_site(str(label), own)
+    except ValueError as error:
+        raise ConfigError(str(error)) from None
 
 
 def prepare_of(label: Any, argv: Any, timed: bool) -> Optional[Tuple[str, ...]]:
@@ -250,7 +298,8 @@ def observe_site(transport: Any, site: SiteConfig, observed: Optional[Path]) -> 
         if observed is not None:
             text = observed.read_text(encoding="utf-8")
         else:
-            argv = site.script("fleetcontrol.py", "observe", "--fleet", str(site.fleet))
+            argv = (fleetcompose.observe_argv(site) if fleetcompose.is_compose(site)
+                    else site.script("fleetcontrol.py", "observe", "--fleet", str(site.fleet)))  # fmt: skip
             code, text, err = transport.run(site, argv, OBSERVE_TIMEOUT_S)
             if code != 0:
                 return SiteView(label=site.label, error=f"its read failed with status {code}: {last_line(err)}")
@@ -305,12 +354,13 @@ def hooks_read(controller: Controller, sites: Sequence[SiteConfig], hooks: Hooks
     file's `settings` (`fleetidentity.identity_reader` and `dead_store_reader` over `fleetidentity.locator`, with the
     settings' study), else nothing is read: a join waits and a lost lease stays charged its grant."""
     identity, spend = hooks.identity, hooks.spend
-    if controller.settings is not None and (identity is None or spend is None):
+    named = controller.settings is not None or controller.study is not None
+    if named and (identity is None or spend is None):
         import fleetidentity
         import fleetplan
 
         try:
-            study = fleetplan.read_settings(controller.settings)["study"]
+            study = controller.study or fleetplan.read_settings(controller.settings)["study"]
             from expcore.study.config import load_study
 
             loaded = load_study(study)
@@ -331,7 +381,7 @@ def dispatcher_of(ledger: Any, controller: Controller, sites: Sequence[SiteConfi
     from expcore.campaign.elastic.dispatch import Dispatcher
     from expcore.campaign.elastic.transport import RoutedTransport, Site, ssh_argv
 
-    named = [Site(s.label, str(s.channel), ssh_argv(s.host) if s.remote else (), (s.python, "-I", "-B"),
+    named = [Site(s.label, str(s.channel), ssh_argv(s.host, s.ssh_config) if s.remote else (), (s.python, "-I", "-B"),
                   str(s.fleet) if s.remote else None, s.env_file) for s in sites]  # fmt: skip
     cwds = {s.label: str(s.fleet) for s in sites if not s.remote}
     transport = hooks.dispatch(cwds) if hooks.dispatch is not None else RoutedTransport(cwds)

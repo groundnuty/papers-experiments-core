@@ -16,11 +16,13 @@ from typing import Any
 SCRIPT = r"""
 import json, os, subprocess, sys, time
 base = os.path.dirname(os.path.abspath(__file__))
-argv, options, host, command = sys.argv[1:], [], None, None
+argv, options, host, command, config = sys.argv[1:], [], None, None, None
 while argv:
     word = argv.pop(0)
     if word == "-o":
         options.append(argv.pop(0))
+    elif word == "-F":  # a site's own ssh config file
+        config = argv.pop(0)
     elif word == "--":
         host, command = argv.pop(0), argv
         break
@@ -28,7 +30,7 @@ while argv:
         print("ssh: unknown option " + word, file=sys.stderr)
         sys.exit(255)
 with open(os.path.join(base, "calls.jsonl"), "a") as log:
-    log.write(json.dumps({"options": options, "host": host, "command": command}) + "\n")
+    log.write(json.dumps({"options": options, "host": host, "command": command, "config": config}) + "\n")
 if host is None or len(command) != 1:
     print("ssh: usage", file=sys.stderr)
     sys.exit(255)

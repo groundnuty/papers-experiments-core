@@ -332,7 +332,10 @@ def campaign_identity(path: str | os.PathLike[str]) -> tuple[dict[str, Any], dic
 def campaign_member_identity(path: str | os.PathLike[str]) -> tuple[dict[str, Any], dict[str, str], str]:
     """`campaign_identity` and the SHA-256 of the federation's own platform fingerprint beside them
     (`declared_platforms.own_sha256`), which a campaign that declares its platforms admits at the join or refuses
-    (C50), and records as the identity each of the federation's runs ran under."""
+    (C50), and records as the identity each of the federation's runs ran under. A core whose commit is unknown (or
+    whose install is stale) is refused, as a run refuses it: the fingerprint holds the core's identity, so a join on it
+    would take leases no run serves."""
+    require_core("identity", allow_dirty=True)
     study = load_study(path)
     check_study(study)
     with study_kinds(study.kinds):
