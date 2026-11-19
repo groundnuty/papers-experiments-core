@@ -17,11 +17,12 @@ here).
 - **observe** reads each member, and writes nothing: live when every service its `facts.json` names has a running
   container of the root's project (the root's mark names it) bound to that root; linked when its `link-check.json`
   says ok; its worker, by the pidfile `launch` wrote for this campaign's channel. A member is `up` and `RUNNING` while
-  live with its worker running or not yet launched; `GONE` (proven ended) once launched and no process of its worker
-  is left (`worker_gone`), whether the project is up or not; `BROKEN` when the project is not live and the worker still
-  runs (drained, then retired, which stops it); `down` when it is not live and was never launched, or was retired for
-  this channel. Its job id is `compose-<project>`, the same at every read, and its end `--horizon-s` from now: a
-  member has no walltime. The site reports no node, so the controller never adds to it.
+  live and not yet launched, or launched with its worker running and its project there (a service merely stopped, as
+  an injected outage stops one, keeps it so); `GONE` (proven ended) once launched and no process of its worker is
+  left (`worker_gone`), whether the project is up or not; `BROKEN` when its project is down (a service with no
+  container) and the worker still runs (drained, then retired, which stops it); `down` when it is not live and was
+  never launched, or was retired for this channel. Its job id is `compose-<project>`, the same at every read, and its
+  end `--horizon-s` from now: a member has no walltime. The site reports no node, so the controller never adds to it.
 - **launch** starts the elastic worker once, detached in a session of its own, with an environment of the allowlist
   alone and HOME the site's `--home` (a 0700 directory of this user holding the study's key tree at its models.toml
   paths, placed by the operator: never copied, never read here), in `<fleet>/members/<name>/run/` (the study copied
@@ -206,17 +207,24 @@ def services_of(root: Path) -> list[str]:
         return []
 
 
-def live(root: Path, project: str | None) -> bool:
-    """Every service of the root runs: a running container of its project, bound to this root. A container of the
-    project bound to another root, or none, is another federation of that name, and fails the read."""
+def services_state(root: Path, project: str | None) -> tuple[bool, bool]:
+    """(every service of the root runs, every service of the root has a container): containers of its project bound
+    to this root. A container of the project bound to another root, or none, is another federation of that name, and
+    fails the read. A service stopped (a sanctioned outage stops a provider's container) still has its container."""
     services = services_of(root)
     if project is None or not services:
-        return False
+        return False, False
     containers = project_containers(project)
     if any(c.root != str(root) for c in containers):
         raise SiteError(f"project {project}: a container binds another root than the member's")
     running = {c.service for c in containers if c.state == "running"}
-    return all(service in running for service in services)
+    present = {c.service for c in containers}
+    return all(s in running for s in services), all(s in present for s in services)
+
+
+def live(root: Path, project: str | None) -> bool:
+    """Every service of the root runs: what a member's join and its worker's launch need."""
+    return services_state(root, project)[0]
 
 
 def linked(root: Path) -> bool:
@@ -233,6 +241,9 @@ def channel_dir(channel: str, site: str, member: str) -> str:
 
 
 def member_view(fleet: Path, site: str, channel: str, member: str, root: Path, now: float, horizon: float) -> dict:
+    """One member as the controller reads it (the module's docstring). A member whose worker was launched for this
+    channel stays `RUNNING` while a service of it is merely stopped (an injected outage), and is `BROKEN` only once its
+    project is down (a service with no container, or the root's mark gone) while its worker lives."""
     here = channel_dir(channel, site, member)
     project = project_of(root)
     view = {"label": member, "root": str(root), "jobs": [f"compose-{project or member}"], "linked": False,
@@ -243,10 +254,14 @@ def member_view(fleet: Path, site: str, channel: str, member: str, root: Path, n
     retired = read_record(member_dir(fleet, member) / RETIRED)
     if retired is not None and retired.get("channel") == here and (worker is None or gone):
         return {**view, "status": "down"}
-    up = live(root, project)
-    if not up and (worker is None or gone):
-        return {**view, "status": "down"} if worker is None else {**view, "status": "up", "state": "GONE"}
-    state = "BROKEN" if not up else ("GONE" if gone else "RUNNING")
+    running, present = services_state(root, project)
+    if worker is None:
+        if not running:
+            return {**view, "status": "down"}  # not in the pool: never launched, and not up to join
+        joined = linked(root)
+        return {**view, "status": "up", "state": "RUNNING", "linked": joined, "verified": joined,
+                "ends_at": now + horizon}  # fmt: skip
+    state = "GONE" if gone else ("RUNNING" if present else "BROKEN")
     joined = linked(root)
     return {**view, "status": "up", "state": state, "linked": joined, "verified": joined, "ends_at": now + horizon}
 

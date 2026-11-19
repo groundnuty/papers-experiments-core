@@ -10,8 +10,8 @@ which the fingerprint already holds). A template that names an HPC pin's placeho
 `build` refuses it. Two instances of one layout (`fedspec.instance`) on one host's shared CA have one record: the
 fingerprint holds no name, port, address or id, and the CA's digest is the shared one's.
 
-The record is written only for a layout with a platform template, on the host the federation runs on, where a
-Compose site's controller reads it (`composesite.py observe`).
+The record is written only for a layout with a platform template, on the host the federation runs on: a study's
+declared identity of the site names it, and an operator compares the instances' records before a campaign.
 """
 
 import importlib.util

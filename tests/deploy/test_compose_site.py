@@ -290,12 +290,19 @@ def test_a_worker_killed_is_proven_ended_only_once_no_process_of_it_is_left(depl
     assert not [c for c in vm.engine_calls() if c["argv"][:1] != ["ps"]]  # only reads: nothing stopped or removed
 
 
-def test_a_live_worker_on_a_project_that_went_down_is_broken_never_ended(deploy, vm, tmp_path):
-    """The project down while the worker runs: not proven (the worker may still spend), drained instead."""
-    clock = FakeClock(time.time())  # the host reads its own clock for a member's end
+def test_a_stopped_service_keeps_a_member_but_a_project_taken_down_under_its_worker_is_broken(deploy, vm, tmp_path):
+    """A provider stopped (as a sanctioned outage stops its container) leaves a joined member as it was: never
+    drained for it, since a label joins once. Its project taken down (no container left) while its worker runs is not
+    proven ended (the worker may still spend): it is drained instead."""
+    clock = FakeClock(time.time())
     ledger = new_ledger(tmp_path, clock)
     tick(deploy, vm, ledger, clock)
-    vm.up("fed-1", state="exited")
+    vm.up("fed-1", services=("zone", "pine"))
+    vm.table["expcore-fed-1"].append(["expcore-fed-1-birch-1", "birch", "exited", str(vm.roots["fed-1"])])
+    (vm.bin / "containers.json").write_text(json.dumps(vm.table), encoding="utf-8")
+    assert vm.view()["fed-1"].state == "RUNNING"
+    assert not [a for a in tick(deploy, vm, ledger, clock) if getattr(a, "member", None) == "fed-1"]
+    vm.up("fed-1", services=())
     assert vm.view()["fed-1"].broken
     actions = tick(deploy, vm, ledger, clock)
     assert [type(a).__name__ for a in actions if getattr(a, "member", None) == "fed-1"] == ["Drain"]

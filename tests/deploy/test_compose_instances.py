@@ -153,3 +153,19 @@ def test_a_root_holding_another_ca_than_the_shared_one_is_refused(fed, tmp_path)
         fed.cli.use_shared_ca(layout)
     with pytest.raises(ValueError, match="outside the federation's root"):
         fed.layout.checked_ca_dir(str(root / "ca"), root)
+
+
+@pytest.mark.skipif(subprocess.run(["which", "openssl"], capture_output=True).returncode != 0, reason="no openssl")
+def test_an_up_without_the_shared_ca_never_makes_a_new_ca_over_the_roots_shared_one(fed, tmp_path):
+    """A root brought up on the host's shared CA holds its certificate and no key: an up run without the setting is
+    refused, so it never writes a CA of its own over the one the root's certificates chain to."""
+    (spec,) = instances(fed, tmp_path, 1)
+    ca_dir = tmp_path / "shared-ca"
+    fed.cli.make_shared_ca({"EXPCORE_FED_CA_DIR": str(ca_dir)})
+    layout = staged(fed, tmp_path, spec, 1, ca_dir)
+    before = layout.ca_pem.read_bytes()
+    unset = fed.layout.Layout(layout.root, layout.parent, spec, None)
+    with pytest.raises(RuntimeError, match="EXPCORE_FED_CA_DIR"):
+        fed.cli.prepare(unset)
+    assert layout.ca_pem.read_bytes() == before
+    assert not unset.ca_key.exists()

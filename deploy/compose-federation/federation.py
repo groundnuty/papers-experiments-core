@@ -205,6 +205,8 @@ def prepare(layout: Layout) -> None:
     layout.ca_pem.parent.mkdir(exist_ok=True)
     layout.journal.mkdir(exist_ok=True)
     if layout.ca_dir is None:
+        if layout.ca_pem.exists() and not layout.ca_key.exists():
+            raise RuntimeError(f"the root's CA is the host's shared one (no key of its own): set {CA_DIR_ENV}")
         make_ca(layout.ca_pem, layout.ca_key, f"{spec.project} test CA")
     else:
         use_shared_ca(layout)
