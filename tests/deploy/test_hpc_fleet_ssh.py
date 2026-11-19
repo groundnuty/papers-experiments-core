@@ -470,23 +470,20 @@ def lay_place(channel: Path, lease_id: int = 1, snapshots: int = 3) -> Path:
     return place
 
 
-def test_c47_a_member_killed_mid_lease_is_retired_with_its_places_and_its_lease_settles_at_its_journals_spend(
-    deploy, login, tmp_path, clean_environment
-):
-    """C47: a federation killed in the middle of its lease is drained and retired with its root gone; the retirement
-    pulled its channel's places beside its evidence, so once the end is proven and KillWait has passed the lease is
-    settled at the journal's spend (read from the pulled place), not left charged its whole grant, and the merge by
-    run has no unsettled lease of the run to refuse."""
-    leased, kept = ran_for_real(tmp_path, clean_environment, "site-a-fed-1")
+def retired_after_a_kill(deploy, login, tmp_path, env) -> SimpleNamespace:
+    """A federation killed in the middle of its real lease at an ssh site, drained and retired (its root evidence and
+    its channel's places pulled, down), its end proven and KillWait passed: only the settle is left to run."""
+    leased, kept = ran_for_real(tmp_path, env, "site-a-fed-1")
     killed_mid_lease(kept, tmp_path)
     ledger, clock, lease = leased.ledger, leased.now, leased.lease
     config = dataclasses.replace(login.config, channel=Path(leased.site.root))
-    locate = deploy.fleetidentity.locator(tmp_path / "evidence", login.transport)
     log = deploy.fleetexecute.Log(None)
-    executor = deploy.fleetexecute.Executor(
-        ledger, tmp_path / "ledger.sqlite", {SITE_LABEL: config}, login.transport, tmp_path / "evidence", log,
-        spend=deploy.fleetexecute.dead_store_reader(locate, leased.loaded), clock=lambda: clock[0],
-    )  # fmt: skip
+    evidence = tmp_path / "evidence"
+    spend = deploy.fleetexecute.dead_store_reader(
+        deploy.fleetidentity.locator(evidence, login.transport), leased.loaded
+    )
+    executor = deploy.fleetexecute.Executor(ledger, tmp_path / "ledger.sqlite", {SITE_LABEL: config}, login.transport,
+                                            evidence, log, spend=spend, clock=lambda: clock[0])  # fmt: skip
     clock[0] += 4000.0  # past the lease's term: no heartbeat, it expires
     ledger.observe_site(SITE_LABEL, SiteReading())
     ledger.drain("site-a-fed-1")
@@ -497,15 +494,61 @@ def test_c47_a_member_killed_mid_lease_is_retired_with_its_places_and_its_lease_
     ledger.prove_ended("site-a-fed-1", "cancelled")  # the down was verified: the end is proven only now
     clock[0] += 181.0  # KillWait
     lost = Settle(SITE_LABEL, "fed-1", "site-a-fed-1", lease.lease_id, None, "lost")  # the member's root is gone
-    executor.in_ledger(lost)
-    (done,) = [r for r in log.lines if r.get("action") == "Settle"]
-    assert (done["ok"], done.get("source")) == (True, "pulled"), done
-    assert 0 < done["spend_micro"] < 5_000_000  # the journal's spend, not the grant of the model (5 USD)
-    assert ledger.lease(lease.lease_id).charge_micro == done["spend_micro"]
+
+    def pulled_only():  # the read of the copy the retirement pulled, as the settle makes it when the channel gives none
+        read = deploy.fleetexecute.dead_store_reader(deploy.fleetidentity.locator(evidence), leased.loaded)
+        return read(dataclasses.replace(config, channel=None), lost)
+
+    return SimpleNamespace(kept=kept, log=log, executor=executor, lost=lost, lease=lease, ledger=ledger,
+                           pulled_only=pulled_only)  # fmt: skip
+
+
+def settled(after: SimpleNamespace, tmp_path: Path) -> dict:
+    """The settle's result line, once the lease is settled: the ledger holds that charge, and no lease of the run is
+    left unsettled for the merge by run to refuse."""
+    (done,) = [r for r in after.log.lines if r.get("action") == "Settle"]
+    assert done["ok"] is True, done
+    assert after.ledger.lease(after.lease.lease_id).charge_micro == done["spend_micro"]
     snapshot = tmp_path / "ledger-snapshot.sqlite"
-    take_ledger_snapshot(ledger.path, snapshot)
+    take_ledger_snapshot(after.ledger.path, snapshot)
     data = snapshot.read_bytes()
-    assert read_ledger(data, hashlib.sha256(data).hexdigest()).unsettled(lease.run_key) == []
+    assert read_ledger(data, hashlib.sha256(data).hexdigest()).unsettled(after.lease.run_key) == []
+    return done
+
+
+def test_c47_a_member_killed_mid_lease_settles_from_the_places_its_retirement_pulled_if_the_channel_is_gone(
+    deploy, login, tmp_path, clean_environment
+):
+    """C47: a federation killed in the middle of its lease is drained and retired with its root gone; the retirement
+    pulled its channel's places beside its evidence, so when the channel's place is gone by the settle the lease is
+    settled at the journal's spend read from the pulled place (never left charged its whole grant), and the merge by
+    run has no unsettled lease of the run to refuse."""
+    after = retired_after_a_kill(deploy, login, tmp_path, clean_environment)
+    shutil.rmtree(after.kept.parent)  # the channel cleaned up since
+    after.executor.in_ledger(after.lost)
+    done = settled(after, tmp_path)
+    assert done["source"] == "pulled"
+    assert 0 < done["spend_micro"] < 5_000_000  # the journal's spend, not the grant of the model (5 USD)
+
+
+def test_c47_a_spend_appended_to_the_channels_journal_after_the_retirements_pull_is_counted_in_the_settle(
+    deploy, login, tmp_path, clean_environment
+):
+    """C47: the settle reads the member's place from its channel whatever its root, over ssh, in preference to the
+    copy pulled at the retirement: by then its job is proven ended and KillWait has passed, so the journal there is
+    the final one, and a probe charge written after the pull is in the lease's charge."""
+    after = retired_after_a_kill(deploy, login, tmp_path, clean_environment)
+    journal = after.kept / "spend.jsonl"
+    header = json.loads(journal.read_text(encoding="utf-8").splitlines()[0])
+    probe = {"kind": "probe", "campaign": header["campaign"], "shard": header["shard"], "event_id": 10**6,
+             "model": after.lease.model, "usd": 0.25}  # fmt: skip
+    pulled_spend = after.pulled_only()[0]
+    with journal.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(probe, sort_keys=True) + "\n")
+    after.executor.in_ledger(after.lost)
+    done = settled(after, tmp_path)
+    assert done["source"] == "root"
+    assert done["spend_micro"] == pulled_spend + 250_000
 
 
 @pytest.mark.parametrize(("call", "trouble"), [("tar -C", "fail"), ("echo yes", "fail"), ("echo yes", "garbage")])

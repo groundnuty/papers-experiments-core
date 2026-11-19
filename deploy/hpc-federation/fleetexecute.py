@@ -24,11 +24,11 @@ process.
   collected copy is already here and `verify-copy` checks it. A site whose `transport` is `ssh` runs every command over
   ssh (`fleetssh.py`): its retirement is collect (into `<fleet>/collected/<member>` at the site), the pull of that copy
   to `<evidence>/<site>-<member>` here, the pull of the member's channel places (`<channel>/<label>/places/`, when the
-  site has a channel: the newest snapshots and journal of each lease's place, into `<evidence>/<site>-<member>/places/`,
-  where a lost lease's spend is read once the member's root is gone), `verify-copy` on this host over the pulled copy
-  against collect's hash, and only then `down`; a place that cannot be pulled stops it before `down`, as an evidence
-  pull does. One at a site is refused while the ledger holds a lease of its federation that is `reported` (its archive
-  not yet pulled here).
+  site has a channel: the newest snapshots and journal of each lease's place, into
+  `<evidence>/<site>-<member>/places/`, which the settle reads when its channel's place cannot be), `verify-copy` on
+  this host over the pulled copy against collect's hash, and only then `down`; a place that cannot be pulled stops it
+  before `down`, as an evidence pull does. One at a site is refused while the ledger holds a lease of its federation
+  that is `reported` (its archive not yet pulled here).
 """
 
 import json

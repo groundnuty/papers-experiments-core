@@ -1791,8 +1791,11 @@ Step 6 of #462, the Helios-only path of the elastic fleet wired end to end. Noth
   allowlist and a home of its own) asks the core for the campaign fingerprint a start there pins and the environment
   identity its plugin declares, the one a lease store pins; the ledger keeps the digest of the identity. A read that fails
   is None and the join waits. **Where a lost lease's store is** (`locator`): a place `<channel>/<label>/places/lease-<id>/`
-  while the decision shows the member's root, or the same under the collected evidence (`pulled`: at an ssh site the
-  retirement pulled the member's places there, before its root was gone). A place holds
+  in the member's channel, whatever its root (the channel is outside the root and outlives the member's `down`; at a
+  settle the job is proven ended, so the journal there is the final one: over ssh at an ssh site, read directly at a
+  local one), or, when that read fails or the place is gone, the same under the collected evidence (`pulled`: at an
+  ssh site the retirement pulled the member's places there, before its `down`). A read of the channel that fails is
+  never "no place": the pulled copy is read, and where neither can be the lease stays charged its grant. A place holds
   `study/out/` with `spend.jsonl` beside `study/` (put there by an operator: read as it is), or what the worker leaves:
   `snapshots/` and `spend.jsonl`. For those the newest snapshot that verifies (each tried in turn, newest first) is
   restored into a private directory on this host with the journal copied beside it, and read as the first form is; the

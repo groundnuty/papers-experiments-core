@@ -11,9 +11,10 @@ fleet's shard settings, `fleetplan.read_settings`).
   None (the join waits and is decided again), never a guess; a read that worked is kept for the member.
 - `locator(evidence)`: `(site, Settle) -> (out/, source)` or None, for `fleetexecute.dead_store_reader`: the lost
   lease's store as a place `lease-<id>/` holds it (`PLACES`): in the federation's channel on the site's shared file
-  system (`root`, offered only while the decision shows the member's root, that is while it still holds the jobs the
-  federation joined with) or in the evidence the controller collected from the member (`pulled`; at an ssh site
-  its retirement pulled the member's places there, `fleetssh.SshSiteTransport.pull_places`). A place holds
+  system (`root`, whatever the member's root: the channel is outside it and outlives the member's down, and at a settle
+  the member's job is proven ended, so its journal there is the final one) or, where that cannot be read or is gone,
+  in the evidence the controller collected from the member (`pulled`; at an ssh site its retirement pulled the
+  member's places there before its down, `fleetssh.SshSiteTransport.pull_places`). A place holds
   either `study/out/` with the lease's `spend.jsonl` beside `study/` (put there by an operator), or what the worker
   leaves while the lease runs (C46): `snapshots/` and `spend.jsonl`. For those the newest snapshot that verifies
   (`out_snapshot.restore`, each in turn, newest first) is restored into a private directory on this host with the
@@ -239,11 +240,14 @@ def locator(evidence: Path, transport: Any = None) -> Callable[[Any, Any], Optio
         name = ch.place_name(action.lease_id)
         candidates = []
         remote = getattr(site, "remote", False)
-        if action.root is not None and site.channel is not None and remote and transport is not None:
+        # the channel first, whatever the member's root: it is outside the root, outlives the member's down, and at a
+        # settle its job is proven ended (and KillWait passed), so its journal is the final one; a read of it that
+        # fails, or a place that is gone, falls back to the copy the retirement pulled
+        if site.channel is not None and remote and transport is not None:
             found = from_remote(site, action)
             if found is not None:
                 return found, "root"
-        elif action.root is not None and site.channel is not None and not remote:
+        elif site.channel is not None and not remote:
             candidates.append((ch.federation_dir(str(site.channel), action.label) / PLACES / name, "root"))
         pulled = Path(evidence) / f"{site.label}-{action.member}"
         candidates.append((pulled / PLACES / name, "pulled"))

@@ -15,7 +15,7 @@ from channel_support import FakeHandle, FakeRunner, FakeSsh, channel_of, outcome
 from elastic_support import SITE, assert_invariants, join, make, plan
 from fake_ssh_bin import install_fake_ssh
 from hpc_fleet_support import fleet_modules
-from leased_support import LABEL, InProcess, leased_example, ran_for_real
+from leased_support import LABEL, InProcess, killed_mid_lease, leased_example, ran_for_real
 from merge_by_run_support import make_running
 from study_support import Campaign, clean_environment
 
@@ -438,6 +438,28 @@ def test_c46_locate_gives_a_lost_leases_newest_snapshot_with_its_journal_and_the
         shutil.copytree(kept, kept.with_name(ch.place_name(lease_id + 1)))
         other = Settle(SITE, LABEL, LABEL, lease_id + 1, str(tmp_path / "root"), "lost")
         assert read(config, other) is None
+
+
+def test_c47_a_lost_lease_at_a_local_site_is_read_from_its_channel_whatever_the_members_root(
+    tmp_path, clean_environment
+):
+    """C47: the settle reads a lost lease's place in the federation's channel on the shared file system although the
+    member's root is gone (the member was retired and taken down): the channel is outside the root and outlives it."""
+    leased, kept = ran_for_real(tmp_path, clean_environment)
+    killed_mid_lease(kept, tmp_path)
+    with fleet_modules():
+        import fleetexecute
+        import fleetidentity
+
+        config = fleetexecute.SiteConfig(
+            SiteSettings(SITE, 7, 1e12, 47.0), tmp_path / "fleet", channel=Path(leased.site.root)
+        )
+        read = fleetexecute.dead_store_reader(fleetidentity.locator(tmp_path / "evidence"), leased.loaded)
+        found = read(config, Settle(SITE, LABEL, LABEL, leased.lease.lease_id, None, "lost"))
+        assert found is not None
+        spend_micro, source, charged = found
+        assert (source, charged) == ("root", 0)
+        assert 0 < spend_micro < 5_000_000
 
 
 @pytest.mark.parametrize("trouble", ["fail-listing", "fail-snapshot", "hang-snapshot", "fail-journal"])
