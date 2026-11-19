@@ -52,7 +52,17 @@ MIN_TIMEOUT_S = 1.0  # the sandbox refuses a shorter limit; the loop cuts a call
 
 
 class CodeExecutionProvider:
-    """A `ToolProvider` with one tool that runs Python source in a sandbox."""
+    """A `ToolProvider` with one tool that runs Python source in a sandbox.
+
+    It says its tool runs code cells with a true `code_cell` attribute, which is how the loop knows which calls the
+    study's declared limit on one cell is for (`[agent] code_cell_bound_s`, L18). Under that limit the call's
+    `timeout_s` is the limit, shorter than the agent's time left, and `ctx.cell_bound_s` says so: a cell the sandbox
+    killed at it returns its timeout, with the output it kept and a text that names the limit, and the run goes on.
+    Without the limit, or with one the time left is shorter than, the text is the one a cell that ran out of the
+    agent's time has always had. Both sandbox backends are reached here alike, through `Sandbox.exec`.
+    """
+
+    code_cell = True  # the loop hands its calls the declared cell limit and records which tools it reached (L18)
 
     def __init__(self, sandbox: Sandbox, *, name: str = DEFAULT_NAME, description: str = DEFAULT_DESCRIPTION) -> None:
         self._sandbox = sandbox
@@ -78,7 +88,8 @@ class CodeExecutionProvider:
             return ToolOutput(
                 "the argument 'code' must be a non-empty string", is_error=True, error_class="bad_arguments"
             )
-        result = await asyncio.to_thread(self._sandbox.exec, code, max(float(timeout_s), MIN_TIMEOUT_S))
+        limit_s = max(float(timeout_s), MIN_TIMEOUT_S)
+        result = await asyncio.to_thread(self._sandbox.exec, code, limit_s)
         # a cell that outlived its kill at its deadline ended the run (O34), and the run's ending is said by the next
         # call, `launch` and the collection (`run_ended_error`): this call keeps its own result, a timeout (O72). Its
         # mount or its sandbox is gone, and nothing read after that, the gate's log included, is the cell's evidence.
@@ -88,32 +99,38 @@ class CodeExecutionProvider:
             failure = kinds.gate_error(result.gate_refusals) or kinds.kill_error(result.kill)
             if failure is not None:
                 raise failure
-        return self._output(result)
+        # the call ran under the study's limit on one cell, which is shorter than the agent's time left: a cell the kill
+        # at that limit ended is told as having run past it and been killed (L18). A cell that outlived its kill is not
+        # told so, since it was not: its text is the one it always had, and the run's ending is the sandbox's (above)
+        under_limit = getattr(ctx, "cell_bound_s", None) is not None and kinds.deadline_error(result.kill) is None
+        return self._output(result, limit_s if under_limit else None)
 
     @classmethod
-    def _output(cls, result: ExecResult) -> ToolOutput:
+    def _output(cls, result: ExecResult, cell_limit_s: float | None = None) -> ToolOutput:
         """The text the model sees for a finished cell, or for one too little time was left to start; a notice ends it
         when the sandbox cut the cell's output (O43). What the cell's completion record showed goes with it, for the
         call's record (`exec_check`, O55); the model never sees it."""
-        shown = cls._shown(result)
+        shown = cls._shown(result, cell_limit_s)
         text, cut = shown.text, None
         if result.output_cut:
             text, cut = f"{shown.text}\n{_cut_notice(result.output_cut)}", True
         return ToolOutput(text, shown.is_error, shown.error_class, source_truncated=cut, exec_check=result.exec_check)
 
     @staticmethod
-    def _shown(result: ExecResult) -> ToolOutput:
-        """The output of a finished cell as it would be shown if nothing had been cut."""
+    def _shown(result: ExecResult, cell_limit_s: float | None = None) -> ToolOutput:
+        """The output of a finished cell as it would be shown if nothing had been cut. `cell_limit_s` is the study's
+        limit on one cell when the call ran under it: a cell that timed out then ran past that limit and was killed."""
         if result.status == NOT_STARTED:  # it ran nothing: no timeout, no exit; the loop's time rule decides the rest
             return ToolOutput(
                 "the code was not started: too little of the time was left", is_error=True, error_class="not_started"
             )
         if result.timed_out:
-            return ToolOutput(
-                _with(result.stdout, "the code did not finish within the time limit and was stopped"),
-                is_error=True,
-                error_class="timeout",
+            note = (
+                "the code did not finish within the time limit and was stopped"
+                if cell_limit_s is None
+                else f"the code ran past its {cell_limit_s:g} s limit and was killed"
             )
+            return ToolOutput(_with(result.stdout, note), is_error=True, error_class="timeout")
         if result.kill is not None:  # the agent's own limit: the kill is told as what it was
             reason = str(result.kill.get("reason", "killed")).replace("_", " ")
             return ToolOutput(

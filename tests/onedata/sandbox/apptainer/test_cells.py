@@ -8,6 +8,7 @@ import pytest
 from apptainer_support import make_settings, start
 from cgroup_v1_support import OWN, v1_host
 from fake_node import FakeNode, Unrecorded
+from loop_support import CellBoundContext
 
 from expcore.errors import InfraError
 from expcore.plugin import NO_WAITS
@@ -358,3 +359,26 @@ def test_an_oom_of_the_step_s_cgroup_comes_before_the_watch_s_kill(node, box):
     result = box.exec("x = bytearray(200 << 20)", 30)
     assert result.kill["reason"] == "host_oom"
     assert result.kill["watch_kills"]
+
+
+def test_l18_under_the_study_s_cell_limit_a_cell_killed_at_it_is_told_and_the_next_cell_runs(node, box):
+    """L18, O34: the Apptainer sandbox is reached through the same code tool as Docker. Handed the study's limit on one
+    cell (the call's `timeout_s`, shorter than the agent's time left, with the limit on the context), a cell that runs
+    past it is killed by the harness's timer, the code tool returns its timeout naming the limit with the output it
+    kept, and the agent's next cell runs on the same sandbox."""
+
+    def slow(cell):
+        _until_dead(cell.procs[1])
+        return CmdResult(137, "partial output\n", "")
+
+    node.cell_handler = slow
+    tool = CodeExecutionProvider(box)
+    told = asyncio.run(
+        tool.execute("python", {"code": "import time; time.sleep(60)"}, timeout_s=1.2, ctx=CellBoundContext(1.2))
+    )
+    assert (told.is_error, told.error_class) == (True, "timeout")
+    assert told.text == "partial output\nthe code ran past its 1.2 s limit and was killed"
+    assert box.metadata()["cell_deadlines"][0]["outcome"] == DL.KILLED
+    node.cell_handler = lambda cell: CmdResult(0, "next\n", "")
+    after = asyncio.run(tool.execute("python", {"code": "print('next')"}, timeout_s=30, ctx=NO_WAITS))
+    assert (after.is_error, after.text) == (False, "next\n")

@@ -859,3 +859,48 @@ def test_c43_a_none_read_is_retried_each_tick_and_a_settle_always_carries_its_ch
         "its call log could not be read: it stays charged its grant",
         "its read gave no charged attempts: not settled",
     ]
+
+
+def test_c44_the_controller_stops_gracefully_on_sigterm_and_on_a_sigint_a_background_shell_ignored(tmp_path):
+    """fleetcontrol.stop_on_signals: SIGTERM, and SIGINT even when the process started with it ignored (a background
+    job of a non-interactive shell), both raise KeyboardInterrupt, so a `finally` runs and nothing is left half done."""
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    from hpc_fed_support import HPC
+
+    code = "\n".join(
+        [
+            "import sys, time",
+            f"sys.path.insert(0, {str(HPC)!r})",
+            "import fleetcontrol",
+            "fleetcontrol.stop_on_signals()",
+            "try:",
+            "    print('ready', flush=True)",
+            "    time.sleep(60)",
+            "except KeyboardInterrupt as stop:",
+            "    print('stopped', stop.args[0] if stop.args else 'SIGINT', flush=True)",
+            "finally:",
+            "    print('finally ran', flush=True)",
+        ]
+    )
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
+    for sent in (signal.SIGTERM, signal.SIGINT):
+        proc = subprocess.Popen(
+            [sys.executable, "-B", "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            cwd=tmp_path,
+            preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN),  # as a background job starts
+        )
+        assert proc.stdout.readline().strip() == "ready"
+        time.sleep(0.2)
+        proc.send_signal(sent)
+        out, err = proc.communicate(timeout=30)
+        assert f"stopped {sent.name}" in out, (out, err)
+        assert "finally ran" in out

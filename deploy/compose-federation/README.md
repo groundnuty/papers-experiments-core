@@ -162,7 +162,10 @@ controller runs `composesite.py` here over ssh, from the site's directory with i
 - **stop** (the worker's run directory, and any lease store in it, is kept), **collect** (the root's allow-listed
   evidence, `hpcevidence.archive_root` with `facts.json` required; a retry takes only this root's whole copy),
   **retired**: a retirement stops the worker and proves it gone, collects, and, once the copy is pulled and verified
-  on the controller's host, records the member retired for the campaign's channel. **No down**: the federation stays
+  on the controller's host, records the member retired for the campaign's channel. **One campaign at a time** (C53,
+  `rootclaim.py`): `launch` claims the federation in its root (`.expcore-worker-claim.json`, under the root's claim
+  lock) and refuses one another campaign's site directory claims; `retired` releases it; `observe` reads a federation
+  another campaign claims as `down`. **No down**: the federation stays
   up for the next campaign (a new site directory and channel) or the operator's own `down`.
 - **identity**: the campaign fingerprint and environment identity a start at the member pins, read here.
 

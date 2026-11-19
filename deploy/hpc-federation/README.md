@@ -1822,6 +1822,41 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   verify-data --root {root} --layout {layout}`, whose marker is what the member joins on. A member retired before it
   ever joined (its prepare failed, say) stays out like a drained one. Nothing of it has run live.
 
+- **Several ledgers, one controller each** (`fleetshare.py`, `expcore.campaign.elastic.siblings`, C53). A study that
+  runs several campaigns at once gives each its own ledger and its own controller, and they cooperate through
+  read-only reads of each other's ledgers (SQLite `mode=ro`, a 2 s busy timeout, never a ledger's dispatch lock).
+  Scheduling only: nothing here writes another ledger, a lease, a settle or a record. Three settings, each optional:
+  - `siblings = [<the other ledgers' paths>]` with `shared_caps = { <model> = N, ... }` in `[controller]` (together,
+    and only with `archives`: the leases are issued by this loop's dispatcher). A shared model takes a lease only
+    while this ledger's cap slots of it plus every sibling's stay under N (slots as the ledger's own cap counts them:
+    leases in flight, and expired ones whose holder is not yet proven ended), and under its own cap too. The siblings
+    are read again before every issue, so an overshoot needs two controllers to issue one model within one
+    read-to-commit window: at most one lease each. A sibling that cannot be read (its file missing too: name a
+    sibling once its ledger exists, then restart this controller) stops the model until it reads; each change is said
+    once. The target holds to the same limit, so no federation is added for a lease it cannot issue.
+  - `defer_to = [<ledger paths>]` in `[controller]`: priority. A ledger waits for capacity while it could issue more
+    leases now (`LedgerView.leases_wanted`: its current set's pending runs within its caps in force and its budget;
+    for a ledger among this controller's siblings, each shared model also within what the shared caps leave) than it has free federations (joined, not drained, not
+    proven ended, before their recorded end, holding no lease with a slot). Its controller's Adds still on their way
+    are not in its ledger, so it reads as waiting until they join. While any ledger deferred to waits, or cannot be
+    read, this controller adds nothing and joins no Compose member (the tick's `defer` says what was held back); its
+    own HPC members that came up still join, and nothing is ever retired for priority.
+  - `shared_site_file = <path on this host>` in an HPC `[[site]]` (a Compose site's members are shared through their
+    roots' claims instead, and refuse it): that site's `max_federations` and `allowance_units` are the totals of every
+    controller naming the file (the least any of them declares; the file is named by its real path). Each tick, after the site reads,
+    the controller takes `<file>.lock` (10 s at most), reads every other holder's entry, decides within what they
+    leave, and rewrites its own (its members that may hold a job, and every member made times one whole `--time`,
+    with the Adds just decided and any add still running) whole and crash-safe, before letting go. The file is JSON:
+    `{"format": "expcore-shared-site/1", "holders": {"<ledger path>": {"members": n, "units": u, "max_federations":
+    m, "allowance_units": a, "at": t}}}`. A file that cannot be read or locked leaves the site no room that tick; a
+    dark site keeps its last entry; a controller gone for good keeps counting until its operator removes its entry.
+    Every controller of a file runs on this host (the lock is a local `flock`).
+  A Compose federation serves one campaign's worker at a time (`deploy/compose-federation/rootclaim.py`): a member one
+  campaign retired joins whichever campaign takes it first (priority permitting), as that campaign's own member. The
+  hand-off is one way: a member its campaign retired after a drain (an idle retirement is one) stays out of that
+  campaign until its operator's `composesite.py undrain`, while another campaign may take it at once.
+  None of these keys: the controller decides and logs exactly as before.
+
 ### A down that could not sweep a node
 
 `down` sweeps the agent's node (and each node a shard was resumed on) while its job still runs, and first cancels, by
