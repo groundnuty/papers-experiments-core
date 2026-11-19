@@ -29,9 +29,25 @@ def start_of(pid: int) -> str:
     return text[text.rfind(")") + 2 :].split()[19]
 
 
+def exec_done(pid: int, within_s: float = 10.0) -> None:
+    """Wait until the child has exec'd its own command line. Between fork and exec /proc/<pid>/cmdline is still the
+    parent's, so a listing taken then records the parent's digest and the kill later finds the process `changed`
+    (seen once on a loaded runner). The start tick does not change at exec; the command line does."""
+    deadline = time.monotonic() + within_s
+    while time.monotonic() < deadline:
+        try:
+            if b"a-listed-process" in Path(f"/proc/{pid}/cmdline").read_bytes():
+                return
+        except OSError:
+            pass
+        time.sleep(0.01)
+    raise AssertionError("the child never exec'd its command line")
+
+
 @pytest.fixture
 def sleeper():
     process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)", "a-listed-process"])
+    exec_done(process.pid)
     yield process
     if process.poll() is None:
         REAL_KILL(process.pid, signal.SIGKILL)

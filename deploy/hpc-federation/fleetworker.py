@@ -75,10 +75,13 @@ def login_line(
     federation's agent node is (`shards.federation`). `--time` is the job's remaining time in whole minutes, rounded up,
     so the step ends with the job and is never open-ended."""
     shards = _shards()
-    env = [f"PATH={settings['step_path']}", "LC_ALL=C", f"EXPCORE_FED_ROOT_PARENT={root.parent}",
-           f"EXPCORE_FED_ROOT={root}", *(f"{k}={v}" for k, v in shards.home_env(shards.NO_HOME).items())]  # fmt: skip
+    passed = shards.pass_env_from(settings.get("pass_env"))  # the login node's site.env values, as a step's line has
+    env = [*(f"{k}={v}" for k, v in passed), f"PATH={settings['step_path']}", "LC_ALL=C",
+           f"EXPCORE_FED_ROOT_PARENT={root.parent}", f"EXPCORE_FED_ROOT={root}",
+           *(f"{k}={v}" for k, v in shards.home_env(shards.NO_HOME).items())]  # fmt: skip
     node = [settings["python"], "-I", "-B", str(SCRIPT), "node", "--federation", federation, "--channel", channel,
-            "--study", settings["study"], "--tmpfs", settings["tmpfs"], "--root", str(root)]  # fmt: skip
+            "--study", settings["study"], "--tmpfs", settings["tmpfs"], "--root", str(root),
+            *(word for name, _ in passed for word in ("--pass-env", name))]  # fmt: skip
     if settings.get("home_files"):  # the path alone rides here: `node` reads the tree itself
         node += ["--home-files", settings["home_files"]]
     if settings.get("fleet_hop"):  # the table rides here as one JSON argument, as the shard step's line carries it
@@ -171,6 +174,11 @@ def node(args: argparse.Namespace, runner: Any = None, hop_keeper: Any = None) -
     if count:
         print(f"fleetworker: home_files: true ({count} file(s) go to federation {args.federation}'s worker; a count: "
               "no name or content is shown)", file=sys.stderr)  # fmt: skip
+    try:
+        passed = dict(shards.pass_env_from(args.pass_env))  # the variables the line passed, checked before anything
+    except shards.ShardsError as error:
+        print(f"fleetworker: ERROR: {error}; the worker is not started", file=sys.stderr)
+        return REFUSED
     directory = Path(tempfile.mkdtemp(prefix=f"{shards.WORK_PREFIX}worker-{args.federation}.", dir=tmpfs))
     disarm = keeper = None
     try:
@@ -188,7 +196,7 @@ def node(args: argparse.Namespace, runner: Any = None, hop_keeper: Any = None) -
         if platform.is_file():  # the federation's, beside study.toml: a copy, never a link out of the study
             shutil.copyfile(platform, copy / shards.PLATFORM)
             (copy / shards.PLATFORM).chmod(0o600)
-        env = {k: os.environ[k] for k in shards.ALLOWLIST if k in os.environ}
+        env = {**passed, **{k: os.environ[k] for k in shards.ALLOWLIST if k in os.environ}}
         env.update(shards.home_env(str(directory / "home")))
         env.update({"TMPDIR": str(directory / "tmp"), "PYTHONDONTWRITEBYTECODE": "1"})
         disarm = shards._unwind_on_stop()  # a stop before the worker runs still ends through the cleanup below
@@ -309,6 +317,7 @@ def parser() -> argparse.ArgumentParser:
     one.add_argument("--federation", required=True)
     one.add_argument("--home-files", dest="home_files", default=None)
     one.add_argument("--fleet-hop", dest="fleet_hop", default=None)
+    one.add_argument("--pass-env", dest="pass_env", action="append", default=[])  # the line's env -i words name them
     login = sub.add_parser("launch")
     for key in ("fleet", "member", "settings", "federation", "channel"):
         login.add_argument(f"--{key}", required=True)

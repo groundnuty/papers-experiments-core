@@ -84,6 +84,7 @@ from fedrest import Rest
 from fedspec import LOOPBACK, ZONE, LayoutError, Service, Spec, instance, load_spec
 from fedsupport import check_rendered_support
 from fedtools import check_artifacts, study_artifacts_from
+from fedverify import MARKER, locked, verify_data
 
 ZONE_TIMEOUT_S = 1500.0
 PROVIDER_TIMEOUT_S = 1800.0
@@ -304,6 +305,7 @@ def up(layout: Layout) -> str:
             timer.mark("baseline")
         written = write_facts(layout, boot, *given)
         written += write_render_identity(layout, study_artifacts)
+        written += write_compose_file(layout)
         links = check_after_up(layout, dict(boot.ids.spaces))  # last: not ready until every pair transfers (#221)
         timer.mark("links")
     finally:
@@ -325,6 +327,12 @@ def reset_clean(layout: Layout) -> str:
     require_resettable(layout)
     timer = Timer()
     require_up(layout)
+    with locked(layout.root):  # no verdict on the spaces' data stands, nor can one be made, while they are emptied
+        (layout.root / MARKER).unlink(missing_ok=True)
+        return _reset_clean(layout, timer)
+
+
+def _reset_clean(layout: Layout, timer: "Timer") -> str:
     study_artifacts = study_artifacts_from(os.environ)
     check_artifacts(layout.spec, study_artifacts, layout.root)
     given = (study_artifacts,) if study_artifacts else ()
@@ -360,6 +368,35 @@ def reset_replicas(layout: Layout) -> str:
     finally:
         rest.close()
     return "\n".join([timer.summary("reset --replicas"), *(f"{space}: {done}" for space, done in evicted.items())])
+
+
+COMPOSE_FILE = "compose.yaml"  # in the root, for a platform file's `[faults] compose_file = "@hpc_root@/compose.yaml"`
+
+
+def write_compose_file(layout: Layout) -> str:
+    """The root's `compose.yaml`: what `federation.py ... compose` prints for this layout and instance, written whole (a
+    draft beside it, renamed over it), so the fault backend's `docker compose --file <root>/compose.yaml` stops and
+    starts this federation's own services."""
+    import tempfile
+
+    descriptor, draft = tempfile.mkstemp(prefix=f".{COMPOSE_FILE}.", dir=layout.root)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(render_compose(layout.spec))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(draft, layout.root / COMPOSE_FILE)
+    return f"; {COMPOSE_FILE} written"
+
+
+def verify(layout: Layout) -> str:
+    """`verify-data`: after the study's ingest, every space the rendered platform.toml declares data for read back
+    against its manifest, and the root's `data-verified.json` written only when each is exactly it (`fedverify`)."""
+    if not layout.owned:
+        require_up(layout)  # refuses: no marked root holds a verdict to remove
+    with locked(layout.root):  # one lock from the invalidation through the check and the marker (fedverify)
+        (layout.root / MARKER).unlink(missing_ok=True)
+        require_up(layout)
+        return verify_data(layout, held=True)
 
 
 def down(layout: Layout) -> str:
@@ -452,6 +489,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": status,
         "memory": memory,
         "describe": describe,
+        "verify-data": verify,
     }
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--layout", type=Path, help="the layout file (default: federation.toml beside this script)")
@@ -459,7 +497,9 @@ def main(argv: list[str] | None = None) -> int:
     which = parser.add_mutually_exclusive_group()
     which.add_argument("--clean", action="store_true", help="reset: back to the baseline, ingested data removed")
     which.add_argument("--replicas", action="store_true", help="reset: evict the mirrors' replicas, keep all data")
-    parser.add_argument("command", choices=("up", "reset", "down", "status", "memory", "describe", "compose", "ca"))
+    parser.add_argument(
+        "command", choices=("up", "reset", "down", "status", "memory", "describe", "compose", "ca", "verify-data")
+    )
     args = parser.parse_args(argv)
     command = args.command
     try:

@@ -543,6 +543,91 @@ def test_a_member_never_launches_on_a_root_whose_other_members_worker_still_runs
     assert [r["ok"] for r in vm.log.lines if r.get("action") == "Worker"] == [False]
 
 
+def campaign(vm: Vm, name: str) -> SimpleNamespace:
+    """Another campaign over the host's same static members: its own site directory, channel, evidence and archives."""
+    fleet, channel = vm.base / f"fleet-{name}", vm.base / f"channels-{name}"
+    for directory in (fleet, channel):
+        directory.mkdir(mode=0o700)
+    text = (vm.tmp / "sites.toml").read_text(encoding="utf-8")
+    for key, old, new in (("fleet", vm.fleet, fleet), ("channel", vm.channel, channel),
+                          ("evidence", vm.tmp / "evidence", vm.tmp / f"evidence-{name}"),
+                          ("archives", vm.tmp / "archives", vm.tmp / f"archives-{name}")):  # fmt: skip
+        text = text.replace(f'{key} = "{old}"', f'{key} = "{new}"')
+    path = vm.tmp / f"sites-{name}.toml"
+    path.write_text(text, encoding="utf-8")
+    controller, (config_,) = vm.deploy.control.load_config(path)
+    return SimpleNamespace(fleet=fleet, controller=controller, config=config_, evidence=vm.tmp / f"evidence-{name}")
+
+
+def tick_as(deploy, vm: Vm, other: SimpleNamespace, ledger: Ledger, clock) -> list:
+    """One tick of the other campaign's controller over the same host."""
+    log = deploy.execute.Log(None)
+    executor = deploy.execute.Executor(ledger, ledger.path, {SITE: other.config}, vm.transport, other.evidence, log,
+                                       identity=lambda site, member: (FINGERPRINT, {"core": "abc"}),
+                                       clock=clock)  # fmt: skip
+    hooks = deploy.control.Hooks(runner=lambda: None, clock=clock, say=lambda line: None)
+    decision = deploy.control.tick(ledger, ledger.path, other.controller, [other.config], {}, vm.transport, executor,
+                                   log, hooks)  # fmt: skip
+    executor.wait()
+    return decision.actions
+
+
+def test_c53_two_campaigns_on_one_host_never_run_two_workers_on_one_federation(deploy, vm, tmp_path):
+    """C53: two campaigns, each its own site directory, channel and ledger, over the host's same two members. The
+    first to launch a member's worker claims the federation: the other reads both down and launches nothing. Once the
+    first retires a member (its worker died), the other joins it as its own member, and the first's next generation of
+    it then reads down: one worker per federation across campaigns."""
+    clock = FakeClock(time.time())
+    first = new_ledger(tmp_path, clock)
+    other = campaign(vm, "c")
+    second = Ledger.create(tmp_path / "out-c" / "ledger.sqlite", plan(tasks=1), config(), clock=clock)
+    try:
+        assert len([a for a in tick(deploy, vm, first, clock) if type(a).__name__ == "Join"]) == 2
+        read = deploy.control.observe_site(vm.transport, other.config, None)
+        assert {m.label: m.status for m in read.members} == {"fed-1": "down", "fed-2": "down"}
+        assert not [a for a in tick_as(deploy, vm, other, second, clock) if type(a).__name__ == "Join"]
+        assert not list(other.fleet.glob("members/*/worker.json"))
+        retire_dead_worker(deploy, vm, first, clock)
+        joins = [a for a in tick_as(deploy, vm, other, second, clock) if type(a).__name__ == "Join"]
+        assert [a.label for a in joins] == ["site-a-fed-1"]
+        launched = json.loads((other.fleet / "members" / "fed-1" / "worker.json").read_text(encoding="utf-8"))
+        assert launched["root"] == str(vm.roots["fed-1"])
+        assert vm.view()["fed-1-g2"].status == "down"
+        assert not [a for a in tick(deploy, vm, first, clock) if type(a).__name__ == "Join"]
+        assert not (vm.fleet / "members" / "fed-1-g2" / "worker.json").exists()
+    finally:
+        for path in other.fleet.glob("members/*/worker.json"):
+            deploy.site.stop_tagged(json.loads(path.read_text(encoding="utf-8"))["tag"], 0.0)
+        second.close()
+
+
+def test_c53_a_worker_that_holds_no_claim_keeps_another_campaign_off_its_federation(deploy, vm, tmp_path):
+    """C53: a worker launched before claims existed holds none: another campaign reads its federation free and joins,
+    but its launch finds that worker on the root and refuses, so no second worker starts there."""
+    clock = FakeClock(time.time())
+    first = new_ledger(tmp_path, clock)
+    other = campaign(vm, "c")
+    second = Ledger.create(tmp_path / "out-c" / "ledger.sqlite", plan(tasks=1), config(), clock=clock)
+    try:
+        tick(deploy, vm, first, clock)
+        (vm.roots["fed-1"] / deploy.site.rootclaim.CLAIM).unlink()  # as a launch before claims left it
+        tick_as(deploy, vm, other, second, clock)
+        assert not (other.fleet / "members" / "fed-1" / "worker.json").exists()
+        assert "site-a-fed-1" not in {f.label for f in second.federations()}
+    finally:
+        for path in other.fleet.glob("members/*/worker.json"):
+            deploy.site.stop_tagged(json.loads(path.read_text(encoding="utf-8"))["tag"], 0.0)
+        second.close()
+
+
+def test_c53_a_compose_site_takes_no_shared_site_file(deploy, vm):
+    """C53: a Compose site's members are shared through their roots' claims: a shared maximum for it is refused."""
+    text = (vm.tmp / "sites.toml").read_text(encoding="utf-8")
+    (vm.tmp / "sites.toml").write_text(text + f'shared_site_file = "{vm.tmp / "shared.json"}"\n', encoding="utf-8")
+    with pytest.raises(deploy.control.ConfigError, match="takes no shared_site_file"):
+        deploy.control.load_config(vm.tmp / "sites.toml")
+
+
 def test_site_labels_one_of_which_begins_with_another_and_a_dash_are_refused(deploy, vm):
     """`a-b`'s member `c` and `a`'s member `b-c` would be one ledger label: such sites never share a sites file."""
     text = (vm.tmp / "sites.toml").read_text(encoding="utf-8")
@@ -625,29 +710,178 @@ def test_c51_a_drained_member_stays_out_until_its_operator_undrains_it(deploy, v
     assert [a.label for a in joins] == ["site-a-fed-1-g2"]
 
 
+def good_marker(manifest: Path) -> dict:
+    """The marker `verify-data` writes for the declared manifest as it is now: format /2, both digests."""
+    from expcore_onedata.importmanifest import load_manifest
+
+    entry = {"space_id": "sid-alpha", "manifest_sha256": load_manifest(manifest).digest(),
+             "manifest_file_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()}  # fmt: skip
+    return {"format": "expcore-compose-data-verified/2", "spaces": {"alpha": entry}}
+
+
 def test_c51_a_member_whose_platform_declares_data_is_verified_only_by_a_marker_of_that_manifest(deploy, vm, tmp_path):
     """C51: verified is never just linked when the member's platform file declares a space's data (a data manifest),
     or a federation with missing or other data would join and score runs. Without a marker it reads unverified and
-    never joins; a marker of another manifest (or another space) is no marker; one naming the space's id and its
-    manifest's SHA-256 as it is now verifies it, exactly as an HPC member's verify-data marker."""
+    never joins; a marker naming the space's id, its manifest's core digest and its file's bytes' digest as it is now
+    verifies it, exactly as an HPC member's verify-data marker."""
     root = vm.roots["fed-1"]
-    manifest = root / "data-manifests" / "alpha.json"
-    manifest.parent.mkdir()
-    manifest.write_text('{"files": []}\n', encoding="utf-8")
-    (root / "platform.toml").write_text(
-        '[[spaces]]\nname = "alpha"\nid = "sid-alpha"\ndata_manifest = "data-manifests/alpha.json"\n', encoding="utf-8"
-    )
+    manifest = declare_data(vm)
     clock = FakeClock(time.time())
     ledger = new_ledger(tmp_path, clock)
     assert not vm.view()["fed-1"].verified
     tick(deploy, vm, ledger, clock)
     assert [f.label for f in ledger.federations()] == ["site-a-fed-2"]  # fed-1 waits: its data is not shown
-    marker = {"format": "expcore-compose-data-verified/1", "spaces": {"alpha": {"space_id": "sid-alpha",
-              "manifest_sha256": hashlib.sha256(b"another manifest").hexdigest()}}}  # fmt: skip
-    (root / "data-verified.json").write_text(json.dumps(marker), encoding="utf-8")
-    assert not vm.view()["fed-1"].verified
-    marker["spaces"]["alpha"]["manifest_sha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
-    (root / "data-verified.json").write_text(json.dumps(marker), encoding="utf-8")
+    (root / "data-verified.json").write_text(json.dumps(good_marker(manifest)), encoding="utf-8")
     assert vm.view()["fed-1"].verified
     tick(deploy, vm, ledger, clock)
     assert "site-a-fed-1" in {f.label for f in ledger.federations()}
+
+
+@pytest.mark.parametrize(
+    "wrong",
+    ["format /1", "manifest_sha256", "manifest_file_sha256", "space_id", "the file rewritten in another layout"],
+)
+def test_c52_a_marker_is_no_marker_when_any_field_is_not_the_files_now(deploy, vm, wrong):
+    """C52: each field the marker holds must be the declared manifest's as it is now: a marker of the earlier format
+    (/1), another core digest, another file digest, another space id, and a manifest file rewritten with the same
+    entries in another byte layout (its core digest the same, its file digest not) each read unverified."""
+    root = vm.roots["fed-1"]
+    manifest = declare_data(vm)
+    marker = good_marker(manifest)
+    entry = marker["spaces"]["alpha"]
+    if wrong == "format /1":
+        marker["format"] = "expcore-compose-data-verified/1"
+    elif wrong == "the file rewritten in another layout":
+        manifest.write_text(json.dumps(json.loads(manifest.read_text(encoding="utf-8")), indent=4), encoding="utf-8")
+        assert good_marker(manifest)["spaces"]["alpha"]["manifest_sha256"] == entry["manifest_sha256"]
+    else:
+        entry[wrong] = "0" * 64 if wrong != "space_id" else "sid-other"
+    (root / "data-verified.json").write_text(json.dumps(marker), encoding="utf-8")
+    assert not deploy.site.data_verified(root)
+
+
+# ------------------------------------------------------------------------------------------------ declared data
+def declare_data(vm: Vm, member: str = "fed-1") -> Path:
+    """The member's platform file declares its study space's data: a manifest of one file, `data.bin`."""
+    from expcore_onedata.importmanifest import Manifest, ManifestFile, write_manifest
+
+    root = vm.roots[member]
+    manifest = root / "data-manifests" / "alpha.json"
+    manifest.parent.mkdir(exist_ok=True)
+    write_manifest(Manifest((ManifestFile("data.bin", 4, hashlib.sha256(b"data").hexdigest()),), ()), manifest)
+    (root / "platform.toml").write_text(
+        f'[[spaces]]\nname = "alpha"\nid = "sid-alpha"\ndata_manifest = "{manifest}"\n', encoding="utf-8"
+    )
+    facts = json.loads((root / "facts.json").read_text(encoding="utf-8"))
+    facts["spaces"] = {"alpha": {"id": "sid-alpha"}}
+    (root / "facts.json").write_text(json.dumps(facts), encoding="utf-8")
+    return manifest
+
+
+def test_c52_verify_data_writes_the_marker_only_for_data_that_is_exactly_its_manifest(deploy, vm):
+    """C52: `verify-data` reads every declared space back (here a stand-in for the owner's REST reader) and writes the
+    marker the member joins on only when each is exactly its manifest; a space with a file of other bytes refuses,
+    naming the space, and removes the marker an earlier check wrote, so a re-ingest that went wrong never keeps it."""
+    import fedverify
+
+    manifest = declare_data(vm)
+    layout = SimpleNamespace(root=vm.roots["fed-1"])
+    whole = ({"data.bin": (4, hashlib.sha256(b"data").hexdigest())}, set())
+    assert "1 space(s) hold exactly their manifests" in fedverify.verify_data(layout, read=lambda space: whole)
+    written = json.loads((vm.roots["fed-1"] / "data-verified.json").read_text(encoding="utf-8"))
+    assert written == good_marker(manifest)  # format /2: the core digest and the file's bytes' digest
+    assert deploy.site.data_verified(vm.roots["fed-1"])
+    other = ({"data.bin": (4, hashlib.sha256(b"dat!").hexdigest())}, set())
+    with pytest.raises(RuntimeError, match="alpha does not hold the data its manifest declares"):
+        fedverify.verify_data(layout, read=lambda space: other)
+    assert not (vm.roots["fed-1"] / "data-verified.json").exists()
+    assert not deploy.site.data_verified(vm.roots["fed-1"])
+    fedverify.verify_data(layout, read=lambda space: whole)
+    fedverify.invalidate(vm.roots["fed-1"])  # what reset --clean does before it empties the spaces
+    assert not deploy.site.data_verified(vm.roots["fed-1"])
+
+
+def test_c52_a_manifest_named_by_a_relative_path_is_never_verified(deploy, vm):
+    """C52: a relative data_manifest resolves against the root for the check and against the study beside the
+    platform file's copy for a run, so the two could be two manifests: it is refused, and the member never verified."""
+    import fedverify
+
+    manifest = declare_data(vm)
+    root = vm.roots["fed-1"]
+    platform = (root / "platform.toml").read_text(encoding="utf-8").replace(str(manifest), "data-manifests/alpha.json")
+    (root / "platform.toml").write_text(platform, encoding="utf-8")
+    whole = ({"data.bin": (4, hashlib.sha256(b"data").hexdigest())}, set())
+    with pytest.raises(RuntimeError, match="relative path"):
+        fedverify.verify_data(SimpleNamespace(root=root), read=lambda space: whole)
+    assert not deploy.site.data_verified(root)
+
+
+PREPARE = """
+import hashlib, json, sys
+from expcore_onedata.importmanifest import load_manifest
+root = sys.argv[1]
+path = root + "/data-manifests/alpha.json"
+marker = {"format": "expcore-compose-data-verified/2", "spaces": {"alpha": {"space_id": "sid-alpha",
+          "manifest_sha256": load_manifest(path).digest(),
+          "manifest_file_sha256": hashlib.sha256(open(path, "rb").read()).hexdigest()}}}
+open(root + "/data-verified.json", "w").write(json.dumps(marker))
+open(root + "/prepare-saw-layout", "w").write(sys.argv[2])
+"""
+
+
+def test_c52_a_compose_member_with_declared_data_joins_after_its_prepare_verifies_it(deploy, vm, tmp_path):
+    """C52: a Compose site's `prepare` (#494's hook) runs once, on the host, for a member linked with its declared data
+    unverified, with `{root}` its root and `{layout}` the site's layout file; the member joins only once the marker its
+    command leaves (the study's ingest, then `composesite.py verify-data`; here a stand-in) verifies it."""
+    declare_data(vm)
+    real = Path(__file__).resolve().parents[2] / "deploy" / "hpc-federation" / "fleetprepare.py"
+    (vm.base / "hpc-federation").mkdir()
+    (vm.base / "hpc-federation" / "fleetprepare.py").write_text(
+        f"import runpy, sys\nsys.argv[0] = {str(real)!r}\nrunpy.run_path({str(real)!r}, run_name='__main__')\n",
+        encoding="utf-8",
+    )
+    (vm.base / "prepare.py").write_text(PREPARE, encoding="utf-8")
+    layout = vm.base / "layout.toml"
+    layout.write_text("# the members' layout\n", encoding="utf-8")
+    text = (vm.tmp / "sites.toml").read_text(encoding="utf-8")
+    command = f'prepare = ["{sys.executable}", "{vm.base / "prepare.py"}", "{{root}}", "{{layout}}"]'
+    (vm.tmp / "sites.toml").write_text(text + f'{command}\nprepare_timeout_s = 120\nlayout = "{layout}"\n', "utf-8")
+    vm.controller, (vm.config,) = deploy.control.load_config(vm.tmp / "sites.toml")
+    clock = FakeClock(time.time())
+    ledger = new_ledger(tmp_path, clock)
+    actions = tick(deploy, vm, ledger, clock)
+    assert [a.member for a in actions if type(a).__name__ == "Prepare"] == ["fed-1"]
+    assert [f.label for f in ledger.federations()] == ["site-a-fed-2"]  # fed-1 waits for its data
+    assert (vm.roots["fed-1"] / "prepare-saw-layout").read_text(encoding="utf-8") == str(layout)
+    assert vm.view()["fed-1"].verified
+    tick(deploy, vm, ledger, clock)
+    assert "site-a-fed-1" in {f.label for f in ledger.federations()}
+    assert not [a for a in tick(deploy, vm, ledger, clock) if type(a).__name__ == "Prepare"]  # once
+
+
+# ------------------------------------------------------------------------------------------------ pass_env
+def test_c52_a_sites_pass_env_reaches_the_worker_and_the_identity_read_with_the_hosts_value(deploy, vm, tmp_path):
+    """C52: a study's plugin may read a variable of the site (the study's artifacts directory, say), which the identity
+    read and every lease run must see alike. A Compose site's `pass_env` names it: the host's own value (its
+    site.env's) is given to the worker, whose lease runs inherit it, and to the identity read, by the shard step's own
+    name and value rules. A name that looks like a secret is refused in the sites file; one the host has not set
+    starts no worker."""
+    vm.env_file.write_text(vm.env_file.read_text(encoding="utf-8") + "STUDY_DATA_DIR='/srv/study-data'\n", "utf-8")
+    text = (vm.tmp / "sites.toml").read_text(encoding="utf-8")
+    (vm.tmp / "sites.toml").write_text(text + 'pass_env = ["STUDY_DATA_DIR"]\n', encoding="utf-8")
+    vm.controller, (vm.config,) = deploy.control.load_config(vm.tmp / "sites.toml")
+    argv = deploy.compose.identity_argv(vm.config, "fed-1")
+    assert argv[-2:] == ["--pass-env", "STUDY_DATA_DIR"]
+    clock = FakeClock(time.time())
+    tick(deploy, vm, new_ledger(tmp_path, clock), clock)
+    pid = vm.worker("fed-1")["pid"]
+    words = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    environ = dict(word.split(b"=", 1) for word in words if b"=" in word)
+    assert environ[b"STUDY_DATA_DIR"] == b"/srv/study-data"
+    (vm.tmp / "sites.toml").write_text(text + 'pass_env = ["API_TOKEN"]\n', encoding="utf-8")
+    with pytest.raises(deploy.control.ConfigError, match="looks like a secret"):
+        deploy.control.load_config(vm.tmp / "sites.toml")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv("STUDY_DATA_DIR", raising=False)
+        with pytest.raises(deploy.site.SiteError, match="STUDY_DATA_DIR is not set"):
+            deploy.site.passed(["STUDY_DATA_DIR"])
