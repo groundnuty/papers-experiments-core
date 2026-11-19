@@ -8,7 +8,8 @@ command here over ssh, from the site's directory (`--fleet`, 0700, one per campa
     <python> -I -B composesite.py stop --fleet F --member NAME
     <python> -I -B composesite.py identity --fleet F --root ROOT --study DIR
     <python> -I -B composesite.py collect --root ROOT --into DIR
-    <python> -I -B composesite.py retired --fleet F --member NAME --channel DIR
+    <python> -I -B composesite.py retired --fleet F --member NAME --channel DIR [--drained]
+    <python> -I -B composesite.py undrain --fleet F --member NAME
 
 Each takes `--engine` after its name (the site's setting, `EXPCORE_FED_ENGINE`; docker by default). The members are
 federations the operator brought up with `federation.py up` (static members: none is ever brought up or taken down
@@ -41,7 +42,10 @@ here).
   written in the root: no `down` follows.
 - **retired** records, after the worker is proven gone, that the member is retired for this channel, so `observe`
   reports it `down` and the controller proves its end. The federation stays up, for the next campaign (a new
-  `--fleet` and channel) or the operator's `down`.
+  `--fleet` and channel) or the operator's `down`. With `--drained` (a member retired after a drain: an operator's,
+  for maintenance say) no later generation of it joins by itself; a member retired for another reason (its worker
+  died) is followed by its next generation once its root reads live and linked.
+- **undrain** is the operator's step that brings a drained member back: its next generation may join again.
 """
 
 import argparse
@@ -308,6 +312,12 @@ def has_records(fleet: Path, label: str) -> bool:
     return (here / PIDFILE).exists() or (here / RETIRED).exists()
 
 
+def drained(fleet: Path, label: str) -> bool:
+    """Whether the generation was retired after a drain and not brought back (`undrain`)."""
+    record = read_record(member_dir(fleet, label) / RETIRED)
+    return bool(record and record.get("drained"))
+
+
 def chain(fleet: Path, site: str, channel: str, member: str, root: Path, now: float, horizon: float,
           last: bool) -> list[dict]:  # fmt: skip
     """A configured member's generations, oldest first, ending at its current one. Once a generation is retired for
@@ -324,8 +334,8 @@ def chain(fleet: Path, site: str, channel: str, member: str, root: Path, now: fl
         following = generation(member, k + 1)
         if has_records(fleet, following):
             continue
-        if not (last and live(root, project_of(root)) and linked(root)):
-            return views
+        if drained(fleet, view["label"]) or not (last and live(root, project_of(root)) and linked(root)):
+            return views  # a drained one stays out until its operator's undrain
     return views
 
 
@@ -516,8 +526,21 @@ def retired(args: argparse.Namespace) -> int:
         record = pidfile(here)
         if record is not None and not worker_gone(record):
             raise SiteError(f"{args.member}: its worker still runs: stop it before it is retired")
-        write_record(here / RETIRED, {"channel": args.channel, "at": time.time()})
+        write_record(here / RETIRED, {"channel": args.channel, "at": time.time(), "drained": args.drained})
     print(f"composesite: {args.member}: retired; its federation stays up")
+    return 0
+
+
+def undrain(args: argparse.Namespace) -> int:
+    """The operator's step: a member retired after a drain may be followed by its next generation again."""
+    here = member_dir(Path(args.fleet), args.member)
+    with member_lock(here):
+        record = read_record(here / RETIRED)
+        if record is None or not record.get("drained"):
+            raise SiteError(f"{args.member}: not retired after a drain; nothing to undrain")
+        write_record(here / RETIRED, {**{k: v for k, v in record.items() if k != "format"}, "drained": False,
+                                      "undrained_at": time.time()})  # fmt: skip
+    print(f"composesite: {args.member}: undrained; its next generation may join")
     return 0
 
 
@@ -611,7 +634,7 @@ def parser() -> argparse.ArgumentParser:
     commands = {"observe": ("fleet", "site", "channel"), "stop": ("fleet", "member"),
                 "launch": ("fleet", "member", "root", "federation", "channel", "study", "home"),
                 "identity": ("fleet", "root", "study"), "collect": ("root", "into"),
-                "retired": ("fleet", "member", "channel")}  # fmt: skip
+                "retired": ("fleet", "member", "channel"), "undrain": ("fleet", "member")}  # fmt: skip
     made = {}
     for name, keys in commands.items():
         made[name] = sub.add_parser(name, parents=[common])
@@ -620,6 +643,7 @@ def parser() -> argparse.ArgumentParser:
     made["observe"].add_argument("--horizon-s", dest="horizon_s", type=float, default=HORIZON_S)
     made["observe"].add_argument("--member", action="append", default=[])
     made["stop"].add_argument("--grace-s", dest="grace_s", type=float, default=GRACE_S)
+    made["retired"].add_argument("--drained", action="store_true")
     made["identity"].add_argument("--home", required=True)  # checked apart from the study before it is copied
     return found
 
@@ -628,7 +652,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     os.environ[ENGINE_ENV] = args.engine  # every call to the engine, here and in feddocker, names this one
     commands: dict[str, Any] = {"launch": launch, "stop": stop, "identity": identity, "collect": collect,
-                                "retired": retired}  # fmt: skip
+                                "retired": retired, "undrain": undrain}  # fmt: skip
     try:
         if args.command == "observe":
             print(json.dumps(observe(args), sort_keys=True))

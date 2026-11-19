@@ -145,9 +145,11 @@ def collect_argv(site: Any, root: str, into: str) -> List[str]:
     return script(site, "collect", "--root", root, "--into", into)
 
 
-def retired_argv(site: Any, member: str, label: str) -> List[str]:
+def retired_argv(site: Any, member: str, label: str, drained: bool = False) -> List[str]:
+    """The retired record; `--drained` for a member retired after a drain, which no later generation follows by itself
+    (`composesite.py undrain` brings it back)."""
     return script(site, "retired", "--fleet", str(site.fleet), "--member", member, "--channel",
-                  channel_of(site, label))  # fmt: skip
+                  channel_of(site, label), *(("--drained",) if drained else ()))  # fmt: skip
 
 
 def is_compose(site: Optional[Any]) -> bool:

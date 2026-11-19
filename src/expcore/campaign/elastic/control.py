@@ -112,7 +112,9 @@ class Drain:
 @dataclass(frozen=True)
 class Retire:
     """Collect the member's root evidence (when `collect`), copy it back, then `down --member`; `label` is its ledger
-    label, None for a member that never joined. `abort_prepare` first ends a prepare found started and never ended."""
+    label, None for a member that never joined. `abort_prepare` first ends a prepare found started and never ended.
+    `drained` says the federation was drained: a Compose site's static member retired after a drain stays out (no
+    later generation joins by itself) until its operator brings it back."""
 
     site: str
     member: str
@@ -121,6 +123,7 @@ class Retire:
     collect: bool
     reason: str
     abort_prepare: bool = False
+    drained: bool = False
 
 
 @dataclass(frozen=True)
@@ -341,7 +344,17 @@ def _joined(now: float, ledger: LedgerView, settings: SiteSettings, m: Member, f
     if fed.ended_at is not None or fed.drained_at is not None:
         if held not in LIVE:
             why = "drained" if fed.ended_at is None else f"its job is proven ended ({fed.end_proof})"
-            acts.append(Retire(site, m.label, label, m.root, True, f"{why}, and no lease in flight"))
+            acts.append(
+                Retire(
+                    site,
+                    m.label,
+                    label,
+                    m.root,
+                    True,
+                    f"{why}, and no lease in flight",
+                    drained=fed.drained_at is not None,
+                )
+            )
         return "gone"
     if m.ended:
         acts.append(ProveEnded(site, m.label, label, "terminal", f"the site shows its job ended ({m.state})"))

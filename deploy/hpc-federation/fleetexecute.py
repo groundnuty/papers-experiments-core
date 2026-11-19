@@ -222,7 +222,7 @@ def retire_compose(action: Any, site: SiteConfig, into: Path, digest: str) -> Re
         steps.append((sys.executable, "-I", "-B", str(HERE / "shards.py"), "verify-copy", str(into / ARCHIVES_MANIFEST),
                       str(into), "--manifest-sha256", digest))  # fmt: skip
         places.append(HERE_PLACE)
-    steps.append(tuple(fleetcompose.retired_argv(site, action.member, label)))
+    steps.append(tuple(fleetcompose.retired_argv(site, action.member, label, getattr(action, "drained", False))))
     return Rendered("site", tuple(steps), places=(*places, SITE))
 
 

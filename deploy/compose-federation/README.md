@@ -140,7 +140,9 @@ controller runs `composesite.py` here over ssh, from the site's directory with i
 - **Rejoin.** A member retired for the campaign's channel (its worker died, say) whose root reads live and linked
   again joins as its next generation, `<member>-g2` up to `-g9`: a new ledger label, with its own worker, channel,
   records and copy. Or the operator adds a member naming the same root after it in the sites file, which takes the
-  root over once the first is retired: members naming one root hold it one at a time, in the file's order.
+  root over once the first is retired: members naming one root hold it one at a time, in the file's order. A member
+  retired after a DRAIN (`fleetcontrol.py drain`, to take a federation out for maintenance) stays out: no generation
+  follows it by itself until the operator runs `composesite.py undrain --fleet F --member <its label>` on the host.
 - **stop** (the worker's run directory, and any lease store in it, is kept), **collect** (the root's allow-listed
   evidence, `hpcevidence.archive_root` with `facts.json` required; a retry takes only this root's whole copy),
   **retired**: a retirement stops the worker and proves it gone, collects, and, once the copy is pulled and verified

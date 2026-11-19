@@ -602,3 +602,23 @@ def test_an_ssh_config_that_is_not_a_private_file_is_refused(deploy, vm, tmp_pat
     (vm.tmp / "sites.toml").write_text(text + f'ssh_config = "{config}"\n', encoding="utf-8")
     with pytest.raises(deploy.control.ConfigError, match="ssh_config"):
         deploy.control.load_config(vm.tmp / "sites.toml")
+
+
+def test_c51_a_drained_member_stays_out_until_its_operator_undrains_it(deploy, vm, tmp_path):
+    """C51: a member drained (an operator taking a VM federation out for maintenance, say) is retired and stays out:
+    no later generation joins by itself, though its root reads live and linked. The operator's `undrain` brings it
+    back, as its next generation (a member whose worker died rejoins with no such step: see above)."""
+    clock = FakeClock(time.time())
+    ledger = new_ledger(tmp_path, clock)
+    tick(deploy, vm, ledger, clock)
+    ledger.drain("site-a-fed-1")
+    assert [a.drained for a in tick(deploy, vm, ledger, clock) if isinstance(a, Retire)] == [True]
+    for _ in range(2):
+        assert not [a for a in tick(deploy, vm, ledger, clock) if type(a).__name__ == "Join"]
+    assert set(vm.view()) == {"fed-1", "fed-2"}
+    assert vm.view()["fed-1"].status == "down"
+    undrain = deploy.compose.script(vm.config, "undrain", "--fleet", str(vm.fleet), "--member", "fed-1")
+    code, _, err = vm.transport.run(vm.config, undrain, 60.0)
+    assert (code, err) == (0, "")
+    joins = [a for a in tick(deploy, vm, ledger, clock) if type(a).__name__ == "Join"]
+    assert [a.label for a in joins] == ["site-a-fed-1-g2"]
