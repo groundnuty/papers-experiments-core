@@ -314,14 +314,16 @@ class OpenAICompatAdapter(_SdkBackend):
         self._session = identity
 
     def _extra_headers(self) -> dict[str, Any]:
-        """The per-request header arguments of the SDK call: the session id when the entry sets a header, else none (so a
-        client is called exactly as before). A backend nobody bound, such as an admission probe's, keeps one random id
-        of its own. The id is never in the request dict, so it is no setting of the record (B15)."""
-        if self.spec.session_header is None:
-            return {}
-        if self._session is None:
-            self._session = random_session_id()
-        return {"extra_headers": {self.spec.session_header: self._session}}
+        """The per-request header arguments of the SDK call: the entry's `extra_headers` and, when it sets a session
+        header, the attempt's id; none when it sets neither (so a client is called exactly as before). A backend nobody
+        bound, such as an admission probe's, keeps one random id of its own. Neither is in the request dict, so
+        neither is a setting of the record (B15)."""
+        headers = dict(self.spec.extra_headers)
+        if self.spec.session_header is not None:
+            if self._session is None:
+                self._session = random_session_id()
+            headers[self.spec.session_header] = self._session
+        return {"extra_headers": headers} if headers else {}
 
     async def _create(self, kw: dict[str, Any]) -> tuple[Any, str | None]:
         """One chat completion and the deployment its reply named. With `deployment_header` set the SDK's raw-response
@@ -337,8 +339,9 @@ class OpenAICompatAdapter(_SdkBackend):
         return parsed, clean_deployment_id(raw.headers.get(self.spec.deployment_header))
 
     def info(self) -> dict[str, Any]:
-        """Describe the route and what the replies reported."""
-        return self._info("openai")
+        """Describe the route and what the replies reported; the names (never the values) of the extra headers sent."""
+        names = {"extra_header_names": sorted(self.spec.extra_headers)} if self.spec.extra_headers else {}
+        return self._info("openai", **names)
 
     def begin(self, system: str, user: str, tools: list[dict]) -> None:
         """Start a conversation with the tools as chat-completion functions."""
