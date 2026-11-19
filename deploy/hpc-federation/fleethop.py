@@ -420,7 +420,8 @@ def probe(args: argparse.Namespace) -> int:
 
 def main(argv: Optional[List[str]] = None) -> int:
     found = argparse.ArgumentParser(prog="fleethop.py", description=__doc__.split("\n\n")[0])
-    sub = found.add_subparsers(dest="command", required=True)
+    sub = found.add_subparsers(dest="command")
+    sub.required = True  # the keyword is Python 3.7's; a login node's own python3 may be older
     one = sub.add_parser("probe")
     one.add_argument("--fleet-hop", dest="fleet_hop", required=True)
     one.add_argument("--path", default="/v1/models")
