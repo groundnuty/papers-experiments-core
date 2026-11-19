@@ -18,6 +18,8 @@ snapshot and never the live platform (R13). The snapshot holds, for the files th
   agent through the tool plane, or a QoS requirement (`space_transfers`: its type, source and target by position
   label, state, counters, and schedule, start and end times; `transferlog.py` says how it is read and where it fails
   closed). An unreadable or unconfirmed listing is `probe_ok` false with a reason and no records, never no transfers;
+  the records above and the listing share one deadline, `[placement] transfer_walk_deadline_s` (`transferlog.py`),
+  past which nothing more is read and each record not read is a failed probe with the reason `deadline`;
 - the bytes moved between each pair of providers, from the growth of a provider's block map, attributed to a source
   only where exactly one other provider held those bytes at the start. Bytes that two or more providers held, and
   bytes no other provider held, are counted apart and attributed to nobody. No pair is ever derived from a transfer's
@@ -56,7 +58,7 @@ from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.placement import Range, held_bytes, merged, uncovered
 from expcore_onedata.provision import Listings, Provisioner
 from expcore_onedata.readretry import ONE_ATTEMPT
-from expcore_onedata.transferlog import MAX_LISTED, PAGE_LIMIT, TransferLog
+from expcore_onedata.transferlog import DEADLINE, MAX_LISTED, PAGE_LIMIT, TransferLog, deadline_at
 from expcore_onedata.transferrecord import state_of
 from expcore_onedata.transferwindow import Window, split_gained
 
@@ -274,12 +276,17 @@ class PlatformProbes:
         name = self._provisioner.provider_named(provider_id)
         return None if name is None else self._client.provider_label(name)
 
-    def _transfer_records(self) -> list[dict[str, Any]]:
+    def _transfer_records(self, deadline: float) -> list[dict[str, Any]]:
+        """The record of every transfer the provisioner scheduled, each read once the walk is within `deadline` (the
+        provisioner's clock); one past it is not read, a failed probe with the reason `deadline`."""
         records = []
         for provider, tid, kind in self._transfers():
-            found = self._probe(
-                lambda p=provider, t=tid: self._client.get(f"/transfers/{t}", provider=p, retry=ONE_ATTEMPT)
-            )
+            if self._provisioner.clock() > deadline:
+                found = ProbeResult(False, None, 0, error=DEADLINE)
+            else:
+                found = self._probe(
+                    lambda p=provider, t=tid: self._client.get(f"/transfers/{t}", provider=p, retry=ONE_ATTEMPT)
+                )
             body = found.value if found.ok and isinstance(found.value, dict) else {}
             records.append(
                 {
@@ -348,10 +355,11 @@ class PlatformProbes:
                     for source, n in row["from"].items():
                         total["from"][source] = total["from"].get(source, 0) + n
             files[label] = {"size": size, "entry": entries[label].to_json(), "providers": readings, "pairs": pairs}
-        transfers = self._transfer_records()
+        deadline = deadline_at(self._provisioner)  # one for the records and the listing (`transferlog.py`)
+        transfers = self._transfer_records(deadline)
         file_ids = {entries[label].value.file_id: label for label in self._files if entries[label].ok}
         harness = {tid for _, tid, _ in self._transfers()}
-        log = self._log.read(window, file_ids, harness)
+        log = self._log.read(window, file_ids, harness, deadline=deadline)
         ok = complete and all(t["probe_ok"] for t in transfers) and log.section["probe_ok"]
         gained = {p: row["gained_bytes"] for p, row in pair_totals.items()}
         return {
