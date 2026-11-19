@@ -160,6 +160,50 @@ def test_the_identity_is_read_beside_the_federations_own_platform_file_by_the_ma
     assert deploy.fleetidentity.read_identity(fleet, "fed-9", settings, runner) is None
 
 
+def test_the_read_command_prints_the_one_json_line_the_controller_of_an_ssh_site_parses(deploy, tmp_path, capsys):
+    """`fleetidentity.py read` (run on the login node of an ssh site) prints `read_identity`'s answer as one JSON line
+    that `read_identity_remote` takes back as the same pair, and exits 1, printing nothing, where there is none."""
+    fleet = tmp_path / "fleet"
+    fleet.mkdir(mode=0o700)
+    study = tmp_path / "study"
+    study.mkdir()
+    (study / "study.toml").write_text("[study]\n")
+    settings = tmp_path / "shard-settings.toml"
+    settings.write_text(
+        f'study = "{study}"\npython = "/venv/bin/python"\ncore_src = "/c"\nresults = "/r"\ntmpfs = "/t"\n'
+        'step_path = "/usr/bin:/bin"\ncpus = 2\nmemory = "4g"\n'
+    )
+    record = deploy.fleetrecord.new_record(tmp_path / "layout.toml", "digest", 2, 5, 1)
+    member = deploy.fleetrecord.new_member(fleet, "fed-1")
+    member["status"] = "up"
+    root = deploy.fleetrecord.root_of(fleet, "fed-1")
+    root.mkdir(parents=True)
+    (root / "platform.toml").write_text('[space]\nname = "s"\n')
+    member["made"] = [root.stat().st_dev, root.stat().st_ino]
+    record["members"].append(member)
+    deploy.fleetrecord.Record(fleet).save(record)
+
+    def runner(argv, **kwargs):
+        out = json.dumps({"fingerprint": FINGERPRINT, "environment": IDENTITY})
+        return subprocess.CompletedProcess(argv, 0, out, "")
+
+    words = ["read", "--fleet", str(fleet), "--settings", str(settings)]
+    assert deploy.fleetidentity.main([*words, "--member", "fed-1"], runner) == 0
+    printed = capsys.readouterr().out
+    assert len(printed.splitlines()) == 1
+    config = SimpleNamespace(
+        shard_settings=settings, fleet=fleet, script=lambda name, *rest: ["python", name, *rest], remote=True
+    )
+
+    class Said:
+        def run(self, site, argv, timeout):
+            return 0, printed, ""
+
+    assert deploy.fleetidentity.read_identity_remote(Said(), config, "fed-1") == (FINGERPRINT, IDENTITY)
+    assert deploy.fleetidentity.main([*words, "--member", "fed-9"], runner) == 1
+    assert capsys.readouterr().out == ""
+
+
 def test_a_lost_leases_store_is_found_in_its_channel_only_while_the_member_shows_and_in_the_pulled_evidence(
     deploy, tmp_path
 ):

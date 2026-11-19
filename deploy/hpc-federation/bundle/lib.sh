@@ -464,11 +464,20 @@ need_2xx() {  # <status> <what> <body-file>: fail on anything but 2xx
 JSONGET_NULL=3
 jsonget() { "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/jsonget.py" "$@"; }
 
+# The node's FQDN: `hostname -f`, whether or not HPC_NODE_DOMAIN is set, when it is dotted; when it is one label,
+# `<hostname -s>.<HPC_NODE_DOMAIN>` (nodefacts.py's node_name makes the same name, by the same rule: the driver puts the
+# value in every step's environment). That name resolves nowhere on the node: write_names maps it to the node's address.
 node_fqdn() {
-  local f
+  local f s d label='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
   f=$(hostname -f)
-  [[ $f =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]] || die "hostname -f gave '$f', not a fully qualified name"
-  printf '%s\n' "$f"
+  if [[ $f =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]]; then printf '%s\n' "$f"; return; fi
+  [[ $f =~ ^[A-Za-z0-9-]+$ ]] || die "hostname -f gave '$f', not a fully qualified name"
+  d=${HPC_NODE_DOMAIN:-}
+  [[ -n $d ]] || die "hostname -f gave the one-label name '$f', not a fully qualified name: set HPC_NODE_DOMAIN in site.env to the domain its FQDN is to carry"
+  s=$(hostname -s)
+  [[ $d =~ ^$label(\.$label)*$ && $s =~ ^$label$ && $(( ${#s} + 1 + ${#d} )) -le 253 ]] \
+    || die "HPC_NODE_DOMAIN '$d' and hostname -s '$s' do not make a fully qualified name"
+  printf '%s.%s\n' "$s" "$d"
 }
 
 valid() {  # <kind> <value>: validate one input before it reaches a file or a template
@@ -613,6 +622,15 @@ storage_binds() {  # <workdir> [--storage=PATH]: the `apptainer exec` arguments 
   "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/posixstorage.py" binds --workdir "$1" "$2"
 }
 
+hosts_bind() {  # <workdir> <array name>: the `apptainer exec` arguments that put W/hosts in the place of /etc/hosts (O73)
+  # Every container on a service's rootfs takes them: the service itself (run_service), the checks that ping its Erlang
+  # nodes (check-defaults.sh) and the commands run beside it (exec.sh). A node name the site's DNS does not hold (a
+  # one-label node with HPC_NODE_DOMAIN) resolves only through this file; none without one, as before.
+  local -n _hb=$2
+  _hb=()
+  if [[ -e $1/hosts ]]; then _hb=(--no-mount bind-paths --bind "$1/hosts:/etc/hosts:ro"); fi
+}
+
 run_service() {  # <workdir> [--storage=PATH]: become the service (apptainer exec) in the foreground of this process
   local W=$1 R=$1/rootfs S epmd b storage=${2:-}
   local -a binds=()
@@ -641,7 +659,7 @@ run_service() {  # <workdir> [--storage=PATH]: become the service (apptainer exe
   # file configure.sh wrote, listing every peer's declared name; --no-mount bind-paths drops the site's binds (and with
   # them /etc/localtime, which becomes the image's), and our file is bound read-only in the place of /etc/hosts.
   local -a naming=()
-  if [[ -e $W/hosts ]]; then naming=(--no-mount bind-paths --bind "$W/hosts:/etc/hosts:ro"); fi
+  hosts_bind "$W" naming
   exec "$HPCOP_PY" -I -B "$HPCOP_BUNDLE/supervise.py" run -- apptainer exec --writable --containall --no-home --pwd /root \
     --workdir "$W/work" "${naming[@]}" "${binds[@]}" "$R" /root/hpcop-start.sh > "$W/run.log" 2>&1 < /dev/null
 }

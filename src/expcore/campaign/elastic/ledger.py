@@ -21,6 +21,8 @@ shown ended; the sweep expires what it must.
 - **Budget.** A lease is issued only if its grant fits what is left of `max_usd` and of its model's ceiling after the
   charge of every lease. A lease is charged its grant until its spend is settled, so with every lease spending its
   whole grant the budget still holds.
+- **Caps.** A model's cap on its leases in flight or held back is the pinned one until an operator changes it, up or
+  down, mid-campaign (`caps`); a lower cap revokes nothing and only stops new leases until the model is under it.
 - **Settling and raising.** A lost lease (`settle`) is charged the spend read from its dead federation instead of its
   grant, and the difference goes back to the budget (`settling`). A ceiling is raised mid-campaign, recorded, never
   lowered or set below what is committed, and never part of the fingerprint (`ceilings`); `status` shows the money,
@@ -34,12 +36,13 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.elastic import attempts, ceilings, schema, settling
+from expcore.campaign.elastic import attempts, caps, ceilings, schema, settling
 from expcore.campaign.elastic.choice import InFlight, Pending, choose
 from expcore.campaign.elastic.config import LedgerConfig, LedgerRun, check_plan, micro_up
 from expcore.campaign.elastic.records import (
     LIVE,
     PROOFS,
+    CapChange,
     Ceiling,
     Completion,
     CompletionConflict,
@@ -250,6 +253,7 @@ class Ledger(LedgerViews):
             self.estimate_s,
             now,
             self.ceilings(),
+            self.caps(),
         )
         if isinstance(chosen, Wait):
             return chosen
@@ -518,6 +522,12 @@ class Ledger(LedgerViews):
         return self._transact(
             lambda: ceilings.raise_ceiling(self.db, self.config, self._clock(), new_max_micro_usd, reason, actor)
         )
+
+    def set_cap(self, model: str, new_cap: int, reason: str, actor: str) -> CapChange:
+        """Set a model's cap on the leases it holds at once, up or down, recorded with the time, `reason` and `actor`.
+        It takes effect at the next `issue`; no lease already issued is revoked (`CapRefused` for a model with no runs
+        here or a cap it already has)."""
+        return self._transact(lambda: caps.set_cap(self.db, self.config, self._clock(), model, new_cap, reason, actor))
 
     def raise_model_ceiling(self, model: str, new_max_micro_usd: int, reason: str, actor: str) -> Ceiling:
         """`raise_ceiling` for a model that has a ceiling of its own, never below what the model has committed."""

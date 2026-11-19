@@ -138,7 +138,11 @@ if [[ $LIVE == --live ]]; then
   }
   check "no process of ours has a secret or the default cookie on its command line" argv_clean
 
-  in_container() { apptainer exec --containall --no-home --pwd /root "$R" /bin/bash -c ". $HPCOP_ERLANG_ENV; $1" < /dev/null 2>&1; }
+  in_container() {  # with the service's own hosts file (hosts_bind), so its Erlang node names resolve as the service's do
+    local -a naming=()
+    hosts_bind "$W" naming
+    apptainer exec --containall --no-home --pwd /root "${naming[@]}" "$R" /bin/bash -c ". $HPCOP_ERLANG_ENV; $1" < /dev/null 2>&1
+  }
   live_vmargs_ok() {  # what onepanel wrote: no cookie, or ours in a 0600 file (env.sh drops it at start)
     local c; c=$(sed -n 's/^-setcookie //p' "$1")
     [[ -z $c || ( $c == "$COOKIE" && $(mode_of "$1") == 600 ) ]]
