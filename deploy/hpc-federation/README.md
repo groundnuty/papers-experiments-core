@@ -1720,17 +1720,23 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   `<fleet>/logs/<member>.prepare.json` by an exclusive create (a member's prepare is started at most once), runs the
   command in a session of its own with its standard input closed and its output in `<fleet>/logs/<member>.prepare.log`
   (0600, at the site: never printed, sent back or logged by the controller), kills the command's whole process group at
-  the timeout (TERM, then KILL after 10 s), and records the start, the end, the exit status, the outcome (`ok`, `failed`,
-  `timeout`, `aborted`) and the duration. **Success** is the member then reading verified: the marker is the proof, not
+  the timeout (TERM, then KILL after 10 s; a command that exits non-zero has the rest of its group killed too), and
+  records the end in `<member>.prepare.end.json`, made by an exclusive create as well, so the first end is the record
+  (the exit status, the outcome `ok`, `failed`, `timeout` or `aborted`, the end and the duration). The files are on the
+  fleet's shared file system, so an abort from any login node reaches the running command within a second. **Success** is the member then reading verified: the marker is the proof, not
   the exit status, and the member joins as before. **Failure** (a non-zero exit, the timeout, or exit 0 with no verified
   marker; also a non-zero exit with a marker left) retires the member unjoined through the retirement path (collect, pull,
   verify-copy, down), and the usual add replaces it where the site has room. **A restart:** a prepare found started and
   never ended, with no run of this controller's, is failed (the controller that started it died, or its call dropped):
   the member is retired the same way, after `fleetprepare.py abort` ends the command's process group (only while the
   process there has the start tick the record names), unless the member already reads verified, which joins. A member
-  whose prepare is in flight is still counted as on its way (no extra add for it), and takes `verify_mb` of the login node's memory: that is
-  the figure a member up, linked and unverified takes already, so a prepare in flight needs none of its own; raise
-  `verify_mb` where the ingest is heavier than a verify-data run. The controller's log keeps the member, the outcome, the
+  whose prepare is in flight is still counted as on its way (no extra add for it), and takes `verify_mb` of the login
+  node's memory: that is the figure a member up, linked and unverified takes already (and a member keeps taking it while
+  its prepare still runs after it left its marker), so a prepare needs no figure of its own; raise `verify_mb` where the
+  ingest is heavier than a verify-data run. A prepare call that fails with no outcome (the wrapper cannot run or make
+  its files) is asked again on the next tick, up to three calls, and then the member is retired. The prepares are
+  counted against the login node's memory, not gated by it: members that link in one tick start theirs together, up to
+  `parallel_ups` of them. A prepare that always fails loops add, prepare, retire, bounded only by `allowance_units`. The controller's log keeps the member, the outcome, the
   exit status, the times and the duration of each prepare, and no command, output, host or path. A site with no `prepare`
   is unchanged. The executor runs each prepare on one of its eight worker threads for as long as it takes, up to its
   timeout, beside adds and retirements. Nothing of it has run live.

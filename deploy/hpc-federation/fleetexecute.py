@@ -64,6 +64,7 @@ HEX64 = re.compile(r"[0-9a-f]{64}")
 COMMAND_TIMEOUT_S = 6 * 3600.0  # the fleet's commands bound their own waits (an up's queue wait, a down's steps)
 LAUNCH_TIMEOUT_S = 300.0  # a worker's launch only spawns a detached srun client: it never holds the tick for long
 PREPARE_GRACE_S = 120.0  # the call's own bound beyond the prepare's timeout, which `fleetprepare.py` enforces itself
+PREPARE_TRIES = 3  # calls that fail with no outcome (the wrapper never ran, or never claimed) before the member is lost
 PREPARE_OUTCOMES = ("ok", "failed", "timeout", "aborted")
 
 
@@ -403,10 +404,11 @@ class Executor:
     clock: Callable[[], float] = time.time
     pool: ThreadPoolExecutor = field(default_factory=lambda: ThreadPoolExecutor(max_workers=8))
     running: Dict[str, Future] = field(default_factory=dict)
+    unclaimed: Dict[str, int] = field(default_factory=dict)  # a prepare's calls that failed with no outcome, by member
 
     def busy(self) -> frozenset:
         self.reap()
-        return frozenset(self.running)
+        return frozenset(self.running) | frozenset(key for key, n in self.unclaimed.items() if n >= PREPARE_TRIES)
 
     def reap(self) -> None:
         for key in [key for key, future in self.running.items() if future.done()]:
@@ -538,14 +540,23 @@ class Executor:
         """A member's prepare: one call at the site (`fleetprepare.py run`), which bounds the command, keeps its output
         in the site's own log and records its start and end there. What this logs is the call's status and the outcome,
         exit status, times and duration it printed, never the command, its output, what the call said on stderr (a
-        path may be in it) or a path; True when it exited 0."""
+        path may be in it) or a path; True when it exited 0. A call that fails with no outcome is asked again on the
+        next tick, up to `PREPARE_TRIES` calls: then the member is reported lost, and retired."""
+        from expcore.campaign.elastic.control import prepare_lost_key
+
         (argv,) = render(action, site, self.evidence, self.ledger_path).steps
         try:
             code, out, _ = self.transport.run(site, list(argv), site.settings.prepare_timeout_s + PREPARE_GRACE_S)
         except (OSError, subprocess.SubprocessError):
             code, out = 1, ""
+        found = prepare_outcome(out)
+        lost = prepare_lost_key(action.site, action.member)
+        if code == 0 or found:
+            self.unclaimed.pop(lost, None)
+        else:  # no outcome: the wrapper did not run, or could not claim; asked again, up to PREPARE_TRIES calls
+            self.unclaimed[lost] = self.unclaimed.get(lost, 0) + 1
         self.log.write("result", action="Prepare", site=action.site, member=action.member, code=code, ok=code == 0,
-                       **prepare_outcome(out))  # fmt: skip
+                       **found)  # fmt: skip
         return code == 0
 
     def site_steps(self, action: Any, site: SiteConfig) -> bool:

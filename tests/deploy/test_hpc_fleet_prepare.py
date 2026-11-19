@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,7 +17,18 @@ from elastic_support import FINGERPRINT, FakeClock, config, plan
 from hpc_fleet_support import SEPARATE_LAYOUT, fleet_modules
 
 from expcore.campaign.elastic import Ledger
-from expcore.campaign.elastic.control import Member, SiteSettings, SiteView, decide, ledger_view, prepare_key, read_only
+from expcore.campaign.elastic.control import (
+    Member,
+    Prepare,
+    Retire,
+    SiteSettings,
+    SiteView,
+    decide,
+    ledger_view,
+    prepare_key,
+    prepare_lost_key,
+    read_only,
+)
 
 DIGEST = "c" * 64
 IDENTITY = {"core_commit": "0123abcd", "python": "3.12.7"}
@@ -41,7 +53,9 @@ HANG = """
 import subprocess, sys, time
 grandchild = subprocess.Popen(["sleep", "60"])
 open(sys.argv[1], "w").write(str(grandchild.pid))
-time.sleep(60)
+if sys.argv[2] == "hang":
+    time.sleep(60)
+sys.exit(1)
 """
 
 
@@ -152,8 +166,9 @@ def alive(pid: int) -> bool:
 
 
 def prepare_files(site, label: str = "fed-1") -> tuple:
+    """The member's end record and its log, at the site."""
     logs = site.fleet / "logs"
-    return logs / f"{label}.prepare.json", logs / f"{label}.prepare.log"
+    return logs / f"{label}.prepare.end.json", logs / f"{label}.prepare.log"
 
 
 # ------------------------------------------------------------------------------------------------ the outcomes
@@ -186,30 +201,34 @@ def test_c49_a_prepare_that_leaves_the_marker_runs_once_then_the_member_joins_it
     assert len(mine) == 2
     assert not any(secret in json.dumps(mine) for secret in (sys.executable, str(tmp_path), "{root}"))
     assert planned[0]["steps"] == [["<the site's prepare command: not logged>"]]
-    assert json.loads(record.read_text(encoding="utf-8"))["state"] == "ended"
+    assert json.loads(record.read_text(encoding="utf-8"))["outcome"] == "ok"
 
 
-@pytest.mark.parametrize("how", ["exit 1", "timeout", "exit 0 without the marker"])
+@pytest.mark.parametrize("how", ["exit 1", "timeout", "exit 0 without the marker", "a worker left behind"])
 def test_c49_a_prepare_that_fails_times_out_or_leaves_no_marker_retires_its_member_unjoined_then_it_is_replaced(
     deploy, tmp_path, site, how
 ):
-    """C49: a non-zero exit, a timeout (the command's whole process group killed) and an exit 0 with no verified
-    marker each retire the member through the retirement path (collect, verify-copy, down), never join it, and the
-    usual add replaces it once the site has room (one federation at most here)."""
+    """C49: a non-zero exit (a worker it left behind killed too), a timeout (the command's whole process group
+    killed) and an exit 0 with no verified marker each retire the member through the retirement path (collect,
+    verify-copy, down), never join it, and the usual add replaces it once the site has room (one federation at most
+    here)."""
     member(site)
     grandchild = tmp_path / "grandchild.pid"
     command = {"exit 1": study(code=1), "exit 0 without the marker": study(mark="bare"),
-               "timeout": [sys.executable, "-c", HANG, str(grandchild)]}[how]  # fmt: skip
+               "timeout": [sys.executable, "-c", HANG, str(grandchild), "hang"],
+               "a worker left behind": [sys.executable, "-c", HANG, str(grandchild), "exit"]}[how]  # fmt: skip
     bench = Bench(tmp_path, deploy, site, prepare=command, timeout=3.0 if how == "timeout" else 30.0,
                   max_federations=1)  # fmt: skip
     site.answers = {"collect": (0, DIGEST + "\n", "")}
     site.on_command = lambda argv: site.set_status("fed-1", "down") if "down" in argv else None
     assert bench.tick() == 0
     assert verbs(site) == ["prepare"]
-    if how == "timeout":
+    if grandchild.exists():  # a timeout ends the command's whole group, and so does a leader that fails
         assert not alive(int(grandchild.read_text()))
+    if how == "timeout":
         (done,) = [r for r in bench.lines("result") if r["action"] == "Prepare"]
-        assert (done["ok"], done["outcome"], done["exit"]) == (False, "timeout", None)
+        assert (done["ok"], done["outcome"]) == (False, "timeout")
+        assert done["exit"] < 0  # the command's own status: killed by a signal
     site.commands.clear()
     assert bench.tick() == 0
     assert verbs(site) == ["collect", "verify-copy", "down"]
@@ -224,11 +243,14 @@ def test_c49_a_prepare_that_fails_times_out_or_leaves_no_marker_retires_its_memb
 
 # ------------------------------------------------------------------------------------------------ restart safety
 def started_record(deploy, site, label: str, pgid=None, start=None) -> None:
-    """The record a prepare leaves while it runs: what a controller that died, or a dropped call, leaves behind."""
-    claim = {"format": deploy.fleetprepare.FORMAT, "member": label, "state": "started", "started_at": site.now - 99.0,
-             "pgid": pgid, "start": start}  # fmt: skip
+    """What a prepare leaves while it runs (its claim and the command's group): what a controller that died, or a
+    dropped call, leaves behind."""
+    prepare = deploy.fleetprepare
     (site.fleet / "logs").mkdir(exist_ok=True)
-    deploy.fleetprepare._write(deploy.fleetprepare.record_path(site.fleet, label), claim, exclusive=True)
+    prepare._create(prepare.record_path(site.fleet, label),
+                    {"format": prepare.FORMAT, "member": label, "started_at": site.now - 99.0})  # fmt: skip
+    if pgid is not None:
+        prepare._replace(prepare.proc_path(site.fleet, label), {"pgid": pgid, "start": start})
 
 
 def test_c49_a_prepare_in_flight_when_the_controller_died_retires_its_member_and_ends_the_command(
@@ -287,6 +309,73 @@ def test_c49_a_members_prepare_is_started_at_most_once_whoever_asks(deploy, tmp_
     assert code == 3
     assert not touched.exists()
     assert str(tmp_path) not in capsys.readouterr().err
+    assert deploy.fleetprepare.main(["abort", "--fleet", str(site.fleet), "--member", "../fed-1"]) == 3  # a label only
+
+
+def test_c49_an_abort_written_by_another_login_node_ends_the_running_command_and_stays_the_record(
+    deploy, tmp_path, site
+):
+    """C49: the prepare's files are on the shared file system, so an abort made on another login node (here: only the
+    end it writes, which is all that node can do) reaches the live `run` within a second: its command's whole group
+    ends, and the end is the abort's, never replaced by the run's own."""
+    member(site)
+    prepare = deploy.fleetprepare
+    argv = [sys.executable, "-I", "-B", prepare.__file__, "run", "--fleet", str(site.fleet), "--member", "fed-1",
+            "--timeout", "60", "--", sys.executable, "-c", HANG, str(tmp_path / "grandchild"), "hang"]  # fmt: skip
+    wrapper = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        proc = prepare.proc_path(site.fleet, "fed-1")
+        deadline = time.monotonic() + 15
+        while not (proc.exists() and (tmp_path / "grandchild").exists()) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        group = json.loads(proc.read_text(encoding="utf-8"))["pgid"]
+        grandchild = int((tmp_path / "grandchild").read_text())
+        assert alive(group)
+        assert alive(grandchild)
+        assert prepare.end_record(site.fleet, "fed-1", site.now, {"outcome": "aborted", "exit": None})
+        assert wrapper.wait(timeout=30) == 1
+    finally:
+        wrapper.kill()
+        wrapper.communicate()
+    assert not alive(group)
+    assert not alive(grandchild)
+    end = json.loads(prepare_files(site)[0].read_text(encoding="utf-8"))
+    assert (end["outcome"], end["exit"]) == ("aborted", None)
+
+
+def test_c49_a_call_that_never_reaches_the_sites_record_is_asked_three_times_then_its_member_is_retired(
+    deploy, tmp_path, site
+):
+    """C49: a prepare call that fails with no outcome (here: the wrapper cannot make its files) is asked again on each
+    tick, up to three calls, and then the member is reported lost and retired: never billed for ever, never retired on
+    one failed call (an ssh call can fail once). The log of those calls holds no path."""
+    member(site)
+    (site.fleet / "logs").write_text("not a directory", encoding="utf-8")
+    log = deploy.fleetexecute.Log(None)
+    settings = SiteSettings("site-a", 7, 1e12, 47.0, prepare_timeout_s=30.0)
+    found = deploy.fleetexecute.SiteConfig(settings, site.fleet, prepare=tuple(study()))
+    bench = Bench(tmp_path, deploy, site)
+    ledger = Ledger.open(bench.ledger, clock=bench.clock)
+    executor = deploy.fleetexecute.Executor(ledger, bench.ledger, {"site-a": found}, site.transport(),
+                                            tmp_path / "evidence", log)  # fmt: skip
+    action = Prepare("site-a", "fed-1", "test")
+    lost = prepare_lost_key("site-a", "fed-1")
+    for tries in (1, 2, 3):
+        assert executor.prepare_steps(action, found) is False
+        assert (lost in executor.busy()) == (tries == 3)
+    ledger.close()
+    assert [e["ok"] for e in log.lines] == [False, False, False]
+    assert str(tmp_path) not in json.dumps(log.lines)
+    now = site.now
+    stuck = Member("fed-1", "up", "/r", ("41", "42"), "RUNNING", now - 3650, now - 3600, now + 4 * 3600, True, False)
+    view = SiteView("site-a", idle_nodes=70, nodes_per_federation=7, time_s=7200.0, members=(stuck,))
+    views = read_only(bench.ledger)
+    try:
+        wanted = ledger_view(views)
+    finally:
+        views.close()
+    (retire,) = [a for a in decide(now, wanted, [(settings, view)], frozenset({lost})).actions if a.__class__ is Retire]
+    assert retire.reason == "never joined: its prepare could not be started"
 
 
 # ------------------------------------------------------------------------------------------------ the decision
@@ -324,11 +413,19 @@ def test_c49_a_prepare_in_flight_counts_as_on_its_way_and_takes_a_verify_runs_sh
         512 + 1024,
     )
     assert decided(True).targets["site-a"]["limits"]["login_memory"] > 0
+    running = decided(True, frozenset({prepare_key("site-a", "fed-1")})).targets["site-a"]["limits"]
+    assert running["login_memory_mb"]["verifying"] == 1  # it left its marker, and the command still runs
+    assert running["login_memory"] == 0
     ended = Member("fed-1", "up", "/r", ("41", "42"), "NODE_FAIL", now - 3650, now - 3600, now - 60, True, False)
     view = SiteView("site-a", idle_nodes=70, nodes_per_federation=7, time_s=7200.0, members=(ended,))
     key = frozenset({prepare_key("site-a", "fed-1")})
     assert [type(a).__name__ for a in decide(now, ledger, [(settings, view)], frozenset()).actions] == ["Retire"]
     assert decide(now, ledger, [(settings, view)], key).actions == []  # one operation per member at a time
+    orphan = Member("fed-1", "up", "/r", ("41", "42"), "NODE_FAIL", now - 3650, now - 3600, now - 60, True, False,
+                    prepare="running")  # fmt: skip
+    view = SiteView("site-a", idle_nodes=70, nodes_per_federation=7, time_s=7200.0, members=(orphan,))
+    (retire,) = [a for a in decide(now, ledger, [(settings, view)], frozenset()).actions if a.__class__ is Retire]
+    assert retire.abort_prepare is True  # a retirement under no live run of ours still ends the orphan command
 
 
 def test_c49_with_no_prepare_declared_nothing_changes_and_the_site_files_pair_prepare_with_its_bound(

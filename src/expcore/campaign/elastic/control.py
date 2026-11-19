@@ -67,6 +67,7 @@ __all__ = [
     "ledger_label",
     "ledger_view",
     "prepare_key",
+    "prepare_lost_key",
     "read_only",
 ]
 
@@ -172,6 +173,12 @@ def prepare_key(site: str, member: str) -> str:
     return f"prepare:{site}/{member}"
 
 
+def prepare_lost_key(site: str, member: str) -> str:
+    """The key under which the executor reports a member whose prepare could not be started at its site (the call that
+    runs it failed, with no record, as many times as it tries): the member is retired, not asked again for ever."""
+    return f"prepare-lost:{site}/{member}"
+
+
 def cutoff_s(settings: SiteSettings, ledger: LedgerView) -> float:
     """How long before its recorded end a federation is drained."""
     bound = ledger.hard_term_s if settings.lease_bound_s is None else settings.lease_bound_s
@@ -198,12 +205,13 @@ def decide(
     busy: frozenset[str] = frozenset(),
 ) -> Decision:
     """The targets and the actions of one tick. `busy` holds the sites with an add running (`site`), the members with
-    a retirement running (`site/member`) and the members with a prepare running (`prepare_key`)."""
+    a retirement running (`site/member`), the members with a prepare running (`prepare_key`) and the members whose
+    prepare could not be started (`prepare_lost_key`)."""
     labels = [s.label for s, _ in sites]
     if len(set(labels)) != len(labels) or any(s.label != v.label for s, v in sites):
         raise ValueError("each site is given once, its settings and its read under one label")
     decision = Decision(at=now, wanted=ledger.leases_wanted())
-    memory = login_budgets(sites)
+    memory = login_budgets(sites, busy)
     free = 0
     rooms: dict[str, int] = {}
     for settings, view in sites:
@@ -266,10 +274,11 @@ def _unjoined(
     if prepare_key(site, m.label) in busy:
         return 1  # a prepare in flight here: nothing else is decided for the member until it ends (a no-op elsewhere)
     if m.status in ("failed", "down-failed") or m.ended or m.broken:
-        acts.append(Retire(site, m.label, None, m.root, False, f"never joined: {m.status}, its job {m.state}"))
+        why = f"never joined: {m.status}, its job {m.state}"
+        acts.append(Retire(site, m.label, None, m.root, False, why, m.prepare == "running"))
         return 0
     if m.status == "up" and m.linked and m.relay == "gone":
-        acts.append(Retire(site, m.label, None, m.root, True, relay_gone(m)))
+        acts.append(Retire(site, m.label, None, m.root, True, relay_gone(m), m.prepare == "running"))
         return 0
     if m.status != "up" or not m.linked or m.waiting:
         return 1
@@ -277,7 +286,7 @@ def _unjoined(
         if not m.verified:
             return 1
     else:
-        held = _prepared(settings, m, acts)
+        held = _prepared(settings, m, acts, busy)
         if held is not None:
             return held
     if m.ends_at is None or m.ends_at - cutoff_s(settings, ledger) <= now:
@@ -289,11 +298,15 @@ def _unjoined(
     return 1
 
 
-def _prepared(settings: SiteSettings, m: Member, acts: list) -> int | None:
+def _prepared(settings: SiteSettings, m: Member, acts: list, busy: frozenset[str]) -> int | None:
     """A member up, linked and running at a site that declares a prepare command: 1 while its data is on its way (a
     prepare is to start), 0 when it is retired unjoined, None when it may join (verified, with no prepare against it).
     A prepare in flight here was handled before this (`_unjoined`)."""
     site = settings.label
+    if prepare_lost_key(site, m.label) in busy:  # its call never reached the site's record, as many times as it tries
+        why = "never joined: its prepare could not be started"
+        acts.append(Retire(site, m.label, None, m.root, True, why, m.prepare == "running"))
+        return 0
     if m.prepare == "failed":  # the marker does not redeem a prepare that failed
         acts.append(Retire(site, m.label, None, m.root, True, "never joined: its prepare failed or timed out"))
         return 0
@@ -355,18 +368,22 @@ def relay_gone(m: Member) -> str:
     return f"relay gone, no exit status (its last heartbeat at {beat}): outage injection cannot run without it"
 
 
-def login_load(settings: SiteSettings, view: SiteView) -> dict:
+def login_load(settings: SiteSettings, view: SiteView, busy: frozenset[str] = frozenset()) -> dict:
     """What one fleet takes of its login node's memory, in MB: the relays beating there, each up and each verify-data
-    in flight (every member up, linked and not yet verified: a prepare in flight is one)."""
+    in flight (every member up, linked and not yet verified, and every member whose prepare is in flight here, which
+    goes on running after it has left its marker)."""
     live = [m for m in view.members if m.status not in HOLDS_NOTHING]
     relays = sum(1 for m in live if m.relay == "here")
     ups = sum(1 for m in live if m.status in ("claimed", "made"))
-    verifying = sum(1 for m in live if m.status == "up" and m.linked and not m.verified)
+    verifying = sum(1 for m in live if m.status == "up" and m.linked
+                    and (not m.verified or prepare_key(settings.label, m.label) in busy))  # fmt: skip
     load = relays * settings.relay_mb + ups * settings.up_mb + verifying * settings.verify_mb
     return {"load_mb": load, "relays": relays, "ups": ups, "verifying": verifying}
 
 
-def login_budgets(sites: Sequence[tuple[SiteSettings, SiteView]]) -> dict[str, tuple[str, int | None, dict]]:
+def login_budgets(
+    sites: Sequence[tuple[SiteSettings, SiteView]], busy: frozenset[str] = frozenset()
+) -> dict[str, tuple[str, int | None, dict]]:
     """Per site: its login node's key, how many more federations (an up now, a relay after) that login node's memory
     takes, shared by every site on it (one cgroup), and the figures; None where no site on it declares a cap. A site
     on it that could not be read leaves no room: its use is unknown."""
@@ -381,7 +398,7 @@ def login_budgets(sites: Sequence[tuple[SiteSettings, SiteView]]) -> dict[str, t
         else:
             reserve = max(s.login_reserve_mb for s, _ in members)
             each = max(s.relay_mb + s.up_mb for s, _ in members)
-            loads = [login_load(s, v) for s, v in members if v.error is None]
+            loads = [login_load(s, v, busy) for s, v in members if v.error is None]
             used = reserve + sum(load["load_mb"] for load in loads)
             free = min(caps) - used
             dark = len(loads) < len(members)
