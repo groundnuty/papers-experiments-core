@@ -808,8 +808,9 @@ section 3).
   recorded work directory of a service whose step it had to cancel (a cancel was an outright kill on the site, which
   left 2 to 2.6 GB per service), checks each node
   for the recorded work directory, sweeps the agent's node (once any step of this federation still running in the
-  agent's own job, the worker's or a shard's, is sent TERM by its id, cancelled if it outlives it, and shown ended:
-  C54, "A down that could not sweep a node" below) and every node a shard was resumed on (`shards.py sweep`, a
+  agent's own job, the worker's or a shard's, is sent TERM by its id, cancelled if it outlives it, and shown ended;
+  a node a down could not sweep holds the root until `down --node-checked`: C54, "A down that could not sweep a
+  node" below) and every node a shard was resumed on (`shards.py sweep`, a
   control step there by `HPC_CORE_PYTHON`: every shard step's
   directory of this federation on its tmpfs whose step is gone is removed, and one holding an `out/` that could not be
   archived is kept and named in what `down` prints; the sandbox's killed runs are reaped, a dead FUSE mount unmounted
@@ -1868,9 +1869,11 @@ squeue and sacct show that id ended: such a step holds the whole job, and the sw
 site's KillWait), leaves the node unswept: the held jobs are cancelled all the
 same, the root and its state are kept, and the state records the node (`unswept`). The node's tmpfs may then still
 hold a step's or the worker's directory, the operator's key files (`home_files`) among them, and a `down` run again
-finds the job gone and removes the root without any sweep. So the elastic controller never takes such a member down
-again by itself (it reads `unswept` and leaves the member `down-failed`, its root kept; the failed down's error is in
-its log), and the operator does, in this order:
+finds the job gone and has nothing to sweep in. So every later `down` keeps the storage and the root until the
+operator says what was checked on that node (`--node-checked "<what was checked>"`, recorded in the state and in
+down's output, which `<fleet>/logs/<member>.down.log` keeps), a sweep that later succeeds there clears the record,
+and the elastic controller never takes such a member down again by itself (it reads `unswept` and leaves the member
+`down-failed`, its root kept; the failed down's error is in its log). The operator, in this order:
 
 1. Find the node: `sandbox.node` in the root's state file (`<fleet>/fed-k/root/hpc-federation.json`).
 2. Sweep it in a short job of the study's own account on that node, from a private 0700 directory, with the core's
@@ -1882,10 +1885,16 @@ its log), and the operator does, in this order:
    every directory of this federation's steps and its worker whose process is gone, the key files with them, and
    names what it keeps. If it cannot run there (the node down, or held by another job for long), tell the coordinator
    before going on: the keys may still be on that node.
-3. Then `fleet.py --fleet F down --member fed-k`, which removes the root and the storage; the controller proves the
-   end on its next tick.
+3. Then `fleet.py --fleet F down --member fed-k --node-checked "<what was checked: the sweep's job, its exit, what
+   it printed>"`, which removes the root and the storage; the controller proves the end on its next tick.
 
 This procedure has not run live.
+
+A member whose held job ended by itself (its walltime, a node failure) gets no sweep at all: `down` says "the held
+job had ended: its nodes could not be checked". At a time limit Slurm sends every step TERM first, so the worker's
+own cleanup normally removes its directory; after a node failure, or whenever in doubt, the operator runs a leftover
+check on that node, a short job there that lists what of ours is left on its tmpfs (`expcore-shard-*` directories, a
+worker's among them), as the end-to-end test's key check does, and sweeps it as in step 2 if anything is.
 
 ## The elastic fleet's worker (`fleetworker.py`, `fleetidentity.py`)
 

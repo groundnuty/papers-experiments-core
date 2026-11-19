@@ -802,3 +802,30 @@ def test_c54_a_step_still_running_after_its_cancel_fails_the_down_closed_and_rec
     assert "4242" in fake.cancelled
     assert rig.root.exists()
     assert rig.state()["unswept"] == ["the agent's node"]
+
+
+def test_c54_a_down_after_one_left_the_node_unswept_keeps_the_root_until_the_operator_says_what_was_checked(
+    hpc, tmp_path, site, capsys
+):
+    """C54: after a down that could not sweep the agent's node, every later down finds the job gone and no node to
+    sweep in it: without `--node-checked` it removes neither the storage nor the root, and says what to do; with it,
+    the operator's word that the node was checked (the README's sweep in a job there), it goes on, and its output (the
+    fleet's down log) records the text."""
+    fake = FakeSlurm(unending=["4343.9"])
+    fake.on_control = held_by_a_live_step(fake)
+    rig = Rig(hpc, tmp_path, site, "separate", fake)
+    rig.up()
+    fake.steps[f"{rig.state()['sandbox']['name']}-worker"] = "4343.9"
+    ticks = itertools.count(0, 60)
+    rig.driver.clock = lambda: next(ticks)
+    with pytest.raises(RuntimeError, match="then run down again with --node-checked"):
+        rig.driver.down()
+    with pytest.raises(RuntimeError, match="the agent's node was never swept and may still hold the operator's key"):
+        rig.driver.down()
+    assert rig.root.exists()
+    assert rig.state()["unswept"] == ["the agent's node"]
+    checked = "shards.py sweep in a job on its node: exit 0, one worker directory removed"
+    printed = rig.driver.down(node_checked=checked)
+    assert f"down: --node-checked: the agent's node not swept by down; the operator checked: {checked}" in printed
+    assert f"the operator checked: {checked}; recorded in the state file" in capsys.readouterr().err
+    assert not rig.root.exists()
