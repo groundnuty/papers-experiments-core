@@ -121,7 +121,7 @@ def node_args(tmp_path: Path, hop: dict | None) -> SimpleNamespace:
     (tmp_path / "tmpfs").mkdir(exist_ok=True)
     (tmp_path / "channel").mkdir(exist_ok=True)
     return SimpleNamespace(federation="site-a-fed-1", channel=str(tmp_path / "channel"), study=str(study),
-                           tmpfs=str(tmp_path / "tmpfs"), root=str(root), home_files=None,
+                           tmpfs=str(tmp_path / "tmpfs"), root=str(root), home_files=None, pass_env=[],
                            fleet_hop=None if hop is None else json.dumps(hop))  # fmt: skip
 
 

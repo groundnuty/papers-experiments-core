@@ -251,3 +251,66 @@ def test_c50_the_read_program_of_an_earlier_core_prints_no_platform_and_does_not
     assert done.returncode == 0, done.stderr
     said = json.loads(done.stdout.strip().splitlines()[-1])
     assert deploy.fleetidentity.said_identity(said) == ("f" * 64, {"layout": "b" * 64}, None)
+
+
+def member_fleet(deploy, tmp_path: Path, extra: str = "") -> tuple[Path, Path]:
+    """A fleet holding one up member, fed-1, with its platform file, and shard settings with `extra` lines."""
+    fleet = tmp_path / "fleet"
+    fleet.mkdir(mode=0o700)
+    study = tmp_path / "study"
+    study.mkdir()
+    (study / "study.toml").write_text("[study]\n")
+    settings = tmp_path / "shard-settings.toml"
+    settings.write_text(
+        f'study = "{study}"\npython = "/venv/bin/python"\ncore_src = "/c"\nresults = "/r"\ntmpfs = "/t"\n'
+        f'step_path = "/usr/bin:/bin"\ncpus = 2\nmemory = "4g"\n{extra}'
+    )
+    record = deploy.fleetrecord.new_record(tmp_path / "layout.toml", "digest", 2, 5, 1)
+    member = deploy.fleetrecord.new_member(fleet, "fed-1")
+    member["status"] = "up"
+    root = deploy.fleetrecord.root_of(fleet, "fed-1")
+    root.mkdir(parents=True)
+    (root / "platform.toml").write_text('[space]\nname = "s"\n')
+    member["made"] = [root.stat().st_dev, root.stat().st_ino]
+    record["members"].append(member)
+    deploy.fleetrecord.Record(fleet).save(record)
+    return fleet, settings
+
+
+def test_c52_the_settings_pass_env_reaches_the_identity_read_and_the_workers_line(deploy, tmp_path, monkeypatch):
+    """C52: the main study's plugin reads its artifacts directory from a variable of the site that the shard settings
+    pass (`pass_env`). The elastic fleet's identity read and its worker's line now carry each with the login node's
+    value (its site.env's), as a shard step's line does; an unset one is no read (the join waits) and no line."""
+    import fleetplan
+    import fleetworker
+
+    fleet, settings = member_fleet(deploy, tmp_path, 'pass_env = ["STUDY_DATA_DIR"]\n')
+    seen = {}
+
+    def runner(argv, **kwargs):
+        seen.update(env=dict(kwargs["env"]))
+        out = json.dumps({"fingerprint": FINGERPRINT, "environment": IDENTITY, "platform": PLATFORM})
+        return subprocess.CompletedProcess(argv, 0, out, "")
+
+    monkeypatch.setenv("STUDY_DATA_DIR", "/srv/study-data")
+    assert deploy.fleetidentity.read_identity(fleet, "fed-1", settings, runner) == (FINGERPRINT, IDENTITY, PLATFORM)
+    assert seen["env"]["STUDY_DATA_DIR"] == "/srv/study-data"
+    loaded = fleetplan.read_settings(settings)
+    line = fleetworker.login_line(loaded, {"job": "5", "node": "n1", "name": "fed"}, Path("/fed/root"),
+                                         "fed-worker", "site-fed-1", "/chan", 3600.0)  # fmt: skip
+    assert "STUDY_DATA_DIR=/srv/study-data" in line[line.index("-i") + 1 : line.index("/venv/bin/python")]
+    assert line[line.index("--pass-env") + 1] == "STUDY_DATA_DIR"
+    assert fleetworker.parser().parse_args(["node", *line[line.index("node") + 1 :]]).pass_env == ["STUDY_DATA_DIR"]
+    monkeypatch.delenv("STUDY_DATA_DIR")
+    assert deploy.fleetidentity.read_identity(fleet, "fed-1", settings, runner) is None
+    with pytest.raises(fleetworker._shards().ShardsError, match="STUDY_DATA_DIR is not set"):
+        fleetworker.login_line(loaded, {"job": "5", "node": "n1", "name": "fed"}, Path("/fed/root"),
+                                      "fed-worker", "site-fed-1", "/chan", 3600.0)  # fmt: skip
+
+
+def test_c52_a_secret_looking_pass_env_name_is_refused_when_the_settings_are_read(deploy, tmp_path):
+    import fleetplan
+
+    _, settings = member_fleet(deploy, tmp_path, 'pass_env = ["API_TOKEN"]\n')
+    with pytest.raises(deploy.fleetrecord.FleetError, match="looks like a secret"):
+        fleetplan.read_settings(settings)
