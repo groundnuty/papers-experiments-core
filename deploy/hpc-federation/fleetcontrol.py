@@ -61,7 +61,7 @@ import stat
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -72,6 +72,7 @@ for _path in (HERE, HERE.parents[1] / "deploy" / "compose-federation"):
         sys.path.insert(0, str(_path))
 
 import fleetcompose  # noqa: E402
+import fleetshare  # noqa: E402
 from fleetexecute import (  # noqa: E402
     Executor,
     Log,
@@ -86,9 +87,9 @@ from fleetexecute import (  # noqa: E402
 )
 
 COMMANDS = ("observe", "control", "drain", "ended", "join", "settle")
-CONTROLLER_KEYS = ("evidence", "interval_s", "log", "archives", "settings", "study")
+CONTROLLER_KEYS = ("evidence", "interval_s", "log", "archives", "settings", "study", *fleetshare.CONTROLLER_KEYS)
 SITE_KEYS = ("fleet", "transport", "interpreter", "deploy", "channel", "host", "env_file", "settings", "prepare",
-             "kind", "ssh_config", *fleetcompose.KEYS)  # fmt: skip
+             "kind", "ssh_config", *fleetcompose.KEYS, *fleetshare.SITE_KEYS)  # fmt: skip
 KINDS = ("hpc", fleetcompose.KIND)
 SSH_ONLY_KEYS = ("host", "env_file", "settings", "ssh_config")
 DISPATCH_S = 30.0  # `elastic.dispatch.TICK_S`: with a dispatcher the loop goes round this often
@@ -108,6 +109,7 @@ class Controller:
     archives: Optional[Path] = None  # where the dispatcher keeps the archives it pulls: set, it runs in this loop
     settings: Optional[Path] = None  # the shard settings (`fleetplan.read_settings`): the study, python and home_files
     study: Optional[Path] = None  # the study here, where no shard settings are named (a Compose site's campaign)
+    sharing: Optional[Any] = None  # `fleetshare.Sharing`: siblings, shared caps, ledgers deferred to, shared sites
 
 
 @dataclass
@@ -169,6 +171,7 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
         _absolute(table["evidence"], "[controller] evidence"), float(interval), log, archives, manifest, study
     )
     sites = []
+    site_files: Dict[str, Any] = {}
     for entry in data.get("site") or []:
         own = {key: entry.pop(key) for key in SITE_KEYS if key in entry}
         prepare = prepare_of(entry.get("label"), own.get("prepare"), "prepare_timeout_s" in entry)
@@ -195,6 +198,10 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
         elif any(key in own for key in SSH_ONLY_KEYS):
             raise ConfigError(f"site {settings.label}: {', '.join(SSH_ONLY_KEYS)} belong to an ssh site")
         config = private_file(own["ssh_config"], f"site {settings.label}: ssh_config") if "ssh_config" in own else None
+        if "shared_site_file" in own:
+            if compose is not None:  # its static members are shared through their roots' claims, never a maximum
+                raise ConfigError(f"site {settings.label}: a Compose site takes no shared_site_file")
+            site_files[settings.label] = own["shared_site_file"]
         sites.append(SiteConfig(settings, fleet, own.get("transport", "local"), python, deploy, channel, host,
                                 env_file, shard_settings, prepare, compose, config))  # fmt: skip
     if not sites or len({s.label for s in sites}) != len(sites):
@@ -210,7 +217,11 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
                           "site's channel and keeps the archives it pulls")  # fmt: skip
     if len({fleet_identity(s.fleet, s.host) for s in sites}) != len(sites):
         raise ConfigError("two sites name one fleet directory: each fleet is one site's, read and acted on once")
-    return controller, sites
+    try:
+        sharing = fleetshare.sharing_of(table, site_files, archives is not None)
+    except ValueError as error:
+        raise ConfigError(str(error)) from None
+    return (controller if sharing is None else replace(controller, sharing=sharing)), sites
 
 
 def private_file(value: Any, what: str) -> str:
@@ -308,22 +319,29 @@ def observe_site(transport: Any, site: SiteConfig, observed: Optional[Path]) -> 
 
 def tick(views: Any, ledger_path: Path, controller: Controller, sites: Sequence[SiteConfig],
          observed: Mapping[str, Path], transport: Any, executor: Optional[Executor], log: Log,
-         hooks: Hooks) -> Any:  # fmt: skip
-    """One tick: read, decide, log, then run (or, with no executor, print)."""
+         hooks: Hooks, state: Optional[Any] = None) -> Any:  # fmt: skip
+    """One tick: read, decide, log, then run (or, with no executor, print). With sharing (`fleetshare`), `state` is
+    what the loop keeps across ticks."""
     from expcore.campaign.elastic.control import decide, ledger_view
 
     by_label = {site.label: site for site in sites}
     busy = executor.busy() if executor is not None else frozenset()  # before the reads: what ends during them is busy
     reads = [(site.settings, observe_site(transport, site, observed.get(site.label))) for site in sites]
-    view = ledger_view(views)
-    decision = decide(hooks.clock(), view, reads, busy)
+    extra: Dict[str, Any] = {}
+    if controller.sharing is None:
+        view = ledger_view(views)
+        decision = decide(hooks.clock(), view, reads, busy)
+    else:
+        view, decision, extra = fleetshare.decide(hooks.clock(), views, reads, busy, controller.sharing, sites,
+                                                  ledger_path, state or fleetshare.State(), executor is not None,
+                                                  hooks.say)  # fmt: skip
     rendered = [render(a, by_label[a.site], controller.evidence, ledger_path, settings=controller.settings)
                 for a in decision.actions]  # fmt: skip
     entries = [described(a, r, by_label[a.site]) for a, r in zip(decision.actions, rendered)]  # logged: no host in it
     plain = [described(a, r) for a, r in zip(decision.actions, rendered)]  # printed: exactly what a live tick runs
     money = dict(view.money)
     log.write("tick", dry_run=executor is None, wanted=decision.wanted, targets=decision.targets,
-              waits=decision.waits, relays=decision.relays, money=money, actions=entries)  # fmt: skip
+              waits=decision.waits, relays=decision.relays, money=money, actions=entries, **extra)  # fmt: skip
     hooks.say(status_line(decision, money))
     if executor is None:
         for entry in plain:
@@ -405,10 +423,9 @@ def dispatch_tick(dispatcher: Any, log: Log) -> None:
 
 
 def control(args: argparse.Namespace, environ: Mapping[str, str], hooks: Hooks) -> int:
-    from expcore.campaign.elastic import Ledger
-    from expcore.campaign.elastic.control import read_only
-
     controller, sites = load_config(args.sites)
+    fleetshare.check_ledger(controller.sharing, args.ledger)
+    state = fleetshare.State()
     known = {site.label for site in sites}
     observed: Dict[str, Path] = {}
     if args.observed and not args.dry_run:
@@ -422,16 +439,16 @@ def control(args: argparse.Namespace, environ: Mapping[str, str], hooks: Hooks) 
     transport = hooks.transport(environ)
     if args.dry_run:
         while True:
-            views = read_only(args.ledger)
+            views = fleetshare.open_reader(args.ledger, controller.sharing)
             try:
-                tick(views, args.ledger, controller, sites, observed, transport, None, log, hooks)
+                tick(views, args.ledger, controller, sites, observed, transport, None, log, hooks, state)
             finally:
                 views.close()
             if args.once:
                 return 0
             hooks.sleep(controller.interval_s)
     identity, spend = hooks_read(controller, sites, hooks, transport)
-    ledger = Ledger.open(args.ledger, clock=hooks.clock)
+    ledger = fleetshare.open_ledger(args.ledger, hooks.clock, controller.sharing)
     executor = Executor(ledger, args.ledger, {s.label: s for s in sites}, transport, controller.evidence, log,
                         identity, spend, settings=controller.settings, clock=hooks.clock)  # fmt: skip
     dispatcher = dispatcher_of(ledger, controller, sites, hooks)
@@ -443,7 +460,7 @@ def control(args: argparse.Namespace, environ: Mapping[str, str], hooks: Hooks) 
             if dispatcher is not None:
                 dispatch_tick(dispatcher, log)
             if hooks.clock() >= decide_at:
-                tick(ledger, args.ledger, controller, sites, observed, transport, executor, log, hooks)
+                tick(ledger, args.ledger, controller, sites, observed, transport, executor, log, hooks, state)
                 decide_at = hooks.clock() + controller.interval_s
             if args.once:
                 return 0
