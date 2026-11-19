@@ -41,6 +41,8 @@ def test_f01_a_model_names_its_two_headers_and_an_entry_that_names_none_has_none
         ('session_header = ""', "session_header"),
         ('deployment_header = "x\\ny"', "deployment_header"),
         ('session_header = "Authorization"', "session_header .* the client sets itself"),
+        ('session_header = "OpenAI-Project"', "session_header .* the client sets itself"),
+        ('session_header = "openai-organization"', "session_header .* the client sets itself"),
         ('deployment_header = "content-length"', "deployment_header .* the client sets itself"),
         ("session_header = 7", "session_header"),
     ],

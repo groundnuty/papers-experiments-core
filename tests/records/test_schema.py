@@ -125,7 +125,7 @@ def test_R02_version_three_marks_the_fields_it_adds_optional_and_no_older_versio
         "turn": ("deployment_id",),
         "record": ("treatment_targets", "instrument_refusal", "lease_id"),
         "outcome": ("infra_target",),
-        "totals": ("reserved_capped", "reply_cap_unheld"),
+        "totals": ("reserved_capped", "reply_cap_unheld", "deployment_switched"),
         "tool_call": ("elapsed_s", "exec_check"),
         "exec_check": ("source_whole", "exit_status", "nonce_matched"),
     }
@@ -133,7 +133,11 @@ def test_R02_version_three_marks_the_fields_it_adds_optional_and_no_older_versio
     assert rules.optional_in("usage", "expcore-record/3") == {"extra", "extra_cut"}
     assert rules.optional_in("record", "expcore-record/3") == {"treatment_targets", "instrument_refusal", "lease_id"}
     assert rules.optional_in("outcome", "expcore-record/3") == {"infra_target"}
-    assert rules.optional_in("totals", "expcore-record/3") == {"reserved_capped", "reply_cap_unheld"}
+    assert rules.optional_in("totals", "expcore-record/3") == {
+        "reserved_capped",
+        "reply_cap_unheld",
+        "deployment_switched",
+    }
     assert rules.optional_in("totals", "expcore-record/2") == frozenset()
     assert rules.optional_in("tool_call", "expcore-record/3") == {"elapsed_s", "exec_check"}
     assert rules.optional_in("tool_call", "expcore-record/2") == frozenset()

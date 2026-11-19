@@ -15,6 +15,7 @@ import signal
 import socket
 import stat
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -81,18 +82,35 @@ def test_f03_a_hop_whose_port_never_opens_is_refused_naming_fleet_hop_and_leaves
     assert settled(lambda: not alive(first["pid"]))
 
 
-def test_f03_a_port_something_else_holds_open_is_no_hop_while_its_own_ssh_has_exited(hop_module, tmp_path, monkeypatch):
-    """O93: an ssh that exits at once (ExitOnForwardFailure on a port another listener holds, a refused key) is no hop
-    even though the port accepts: the keeper wants its own child alive too."""
-    ssh = Ssh(tmp_path, monkeypatch, "die")
+def test_o93_a_port_something_else_holds_is_refused_before_any_ssh_runs(hop_module, tmp_path, monkeypatch):
+    """O93: a listener that already holds the port means the hop could never bind it, and an ssh that is still
+    authenticating would pass any check of the port: the start is refused, naming `fleet_hop`, before ssh is run."""
+    ssh = Ssh(tmp_path, monkeypatch)
     stranger = socket.socket()
     stranger.bind(("127.0.0.1", ssh.port))
     stranger.listen()
     try:
-        with pytest.raises(hop_module.HopRefused, match="fleet_hop"):
-            keeper(hop_module, ssh.hop(), wait_s=1.0, min_interval_s=5.0, max_interval_s=5.0).start()
+        with pytest.raises(hop_module.HopRefused, match="fleet_hop") as refused:
+            keeper(hop_module, ssh.hop()).start()
     finally:
         stranger.close()
+    assert str(ssh.port) not in str(refused.value)
+    assert ssh.started() == []
+
+
+def test_o93_a_stop_before_the_monitor_thread_runs_still_kills_the_hop(hop_module, tmp_path, monkeypatch):
+    """O93: a stop signal that lands after the keeper made its monitor thread and before it ran it leaves a thread that
+    cannot be joined; the stop must go on to kill the ssh."""
+    ssh = Ssh(tmp_path, monkeypatch)
+    one = keeper(hop_module, ssh.hop())
+    one.start()
+    one._stopped.set()  # let the real monitor thread end, then put in its place one that was made and never started
+    one._thread.join(timeout=5)
+    one._stopped.clear()
+    one._thread = threading.Thread(target=lambda: None)
+    one.stop()
+    (first,) = ssh.started()
+    assert settled(lambda: not alive(first["pid"]))
 
 
 def test_f03_a_hop_that_dies_is_restarted_no_faster_than_the_interval_and_the_restarts_are_counted(
@@ -136,6 +154,8 @@ def test_f03_nothing_is_restarted_once_the_keeper_is_stopped(hop_module, tmp_pat
         {"login": "-oProxyCommand=x"}, {"login": "a b"}, {"login": ""}, {"login": 7}, {"login": "a:b"},
         {"socket": "relative.sock"}, {"socket": "/a:b/s"}, {"socket": "/a/../s"}, {"socket": "/a//s"},
         {"socket": "/a/s\n"}, {"key": "k"}, {"key": 7}, {"known_hosts": "/a/./h"}, {"local_port": "30051"},
+        {"known_hosts": "/team keys/pins"}, {"socket": "/a b/s"}, {"backup_socket": "/a:b"}, {"backup_socket": SOCKET},
+        {"backup_socket": "rel"}, {"backup_socket": 7}, {"backup_socket": "/b s/s"},
         {"local_port": True}, {"local_port": 80}, {"local_port": 70000}, {"extra": 1}, {"login": None},
     ],
 )  # fmt: skip
@@ -144,6 +164,7 @@ def test_f03_a_hop_that_could_change_the_command_or_is_not_a_table_of_the_five_v
     the forward's parts), and every value is of its type; the reason names `fleet_hop`, never a value."""
     good = {"login": LOGIN, "socket": SOCKET, "key": KEY, "known_hosts": KNOWN, "local_port": 30051}
     assert hop_module.hop_problem(good) is None
+    assert hop_module.hop_problem({**good, "backup_socket": "/ZQ/front-b.sock"}) is None  # the optional sixth value
     problem = hop_module.hop_problem({**good, **bad})
     assert problem
     assert not any(str(v) in problem for v in (LOGIN, SOCKET, KEY, KNOWN) if v)
@@ -368,7 +389,8 @@ def test_f03_the_hop_rides_on_every_line_and_nothing_else_changes_and_the_plan_s
     shards, tmp_path, capsys
 ):
     """O93: `lines` ends each line in `--fleet-hop <the table as JSON>` and is otherwise the line a manifest without the
-    key prints; `plan` carries the same line and says `fleet_hop: true`, as it says `home_files: true`."""
+    key prints; `plan` says `fleet_hop: true` and shows `<hidden>` for the table, so a kept plan holds no host, path
+    or port."""
     plain = printed(shards, tmp_path / "plain", capsys, "lines")
     lines = printed(shards, tmp_path / "with", capsys, "lines", TABLE)
     carried = json.dumps({"known_hosts": KNOWN, "key": KEY, "local_port": 30051, "login": LOGIN, "socket": SOCKET},
@@ -380,6 +402,8 @@ def test_f03_the_hop_rides_on_every_line_and_nothing_else_changes_and_the_plan_s
         assert stripped.replace(str(tmp_path / "with"), "ROOT") == base.replace(str(tmp_path / "plain"), "ROOT")
     plans = [json.loads(p) for p in printed(shards, tmp_path / "with", capsys, "plan", TABLE)]
     assert [p["fleet_hop"] for p in plans] == [True, True]
+    assert all(p["argv"][-2:] == ["--fleet-hop", "<hidden>"] for p in plans)  # a plan is read and kept: no value in it
+    assert not any(secret in json.dumps(p) for p in plans for secret in (LOGIN, SOCKET, KEY, KNOWN, "30051"))
     assert all("fleet_hop" not in json.loads(p) for p in printed(shards, tmp_path / "plain", capsys, "plan"))
 
 
@@ -484,10 +508,14 @@ def test_o93_a_stop_that_is_cut_short_leaves_the_hop_to_the_next_stop(hop_module
 
     child = Child()
     listener = socket.socket()
-    listener.bind(("127.0.0.1", ssh.port))
-    listener.listen()
+
+    def popen(*args, **kwargs):
+        listener.bind(("127.0.0.1", ssh.port))  # the ssh's forward binds the port once it is running
+        listener.listen()
+        return child
+
     try:
-        one = keeper(hop_module, ssh.hop(), popen=lambda *args, **kwargs: child)
+        one = keeper(hop_module, ssh.hop(), popen=popen)
         one.start()
         with pytest.raises(SystemExit):
             one.stop()
@@ -498,3 +526,91 @@ def test_o93_a_stop_that_is_cut_short_leaves_the_hop_to_the_next_stop(hop_module
         assert child.terminates == 2
     finally:
         listener.close()
+
+
+# -- the backup socket and the front's answer ---------------------------------------------------------------------
+
+
+def backed(ssh) -> dict:
+    return ssh.hop(backup_socket="/ZQ/front-b.sock")
+
+
+def forwards(ssh) -> list[str]:
+    """The socket each start of the fake ssh was asked to forward to, in order."""
+    return [entry["argv"][entry["argv"].index("-L") + 1].split(":", 2)[2] for entry in ssh.started()]
+
+
+def test_o93_a_primary_whose_ssh_dies_at_once_leaves_the_backup_up_and_the_dispatcher_starts(
+    shards, hop_module, tmp_path, monkeypatch, capsys
+):
+    """O93: the primary's forward does not come up (its ssh exits), the backup's does and answers: the step starts its
+    dispatcher on the backup and says only that the backup is the one up."""
+    ssh = Ssh(tmp_path, monkeypatch, "die", "http401")
+    run, seen = dispatcher(ssh.port)
+    code, _ = run_step(shards, step_args(tmp_path, backed(ssh)), run, hop_module)
+    assert code == 0
+    assert seen["port_open"] is True
+    assert forwards(ssh) == ["/ZQ/front.sock", "/ZQ/front-b.sock"]
+    shown = capsys.readouterr().err
+    assert "fleet_hop: true (restarts: 0, fleet_hop_backup: true, switches: 0)" in shown
+    assert not any("ZQ" in text or str(ssh.port) in text for text in (shown, json.dumps(seen["owner"])))
+    assert settled(lambda: not any(alive(entry["pid"]) for entry in ssh.started()))
+
+
+def test_o93_a_primary_that_accepts_and_never_answers_is_dead_and_the_backup_is_taken(
+    hop_module, tmp_path, monkeypatch
+):
+    """O93: a dead tunnel leaves its socket file behind, so `ssh -L` comes up and its port accepts: only a request
+    through it shows. The primary accepts and answers nothing; the backup answers 401 (any status is alive): the keeper
+    ends on the backup, the primary's ssh is gone, and the probe sent no key."""
+    ssh = Ssh(tmp_path, monkeypatch, "silent", "http401")
+    with keeper(hop_module, backed(ssh)) as hop:
+        assert forwards(ssh) == ["/ZQ/front.sock", "/ZQ/front-b.sock"]
+        assert hop.status() == "fleet_hop: true (restarts: 0, fleet_hop_backup: true, switches: 0)"
+        assert hop_module.answers(ssh.port, 2.0)
+        first = ssh.started()[0]
+        assert settled(lambda: not alive(first["pid"]))
+
+
+def test_o93_with_no_socket_answering_the_start_is_refused_naming_fleet_hop(hop_module, tmp_path, monkeypatch):
+    ssh = Ssh(tmp_path, monkeypatch, "silent", "silent")
+    with pytest.raises(hop_module.HopRefused, match="fleet_hop") as refused:
+        keeper(hop_module, backed(ssh)).start()
+    assert not any(secret in str(refused.value) for secret in (LOGIN, SOCKET, KEY, KNOWN, str(ssh.port), "front"))
+    assert settled(lambda: not any(alive(entry["pid"]) for entry in ssh.started()))
+
+
+def test_o93_a_primary_that_stops_answering_while_the_dispatcher_runs_moves_to_the_backup_after_two_dead_probes(
+    hop_module, tmp_path, monkeypatch
+):
+    """O93: the forward answered at the start and then stops answering: two dead probes in a row restart it on the other
+    socket, once, and the keeper counts the switch."""
+    ssh = Ssh(tmp_path, monkeypatch, "answer_then_silent", "http401", answers=1)
+    with keeper(hop_module, backed(ssh)) as hop:
+        assert forwards(ssh) == ["/ZQ/front.sock"]
+        assert settled(lambda: hop.switches == 1, seconds=15)
+        assert settled(lambda: forwards(ssh) == ["/ZQ/front.sock", "/ZQ/front-b.sock"])
+        assert settled(lambda: hop_module.answers(ssh.port, 2.0))
+        assert hop.status() == "fleet_hop: true (restarts: 0, fleet_hop_backup: true, switches: 1)"
+        first = ssh.started()[0]
+        assert settled(lambda: not alive(first["pid"]))
+
+
+def test_o93_a_hop_that_dies_after_answering_is_started_again_on_the_primary_first(hop_module, tmp_path, monkeypatch):
+    """O93: a forward that had been proven alive and then dies is restarted on the primary socket, not the backup."""
+    ssh = Ssh(tmp_path, monkeypatch, "answer_then_die", "http401", life=0.3)
+    with keeper(hop_module, backed(ssh), min_interval_s=0.3, max_interval_s=1.0) as hop:
+        assert settled(lambda: hop.restarts == 1 and len(ssh.started()) == 2, seconds=15)
+        assert forwards(ssh) == ["/ZQ/front.sock", "/ZQ/front.sock"]
+        assert hop.status() == "fleet_hop: true (restarts: 1, fleet_hop_backup: false, switches: 0)"
+
+
+def test_o93_a_table_with_no_backup_is_never_probed_and_says_nothing_of_one(hop_module, tmp_path, monkeypatch):
+    """O93: without `backup_socket` nothing changes: the port opening is the whole check (a tunnel that accepts and
+    answers nothing is taken), and the status line has no backup."""
+    ssh = Ssh(tmp_path, monkeypatch, "silent")
+    with keeper(hop_module, ssh.hop()) as hop:
+        assert hop.status() == "fleet_hop: true (restarts: 0)"
+        time.sleep(1.0)
+        assert hop.switches == 0
+        assert len(ssh.started()) == 1

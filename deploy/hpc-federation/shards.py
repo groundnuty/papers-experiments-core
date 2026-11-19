@@ -3758,6 +3758,14 @@ def check_home_files(args: argparse.Namespace) -> HomeTree | None:
         raise StepRefused(str(error)) from None
 
 
+def hidden_hop(line: Sequence[str]) -> list[str]:
+    """A step line as `plan` shows it: the `--fleet-hop` table (the login, the paths, the port) replaced by `<hidden>`;
+    `lines` prints the whole line, which is what is run."""
+    out = list(line)
+    out[out.index("--fleet-hop") + 1] = "<hidden>"
+    return out
+
+
 def check_fleet_hop(args: argparse.Namespace) -> dict[str, Any] | None:
     """The hop to the LLM fleet the line names (`--fleet-hop`, JSON), as `fleethop.parse_hop` reads it: None when the
     line names none. `StepRefused` naming `fleet_hop` and never a value."""
@@ -4202,7 +4210,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         built = []
         for shard in plan.shards:
             line = step_argv(plan, shard, federation(shard), script)
-            record = {"shard": shard.label, "argv": line}
+            shown = (
+                hidden_hop(line) if plan.fleet_hop is not None else line
+            )  # a plan is read and kept: no host, path or port
+            record = {"shard": shard.label, "argv": shown}
             if plan.pre_step is not None:
                 record["pre_step"] = {"path": plan.pre_step, "sha256": plan.pre_step_sha256,
                                       "timeout_s": plan.pre_step_timeout_s}  # fmt: skip

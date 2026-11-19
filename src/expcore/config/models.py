@@ -322,7 +322,7 @@ def _request_problems(spec: ModelSpec) -> list[str]:
             continue
         if spec.backend != "openai_compat":
             problems.append(f"{name} applies to openai_compat models only")
-        elif problem := header_name_problem(value):
+        elif problem := header_name_problem(value, request=name == "session_header"):
             problems.append(f"{name} {problem}")
     if spec.prompt_cache_ttl is not None:
         if spec.backend != "anthropic":

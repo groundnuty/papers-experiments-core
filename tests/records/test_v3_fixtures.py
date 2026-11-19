@@ -510,8 +510,12 @@ def test_f02_the_thirteenth_fixture_pins_the_deployment_a_turn_names_and_the_twe
     assert list(record.transcript[1])[-1] == "deployment_id"
     earlier = [json.loads(p.read_text(encoding="utf-8")) for p in FIXTURES if p != thirteenth[0]]
     assert all("deployment_id" not in turn for body in earlier for turn in body["transcript"])
+    assert all("deployment_switched" not in body["totals"] for body in earlier)
     fifth = load_record(DIRECTORY / "05-reserved-capped.json")
     bare = [{k: v for k, v in turn.items() if k != "deployment_id"} for turn in record.transcript]
-    assert dataclasses.replace(record, transcript=bare) == fifth
+    unswitched = {k: v for k, v in record.totals.items() if k != "deployment_switched"}
+    assert record.totals["deployment_switched"] is True  # a turn without the id among turns with it is one more
+    assert list(record.totals)[-1] == "deployment_switched"
+    assert dataclasses.replace(record, transcript=bare, totals=unswitched) == fifth
     named = [turn.get("deployment_id") for turn in replay_record(record).transcript]
     assert named == [None, record.transcript[1]["deployment_id"]]

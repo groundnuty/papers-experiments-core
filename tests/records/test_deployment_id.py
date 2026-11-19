@@ -74,3 +74,55 @@ def test_f02_a_record_of_turns_that_name_deployments_replays_to_its_own_bytes_an
     assert "deployment_id" not in without.transcript[0]
     assert replay_record(recorded(None, None)).dumps() == recorded(None, None).dumps()
     assert all("deployment_id" not in t for t in recorded(None, None).transcript)
+
+
+def run_of(*ids) -> RunRecord:
+    """A run with one turn per entry, each naming that deployment (None: its reply named none); the last answers."""
+    script = []
+    for index, name in enumerate(ids):
+        base = turn(call(f"call-{index}", "echo")) if index < len(ids) - 1 else turn(text="done")
+        script.append(dataclasses.replace(base, deployment_id=name))
+    return record_run(script, {"echo": lambda args: "echoed"})
+
+
+@pytest.mark.parametrize(
+    ("ids", "switched"),
+    [
+        (("dep-1", None, "dep-1"), True),  # a front that overflowed to another service for one turn
+        ((None, "dep-1"), True),
+        (("dep-1", "dep-2"), True),
+        ((None, None, None), False),  # a model that is never served through a front
+        (("dep-1", "dep-1", "dep-1"), False),
+        (("dep-1",), False),
+    ],
+)
+def test_b20_a_record_says_its_turns_switched_deployment_when_they_show_more_than_one_and_a_turn_without_the_id_counts(
+    ids, switched
+):
+    """B20: the totals' optional `deployment_switched` is written (true) when the turns show more than one deployment,
+    the turns without the id among turns with it counting as one more, and left out otherwise; it is the last of the
+    totals, validates, and replays to the record's own bytes."""
+    record = run_of(*ids)
+    text = record.dumps()
+    if switched:
+        assert record.totals["deployment_switched"] is True
+        assert list(record.totals)[-1] == "deployment_switched"
+    else:
+        assert "deployment_switched" not in record.totals  # absent, never false
+    assert validate(decode(text)) == V3
+    assert replay_record(record).dumps() == text
+
+
+def test_b20_deployment_switched_is_optional_in_version_three_and_unknown_to_version_two():
+    assert "deployment_switched" in optional_in("totals", V3)
+    assert "deployment_switched" not in fields_of("totals", V2)
+    older = recorded(record_options={"schema_version": V2})
+    assert "deployment_switched" not in older.totals  # a version that predates it is built without it
+    data = decode(older.dumps())
+    data["totals"]["deployment_switched"] = True
+    with pytest.raises(RecordError, match=r"totals: unknown field\(s\) \['deployment_switched'\]"):
+        validate(data)
+    body = decode(run_of("dep-1", None).dumps())
+    body["totals"]["deployment_switched"] = "yes"
+    with pytest.raises(RecordError, match="deployment_switched"):
+        validate(body)

@@ -34,12 +34,25 @@ server.listen()
 if mode == "listen_then_die":
     time.sleep(float(os.environ.get("FAKE_SSH_LIFE", "0.5")))
     sys.exit(255)
+held, answered = [], 0
+life = float(os.environ.get("FAKE_SSH_LIFE", "0.5"))
+born = time.monotonic()
 while True:
     client, _ = server.accept()
-    if mode == "http401":
-        client.recv(4096)
+    if mode == "silent":  # a tunnel whose far end is dead: it accepts, and nothing ever comes back
+        held.append(client)
+        continue
+    data = client.recv(4096) if mode in ("http401", "answer_then_silent", "answer_then_die") else b""
+    if data and mode == "answer_then_silent" and answered >= int(os.environ.get("FAKE_SSH_ANSWERS", "1")):
+        held.append(client)
+        continue
+    if data:
+        answered += 1
         client.sendall(b"HTTP/1.1 401 Unauthorized\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n")
     client.close()
+    if mode == "answer_then_die" and data:
+        time.sleep(life)
+        sys.exit(255)
 """
 
 
@@ -78,7 +91,7 @@ def settled(condition, seconds=10.0) -> bool:
 class Ssh:
     """A fake `ssh` first on PATH, its plan (what each start does, the last repeating), and what it logged."""
 
-    def __init__(self, tmp_path: Path, monkeypatch, *plan: str, life: float = 0.5):
+    def __init__(self, tmp_path: Path, monkeypatch, *plan: str, life: float = 0.5, answers: int = 1):
         self.directory = tmp_path / "fakebin"
         self.directory.mkdir()
         script = self.directory / "ssh"
@@ -90,6 +103,7 @@ class Ssh:
         monkeypatch.setenv("FAKE_SSH_LOG", str(self.log))
         monkeypatch.setenv("FAKE_SSH_STATE", str(self.state))
         monkeypatch.setenv("FAKE_SSH_LIFE", str(life))
+        monkeypatch.setenv("FAKE_SSH_ANSWERS", str(answers))
         self.port = free_port()
 
     def hop(self, **changes) -> dict:
@@ -102,5 +116,6 @@ class Ssh:
 
 
 def keeper(hop_module, hop, **timing):
-    fast = {"wait_s": 5.0, "settle_s": 0.3, "min_interval_s": 0.3, "max_interval_s": 1.0, "poll_s": 0.05}
+    fast = {"wait_s": 5.0, "settle_s": 0.3, "min_interval_s": 0.3, "max_interval_s": 1.0, "poll_s": 0.05,
+            "probe_s": 0.4, "probe_timeout_s": 0.4}  # fmt: skip
     return hop_module.HopKeeper(hop, **{**fast, **timing})

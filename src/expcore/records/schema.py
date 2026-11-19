@@ -40,7 +40,9 @@ can each have an attempt of one number, so the lease id, with the run key and th
 Version 3 also says, in one more optional field of a turn, which deployment served its reply (B20): `deployment_id`,
 what a front named in the response header the model entry's `deployment_header` names, beside `system_fingerprint`.
 It is the last field of a turn, absent for a turn whose reply named none (never a null), and a present one is plain
-printable text of 1 to 128 characters (`expcore.models.fleetheaders`).
+printable text of 1 to 128 characters (`expcore.models.fleetheaders`). The totals say, in one more optional field,
+when the attempt's turns show more than one deployment (`deployment_switched`, written only when true: a turn without
+the id among turns with it counts as one more; visibility only, nothing is set aside for it).
 Version 3 also says, in two optional fields of the totals, whether the attempt was held to the reservation R (C27):
 `reserved_capped`, the bound the budget gate reserved the run by, the value the campaign store keeps for the attempt
 (True: by the reply maximum, False: by the window), and `reply_cap_unheld`, whether the campaign had taken the
@@ -217,6 +219,7 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "final_text": (str, NONE),
         "reserved_capped": (bool,),
         "reply_cap_unheld": (bool,),
+        "deployment_switched": (bool,),
     },
 }
 FAILURE_KINDS = ("infra", "context_overflow", "abandoned", "error", "cut")
@@ -284,7 +287,7 @@ SCHEMAS: tuple[SchemaVersion, ...] = (
             "turn": ("deployment_id",),
             "record": ("treatment_targets", "instrument_refusal", "lease_id"),
             "outcome": ("infra_target",),
-            "totals": ("reserved_capped", "reply_cap_unheld"),
+            "totals": ("reserved_capped", "reply_cap_unheld", "deployment_switched"),
             "tool_call": ("elapsed_s", "exec_check"),
             "exec_check": ("source_whole", "exit_status", "nonce_matched"),
         },
@@ -293,7 +296,7 @@ SCHEMAS: tuple[SchemaVersion, ...] = (
             "turn": ("deployment_id",),
             "record": ("treatment_targets", "instrument_refusal", "lease_id"),
             "outcome": ("infra_target",),
-            "totals": ("reserved_capped", "reply_cap_unheld"),
+            "totals": ("reserved_capped", "reply_cap_unheld", "deployment_switched"),
             "tool_call": ("elapsed_s", "exec_check"),
             "exec_check": ("source_whole", "exit_status", "nonce_matched"),
         },

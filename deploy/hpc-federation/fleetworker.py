@@ -286,7 +286,8 @@ def launch(
             settle = SETTLE_S
             if settings.get("fleet_hop"):  # `node` waits for the hop's port, then for it to stay up, before it refuses
                 fleethop = shards._sibling("fleethop")
-                settle += fleethop.WAIT_S + fleethop.SETTLE_S + 5.0
+                tries = len(fleethop.sockets_of(settings["fleet_hop"]))  # a backup socket is tried the same way
+                settle += tries * (fleethop.WAIT_S + fleethop.SETTLE_S + fleethop.PROBE_TIMEOUT_S) + 5.0
             for _ in range(int(settle)):  # `node` refuses a start within seconds: a client gone then is no worker
                 sleep(1.0)
                 if not runner.client_alive(client):

@@ -16,6 +16,7 @@ import hashlib
 import json
 import re
 import secrets
+from collections.abc import Iterable
 
 SESSION_ID_LENGTH = 32  # hex characters
 DEPLOYMENT_ID_MAX = 128  # characters
@@ -38,12 +39,14 @@ CLIENT_HEADERS = frozenset(
 )
 
 
-def header_name_problem(name: object) -> str | None:
+def header_name_problem(name: object, request: bool = False) -> str | None:
     """Why `name` cannot be a header a model entry names, or None: an HTTP token of at most 64 characters, and not one
-    the client sets itself."""
+    the client sets itself. A request header (`session_header`) may not be one of the SDK's own (`OpenAI-Project` would
+    be replaced by the attempt's id and a project-checking endpoint would refuse the request)."""
     if not isinstance(name, str) or not HEADER_NAME.fullmatch(name):
         return "must be an HTTP header name (letters, digits and !#$%&'*+.^_`|~-, at most 64 characters)"
-    if name.lower() in CLIENT_HEADERS or name.lower().startswith("x-stainless-"):
+    low = name.lower()
+    if low in CLIENT_HEADERS or low.startswith("x-stainless-") or (request and low.startswith("openai-")):
         return f"names {name!r}, a header the client sets itself"
     return None
 
@@ -59,6 +62,15 @@ def session_id(fingerprint_sha256: str | None, run_key: str, attempt: int, lease
 def random_session_id() -> str:
     """An id for a backend nobody bound to an attempt (an admission probe): one per backend, never the same twice."""
     return secrets.token_hex(SESSION_ID_LENGTH // 2)
+
+
+def deployment_switched(ids: Iterable[str | None]) -> bool:
+    """Tell whether an attempt's turns show more than one deployment (B20): the ids of its turns, None for a turn whose
+    reply named none, count as distinct values when at least one turn named one. A front that overflows to another
+    service without strict stickiness shows as a turn without the header among turns with it; turns that all lack it
+    are no switch (a model that is never served through a front). Visibility only: nothing is set aside for it."""
+    seen = list(ids)
+    return any(i is not None for i in seen) and len(set(seen)) > 1
 
 
 def deployment_id_ok(value: object) -> bool:
