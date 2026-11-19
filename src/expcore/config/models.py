@@ -45,7 +45,7 @@ from expcore.config.loading import ConfigError, Section, close_match, load_toml_
 from expcore.config.model_checks import base_url_problems, sampling_problems, thinking_problems
 from expcore.config.price_table import read_price
 from expcore.config.prices import Price, TieredPrice
-from expcore.models.fleetheaders import header_name_problem
+from expcore.models.fleetheaders import extra_headers_problems, header_name_problem
 from expcore.models.served import MIXED_FINGERPRINTS
 
 BACKENDS = ("openai_compat", "anthropic", "stub")  # the backends the core builds; a plugin's factory serves others
@@ -139,6 +139,9 @@ class ModelSpec:
     # response header that names the deployment that served a reply; None sends nothing and reads nothing
     session_header: str | None = None
     deployment_header: str | None = None
+    # openai_compat: request headers (name to value) sent on every request of the model, probes included, beside the
+    # session header; the front routes by them. Part of the model's digest only while set (B20)
+    extra_headers: dict[str, str] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Keep the accepted fingerprints sorted, then refuse an entry whose settings break a rule, before any request
@@ -324,6 +327,7 @@ def _request_problems(spec: ModelSpec) -> list[str]:
             problems.append(f"{name} applies to openai_compat models only")
         elif problem := header_name_problem(value, request=name == "session_header"):
             problems.append(f"{name} {problem}")
+    problems += extra_headers_problems(spec.backend, spec.extra_headers, spec.session_header)
     if spec.prompt_cache_ttl is not None:
         if spec.backend != "anthropic":
             problems.append("prompt_cache_ttl applies to anthropic models only")
@@ -430,6 +434,7 @@ _ENTRY_KEYS = (
     "accepted_fingerprints",
     "session_header",
     "deployment_header",
+    "extra_headers",
 )
 
 
@@ -500,6 +505,7 @@ def _entry_args(section: Section, key: str, backend: str) -> dict[str, Any]:
         "accepted_fingerprints": _accepted(section),
         "session_header": section.optional_string("session_header"),
         "deployment_header": section.optional_string("deployment_header"),
+        "extra_headers": section.table("extra_headers"),
     }
 
 
