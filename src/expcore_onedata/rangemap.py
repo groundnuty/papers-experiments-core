@@ -33,6 +33,9 @@ reset_concurrency = 4           # the spaces a reset of several spaces works on 
 reset_shortcut = false          # re-read only held and transferred files after the eviction (`resetgrant.py`; needs [faults])
 reset_exclusive_wait_s = 60     # no longer used: a reset waits within [faults] admission_timeout_s, then refuses
 provider_concurrency = 16       # the most of a reset's per-file reads in flight at one provider, every space together
+wait_mode = "fixed"             # the reset's occupancy wait: "fixed" (the lag) or "event" (read at once, O46; `reset.py`)
+evict_batch = 500               # the most per-file evictions the reset has scheduled at once (`eviction.py`)
+transfer_walk_deadline_s = 600  # the longest the probes' transfer walk may take, or it fails closed (`transferlog.py`)
 
 [[placement.map]]               # a row (inline instead of `map = ...`); top-level [[map]] in the study's file
 file = "dir/file.bin"           # relative to the space root
@@ -75,6 +78,10 @@ DEFAULT_FRESH_CONNECTION_BYTES = 16 << 20
 # does not depend on it.
 QOS_SCANS = ("summaries", "listing")
 DEFAULT_QOS_SCAN = "listing"
+# How the reset takes its occupancy wait (O46): `fixed`, the lag for the deepest file from the eviction stage's end, as
+# it always was, or `event`, the reading at once after that end, since the files' block maps show an eviction and a
+# placement at once; a space with a provider declared never to hold its bytes keeps the lag either way (`reset.py`).
+WAIT_MODES = ("fixed", "event")
 
 
 @dataclass(frozen=True)
@@ -109,6 +116,14 @@ class PlacementSettings:
     # The most reads of a reset's readings (block maps; the QoS scans' root, pages, summaries and records) in flight at
     # one provider, every space and planner reading of the process together (`readslots.py`, O46, O51).
     provider_concurrency: int = 16
+    # The reset's occupancy wait (`WAIT_MODES`): `fixed` keeps every wait as it was.
+    wait_mode: str = "fixed"
+    # The most per-file evictions the reset has scheduled at once: the next batch is sent once this one's have ended
+    # (`eviction.py`), since one batch of about 15,300 OOM-killed a provider (18 Nov).
+    evict_batch: int = 500
+    # The longest the probes' transfer walk (the harness's records and the space's listing) may take before it fails
+    # closed (`transferlog.py`).
+    transfer_walk_deadline_s: float = 600.0
 
     def reset_settings(self) -> dict[str, Any]:
         """The settings the core records at a start and compares at a resume, `StudyPlugin(reset_settings=...)` (C35).
@@ -321,6 +336,9 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
             "reset_shortcut",
             "reset_exclusive_wait_s",
             "provider_concurrency",
+            "wait_mode",
+            "evict_batch",
+            "transfer_walk_deadline_s",
         )
     )
     holder = table.string("holder")
@@ -329,6 +347,9 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
     qos_scan = table.optional_string("qos_scan") or DEFAULT_QOS_SCAN
     if qos_scan not in QOS_SCANS:
         raise table.fail("qos_scan", f"must be one of {', '.join(QOS_SCANS)}")
+    wait_mode = table.optional_string("wait_mode") or "fixed"
+    if wait_mode not in WAIT_MODES:
+        raise table.fail("wait_mode", f"must be one of {', '.join(WAIT_MODES)}")
     shortcut = table.data.get("reset_shortcut", False)
     if not isinstance(shortcut, bool):
         raise table.fail("reset_shortcut", "must be true or false")
@@ -361,6 +382,9 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
         reset_shortcut=shortcut,
         reset_exclusive_wait_s=_number(table, "reset_exclusive_wait_s", 60.0, minimum=0),
         provider_concurrency=_number(table, "provider_concurrency", 16, minimum=1, integer=True),
+        wait_mode=wait_mode,
+        evict_batch=_number(table, "evict_batch", 500, minimum=1, integer=True),
+        transfer_walk_deadline_s=_number(table, "transfer_walk_deadline_s", 600.0, minimum=1),
     )
     rows = _map_rows(table, file, config, holder)
     return Placement(settings, build_map(rows, file))

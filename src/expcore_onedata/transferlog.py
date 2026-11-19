@@ -58,13 +58,26 @@ setting is what bounds that.
 
 **The harness's own jobs (O08).** A job the provisioner scheduled that the accepted listing does not show proves the
 listing incomplete, and what else it misses could be into any provider: every bound is unknown, `harness_unlisted`
-counts them. The provisioner's log holds the jobs it scheduled before the run too, a reset's evictions among them, and
+counts them. The probes hand over only the jobs that bear on the run (`Provisioner.transfers_from`): those scheduled
+since its start, and earlier ones unless the log noted, before the start, their end with a finish time before the
+cutoff (`Provisioner.note_ended`, written when a wait of the provisioner's own saw them end, as a reset's eviction
+batches and a replication's do): the proof `_ended_before_cutoff` asks of a job's records, so such a job is absent from
+the listing by design, and the log, kept across runs, is not read again job by job. Those it hands over may include
+jobs from before the run, and
 the ended walk never keeps a job that ended before the cutoff, so for each harness job the listing lacks, its record is
 read on every tracked provider. The job is absent by design and flags nothing (`harness_before_window` counts them)
 when a record says it ended (a final state) with a finish time after 0 and before the cutoff and no readable record
 contradicts that: every final record gives that same finish time. A copy that has not ended lags and contradicts
 nothing; a record that cannot be read neither confirms nor contradicts. With no such record, or a final one that gives
 another finish time, none, 0, or one at or after the cutoff, the job is missing.
+
+**A deadline for the whole walk** (`[placement] transfer_walk_deadline_s`, 600 s by default): the harness's own records
+(`probes.py`), every observation and the reads of the harness's jobs the listing lacks share one bound, counted on the
+provisioner's clock from when the probes begin their transfer reads. It is looked at before every request, each of
+which the client bounds itself, so a walk that has run past it sends nothing more: the listing is `probe_ok` false with
+`reason` `deadline` and no records, never no transfers, and a record not read is a failed probe with that reason. Two
+federations' walks once ran for 41 to 47 minutes. The section records the bound (`deadline_s`) and each observation's
+seconds (`observations_s`), a failed walk's so far included.
 
 **Fail closed.** A page or record that cannot be read, or one not in the documented shape (`transferrecord.py`), makes
 the whole listing `probe_ok` false with the reason and no records, never fewer or no transfers. A listing longer than
@@ -104,6 +117,27 @@ from expcore_onedata.transferwindow import (
 PAGE_LIMIT = 1000  # ids asked for per page; the listing takes 1 to 1000
 MAX_LISTED = 2000  # distinct ids of the window read before the listing is unknown: each one costs a read of its record
 ACTIVE = ("waiting", "ongoing")  # the listings read to their end; the ended one is read down to the window
+DEADLINE = "deadline"  # the reason of a walk that ran past `[placement] transfer_walk_deadline_s`
+
+
+class WalkDeadline(Exception):
+    """The transfer walk ran past its deadline: nothing more is sent, and the listing is unknown. Deliberately not an
+    `Unreadable`, which a check of one harness job takes for one provider's unread record and goes on past."""
+
+
+def deadline_at(provisioner: Provisioner, started: float | None = None) -> float:
+    """The instant, on the provisioner's clock, past which a walk begun at `started` (by default now) reads no more."""
+    began = provisioner.clock() if started is None else started
+    return began + provisioner.settings.transfer_walk_deadline_s
+
+
+def require_time(provisioner: Provisioner, deadline: float) -> None:
+    """Raise WalkDeadline once the provisioner's clock is past `deadline`."""
+    if provisioner.clock() > deadline:
+        raise WalkDeadline(
+            f"the transfer walk ran past its deadline of {provisioner.settings.transfer_walk_deadline_s:g} s "
+            "([placement] transfer_walk_deadline_s): the listing is unknown"
+        )
 
 
 class Probed(Protocol):
@@ -161,13 +195,25 @@ class TransferLog:
         is this host's epoch clock, the one the run's window is on."""
         if not 1 <= page_limit <= PAGE_LIMIT or max_listed < 1:
             raise ValueError(f"a page holds 1 to {PAGE_LIMIT} ids and the listing's bound is at least one")
-        self._client, self._provisioner, self._providers, self._probe = client, provisioner, list(providers), probe
+        self._client, self._provisioner, self._providers, self._run_probe = client, provisioner, list(providers), probe
         self._page_limit, self._max_listed, self._sleep, self._now = page_limit, max_listed, sleep, now
         self._pages = 0
         self._offsets: dict[str, list[float | None]] = {}  # provider -> each listing answer's clock offset, or None
         self._zone: list[ZoneClock | None] = []  # the global clock each observation read from Onezone, or None
         self._seen: set[str] = set()  # every job id any observation of the current reading showed
         self._cutoff = 0.0  # the earliest finish time the ended listing is read down to, this host's clock
+        self._deadline = math.inf  # the walk's deadline, on the provisioner's clock (`deadline_at`)
+        self._durations: list[float] = []  # each observation's seconds, on the provisioner's clock
+
+    def _probe(self, read: Callable[[], Any]) -> Probed:
+        """`read` through the probes' own probe, each attempt sent only while the walk is within its deadline
+        (`require_time`, which raises WalkDeadline past it and so ends the walk)."""
+
+        def within() -> Any:
+            require_time(self._provisioner, self._deadline)
+            return read()
+
+        return self._run_probe(within)
 
     def _dated_page(self, path: str, provider: str, params: Mapping[str, Any]) -> Any:
         """Read one page of a provider's listing and keep the provider's system-clock offset its Date header gives, a
@@ -259,6 +305,14 @@ class TransferLog:
             raise Unreadable(f"more than {self._max_listed} transfers in the window: the listing is unknown, not cut")
         return observation
 
+    def _timed_observe(self) -> Observation:
+        """One observation (`_observe`), its seconds kept for the snapshot (`observations_s`), a failed one's too."""
+        began = self._provisioner.clock()
+        try:
+            return self._observe()
+        finally:
+            self._durations.append(round(self._provisioner.clock() - began, 3))
+
     def _label(self, provider_id: str | None) -> str | None:
         """Name a provider id by its declared provider's position label, or `undeclared`; None stays None."""
         if provider_id is None:
@@ -279,12 +333,18 @@ class TransferLog:
         on observations is reached. Return the last observation, the readings that still changed between the last two
         (none when the listing settled), and how many observations were made. Raise Unreadable when one fails."""
         settings = self._provisioner.settings
-        previous = self._observe()
+        previous = self._timed_observe()
         self._seen = set(_ids(previous, self._providers))
         changed: list[Job] = []
         for polls in range(2, settings.transfer_settle_polls + 1):
+            if self._provisioner.clock() + settings.transfer_settle_s > self._deadline:
+                raise WalkDeadline(  # the next observation could only begin past the deadline: none is waited for
+                    f"the transfer walk's next observation would begin past its deadline of "
+                    f"{settings.transfer_walk_deadline_s:g} s ([placement] transfer_walk_deadline_s): the listing is "
+                    "unknown"
+                )
             self._sleep(settings.transfer_settle_s)
-            current = self._observe()
+            current = self._timed_observe()
             self._seen |= _ids(current, self._providers)
             changed = changed_between(previous, current)
             if not changed:
@@ -292,27 +352,55 @@ class TransferLog:
             previous = current
         return previous, changed, settings.transfer_settle_polls
 
-    def read(self, window: Window | None, file_ids: Mapping[str, str], harness: Collection[str]) -> Reading:
+    def read(
+        self,
+        window: Window | None,
+        file_ids: Mapping[str, str],
+        harness: Collection[str],
+        *,
+        deadline: float | None = None,
+    ) -> Reading:
         """Return the snapshot's record of the space's transfers in the window, with the jobs in it and those that leave
         a bound unknown. `file_ids` labels a tracked file's id, and `harness` holds the ids the provisioner scheduled,
         before the run as well as in it: one the accepted listing does not show leaves every bound unknown
         (`harness_unlisted`), unless its records agree that it ended before the cutoff (`harness_before_window`).
-        When the listing is unknown the jobs are None and the section's `probe_ok` is false with the reason."""
-        self._pages = 0
-        section: dict[str, Any] = {
+        When the listing is unknown the jobs are None and the section's `probe_ok` is false with the reason. `deadline`
+        is the walk's (`deadline_at`, the probes' own, begun before their records); by default one begun now. Past it
+        the listing is unknown with `reason` `deadline`."""
+        self._deadline = deadline_at(self._provisioner) if deadline is None else deadline
+        self._durations = []
+        try:
+            reading = self._read(window, file_ids, harness)
+        except WalkDeadline as error:
+            section = {**self._section(window), "pages": self._pages, "error": str(error), "reason": DEADLINE}
+            reading = Reading(section, None)
+        reading.section["observations_s"] = list(self._durations)  # the section is this reading's own
+        return reading
+
+    def _section(self, window: Window | None) -> dict[str, Any]:
+        """The section before anything is read: unknown, with the settings it is read under."""
+        settings = self._provisioner.settings
+        return {
             "probe_ok": False,
             "error": None,
             "window": None if window is None else window.to_json(),
             "providers": [self._client.provider_label(p) for p in self._providers],
             "pages": 0,
-            "settle_s": self._provisioner.settings.transfer_settle_s,
+            "settle_s": settings.transfer_settle_s,
             "settled": None,
             "polls": None,
             "ended_since": None,
             "listed": None,
             "records": None,
             "carried_over": None,
+            "deadline_s": settings.transfer_walk_deadline_s,
+            "observations_s": [],
         }
+
+    def _read(self, window: Window | None, file_ids: Mapping[str, str], harness: Collection[str]) -> Reading:
+        """`read` within its deadline: raise WalkDeadline past it."""
+        self._pages = 0
+        section = self._section(window)
         if window is None:
             return Reading({**section, "error": "the run's start was not read, so the run has no window"}, None)
         self._offsets, self._zone = {}, []
