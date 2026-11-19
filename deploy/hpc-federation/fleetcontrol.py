@@ -56,6 +56,7 @@ One campaign drives one site: the ledger and `archives` are this host's; each ar
 import argparse
 import json
 import os
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -572,5 +573,23 @@ def main(argv: Optional[Sequence[str]] = None, environ: Optional[Mapping[str, st
         return 2
 
 
+def stop_on_signals() -> None:
+    """Stop the controller the same way on SIGTERM as on SIGINT: `KeyboardInterrupt` in the main thread, so the
+    loop's `finally` waits for the actions it started (a down, a pull, a retirement) and closes the ledger. Without it
+    SIGTERM ended the process at once, an action half done. A background job of a non-interactive shell starts with
+    SIGINT ignored, so SIGINT's own handler is put back too. Only the script installs them, never an import."""
+
+    def interrupt(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt(signal.Signals(signum).name)
+
+    signal.signal(signal.SIGTERM, interrupt)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    stop_on_signals()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt as stop:
+        print(f"fleetcontrol: stopped by {stop.args[0] if stop.args else 'SIGINT'}", file=sys.stderr)
+        sys.exit(130)
