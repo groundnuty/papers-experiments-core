@@ -23,6 +23,7 @@ from expcore_onedata.fault_hpc import (
     status_domain_wait,
     stop_evidence,
 )
+from expcore_onedata.fault_restore import stop_record
 
 LABELS = {"store-one": "providers[0]", "store-two": "providers[1]"}
 SERVICE = "store-two"
@@ -313,3 +314,18 @@ def test_o58_the_driver_is_never_built_without_a_probe():
     """O58: as the Compose driver, it cannot take a running service for one that serves without asking."""
     with pytest.raises(TypeError):
         HpcDriver(VerbCommand([TOOL], Answer(CommandResult(0, ""))))  # type: ignore[call-arg]
+
+
+def test_o96_a_stop_that_kept_the_service_with_no_holder_keeps_the_word_and_fails_the_injection():
+    """O96: a stop whose evidence says `"holder": "failed"` (no holder step beside the kept work directory) keeps
+    that word with the evidence, which the injector journals with the stop (`stop_record`), and raises DriverError, so
+    the injector brings the provider back at once and the attempt is set aside; an answer without the word, or with
+    any other, keeps the four figures alone, as before."""
+    answer = '{"stopped": true, "ended": "exit", "seconds": 40.0, "service_seconds": 30.0, "holder": "failed"}\n'
+    driver, _ = answering(CommandResult(0, answer))
+    with pytest.raises(DriverError, match="no holder step"):
+        driver.stop(SERVICE)
+    kept = {"stopped": True, "ended": "exit", "seconds": 40.0, "service_seconds": 30.0}
+    assert driver.last_stop == {**kept, "holder": "failed"}
+    assert stop_record(driver)["stop"]["holder"] == "failed"
+    assert stop_evidence(answer.replace('"failed"', '"n-1"')) == kept

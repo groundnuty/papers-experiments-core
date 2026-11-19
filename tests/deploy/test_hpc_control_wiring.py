@@ -482,3 +482,138 @@ def test_o58_the_relay_up_starts_beats_and_the_stop_down_runs_ends_it(hpc, tmp_p
         runner.end_client(client, grace_s=2.0)
         with contextlib.suppress(ChildProcessError):
             os.waitpid(client.pid, os.WNOHANG)
+
+
+# -- a kept stop's holder (O96) -------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ticking(fed, monkeypatch):
+    """The verbs' waits on a clock their sleeps advance, so a bound costs no time and never spins."""
+    now = [1000.0]
+    monkeypatch.setattr(fed.hpc.control, "_MONOTONIC", lambda: now[0])
+    monkeypatch.setattr(fed.hpc.control, "_SLEEP", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    return now
+
+
+def holder_of(fed, service):
+    return f"{fed.state()['allocation']['name']}-hold-{service}"
+
+
+def holders(fed):
+    return [srun for srun in fed.fake.spawned if srun.command[:1] == ["sleep"]]
+
+
+def test_o96_a_kept_stop_launches_a_holder_on_the_providers_node_before_teardown_and_records_it(fed, monkeypatch):
+    """O96: the kept stop launches, just before teardown's control step, a detached `sleep` to the allocation's end on
+    the provider's own node in the services' job: `--overlap` (never `--exact`), one core and 64 MB, named
+    `<allocation>-hold-<service>`; the state records it by name and listed id and its srun client; the evidence the
+    verb prints carries no holder word, as before."""
+    until = int(datetime.fromisoformat(END_TIME).timestamp())
+    monkeypatch.setattr(fed.hpc.control, "_STAMP", lambda: until - 3600)
+    status, out, err = fed.verb("stop", "aspen")
+    assert status == 0, err
+    name = holder_of(fed, "aspen")
+    [holder] = holders(fed)
+    record = fed.state()["services"]["aspen"]
+    assert (holder.name, holder.node, holder.job) == (name, record["node"], fed.state()["allocation"]["job"])
+    assert (holder.overlap, holder.exact, holder.cpus, holder.mem) == (True, False, 1, "64M")
+    assert holder.command == ["sleep", "3600"]
+    assert fed.fake.sruns.index(holder) < fed.fake.sruns.index(fed.teardowns[0])  # never a moment with none of ours
+    assert record["holder"] == {"name": name, "id": fed.fake.steps[name]}
+    assert name in fed.state()["clients"]
+    assert "holder" not in json.loads(out)
+    assert json.loads(fed.verb("status", "aspen")[1])["holder"] == fed.fake.steps[name]
+    assert fed.verb("stop", "aspen")[0] == 0  # a stop of the stopped service: no second holder
+    assert len(holders(fed)) == 1
+
+
+def test_o96_a_start_ends_the_holder_by_its_id_only_once_the_new_provider_step_reads_running(fed, ticking, monkeypatch):
+    """O96: the start launches the new provider step first, reads it running by its exact id, and only then sends the
+    holder TERM by the exact id the step list shows under its name; the holder ends and its record goes."""
+    assert fed.verb("stop", "aspen")[0] == 0
+    name = holder_of(fed, "aspen")
+    holder = fed.fake.steps[name]
+    timeline = []
+    observed = fed.hpc.slurm.Slurm.step_observed
+
+    def watched(self, step_id, step_name=None):
+        seen = observed(self, step_id, step_name)
+        timeline.append(("observed", step_id, seen["running"]))
+        return seen
+
+    run = fed.fake.run
+
+    def recorded(argv, timeout):
+        if argv[:2] == ["scancel", "--signal=TERM"]:
+            timeline.append(("term", argv[-1]))
+        return run(argv, timeout)
+
+    monkeypatch.setattr(fed.hpc.slurm.Slurm, "step_observed", watched)
+    monkeypatch.setattr(fed.fake, "run", recorded)
+    status, _, err = fed.verb("start", "aspen")
+    assert status == 0, err
+    new = fed.state()["services"]["aspen"]["step"]["id"]
+    assert timeline.index(("observed", new, True)) < timeline.index(("term", holder))
+    assert fed.fake.termed == [holder]
+    assert holder not in fed.fake.cancelled
+    assert name not in fed.fake.steps
+    assert "holder" not in fed.state()["services"]["aspen"]
+
+
+def test_o96_a_start_whose_new_step_does_not_read_running_keeps_the_holder(fed, ticking, monkeypatch):
+    """O96: a new provider step that is listed but does not read running by its id (accounting cannot tell) is no
+    process of ours shown on the node: the holder is kept, running and recorded, and the start still succeeds."""
+    assert fed.verb("stop", "aspen")[0] == 0
+    name = holder_of(fed, "aspen")
+    holder = fed.fake.steps[name]
+    monkeypatch.setattr(fed.hpc.slurm.Slurm, "step_observed", lambda self, step_id, step_name=None: {"running": None})
+    status, _, err = fed.verb("start", "aspen")
+    assert status == 0, err
+    assert fed.fake.termed == []
+    assert fed.fake.steps[name] == holder
+    assert fed.state()["services"]["aspen"]["holder"] == {"name": name, "id": holder}
+    assert "its holder is kept" in err
+
+
+def test_o96_a_holder_that_cannot_be_launched_leaves_the_stop_standing_and_says_so(fed, ticking):
+    """O96: srun refuses the holder (its client exits at once, no step is made): the stop stands, exit 0 and stopped,
+    and its evidence, printed and recorded in the state's stops, says `"holder": "failed"`; a warning goes to stderr."""
+    fed.fake.holder_refused = True
+    status, out, err = fed.verb("stop", "aspen")
+    assert status == 0, err
+    evidence = json.loads(out)
+    assert (evidence["stopped"], evidence["holder"]) == (True, "failed")
+    record = fed.state()["services"]["aspen"]
+    assert record["state"] == "stopped"
+    assert record["stops"] == [evidence]
+    assert record["holder"] == {"name": holder_of(fed, "aspen"), "id": None}
+    assert "WARNING: no holder step" in err
+
+
+def test_o96_down_ends_a_holder_by_its_id_before_the_services_teardown_and_launches_none(fed):
+    """O96: down sends the recorded holder TERM by its exact id before any teardown of its own (without --keep), and
+    the TERM ends it (no cancel of it); down's own teardowns, stops that keep nothing, launch no holder."""
+    assert fed.verb("stop", "larch")[0] == 0
+    holder = fed.fake.steps[holder_of(fed, "larch")]
+    assert fed.driver.down().startswith("down: the held job 4242 is gone")
+    assert fed.fake.termed == [holder]
+    assert holder not in fed.fake.cancelled
+    term = fed.fake.calls.index(["scancel", "--signal=TERM", holder])
+    teardown = [str(fed.hpc.control.BUNDLE / "teardown.sh")]
+    plain = [i for i, argv in enumerate(fed.fake.calls) if set(teardown) & set(argv) and "--keep" not in argv]
+    assert plain
+    assert term < plain[0]
+    assert len(holders(fed)) == 1
+    assert not fed.root.exists()
+
+
+def test_o96_observe_reports_a_recorded_holder_and_nothing_for_a_service_without_one(hpc, fed):
+    """O96: hpcobserve gives a service whose state records a holder the id squeue lists the holder under, and adds
+    nothing for a service that records none."""
+    import hpcobserve
+
+    assert fed.verb("stop", "aspen")[0] == 0
+    found = hpcobserve.read(fed.state(), fed.driver.slurm, accounting_wait_s=0)["services"]
+    assert found["aspen"]["holder"] == fed.fake.steps[holder_of(fed, "aspen")]
+    assert "holder" not in found["larch"]

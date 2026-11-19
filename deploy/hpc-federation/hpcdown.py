@@ -29,6 +29,7 @@ TEARDOWN_MARGIN_S = 90
 AGENT_NODE = "the agent's node"  # as `unswept` names it (the elastic controller reads that a node is named, C54)
 UNSWEPT_REMEDY = 'sweep it in a job on that node (README.md, "A down that could not sweep a node")'
 STEP_TERM_S = 60.0  # declared bound: a drained worker's step, sent TERM, ends in seconds (its cleanup is a removal)
+HOLDER_TERM_S = 10.0  # a kept stop's holder (O96) is a sleep: TERM ends it at once
 WORKDIR_LINE = re.compile(r"^hpcop: work directory (/\S+)$", re.M)  # the batch scripts' own line (zone.sbatch)
 
 
@@ -209,6 +210,7 @@ class Down:
         agent, agent_info = self.ours(state, "sandbox", lost) if self.separate(state) else (None, None)
         if info is not None and info.get("JobState") == "RUNNING":
             try:
+                self.end_holders(state)
                 unverified += self.stop_services(job)
             except (RuntimeError, OSError, ValueError) as error:
                 self.say(f"stopping the services failed ({error}); the held job is cancelled all the same")
@@ -334,6 +336,35 @@ class Down:
         if not record.get("node"):
             return ""
         return self.sweep_node(state, record["node"], f"{state['allocation']['name']}-sandbox-sweep")
+
+    def end_holders(self, state: Mapping[str, Any]) -> None:
+        """O96: each kept stop's holder the state records (`services.<n>.holder`) that the step list shows under its
+        exact name is sent TERM by that id, and cancelled by it when it outlives TERM by `HOLDER_TERM_S`, before the
+        services' teardown: a holder sleeps to the allocation's end, and would otherwise hold `wait_steps` to its whole
+        bound. One that still has not ended is said, never fatal: `wait_steps` cancels what is left, and the held job's
+        cancel ends it."""
+        names = [
+            record["holder"]["name"]
+            for record in state["services"].values()
+            if isinstance(record.get("holder"), dict) and isinstance(record["holder"].get("name"), str)
+        ]
+        left = [(step, name) for name in names if (step := self.launcher.listed(name)) is not None]
+        for step, name in left:
+            self.say(f"a kept stop's holder ({name}) still runs: sent TERM by its id")
+            try:
+                self.launcher.term(step)
+            except SlurmError as error:  # its end, read by its id, decides
+                self.say(f"the TERM to step {step} reported a failure ({error})")
+        left = self.unended(left, HOLDER_TERM_S)
+        for step, _ in left:
+            self.say(f"step {step} outlived its TERM: it is cancelled by its id")
+            try:
+                self.launcher.cancel(step)
+            except SlurmError as error:
+                self.say(f"the cancel of step {step} reported a failure ({error})")
+        left = self.unended(left, self.timeouts["cancel"])
+        if left:
+            self.say(f"holder step {', '.join(s for s, _ in left)} has not ended: the held job's cancel ends it")
 
     def end_agent_steps(self, state: Mapping[str, Any], job: str) -> None:
         """C54: a step of this federation still running in the agent's own job, the elastic worker's (`<agent job
