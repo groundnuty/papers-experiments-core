@@ -88,3 +88,18 @@ def test_c50_a_start_on_a_platform_the_campaign_does_not_declare_is_refused_befo
 def test_c50_a_set_that_is_empty_malformed_or_repeats_a_platform_is_refused_at_load(tmp_path, declared, says):
     with pytest.raises(ConfigError, match=says):
         site(tmp_path, "bad", APPTAINER, declared)
+
+
+def test_c50_a_platform_given_as_a_read_only_mapping_is_hashed_as_the_campaign_fingerprint_holds_it():
+    """C50 (Codex round 1): `StudyPlugin.platform` may be any mapping, with tuples in it; its SHA-256 is that of the
+    plain data the campaign fingerprint holds, so a read-only mapping hashes as its dict does and never raises."""
+    from types import MappingProxyType
+
+    from expcore.study.declared_platforms import own_sha256
+
+    given = MappingProxyType(
+        {"backend": "docker", "trust_paths": ("/a", "/b"), "limits": MappingProxyType({"cpus": 2})}
+    )
+    assert own_sha256(given) == fingerprint_sha256(
+        {"backend": "docker", "trust_paths": ["/a", "/b"], "limits": {"cpus": 2}}
+    )

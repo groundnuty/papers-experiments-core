@@ -13,10 +13,12 @@ fleet's shard settings, `fleetplan.read_settings`).
   is None (the join waits and is decided again), never a guess; a read that worked is kept for the member.
 - **The read's contract**, for every site kind's read (one JSON line): `fingerprint` (the campaign fingerprint's
   SHA-256), `environment` (the identity, names to digests) and `platform`, the SHA-256 of the member's platform
-  fingerprint as `expcore.study.declared_platforms.own_sha256` takes it: the value its root's `render-identity.json`
-  holds as `platform_fingerprint_sha256` (`hpcidentity.fingerprint_sha256_of`, the same hash of the same
-  fingerprint). A read with no `platform` (an earlier core) joins a campaign that declares none, and is refused by
-  one that declares its platforms.
+  fingerprint as its study's plugin gives it (`StudyPlugin.platform`, `expcore.study.declared_platforms.own_sha256`,
+  through `expcore.study.pipeline.campaign_member_identity`). That is the value its root's `render-identity.json`
+  holds as `platform_fingerprint_sha256` only when the plugin's platform is the platform file's fingerprint alone; a
+  plugin that adds to it (its read-only inputs) gives another, so the value to declare is the one the read prints. A
+  read with no `platform` (null, or an earlier core's read without the field) joins a campaign that declares none,
+  and is refused by one that declares its platforms.
 - `locator(evidence)`: `(site, Settle) -> (out/, source)` or None, for `fleetexecute.dead_store_reader`: the lost
   lease's store as a place `lease-<id>/` holds it (`PLACES`): in the federation's channel on the site's shared file
   system (`root`, whatever the member's root: the channel is outside it and outlives the member's down, and at a settle
@@ -57,7 +59,12 @@ PLACES = "places"  # in a federation's channel, and in a member's collected evid
 PROGRAM = (
     "import json, sys\n"
     "from expcore.campaign.manifest import fingerprint_sha256\n"
-    "from expcore.study.pipeline import campaign_member_identity\n"
+    "try:\n"
+    "    from expcore.study.pipeline import campaign_member_identity\n"
+    "except ImportError:  # an earlier core: no platform, which only a campaign declaring its platforms refuses\n"
+    "    from expcore.study.pipeline import campaign_identity\n"
+    "    def campaign_member_identity(path):\n"
+    "        return (*campaign_identity(path), None)\n"
     "fingerprint, environment, platform = campaign_member_identity(sys.argv[1])\n"
     "print(json.dumps({'fingerprint': fingerprint_sha256(fingerprint), 'environment': environment,\n"
     "                  'platform': platform}, sort_keys=True))\n"

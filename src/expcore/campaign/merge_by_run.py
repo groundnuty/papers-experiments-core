@@ -198,8 +198,8 @@ def check_platform_environments(stores: Sequence[LeaseStore], ledger: LedgerFact
     for store in stores:
         groups.setdefault(ledger.leases[store.lease.lease_id].platform, []).append(store)
     for platform, group in sorted(groups.items(), key=lambda item: item[0] or ""):
-        if platform is None:
-            raise MergeRefused(f"{group[0].name}: its lease's federation joined on no declared platform")
+        if platform is None or platform not in ledger.config.platforms:
+            raise MergeRefused(f"{group[0].name}: its lease's federation joined on no platform the ledger declares")
         check_environment(group)
         pinned = ledger.environments.get(platform)
         if pinned != environment_digest(group[0].environment):

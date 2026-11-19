@@ -44,7 +44,7 @@ models on one unit are that unit's concurrent runs: a sum above the unit's `[sch
 layout is in the campaign's caps, so in the fingerprint every shard shares; without the table nothing changes.
 
 `platform_fingerprints` declares the platforms a campaign's members may run on, each by the SHA-256 of its
-fingerprint (`StudyPlugin.platform`; on HPC the render identity's `platform_fingerprint_sha256`): the campaign
+fingerprint (`StudyPlugin.platform`, the `platform` a member's identity read prints): the campaign
 fingerprint then holds the sorted set in the platform's place, and a start on another platform is refused
 (`study.declared_platforms`, C50).
 

@@ -185,3 +185,15 @@ def test_c50_the_merge_refuses_two_stores_of_one_platform_whose_environments_dif
     other = store_on(on_hpc, {"layout": "4" * 64})
     with pytest.raises(MergeRefused, match="another environment than"):
         check_platform_environments([store_on(on_hpc, ENV_HPC), other], facts)
+
+
+def test_c50_the_merge_refuses_a_federation_on_a_platform_the_ledger_does_not_declare(tmp_path):
+    """C50 (Codex round 1): a federation row whose platform the pinned set does not hold is refused, never published."""
+    import dataclasses
+
+    from expcore.campaign.merge_by_run import check_platform_environments
+
+    facts, on_hpc, on_vm = two_platforms(tmp_path)
+    narrowed = dataclasses.replace(facts, config=dataclasses.replace(facts.config, platforms=(DOCKER,)))
+    with pytest.raises(MergeRefused, match="no platform the ledger declares"):
+        check_platform_environments([store_on(on_hpc, ENV_HPC), store_on(on_vm, ENV_VM)], narrowed)
