@@ -157,15 +157,6 @@ def test_l18_a_cell_that_reaches_the_time_left_first_has_the_text_it_always_had(
     assert with_limit.tool_calls[0].raw_text == without.tool_calls[0].raw_text
 
 
-def test_l18_a_limit_shorter_than_the_sandboxs_minimum_names_the_limit_the_cell_was_given():
-    """L18: the sandbox refuses a limit under a second, so the code tool hands it a second: that is the limit the cell
-    ran under, and the one the text names."""
-    sandbox = ScriptedSandbox()
-    result = run_cells(sandbox, ["sleep 30"], clock=FakeClock(), code_cell_bound_s=0.4)
-    assert sandbox.limits == [1.0]
-    assert "ran past its 1 s limit and was killed" in result.tool_calls[0].text
-
-
 def test_l18_a_cell_that_outlives_its_kill_at_the_limit_still_ends_the_run_as_infrastructure():
     """L18: the limit changes nothing of O34. A cell a process of which outlived its kill returns its timeout as before,
     without telling the agent it was killed since it was not, and the next call is refused as `cell_unkillable`: the

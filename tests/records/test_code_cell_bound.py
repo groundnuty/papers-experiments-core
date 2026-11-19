@@ -13,6 +13,7 @@ from record_support import record_run
 from expcore.plugin import ToolOutput
 from expcore.records.record import RunRecord, decode
 from expcore.records.schema import RecordError, validate
+from expcore.replay.divergence import ReplayDivergence
 from expcore.replay.replay import replay_record
 
 V2, V3 = "expcore-record/2", "expcore-record/3"
@@ -69,11 +70,11 @@ def test_l18_a_run_that_killed_a_cell_at_the_limit_and_went_on_round_trips_and_r
 
 
 def test_l18_a_replay_whose_list_of_code_cell_tools_was_edited_diverges():
-    """L18: the list is part of the configuration the record's digest covers, so an edited one, sealed again, is not the
-    run that was recorded and the replay does not pass it."""
+    """L18: the list is part of the configuration the record keeps and hashes, so a list edited after the run is not the
+    configuration the replay's loop writes, and the replay diverges at the configuration."""
     data = decode(killed_then_answered().dumps())
     data["agent_config"]["code_cell_tools"] = ["echo", "python"]
-    with pytest.raises(Exception, match="agent_config"):
+    with pytest.raises(ReplayDivergence, match="agent_config"):
         replay_record(RunRecord.from_json(data))
 
 
