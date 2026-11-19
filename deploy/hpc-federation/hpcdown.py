@@ -26,6 +26,7 @@ SHARDS = BUNDLE.parent / "shards.py"  # its `sweep`, on the agent's node at down
 # A teardown step's bound beyond its launch wait, the graceful stop (`stop_seconds`) and supervise.py's kill tail: what
 # teardown.sh spends on its own steps and the client's end. The launch wait and `stop_seconds` come from the layout.
 TEARDOWN_MARGIN_S = 90
+STEP_TERM_S = 60.0  # declared bound: a drained worker's step, sent TERM, ends in seconds (its cleanup is a removal)
 WORKDIR_LINE = re.compile(r"^hpcop: work directory (/\S+)$", re.M)  # the batch scripts' own line (zone.sbatch)
 
 
@@ -304,28 +305,42 @@ class Down:
         name>-worker`, fleetworker.py) or a shard's (`-shard-<n>`), is sized to the whole job, so the sweep's control
         step there can never start (live, 19 Nov: the sweep waited behind the worker's step until its bound, and a
         second down, its job gone by then, removed the root unswept). Each one listed under the job by such a name is
-        cancelled by its own id (TERM, so the worker removes its own directory; KILL after the site's KillWait, and the
-        sweep removes what that leaves) and must read ended by that id in squeue and sacct (`step_observed`) within the
-        cancel's bound, which covers the KillWait; RuntimeError otherwise, and the node is not swept. No other step of
-        the job is touched."""
+        sent TERM by its own id (`term_step`: the worker then removes its own directory, its key files first, as on
+        every way out) and given `STEP_TERM_S` to end; one still running then is cancelled by its id (on the site an
+        outright kill, K1: the sweep removes what it leaves, once its process is gone). Each must read ended by that
+        id in squeue and sacct (`step_observed`) within the cancel's bound, which covers the site's KillWait;
+        RuntimeError otherwise, and the node is not swept. No other step of the job is touched."""
         prefixes = [n for n in ((state.get("sandbox") or {}).get("name"), state["allocation"]["name"]) if n]
         ours = re.compile("(?:" + "|".join(re.escape(p) for p in prefixes) + r")-(?:worker|shard-[0-9]+)")
         left = [(step, name) for step, name in self.slurm.step_listing(job) if ours.fullmatch(name)]
         for step, name in left:
-            self.say(f"a step of this federation ({name}) still runs in the agent's job {job}: cancelled by its id")
+            self.say(f"a step of this federation ({name}) still runs in the agent's job {job}: sent TERM by its id")
+            try:
+                self.slurm.term_step(step)
+            except SlurmError as error:  # its end, read by its id, decides
+                self.say(f"the TERM to step {step} reported a failure ({error})")
+        left = self.unended(left, STEP_TERM_S)
+        for step, _ in left:
+            self.say(f"step {step} outlived its TERM: it is cancelled by its id")
             try:
                 self.slurm.cancel_step(step)
-            except SlurmError as error:  # its end, read by its id, decides
+            except SlurmError as error:
                 self.say(f"the cancel of step {step} reported a failure ({error})")
-        deadline = self.clock() + self.timeouts["cancel"]
-        while left:
-            left = [(s, n) for s, n in left if self.slurm.step_observed(s, n).get("running") is not False]
-            if not left or self.clock() >= deadline:
-                break
-            self.sleep(self.poll_s)
+        left = self.unended(left, self.timeouts["cancel"])
         if left:
             raise RuntimeError(f"step {', '.join(s for s, _ in left)} of the agent's job has not ended "
                                f"{self.timeouts['cancel']:.0f} s after its cancel")  # fmt: skip
+
+    def unended(self, steps: List[Tuple[str, str]], bound_s: float) -> List[Tuple[str, str]]:
+        """The (id, name) steps not yet shown ended by their ids (`step_observed`) once `bound_s` has passed, read
+        again every poll until none is left; a step that cannot be told counts as not ended."""
+        deadline = self.clock() + bound_s
+        while steps:
+            steps = [(s, n) for s, n in steps if self.slurm.step_observed(s, n).get("running") is not False]
+            if not steps or self.clock() >= deadline:
+                break
+            self.sleep(self.poll_s)
+        return steps
 
     def sweep_shard_node(self, state: Mapping[str, Any], entry: Mapping[str, str]) -> str:
         """The sweep on a node a shard was resumed on (`shard_nodes`, which `shards.py resume-line` records), in the job

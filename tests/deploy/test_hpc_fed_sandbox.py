@@ -754,22 +754,28 @@ def held_by_a_live_step(fake):
     return control
 
 
-@pytest.mark.parametrize("suffix", ["-worker", "-shard-1"])
-def test_c54_down_cancels_a_live_step_of_the_agents_job_by_its_id_and_sweeps_once_it_ended(hpc, tmp_path, site, suffix):
+@pytest.mark.parametrize(("suffix", "obeys"), [("-worker", True), ("-shard-1", True), ("-worker", False)])
+def test_c54_down_ends_a_live_step_of_the_agents_job_by_its_id_and_sweeps_once_it_ended(
+    hpc, tmp_path, site, suffix, obeys
+):
     """C54: a step of this federation still running in the agent's own job (the elastic worker's, or a shard's) held
     the whole job live, so down's sweep of the agent's node never started and a second down removed the root unswept:
-    down now cancels that step by its own id (TERM: the worker removes its own directory), waits until squeue and
-    sacct show that id ended, and only then sweeps the node; the root goes."""
-    fake = FakeSlurm()
+    down now sends that step TERM by its own id (the worker removes its own directory, its key files first), cancels
+    it by its id only if it outlives TERM (an outright kill on the site), waits until squeue and sacct show that id
+    ended, and only then sweeps the node; the root goes."""
+    fake = FakeSlurm(ignores_term=[] if obeys else ["4343.9"])
     fake.on_control = held_by_a_live_step(fake)
     rig = Rig(hpc, tmp_path, site, "separate", fake)
     rig.up()
     fake.steps[f"{rig.state()['sandbox']['name']}{suffix}"] = "4343.9"
     fake.calls.clear()
+    ticks = itertools.count(0, 60)
+    rig.driver.clock = lambda: next(ticks)
     rig.driver.down()
     calls = [" ".join(call) for call in fake.calls]
     swept = next(i for i, call in enumerate(calls) if call.startswith("srun") and "shards.py sweep " in call)
-    assert calls.index("scancel 4343.9") < swept
+    assert calls.index("scancel --signal=TERM 4343.9") < swept
+    assert ("scancel 4343.9" in calls[:swept]) is not obeys
     assert "sacct -j 4343 -n -P -o JobID,JobName,State,Start,End,ExitCode" in calls[:swept]
     assert len(fake.sweeps) == 1
     assert not rig.root.exists()
@@ -778,7 +784,7 @@ def test_c54_down_cancels_a_live_step_of_the_agents_job_by_its_id_and_sweeps_onc
 def test_c54_a_step_still_running_after_its_cancel_fails_the_down_closed_and_records_the_node_unswept(
     hpc, tmp_path, site
 ):
-    """C54: the worker's step still runs at the cancel's bound (it outlived TERM, or Slurm never shows it ended): no
+    """C54: the worker's step still runs after its TERM and at its cancel's bound (Slurm never shows it ended): no
     sweep, both held jobs cancelled all the same, the root kept, and the state records the agent's node as unswept,
     which the elastic controller reads to never take that member down again by itself."""
     fake = FakeSlurm(unending=["4343.9"])
@@ -791,6 +797,7 @@ def test_c54_a_step_still_running_after_its_cancel_fails_the_down_closed_and_rec
     with pytest.raises(RuntimeError, match="the agent's node could not be verified clean"):
         rig.driver.down()
     assert fake.sweeps == []
+    assert fake.termed == ["4343.9"]
     assert fake.cancelled.index("4343.9") < fake.cancelled.index("4343")
     assert "4242" in fake.cancelled
     assert rig.root.exists()

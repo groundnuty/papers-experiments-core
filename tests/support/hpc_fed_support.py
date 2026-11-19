@@ -444,7 +444,9 @@ class FakeSlurm:
     sweeps: list = field(default_factory=list)  # each sweep step down launched
     leftovers: dict = field(default_factory=dict)  # node -> the work directories of ours leftovers.py counts there
     step_cancel_rc: int = 0  # a step's scancel ends it but exits so (225: as the site's did on a het job, live slot 5)
-    unending: list = field(default_factory=list)  # step ids a step's scancel does not end (it outlives TERM, KillWait)
+    unending: list = field(default_factory=list)  # step ids neither TERM nor a cancel ends (Slurm never shows it ended)
+    ignores_term: list = field(default_factory=list)  # step ids TERM does not end, a cancel does
+    termed: list = field(default_factory=list)  # each step sent TERM (`scancel --signal=TERM <id>`), in order
     ended_steps: dict = field(default_factory=dict)  # step id -> name, of each step a step's scancel ended
     accounting: dict = field(default_factory=dict)  # job id -> what `sacct -o JobID,State,AllocTRES` prints of it
     interconnect_after: int | None = None  # the steps of component 0 with no --network that start before the rest fail
@@ -537,7 +539,15 @@ class FakeSlurm:
             ident = argv[argv.index("-j") + 1]
             return Completed(0, "".join(f"{i}\n" for i in self.listed_ids() if i.split("+")[0] == ident), "")
         if tool == "scancel":
-            target = argv[1]
+            target = argv[-1]
+            if argv[1:-1] == ["--signal=TERM"]:  # a step sent TERM: it ends by itself, unless it outlives TERM
+                assert "." in target, f"TERM is sent to a step alone: {argv}"
+                self.termed.append(target)
+                if target not in self.unending and target not in self.ignores_term:
+                    self.ended_steps.update({s: n for n, s in self.steps.items() if s == target})
+                    self.steps = {n: s for n, s in self.steps.items() if s != target}
+                return Completed(0, "", "")
+            assert len(argv) == 2, f"a cancel names one id and nothing else: {argv}"
             self.cancel_views.append((target, self.billing()))
             self.cancelled.append(target)
             if "." in target:
