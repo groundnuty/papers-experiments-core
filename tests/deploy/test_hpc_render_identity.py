@@ -986,3 +986,62 @@ def test_o74_collect_accepts_a_shard_whose_out_holds_the_record_in_study_state(s
     kept = [next((o / STUDY_STATE).glob("render-identity.*.json")) for o in outs]
     assert [path.read_bytes() for path in kept] == [canonical(identity()).encode()] * 2
     assert not os.access(kept[0], os.W_OK)
+
+
+# -- C50: a campaign's set of expected records, one for each platform it declares ----------------------------------
+
+APPTAINER = identity()
+DOCKER = identity(sandbox_sif_sha256=sha("a Docker site's image"), platform_fingerprint_sha256=sha("its platform"))
+
+
+def as_set(*records: dict) -> str:
+    return json.dumps(list(records), sort_keys=True)
+
+
+def test_c50_a_step_expecting_a_set_runs_on_a_federation_whose_record_is_any_one_of_them(shards, tmp_path, monkeypatch):
+    """C50: the expected file holds the campaign's set, one record for each platform it declares: a federation whose
+    record is the second runs, and its archive carries its own record, which says which one it ran under."""
+    root = federation_root(tmp_path, DOCKER)
+    code, seen, _ = run_step(shards, step_args(tmp_path, as_set(APPTAINER, DOCKER)), root, monkeypatch)
+    assert code == 0
+    assert "run" in seen["argv"]
+    assert archived(tmp_path) == (root / FILE).read_bytes()
+
+
+def test_c50_a_federation_whose_record_is_none_of_the_set_is_refused_naming_what_differs_from_the_nearest(
+    shards, tmp_path, monkeypatch, capsys
+):
+    """C50: a record the set does not hold refuses the step before anything is made (73), naming the keys in which it
+    differs from the nearest record of the set and no value."""
+    root = federation_root(tmp_path, {**DOCKER, "egress_shim_sha256": sha("another shim")})
+    code, seen, checks = run_step(shards, step_args(tmp_path, as_set(APPTAINER, DOCKER)), root, monkeypatch)
+    err = capsys.readouterr().err
+    assert code == shards.PRE_STEP_REFUSED
+    nothing_made(tmp_path, seen, checks)
+    assert "any of the 2 expected" in err
+    assert "egress_shim_sha256" in err
+    assert "sandbox_sif_sha256" not in err
+    assert not HEX.search(err)
+
+
+@pytest.mark.parametrize(
+    "content", [as_set(), as_set(APPTAINER, APPTAINER), json.dumps([APPTAINER, "not a record"]), "[1]"]
+)
+def test_c50_a_set_that_is_empty_repeats_a_record_or_holds_a_malformed_one_refuses_the_plan(
+    shards, tmp_path, capsys, content
+):
+    path = manifest(tmp_path, DECLARED, identity())
+    put(tmp_path / "study" / EXPECTED, content, 0o644)
+    assert shards.main(["plan", "--manifest", str(path)]) == 2
+    out = capsys.readouterr()
+    assert out.out == ""
+    assert "set of render identities" in out.err
+
+
+def test_c50_a_set_is_pinned_by_its_hash_as_one_record_is(shards, tmp_path, capsys):
+    """C50: the plan hashes the file as it is: a set is pinned like one record, and every line carries its hash."""
+    path = manifest(tmp_path, DECLARED, identity())
+    put(tmp_path / "study" / EXPECTED, as_set(APPTAINER, DOCKER), 0o644)
+    assert shards.main(["plan", "--manifest", str(path)]) == 0
+    plans = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [p["expect_render_identity"]["sha256"] for p in plans] == [sha(as_set(APPTAINER, DOCKER))] * 2

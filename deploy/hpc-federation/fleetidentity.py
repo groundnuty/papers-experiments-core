@@ -2,13 +2,23 @@
 6; README.md, "The elastic fleet's worker"). `fleetcontrol.py control` builds both from its sites file's `settings` (the
 fleet's shard settings, `fleetplan.read_settings`).
 
-- `identity_reader(settings, sites)`: `(site label, member) -> (campaign fingerprint's SHA-256, environment identity)`
-  or None. Only for a member this fleet's up made and holds, up and linked (`fleetrecord.identity`): the study is
-  copied into a private directory with the federation's own `platform.toml` beside it, as a shard step places it, and
-  the manifest's Python (`-I -B`, an environment of the allowlist and a home of its own) asks the core for what a start
-  there pins (`expcore.study.pipeline.campaign_identity`): the fingerprint (hashed as the lease's `campaign_sha256` is)
-  and the environment identity a lease store pins, whose digest the ledger pins at its first join. A read that fails is
-  None (the join waits and is decided again), never a guess; a read that worked is kept for the member.
+- `identity_reader(settings, sites)`: `(site label, member) -> (campaign fingerprint's SHA-256, environment identity,
+  platform fingerprint's SHA-256)` or None. Only for a member this fleet's up made and holds, up and linked
+  (`fleetrecord.identity`): the study is copied into a private directory with the federation's own `platform.toml`
+  beside it, as a shard step places it, and the manifest's Python (`-I -B`, an environment of the allowlist and a home
+  of its own) asks the core for what a start there pins (`expcore.study.pipeline.campaign_member_identity`): the
+  fingerprint (hashed as the lease's `campaign_sha256` is), the environment identity a lease store pins, whose digest
+  the ledger pins at its first join (on its platform, with declared platforms), and the SHA-256 of the federation's
+  own platform fingerprint, which a campaign that declares its platforms admits or refuses (C50). A read that fails
+  is None (the join waits and is decided again), never a guess; a read that worked is kept for the member.
+- **The read's contract**, for every site kind's read (one JSON line): `fingerprint` (the campaign fingerprint's
+  SHA-256), `environment` (the identity, names to digests) and `platform`, the SHA-256 of the member's platform
+  fingerprint as its study's plugin gives it (`StudyPlugin.platform`, `expcore.study.declared_platforms.own_sha256`,
+  through `expcore.study.pipeline.campaign_member_identity`). That is the value its root's `render-identity.json`
+  holds as `platform_fingerprint_sha256` only when the plugin's platform is the platform file's fingerprint alone; a
+  plugin that adds to it (its read-only inputs) gives another, so the value to declare is the one the read prints. A
+  read with no `platform` (null, or an earlier core's read without the field) joins a campaign that declares none,
+  and is refused by one that declares its platforms.
 - `locator(evidence)`: `(site, Settle) -> (out/, source)` or None, for `fleetexecute.dead_store_reader`: the lost
   lease's store as a place `lease-<id>/` holds it (`PLACES`): in the federation's channel on the site's shared file
   system (`root`, whatever the member's root: the channel is outside it and outlives the member's down, and at a settle
@@ -49,9 +59,15 @@ PLACES = "places"  # in a federation's channel, and in a member's collected evid
 PROGRAM = (
     "import json, sys\n"
     "from expcore.campaign.manifest import fingerprint_sha256\n"
-    "from expcore.study.pipeline import campaign_identity\n"
-    "fingerprint, environment = campaign_identity(sys.argv[1])\n"
-    "print(json.dumps({'fingerprint': fingerprint_sha256(fingerprint), 'environment': environment}, sort_keys=True))\n"
+    "try:\n"
+    "    from expcore.study.pipeline import campaign_member_identity\n"
+    "except ImportError:  # an earlier core: no platform, which only a campaign declaring its platforms refuses\n"
+    "    from expcore.study.pipeline import campaign_identity\n"
+    "    def campaign_member_identity(path):\n"
+    "        return (*campaign_identity(path), None)\n"
+    "fingerprint, environment, platform = campaign_member_identity(sys.argv[1])\n"
+    "print(json.dumps({'fingerprint': fingerprint_sha256(fingerprint), 'environment': environment,\n"
+    "                  'platform': platform}, sort_keys=True))\n"
 )
 TIMEOUT_S = 600.0
 
@@ -68,7 +84,7 @@ def _modules() -> Any:
 
 def read_identity(
     fleet: Path, member: str, settings_path: Path, runner: Callable[..., Any] = subprocess.run
-) -> Optional[Tuple[str, Mapping[str, str]]]:  # fmt: skip
+) -> Optional[Tuple[str, Mapping[str, str], Optional[str]]]:  # fmt: skip
     """One member's (fingerprint, environment identity), read now; None as the module says."""
     fleetplan, fleetrecord = _modules()
     shards = fleetplan.shards
@@ -101,11 +117,7 @@ def read_identity(
                       capture_output=True, text=True, timeout=TIMEOUT_S, check=False)  # fmt: skip
         if done.returncode != 0:
             return None
-        said = json.loads(done.stdout.strip().splitlines()[-1])
-        digest, environment = said["fingerprint"], said["environment"]
-        if not isinstance(digest, str) or not isinstance(environment, dict):
-            return None
-        return digest, {str(k): str(v) for k, v in environment.items()}
+        return said_identity(json.loads(done.stdout.strip().splitlines()[-1]))
     except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
         return None
     finally:
@@ -114,7 +126,7 @@ def read_identity(
 
 def read_identity_remote(
     transport: Any, site: Any, member: str
-) -> Optional[Tuple[str, Mapping[str, str]]]:  # fmt: skip
+) -> Optional[Tuple[str, Mapping[str, str], Optional[str]]]:  # fmt: skip
     """One member's identity read on an ssh site's login node (`fleetidentity.py read` there, over the transport); None
     for any failure, a call that cannot be made or that is past its bound included: the join waits."""
     settings = site.shard_settings
@@ -124,23 +136,30 @@ def read_identity_remote(
                        str(settings))  # fmt: skip
     try:
         code, out, _ = transport.run(site, argv, TIMEOUT_S + 60)  # past the read's own bound there
-        said = json.loads(out.strip().splitlines()[-1])
-        digest, environment = said["fingerprint"], said["environment"]
+        found = said_identity(json.loads(out.strip().splitlines()[-1]))
     except (OSError, ValueError, KeyError, IndexError, TypeError, subprocess.SubprocessError):
         return None
-    if code != 0 or not isinstance(digest, str) or not isinstance(environment, dict):
+    return found if code == 0 else None
+
+
+def said_identity(said: Any) -> Optional[Tuple[str, Mapping[str, str], Optional[str]]]:
+    """The (fingerprint, environment identity, platform fingerprint) a read printed, or None when it is not that: the
+    platform is the SHA-256 of the federation's own platform fingerprint, which a campaign that declares its platforms
+    admits at the join or refuses (C50); None from a core that prints none, which only such a campaign refuses."""
+    digest, environment, platform = said["fingerprint"], said["environment"], said.get("platform")
+    if not isinstance(digest, str) or not isinstance(environment, dict) or not isinstance(platform, (str, type(None))):
         return None
-    return digest, {str(k): str(v) for k, v in environment.items()}
+    return digest, {str(k): str(v) for k, v in environment.items()}, platform
 
 
 def identity_reader(
     settings_path: Path, sites: Mapping[str, Any], runner: Callable[..., Any] = subprocess.run, transport: Any = None
-) -> Callable[[str, str], Optional[Tuple[str, Mapping[str, str]]]]:  # fmt: skip
+) -> Callable[[str, str], Optional[Tuple[str, Mapping[str, str], Optional[str]]]]:  # fmt: skip
     """The controller's identity hook over the sites' fleets (`read_identity`, on the login node through `transport`
     for an ssh site); a member's read that worked is kept."""
     kept: dict = {}
 
-    def read(site: str, member: str) -> Optional[Tuple[str, Mapping[str, str]]]:
+    def read(site: str, member: str) -> Optional[Tuple[str, Mapping[str, str], Optional[str]]]:
         found = kept.get((site, member))
         if found is None and site in sites:
             if getattr(sites[site], "remote", False):
@@ -281,7 +300,7 @@ def main(argv: Optional[Sequence[str]] = None, runner: Callable[..., Any] = subp
     got = read_identity(Path(args.fleet), args.member, Path(args.settings), runner)
     if got is None:
         return 1
-    print(json.dumps({"fingerprint": got[0], "environment": dict(got[1])}, sort_keys=True))
+    print(json.dumps({"fingerprint": got[0], "environment": dict(got[1]), "platform": got[2]}, sort_keys=True))
     return 0
 
 

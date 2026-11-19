@@ -397,8 +397,9 @@ class Executor:
     transport: Any
     evidence: Path
     log: Log
-    # (site, member) -> (its campaign fingerprint, its environment identity as a lease store pins it), or None
-    identity: Callable[[str, str], Optional[Tuple[str, Mapping[str, str]]]] = lambda site, member: None
+    # (site, member) -> (its campaign fingerprint, its environment identity as a lease store pins it, its platform
+    # fingerprint, C50), or None
+    identity: Callable[[str, str], Optional[Tuple[str, Mapping[str, str], Optional[str]]]] = lambda site, member: None
     # (site, the Settle) -> (spend in micro-dollars, its source "root" or "pulled", charged attempts or None), or None
     spend: Callable[[Any, Any], Optional[Tuple[int, str, Optional[int]]]] = lambda site, action: None
     settings: Optional[Path] = None  # the shard settings a joining federation's worker is launched from
@@ -485,7 +486,8 @@ class Executor:
             self.ledger.join(action.label, site=action.site, job_ids=tuple(action.job_ids),
                              job_end_at=action.job_end_at, fingerprint=found[0],
                              environment=environment_digest(found[1]),
-                             kill_wait_s=action.kill_wait_s)  # fmt: skip
+                             kill_wait_s=action.kill_wait_s,
+                             platform=found[2] if len(found) > 2 else None)  # fmt: skip
             self.log.write("queue_wait", site=action.site, member=action.member, queue_wait_s=action.queue_wait_s)
         self.log.write("result", action=kind, label=action.label, ok=True)
 
