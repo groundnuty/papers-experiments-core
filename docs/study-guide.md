@@ -1694,10 +1694,8 @@ What you get, with nothing else to call: once one analysed record carries the `e
 
 **If your agents install packages, declare the indexes they install from** (O95). Without a declaration a `pip install` is a static-scan hit and flags the run. In campaign.toml:
 
-```toml
-[egress]
-package_indexes = ["files.pythonhosted.org", "pypi.org"]
-```
+    [egress]
+    package_indexes = ["files.pythonhosted.org", "pypi.org"]
 
 A plain install from those indexes, and an http(s) URL on exactly one of their hosts, are then counted in a class of their own, `package_index`, which flags nothing, so the reruns keep such a run. An install that names another index, a requirements file, a path, a URL or a VCS requirement still flags, as do curl, wget, git clone, conda, every other URL, every network call and every outside connection in the egress log. The list is in the campaign fingerprint, so declare it before the campaign's first start: adding or changing it later is another experiment. `analyze` reads it from the fingerprint the stores recorded, never from the file.
 
