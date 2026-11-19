@@ -149,6 +149,15 @@ def test_b20_a_record_says_its_turns_switched_when_their_fingerprints_show_more_
     assert replay_record(record).dumps() == text
 
 
+def test_b20_a_record_written_before_the_fingerprint_rule_replays_to_its_own_bytes():
+    """B20: a record whose replies show two fingerprints and whose totals have no `deployment_switched` (written before
+    the fingerprint rule) is replayed with the flag served as recorded, never filled in: no divergence at the totals."""
+    record = run_of_fingerprints("fp-a", "fp-b")
+    assert record.totals["deployment_switched"] is True
+    older = dataclasses.replace(record, totals={k: v for k, v in record.totals.items() if k != "deployment_switched"})
+    assert replay_record(older).dumps() == older.dumps()
+
+
 def test_b20_deployment_switched_is_optional_in_version_three_and_unknown_to_version_two():
     assert "deployment_switched" in optional_in("totals", V3)
     assert "deployment_switched" not in fields_of("totals", V2)

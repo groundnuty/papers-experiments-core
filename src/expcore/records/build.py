@@ -212,12 +212,16 @@ def capped_totals(
 
 
 def switched_totals(
-    turns: Sequence[Mapping[str, Any]], schema_version: str, schemas: Sequence[SchemaVersion] = SCHEMAS
+    turns: Sequence[Mapping[str, Any]],
+    schema_version: str,
+    schemas: Sequence[SchemaVersion] = SCHEMAS,
+    recorded: bool | None = None,
 ) -> dict[str, bool]:
     """The optional total that says the attempt's turns show more than one deployment (B20): `deployment_switched`,
     written only when it is true (absent otherwise, and for a version that predates it), from the turns' own ids and
-    system fingerprints (`attempt_switched`)."""
-    switched = attempt_switched(turns)
+    system fingerprints (`attempt_switched`). A replay passes `recorded`, what the record holds (False: absent), so a
+    record written before a rule that decides the flag is served as it was, never filled in."""
+    switched = attempt_switched(turns) if recorded is None else recorded
     if switched and "deployment_switched" in fields_of("totals", schema_version, schemas):
         return {"deployment_switched": True}
     return {}
@@ -393,6 +397,7 @@ def _build_record(
     instrument_refusal: Mapping[str, Any] | None = None,
     reserved_capped: bool | None = None,
     reply_cap_unheld: bool | None = None,
+    deployment_switched: bool | None = None,
 ) -> RunRecord:
     """Build the record of a finished attempt from the loop's result and the recording wrapper it ran through.
 
@@ -409,6 +414,8 @@ def _build_record(
 
     `reserved_capped` and `reply_cap_unheld` are the two optional totals that say whether the attempt was held to the
     reservation R (`capped_totals`); None leaves one out, and a replay serves back what the record holds.
+    `deployment_switched` is the optional total of B20 (`switched_totals`): None derives it from the turns, and a
+    replay serves back what the record holds, so a record written before a rule that decides it replays to its bytes.
 
     The record is written as `schema_version`, and its outcome's treatment flag follows the rules of that version in
     `schemas`. Private: only a replay of an older record (its own version) and tests building older records choose a
@@ -492,7 +499,7 @@ def _build_record(
             "abandoned_threads": result.abandoned_threads,
             "final_text": result.final_text,
             **capped_totals(reserved_capped, reply_cap_unheld, schema_version, schemas),
-            **switched_totals(turns, schema_version, schemas),
+            **switched_totals(turns, schema_version, schemas, deployment_switched),
         },
         "instruments": plain(dict(instruments or {})),
         "scores": {},
@@ -521,7 +528,7 @@ def build_record(result: LoopResult, recording: RecordingBackend, **options: Any
     A live run cannot choose an older record version: that would apply an older treatment rule to a new run. The
     keyword options are those of `_build_record` (`identity`, `system`, `user`, `specs`, `code`, `core_version`,
     `instruments`, `instrument_refusal`, `treatment_kinds`, `treatment_targets`, `reserved_capped`, `reply_cap_unheld`,
-    `redactor`, `secrets`, `secret_env`, `models`, `environ`); `schema_version` is refused.
+    `deployment_switched`, `redactor`, `secrets`, `secret_env`, `models`, `environ`); `schema_version` is refused.
     """
     if "schema_version" in options:
         raise TypeError("build_record writes the current record version; a live run cannot choose another")

@@ -673,8 +673,8 @@ class Store:
         """Keep the deployments an attempt's turns named (B20): a JSON list of the distinct ids, sorted (None: no turn
         named one, the attempt is kept for its switch alone), and whether the turns' ids or system fingerprints show
         more than one deployment. The two columns are not in the schema every store has: the first write adds
-        them, in the transaction of that write, so a store whose attempts name no deployment keeps its schema text byte
-        for byte, and a reader treats a missing column as none. Called from the `also` step of `finish_attempt`, it
+        them, in the transaction of that write, so a store whose attempts name no deployment and never switched keeps
+        its schema text byte for byte, and a reader treats a missing column as none. Called from the `also` step of `finish_attempt`, it
         joins that transaction and stands or falls with the result."""
 
         def write() -> None:
