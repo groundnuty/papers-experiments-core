@@ -405,10 +405,15 @@ class Executor:
     pool: ThreadPoolExecutor = field(default_factory=lambda: ThreadPoolExecutor(max_workers=8))
     running: Dict[str, Future] = field(default_factory=dict)
     unclaimed: Dict[str, int] = field(default_factory=dict)  # a prepare's calls that failed with no outcome, by member
+    counting: threading.Lock = field(
+        default_factory=threading.Lock
+    )  # `unclaimed`: the workers change it, the loop reads
 
     def busy(self) -> frozenset:
         self.reap()
-        return frozenset(self.running) | frozenset(key for key, n in self.unclaimed.items() if n >= PREPARE_TRIES)
+        with self.counting:
+            lost = frozenset(key for key, n in self.unclaimed.items() if n >= PREPARE_TRIES)
+        return frozenset(self.running) | lost
 
     def reap(self) -> None:
         for key in [key for key, future in self.running.items() if future.done()]:
@@ -551,10 +556,11 @@ class Executor:
             code, out = 1, ""
         found = prepare_outcome(out)
         lost = prepare_lost_key(action.site, action.member)
-        if code == 0 or found:
-            self.unclaimed.pop(lost, None)
-        else:  # no outcome: the wrapper did not run, or could not claim; asked again, up to PREPARE_TRIES calls
-            self.unclaimed[lost] = self.unclaimed.get(lost, 0) + 1
+        with self.counting:
+            if code == 0 or found:
+                self.unclaimed.pop(lost, None)
+            else:  # no outcome: the wrapper did not run, or could not claim; asked again, up to PREPARE_TRIES calls
+                self.unclaimed[lost] = self.unclaimed.get(lost, 0) + 1
         self.log.write("result", action="Prepare", site=action.site, member=action.member, code=code, ok=code == 0,
                        **found)  # fmt: skip
         return code == 0

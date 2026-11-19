@@ -223,8 +223,8 @@ def test_c49_a_prepare_that_fails_times_out_or_leaves_no_marker_retires_its_memb
     site.on_command = lambda argv: site.set_status("fed-1", "down") if "down" in argv else None
     assert bench.tick() == 0
     assert verbs(site) == ["prepare"]
-    if grandchild.exists():  # a timeout ends the command's whole group, and so does a leader that fails
-        assert not alive(int(grandchild.read_text()))
+    if how in ("timeout", "a worker left behind"):  # a timeout ends the command's whole group, and so does a failure
+        assert not alive(int(grandchild.read_text()))  # (the command wrote its worker's pid, or this raises)
     if how == "timeout":
         (done,) = [r for r in bench.lines("result") if r["action"] == "Prepare"]
         assert (done["ok"], done["outcome"]) == (False, "timeout")

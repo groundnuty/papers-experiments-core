@@ -119,12 +119,20 @@ def _data(record: Mapping[str, Any]) -> bytes:
 
 
 def _create(path: Path, record: Mapping[str, Any]) -> None:
-    """The record, made exclusively (FileExistsError when it is there) and durable."""
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(descriptor, "wb") as handle:
-        handle.write(_data(record))
-        handle.flush()
-        os.fsync(handle.fileno())
+    """The record, made exclusively (FileExistsError when the name is taken) and whole: written to a draft of ours and
+    linked under its name, which is atomic and fails when the name exists, so no reader and no later writer ever meets
+    a file that is only part written (a writer that dies leaves no claim or end at all, never an empty one)."""
+    draft = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(_data(record))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(draft, path)
+    finally:
+        with contextlib.suppress(OSError):
+            draft.unlink()
     _sync_directory(path.parent)
 
 
@@ -315,7 +323,8 @@ def abort(directory: Path, label: str, clock: Callable[[], float] = time.time) -
     if found is None or found["state"] != "started":
         return 0
     ended = clock()
-    result = {"outcome": "aborted", "exit": None, "ended_at": ended, "duration_s": ended - float(found["started_at"])}
+    since = max(ended - float(found["started_at"]), 0.0)  # two login nodes' clocks may differ
+    result = {"outcome": "aborted", "exit": None, "ended_at": ended, "duration_s": since}
     end_record(directory, label, float(found["started_at"]), result)
     try:
         proc = _read(proc_path(directory, label)) or {}
