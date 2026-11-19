@@ -807,7 +807,9 @@ section 3).
 - **`down`** stops the fault relay first, then tears every service down (the providers, then the zone), waits for every step to leave, removes the
   recorded work directory of a service whose step it had to cancel (a cancel was an outright kill on the site, which
   left 2 to 2.6 GB per service), checks each node
-  for the recorded work directory, sweeps the agent's node and every node a shard was resumed on (`shards.py sweep`, a
+  for the recorded work directory, sweeps the agent's node (once any step of this federation still running in the
+  agent's own job, the worker's or a shard's, is cancelled by its id and shown ended: C54, "A down that could not
+  sweep a node" below) and every node a shard was resumed on (`shards.py sweep`, a
   control step there by `HPC_CORE_PYTHON`: every shard step's
   directory of this federation on its tmpfs whose step is gone is removed, and one holding an `out/` that could not be
   archived is kept and named in what `down` prints; the sandbox's killed runs are reaped, a dead FUSE mount unmounted
@@ -1819,6 +1821,29 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   records in the site's `<fleet>/logs/` as at an HPC site; the study's command ingests and then runs `composesite.py
   verify-data --root {root} --layout {layout}`, whose marker is what the member joins on. A member retired before it
   ever joined (its prepare failed, say) stays out like a drained one. Nothing of it has run live.
+
+### A down that could not sweep a node
+
+`down` sweeps the agent's node (and each node a shard was resumed on) while its job still runs, and first cancels, by
+its own id, any step of this federation still running in the agent's own job (`<agent job name>-worker`, the elastic
+worker's, or `-shard-<n>`), waiting until squeue and sacct show that id ended: such a step holds the whole job, and
+the sweep's step could not start behind it (live, 19 Nov). A sweep that still fails, or a step that does not end within
+the cancel's bound (300 s, beyond the site's KillWait), leaves the node unswept: the held jobs are cancelled all the
+same, the root and its state are kept, and the state records the node (`unswept`). The node's tmpfs may then still
+hold a step's or the worker's directory, the operator's key files (`home_files`) among them, and a `down` run again
+finds the job gone and removes the root without any sweep. So the elastic controller never takes such a member down
+again by itself (it reads `unswept` and leaves the member `down-failed`, its root kept; the failed down's error is in
+its log), and the operator does, in this order:
+
+1. Find the node: `sandbox.node` in the root's state file (`<fleet>/fed-k/root/hpc-federation.json`).
+2. Sweep it in a short job of the study's own account on that node, from a private 0700 directory, with the core's
+   Python: `srun --account=<account> --nodelist=<node> -N1 -n1 -c1 --mem=1g --time=5 --chdir=/
+   <HPC_CORE_PYTHON> -I -B <deploy>/shards.py sweep --tmpfs <HPC_NODE_TMP> --root <the member's root>`. It removes
+   every directory of this federation's steps and its worker whose process is gone, the key files with them, and
+   names what it keeps. If it cannot run there (the node down, or held by another job for long), tell the coordinator
+   before going on: the keys may still be on that node.
+3. Then `fleet.py --fleet F down --member fed-k`, which removes the root and the storage; the controller proves the
+   end on its next tick.
 
 ## The elastic fleet's worker (`fleetworker.py`, `fleetidentity.py`)
 

@@ -444,6 +444,8 @@ class FakeSlurm:
     sweeps: list = field(default_factory=list)  # each sweep step down launched
     leftovers: dict = field(default_factory=dict)  # node -> the work directories of ours leftovers.py counts there
     step_cancel_rc: int = 0  # a step's scancel ends it but exits so (225: as the site's did on a het job, live slot 5)
+    unending: list = field(default_factory=list)  # step ids a step's scancel does not end (it outlives TERM, KillWait)
+    ended_steps: dict = field(default_factory=dict)  # step id -> name, of each step a step's scancel ended
     accounting: dict = field(default_factory=dict)  # job id -> what `sacct -o JobID,State,AllocTRES` prints of it
     interconnect_after: int | None = None  # the steps of component 0 with no --network that start before the rest fail
     component_zero_steps: int = 0  # the steps of component 0 that named no --network, so far
@@ -539,7 +541,9 @@ class FakeSlurm:
             self.cancel_views.append((target, self.billing()))
             self.cancelled.append(target)
             if "." in target:
-                self.steps = {n: s for n, s in self.steps.items() if s != target}
+                if target not in self.unending:
+                    self.ended_steps.update({s: n for n, s in self.steps.items() if s == target})
+                    self.steps = {n: s for n, s in self.steps.items() if s != target}
                 if self.step_cancel_rc:
                     said = f"scancel: error: Kill job error on job step id {target}: Invalid job id specified\n"
                     return Completed(self.step_cancel_rc, "", said)
@@ -553,6 +557,8 @@ class FakeSlurm:
                 if self.sacct_steps is not None:
                     return self.sacct_steps(argv)
                 return Completed(0, "".join(f"{row}\n" for row in self.step_rows.get(ident, [])), "")
+            if fields == "JobID,JobName,State,Start,End,ExitCode":  # one step by its id (`step_observed`)
+                return Completed(0, self.step_accounting(ident), "")
             wanted = fields == "JobID,State,AllocTRES"
             return Completed(0, self.accounting.get(ident, "") if wanted else "", "")
         if RELAY_MODULE in argv and argv[argv.index(RELAY_MODULE) - 1] == "-m":
@@ -580,6 +586,17 @@ class FakeSlurm:
 
     def _options(self, ident) -> list:
         return self.submitted.get(ident) or [self.asked]
+
+    def step_accounting(self, ident) -> str:
+        """sacct's `JobID|JobName|State|Start|End|ExitCode` rows of a job: its own, each step still listed running,
+        and each step a step's scancel ended as CANCELLED with its end (the job's own row is what shows accounting
+        knows the job)."""
+        began = "2026-11-16T10:00:00"
+        rows = [f"{ident}|{self._options(ident)[0].get('--job-name', 'job')}|RUNNING|{began}|Unknown|0:0"]
+        rows += [f"{s}|{n}|RUNNING|{began}|Unknown|0:0" for n, s in self.steps.items() if s.split(".")[0] == ident]
+        rows += [f"{s}|{n}|CANCELLED by 5001|{began}|2026-11-16T11:00:00|0:15"
+                 for s, n in self.ended_steps.items() if s.split(".")[0] == ident]  # fmt: skip
+        return "".join(f"{row}\n" for row in rows)
 
     def leader_of(self, ident) -> str | None:
         """The job an id belongs to: a job's own id, a component's own id (the leader's plus k) or `<leader>+<k>`, as

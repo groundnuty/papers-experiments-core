@@ -210,27 +210,42 @@ class Down:
         elif any(r.get("workdir") and r.get("state") != "removed" for r in state["services"].values()):
             self.say("the held job had ended: its nodes could not be checked (the next job's sweep removes leftovers)")
         swept = ""
+        unswept: List[str] = []  # C54: the nodes a sweep failed on, recorded before anything else may fail
         if ((agent_info if self.separate(state) else info) or {}).get("JobState") == "RUNNING":
             try:
+                if agent is not None:  # `separate`: the services' wait never looks at the agent's own job
+                    self.end_agent_steps(state, agent)
                 swept = self.sweep_agent_node(state)
             except (RuntimeError, OSError, TimeoutError) as error:
                 self.say(f"the agent's node could not be swept ({error}); the held job is cancelled all the same")
-                unverified.append("the agent's node")
+                unswept.append("the agent's node")
+        elif "the agent's node" in state.get("unswept", []):
+            self.say("an earlier down could not sweep the agent's node, and its job is gone: this down removes the "
+                     "root without that sweep (README.md, \"A down that could not sweep a node\")")  # fmt: skip
         for entry in state.get("shard_nodes", []):  # W1: every other node a shard step of this federation ran on
             try:
                 swept = "\n".join(filter(None, [swept, self.sweep_shard_node(state, entry)]))
             except (RuntimeError, OSError, TimeoutError) as error:
                 self.say(f"the node shard {entry['label']} was resumed on could not be swept ({error})")
-                unverified.append(f"the node shard {entry['label']} was resumed on")
+                unswept.append(f"the node shard {entry['label']} was resumed on")
+        if unswept:  # what the elastic controller reads (fleetobserve) to never retry this down by itself
+            self.set(lambda s: s.update(unswept=sorted({*s.get("unswept", []), *unswept})))
+        unverified += unswept
         self.cancel_all([j for j, i in ((job, info), (agent, agent_info)) if i is not None], lost)
         unverified += self.end_clients([j for j in (job, agent) if j is not None])
         if relay_unstopped and not self.relay_stopped():  # its client is ended now: checked again, never read before
             unverified.append("the fault relay")
         if unverified:
             self.set(lambda s: s.update(phase="down"))
+            check = (
+                "; a node not swept may still hold a step's or the worker's files, the operator's key files among "
+                'them: sweep it first (README.md, "A down that could not sweep a node"), then'
+                if unswept
+                else ":"
+            )
             raise RuntimeError(
                 f"the held job is gone, but {', '.join(unverified)} could not be verified clean; the root and its "
-                "state are kept: run down again to remove them"
+                f"state are kept{check} run down again to remove them"
             )
         gone = " and ".join(j for j in (job, agent) if j) or "(never submitted, or no longer ours)"
         stored = self.remove_storage(f"the held job {gone} is gone")
@@ -283,6 +298,34 @@ class Down:
         if not record.get("node"):
             return ""
         return self.sweep_node(state, record["node"], f"{state['allocation']['name']}-sandbox-sweep")
+
+    def end_agent_steps(self, state: Mapping[str, Any], job: str) -> None:
+        """C54: a step of this federation still running in the agent's own job, the elastic worker's (`<agent job
+        name>-worker`, fleetworker.py) or a shard's (`-shard-<n>`), is sized to the whole job, so the sweep's control
+        step there can never start (live, 19 Nov: the sweep waited behind the worker's step until its bound, and a
+        second down, its job gone by then, removed the root unswept). Each one listed under the job by such a name is
+        cancelled by its own id (TERM, so the worker removes its own directory; KILL after the site's KillWait, and the
+        sweep removes what that leaves) and must read ended by that id in squeue and sacct (`step_observed`) within the
+        cancel's bound, which covers the KillWait; RuntimeError otherwise, and the node is not swept. No other step of
+        the job is touched."""
+        prefixes = [n for n in ((state.get("sandbox") or {}).get("name"), state["allocation"]["name"]) if n]
+        ours = re.compile("(?:" + "|".join(re.escape(p) for p in prefixes) + r")-(?:worker|shard-[0-9]+)")
+        left = [(step, name) for step, name in self.slurm.step_listing(job) if ours.fullmatch(name)]
+        for step, name in left:
+            self.say(f"a step of this federation ({name}) still runs in the agent's job {job}: cancelled by its id")
+            try:
+                self.slurm.cancel_step(step)
+            except SlurmError as error:  # its end, read by its id, decides
+                self.say(f"the cancel of step {step} reported a failure ({error})")
+        deadline = self.clock() + self.timeouts["cancel"]
+        while left:
+            left = [(s, n) for s, n in left if self.slurm.step_observed(s, n).get("running") is not False]
+            if not left or self.clock() >= deadline:
+                break
+            self.sleep(self.poll_s)
+        if left:
+            raise RuntimeError(f"step {', '.join(s for s, _ in left)} of the agent's job has not ended "
+                               f"{self.timeouts['cancel']:.0f} s after its cancel")  # fmt: skip
 
     def sweep_shard_node(self, state: Mapping[str, Any], entry: Mapping[str, str]) -> str:
         """The sweep on a node a shard was resumed on (`shard_nodes`, which `shards.py resume-line` records), in the job
