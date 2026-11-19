@@ -488,7 +488,9 @@ def launch(args: argparse.Namespace) -> int:
     here = member_dir(fleet, args.member)
     home = private_dir(args.home, "--home")
     apart(home, study, fleet)
-    with member_lock(fleet / "launch"), member_lock(here):
+    # the root's data lock too: no check can invalidate the marker between its last read here and the worker's start
+    data_lock = fedverify.locked(root) if root.is_dir() and not root.is_symlink() else contextlib.nullcontext()
+    with member_lock(fleet / "launch"), member_lock(here), data_lock:
         record = worker_of(fleet, args.member, args.channel)
         if record is not None and not worker_gone(record):
             print(f"composesite: {args.member}: its worker already runs (pid {record.get('pid')})")
@@ -629,9 +631,11 @@ def layout_of(root: Path, layout_file: Path) -> Any:
 def verify_data(args: argparse.Namespace) -> int:
     """The member's declared data read back against its manifests, and its marker written (`fedverify`)."""
     root = Path(args.root)
-    if project_of(root) is not None and not root.is_symlink():
-        fedverify.invalidate(root)  # first, before any check that may fail: an earlier verdict never stands unchecked
-    print(fedverify.verify_data(layout_of(root, Path(args.layout))))
+    if project_of(root) is None or root.is_symlink():
+        raise SiteError("the root is not a Compose federation's (its mark)")
+    with fedverify.locked(root):  # one lock from the invalidation through the checks and the marker
+        (root / fedverify.MARKER).unlink(missing_ok=True)
+        print(fedverify.verify_data(layout_of(root, Path(args.layout)), held=True))
     return 0
 
 

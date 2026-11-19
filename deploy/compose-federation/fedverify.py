@@ -86,6 +86,16 @@ def invalidate(root: Path) -> None:
         (root / MARKER).unlink(missing_ok=True)
 
 
+def read_once(path: Path, data: ModuleType) -> tuple[Any, str]:
+    """The manifest at `path` and the SHA-256 of the very bytes it was parsed from: read once, parsed from a private
+    copy of those bytes, so a file replaced meanwhile is never checked under one digest and published under another."""
+    raw = path.read_bytes()
+    with tempfile.TemporaryDirectory(prefix=".manifest-") as scratch:
+        copy = Path(scratch) / path.name
+        copy.write_bytes(raw)
+        return data.load_manifest(copy), hashlib.sha256(raw).hexdigest()
+
+
 def write_marker(root: Path, spaces: dict[str, dict[str, str]]) -> None:
     """The marker written whole: a draft beside it, mode 0600, renamed over it."""
     descriptor, draft = tempfile.mkstemp(prefix=f".{MARKER}.", dir=root)
@@ -96,11 +106,14 @@ def write_marker(root: Path, spaces: dict[str, dict[str, str]]) -> None:
     os.replace(draft, root / MARKER)
 
 
-def verify_data(layout: Any, read: Callable[[str], Any] | None = None) -> str:
+def verify_data(layout: Any, read: Callable[[str], Any] | None = None, *, held: bool = False) -> str:
     """Verify every declared space of the federation at `layout` (the module's docstring); what was done. `read` gives
     a space's tree (`hpcdata.Tree`), the owner's REST reader by default; a test's stand-in otherwise. RuntimeError for
     a refusal, the marker removed first."""
     root = layout.root
+    if held:  # the caller holds the root's lock, from its own invalidation on (`locked`)
+        (root / MARKER).unlink(missing_ok=True)
+        return _verify(layout, root, read)
     with locked(root):
         (root / MARKER).unlink(missing_ok=True)  # an earlier verdict never outlives a new check
         return _verify(layout, root, read)
@@ -138,13 +151,9 @@ def _check(root: Path, spaces: dict[str, tuple[Path, Any]], data: ModuleType, re
     verdict = {}
     for name, (path, space_id) in spaces.items():
         try:
-            digest = manifest_sha256(path)
-            manifest = data.load_manifest(path)
-            changed = manifest_sha256(path) != digest  # the manifest checked is the one whose digest is published
+            manifest, digest = read_once(path, data)  # the manifest checked is the one whose digest is published
         except (OSError, ValueError, RuntimeError) as error:  # the core's ConfigError is a RuntimeError
             raise RuntimeError(f"{name}: its manifest cannot be read ({type(error).__name__}): not verified") from None
-        if changed:
-            raise RuntimeError(f"{name}: its manifest changed while it was read: not verified")
         found = data.differences(read(name), manifest)
         if found:
             raise RuntimeError(f"{name} does not hold the data its manifest declares ({found}): not verified")
