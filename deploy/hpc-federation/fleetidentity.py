@@ -110,16 +110,17 @@ def read_identity(
         if os.path.lexists(copy / shards.PLATFORM) or os.path.lexists(copy / "out"):
             return None  # the step places the federation's platform file there, and a study has no out/ of its own
         shutil.copyfile(root / shards.PLATFORM, copy / shards.PLATFORM)
-        env = {"PATH": settings["step_path"], "LC_ALL": "C", "EXPCORE_FED_ROOT_PARENT": str(root.parent),
-               "EXPCORE_FED_ROOT": str(root), **shards.home_env(str(scratch / "home")),
-               "TMPDIR": str(scratch / "tmp")}  # fmt: skip
+        # the settings' pass_env first (what the study's plugin reads: its artifacts directory), the read's own after
+        env = {**dict(shards.pass_env_from(settings.get("pass_env"))), "PATH": settings["step_path"], "LC_ALL": "C",
+               "EXPCORE_FED_ROOT_PARENT": str(root.parent), "EXPCORE_FED_ROOT": str(root),
+               **shards.home_env(str(scratch / "home")), "TMPDIR": str(scratch / "tmp")}  # fmt: skip
         done = runner([settings["python"], "-I", "-B", "-c", PROGRAM, str(copy)], cwd=str(scratch), env=env,
                       capture_output=True, text=True, timeout=TIMEOUT_S, check=False)  # fmt: skip
         if done.returncode != 0:
             return None
         return said_identity(json.loads(done.stdout.strip().splitlines()[-1]))
-    except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
-        return None
+    except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError, shards.ShardsError):
+        return None  # a pass_env variable unset or refused too: the join waits
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 

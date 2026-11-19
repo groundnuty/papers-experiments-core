@@ -6,6 +6,7 @@ The CA's SHA-256 is in the campaign fingerprint (the TLS setting's record) and t
 whose fingerprint is not the campaign's, so instances that each made their own CA could never take leases of one
 campaign: one template rendered for two instances on one shared CA has one fingerprint, and on two CAs it has two."""
 
+import hashlib
 import json
 import os
 import subprocess
@@ -169,3 +170,75 @@ def test_an_up_without_the_shared_ca_never_makes_a_new_ca_over_the_roots_shared_
         fed.cli.prepare(unset)
     assert layout.ca_pem.read_bytes() == before
     assert not unset.ca_key.exists()
+
+
+def test_c52_up_writes_the_roots_compose_file_as_the_compose_command_prints_it(fed, tmp_path, capsys):
+    """C52: a platform file's `[faults] compose_file = "@hpc_root@/compose.yaml"` needs that file in the root, so `up`
+    writes it: for each instance exactly what `federation.py --layout L --instance K compose` prints, its own project,
+    so the fault backend stops and starts this federation's services and never another instance's."""
+    layout_file = layout_with_template(TEMPLATE, tmp_path / "layout", MINIMAL)
+    specs = instances(fed, tmp_path, count=2)
+    for k, spec in enumerate(specs, start=1):
+        root = tmp_path / "parent" / spec.project
+        root.mkdir(parents=True)
+        layout = fed.layout.Layout(root, tmp_path / "parent", spec)
+        assert fed.cli.write_compose_file(layout) == "; compose.yaml written"
+        assert fed.cli.main(["--layout", str(layout_file), "--instance", str(k), "compose"]) == 0
+        written = (root / "compose.yaml").read_text(encoding="utf-8")
+        assert written == capsys.readouterr().out
+        assert f'name: "{spec.project}"' in written
+        assert f'"{specs[2 - k].project}"' not in written  # never the other instance's project
+        assert not [p.name for p in root.iterdir() if p.name.startswith(".compose.yaml.")]  # no draft left
+
+
+TEMPLATE_DATA = TEMPLATE.replace(
+    'prefixes = ["alpha-"] }',
+    'prefixes = ["alpha-"], data_manifest = "@hpc_root@/data-manifests/alpha-space.json" }',
+)
+
+
+@pytest.mark.skipif(subprocess.run(["which", "openssl"], capture_output=True).returncode != 0, reason="no openssl")
+def test_c52_both_verify_data_entry_points_verify_a_staged_root_by_its_real_facts(fed, tmp_path, monkeypatch, capsys):
+    """C52: `composesite.py verify-data --root R --layout L` (the argv a prepare runs, `--engine` left to its default)
+    and `federation.py --layout L --instance K verify-data`, on a root staged by the real `write_facts` with its mark
+    and the shared CA: the instance is found from the mark, the space id from facts.json, and only the owner's reader
+    is a stand-in (the engine's `require_up` too, for federation.py). An empty space refuses, naming it; the data the
+    manifest declares writes the /2 marker, and `observe`'s check then holds it."""
+    import composesite
+    import fedverify
+
+    from expcore_onedata.importmanifest import Manifest, ManifestFile, write_manifest
+
+    layout_file = layout_with_template(TEMPLATE_DATA, tmp_path / "layout", MINIMAL)
+    spec = fed.spec.instance(fed.spec.load_spec(layout_file), 1)
+    ca_dir = tmp_path / "ca"
+    fed.cli.make_shared_ca({"EXPCORE_FED_CA_DIR": str(ca_dir)})
+    layout = staged(fed, tmp_path, spec, 1, ca_dir)
+    root = layout.root
+    (root / "data-manifests").mkdir()
+    write_manifest(Manifest((ManifestFile("data.bin", 4, hashlib.sha256(b"data").hexdigest()),), ()),
+                   root / "data-manifests" / "alpha-space.json")  # fmt: skip
+    space_id = json.loads(layout.facts.read_text(encoding="utf-8"))["spaces"]["alpha-space"]["id"]
+    assert fedverify.declared(root) == {"alpha-space": (root / "data-manifests" / "alpha-space.json", space_id)}
+    trees = {"empty": ({}, set()), "whole": ({"data.bin": (4, hashlib.sha256(b"data").hexdigest())}, set())}
+    held = {"tree": trees["empty"]}
+    monkeypatch.setattr(fedverify.hpcdata(), "content_reader", lambda boot: lambda space: held["tree"])
+    site_argv = ["verify-data", "--root", str(root), "--layout", str(layout_file)]
+    assert composesite.main(site_argv) == composesite.REFUSED
+    assert "alpha-space does not hold the data its manifest declares (1 file(s) missing)" in capsys.readouterr().err
+    assert not composesite.data_verified(root)
+    held["tree"] = trees["whole"]
+    assert composesite.main(site_argv) == 0
+    assert "1 space(s) hold exactly their manifests" in capsys.readouterr().out
+    assert json.loads((root / "data-verified.json").read_text(encoding="utf-8"))["format"].endswith("/2")
+    assert composesite.data_verified(root)
+    monkeypatch.setattr(fed.cli, "require_up", lambda layout: None)  # the engine's part: the live plan's V3 shows it
+    monkeypatch.setenv("EXPCORE_FED_ROOT_PARENT", str(root.parent))
+    monkeypatch.setenv("EXPCORE_FED_CA_DIR", str(ca_dir))
+    monkeypatch.delenv("EXPCORE_FED_ROOT", raising=False)
+    held["tree"] = trees["empty"]
+    assert fed.cli.main(["--layout", str(layout_file), "--instance", "1", "verify-data"]) == 1
+    assert not (root / "data-verified.json").exists()  # removed first, and not written again
+    held["tree"] = trees["whole"]
+    assert fed.cli.main(["--layout", str(layout_file), "--instance", "1", "verify-data"]) == 0
+    assert composesite.data_verified(root)
