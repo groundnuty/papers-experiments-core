@@ -228,11 +228,14 @@ class Down:
                 self.say(f"the agent's node could not be swept ({error}); the held job is cancelled all the same")
                 unswept.append(AGENT_NODE)
         for entry in state.get("shard_nodes", []):  # W1: every other node a shard step of this federation ran on
+            label = f"the node shard {entry['label']} was resumed on"
             try:
-                swept = "\n".join(filter(None, [swept, self.sweep_shard_node(state, entry)]))
+                done = self.sweep_shard_node(state, entry)  # what its sweep printed; nothing when it was not swept
+                swept = "\n".join(filter(None, [swept, done]))
+                cleared += [label] if done else []
             except (RuntimeError, OSError, TimeoutError) as error:
-                self.say(f"the node shard {entry['label']} was resumed on could not be swept ({error})")
-                unswept.append(f"the node shard {entry['label']} was resumed on")
+                self.say(f"{label} could not be swept ({error})")
+                unswept.append(label)
         left = self.record_unswept(state, unswept, cleared)
         unverified += unswept
         self.cancel_all([j for j, i in ((job, info), (agent, agent_info)) if i is not None], lost)

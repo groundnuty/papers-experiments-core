@@ -1143,7 +1143,8 @@ processes with it, and leaves the run's directory and its `_runs` record under t
 its work root, and `down`'s sweep run the Apptainer run reaper over the work root: a run whose driver is shown gone has
 its token files removed, its processes ended, each mount in its directory unmounted (`fusermount3 -u`, then `-uz`)
 and shown gone by the mount table, then its directory and record removed. A dead run whose leftovers cannot all go
-refuses the step and fails the sweep (so `down` keeps the root for a second pass). The sweep then removes the work
+refuses the step and fails the sweep (so `down` keeps the root, and a later `down`, the node's job gone, needs `--node-checked`:
+"A down that could not sweep a node"). The sweep then removes the work
 root, by `rmdir` alone, once it is empty and no step directory is on the node.
 
 **A resume on another node (`resume-line`).** When the agent's node is lost, or a shard is better continued elsewhere,
