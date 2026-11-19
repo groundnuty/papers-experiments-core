@@ -289,14 +289,14 @@ def data_verified(root: Path) -> bool:
         spaces = marker["spaces"] if marker.get("format") == fedverify.FORMAT else None
         for name, (manifest, space_id) in declared.items():
             entry = spaces.get(name)
-            digest = fedverify.manifest_sha256(manifest)
+            digest = fedverify.manifest_digest(manifest)
             if (
                 not isinstance(entry, dict)
                 or entry.get("manifest_sha256") != digest
                 or entry.get("space_id") != space_id
             ):
                 return False
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, ImportError):  # unread: unverified
         return False
     return True
 

@@ -6,15 +6,14 @@ form) is read back through its owner, every directory listed and every file's by
 reader (`deploy/hpc-federation/hpcdata.content_reader`, built on this directory's bootstrap) and compared with its
 manifest (`hpcdata.differences`: counts, never a path). Only when every such space is exactly its manifest is
 `data-verified.json` written in the root: for each space its id (the one the platform file names, which must be the one
-`up` recorded in `facts.json`) and the SHA-256 of its manifest file. Any difference, an id that disagrees, a manifest
-that cannot be read, refuses, naming the space, and removes an earlier marker first: a re-ingest that went wrong never
-keeps the verdict of the one before. A Compose site's member reads verified only by that marker
-(`composesite.data_verified`).
-"""
+`up` recorded in `facts.json`) and its manifest's core digest (`Manifest.digest()`, the SHA-256 of its canonical JSON:
+what the campaign fingerprint holds and the study's ingest plans, as `manifest_sha256`). Any difference, an id that
+disagrees, a manifest that cannot be read, refuses, naming the space, and removes an earlier marker first: a re-ingest
+that went wrong never keeps the verdict of the one before. A Compose site's member reads verified only by that marker
+(`composesite.data_verified`)."""
 
 import contextlib
 import fcntl
-import hashlib
 import importlib.util
 import json
 import os
@@ -52,8 +51,13 @@ def declared(root: Path) -> dict[str, tuple[Path, Any]] | None:
     return found
 
 
-def manifest_sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def manifest_digest(path: Path) -> str:
+    """The core's digest of the manifest at `path` (`importmanifest.Manifest.digest()`: the SHA-256 of its canonical
+    JSON), which the campaign fingerprint holds for the space and the study's ingest plans: never the file's bytes,
+    whose layout two writers may differ in."""
+    from expcore_onedata.importmanifest import load_manifest
+
+    return load_manifest(path).digest()
 
 
 def hpcdata() -> ModuleType:
@@ -87,13 +91,14 @@ def invalidate(root: Path) -> None:
 
 
 def read_once(path: Path, data: ModuleType) -> tuple[Any, str]:
-    """The manifest at `path` and the SHA-256 of the very bytes it was parsed from: read once, parsed from a private
-    copy of those bytes, so a file replaced meanwhile is never checked under one digest and published under another."""
+    """The manifest at `path` and its core digest (`Manifest.digest()`), both of one parse: read once, from a private
+    copy of its bytes, so a file replaced meanwhile is never checked as one manifest and published as another."""
     raw = path.read_bytes()
     with tempfile.TemporaryDirectory(prefix=".manifest-") as scratch:
         copy = Path(scratch) / path.name
         copy.write_bytes(raw)
-        return data.load_manifest(copy), hashlib.sha256(raw).hexdigest()
+        manifest = data.load_manifest(copy)
+        return manifest, manifest.digest()
 
 
 def write_marker(root: Path, spaces: dict[str, dict[str, str]]) -> None:
