@@ -12,7 +12,7 @@ service verbs (`hpcfed_control.py`, M4) through the hook in `hpcfed.py` (DESIGN.
   name, asked of every id the federation's steps are listed under (`listings`: the held job's, and its agent's
   component's own or the agent's own job's); `cancel(step_id)` cancels that one step; `holder(node, seconds, *, name,
   log)` launches a kept stop's holder (O96), a detached `sleep` of one core and 64 MB that overlaps every other step;
-  `term(step_id)` sends one step TERM; `observed(step_id, name)` reads one step by its exact id.
+  `term(step_id)` sends one step TERM (down's end of a holder).
 """
 
 import contextlib
@@ -282,7 +282,3 @@ class Launcher:
         """Send TERM to one step of the federation's own jobs by its id, without cancelling it (`Slurm.term_step`)."""
         self._ours(step_id, "signal")
         self.slurm.term_step(step_id)
-
-    def observed(self, step_id: str, name: Optional[str] = None) -> Dict[str, Any]:
-        """One step as Slurm shows it now, by its exact id (`Slurm.step_observed`): read-only."""
-        return self.slurm.step_observed(step_id, name)

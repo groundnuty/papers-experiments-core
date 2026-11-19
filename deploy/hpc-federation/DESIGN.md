@@ -1069,8 +1069,8 @@ verdict) and `service_seconds` (the service's own end after its SIGTERM, as tear
 core journals it (section (e)). **The holder (O96):** just before teardown the stop launches a detached `sleep` to the
 allocation's end on the service's node (`<allocation>-<service>-hold`, `--overlap`, one core, 64 MB), recorded as
 `services.<n>.holder`, because a kept work directory with no process of ours on its node was removed from outside the
-core during outages (live, 19 Nov 2026). A start ends it by its exact id only once its new step reads running; `down`
-ends it before its teardown. A holder the stop cannot show adds `"holder": "failed"` to the evidence, and the core then
+core during outages (live, 19 Nov 2026). A start leaves it running (a restart that fails its own checks later still
+has it); the next kept stop reuses it by name, and `down` ends it by its exact id before its teardown. A holder the stop cannot show adds `"holder": "failed"` to the evidence, and the core then
 fails the injection and restores the provider at once (`hpcfed_control.py`'s docstring has the whole contract).
 
 **(b) START** `hpcfed.py start <service>`: a new detached service step, the same size, on the same node, running
