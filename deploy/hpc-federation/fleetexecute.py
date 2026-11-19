@@ -536,17 +536,16 @@ class Executor:
 
     def prepare_steps(self, action: Any, site: SiteConfig) -> bool:
         """A member's prepare: one call at the site (`fleetprepare.py run`), which bounds the command, keeps its output
-        in the site's own log and records its start and end there. What this logs is the outcome, the exit status, the
-        times and the duration the call printed, never the command, its output or a path; True when it exited 0."""
+        in the site's own log and records its start and end there. What this logs is the call's status and the outcome,
+        exit status, times and duration it printed, never the command, its output, what the call said on stderr (a
+        path may be in it) or a path; True when it exited 0."""
         (argv,) = render(action, site, self.evidence, self.ledger_path).steps
         try:
-            code, out, err = self.transport.run(site, list(argv), site.settings.prepare_timeout_s + PREPARE_GRACE_S)
-        except (OSError, subprocess.SubprocessError) as error:
-            code, out, err = 1, "", f"it could not be run ({type(error).__name__})"
-        found = prepare_outcome(out)
-        fields = found if found else {"said": said_of(site, err, "")}
+            code, out, _ = self.transport.run(site, list(argv), site.settings.prepare_timeout_s + PREPARE_GRACE_S)
+        except (OSError, subprocess.SubprocessError):
+            code, out = 1, ""
         self.log.write("result", action="Prepare", site=action.site, member=action.member, code=code, ok=code == 0,
-                       **fields)  # fmt: skip
+                       **prepare_outcome(out))  # fmt: skip
         return code == 0
 
     def site_steps(self, action: Any, site: SiteConfig) -> bool:

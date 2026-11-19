@@ -200,7 +200,7 @@ def test_c49_a_prepare_that_fails_times_out_or_leaves_no_marker_retires_its_memb
     grandchild = tmp_path / "grandchild.pid"
     command = {"exit 1": study(code=1), "exit 0 without the marker": study(mark="bare"),
                "timeout": [sys.executable, "-c", HANG, str(grandchild)]}[how]  # fmt: skip
-    bench = Bench(tmp_path, deploy, site, prepare=command, timeout=1.0 if how == "timeout" else 30.0,
+    bench = Bench(tmp_path, deploy, site, prepare=command, timeout=3.0 if how == "timeout" else 30.0,
                   max_federations=1)  # fmt: skip
     site.answers = {"collect": (0, DIGEST + "\n", "")}
     site.on_command = lambda argv: site.set_status("fed-1", "down") if "down" in argv else None
@@ -324,6 +324,11 @@ def test_c49_a_prepare_in_flight_counts_as_on_its_way_and_takes_a_verify_runs_sh
         512 + 1024,
     )
     assert decided(True).targets["site-a"]["limits"]["login_memory"] > 0
+    ended = Member("fed-1", "up", "/r", ("41", "42"), "NODE_FAIL", now - 3650, now - 3600, now - 60, True, False)
+    view = SiteView("site-a", idle_nodes=70, nodes_per_federation=7, time_s=7200.0, members=(ended,))
+    key = frozenset({prepare_key("site-a", "fed-1")})
+    assert [type(a).__name__ for a in decide(now, ledger, [(settings, view)], frozenset()).actions] == ["Retire"]
+    assert decide(now, ledger, [(settings, view)], key).actions == []  # one operation per member at a time
 
 
 def test_c49_with_no_prepare_declared_nothing_changes_and_the_site_files_pair_prepare_with_its_bound(

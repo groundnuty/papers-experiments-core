@@ -263,6 +263,8 @@ def _unjoined(
     site = settings.label
     if m.status == "down":
         return 0
+    if prepare_key(site, m.label) in busy:
+        return 1  # a prepare in flight here: nothing else is decided for the member until it ends (a no-op elsewhere)
     if m.status in ("failed", "down-failed") or m.ended or m.broken:
         acts.append(Retire(site, m.label, None, m.root, False, f"never joined: {m.status}, its job {m.state}"))
         return 0
@@ -275,7 +277,7 @@ def _unjoined(
         if not m.verified:
             return 1
     else:
-        held = _prepared(settings, m, acts, busy)
+        held = _prepared(settings, m, acts)
         if held is not None:
             return held
     if m.ends_at is None or m.ends_at - cutoff_s(settings, ledger) <= now:
@@ -287,13 +289,11 @@ def _unjoined(
     return 1
 
 
-def _prepared(settings: SiteSettings, m: Member, acts: list, busy: frozenset[str]) -> int | None:
+def _prepared(settings: SiteSettings, m: Member, acts: list) -> int | None:
     """A member up, linked and running at a site that declares a prepare command: 1 while its data is on its way (a
-    prepare is to start, or is in flight here: its end is decided on a later tick, never under a live run), 0 when it
-    is retired unjoined, None when it may join (verified, with no prepare against it)."""
+    prepare is to start), 0 when it is retired unjoined, None when it may join (verified, with no prepare against it).
+    A prepare in flight here was handled before this (`_unjoined`)."""
     site = settings.label
-    if prepare_key(site, m.label) in busy:
-        return 1
     if m.prepare == "failed":  # the marker does not redeem a prepare that failed
         acts.append(Retire(site, m.label, None, m.root, True, "never joined: its prepare failed or timed out"))
         return 0

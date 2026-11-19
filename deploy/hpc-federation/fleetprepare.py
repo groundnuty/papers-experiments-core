@@ -74,6 +74,14 @@ def start_tick(pid: int) -> Optional[int]:
         return None
 
 
+def alive(pid: int) -> bool:
+    """Whether the process `pid` is there and not a zombie (one that ended and is not yet reaped is gone)."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
 def _write(path: Path, record: Mapping[str, Any], exclusive: bool) -> None:
     """The record, whole: created exclusively (`exclusive`: the claim), or a draft of ours renamed over it."""
     data = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
@@ -144,7 +152,7 @@ def kill_group(pgid: int, process: Optional["subprocess.Popen[bytes]"] = None) -
         if process is not None:
             if process.poll() is not None:
                 break
-        elif start_tick(pgid) is None:
+        elif not alive(pgid):
             break
         time.sleep(0.05)
     with contextlib.suppress(ProcessLookupError, PermissionError):
