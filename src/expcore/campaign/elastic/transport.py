@@ -41,6 +41,9 @@ MAX_REPLY = 1 << 26
 SSH_OPTIONS = (
     "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=20", "-o", "ServerAliveCountMax=3"
 )  # fmt: skip
+# With a site's own ssh config file (`ssh -F`), host-key checking is forced on the command line, which ssh reads
+# before any file: the file can name a key, a known-hosts file or a jump host, never weaken the checking.
+STRICT_OPTIONS = ("-o", "StrictHostKeyChecking=yes")
 HOST = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._@:%\[\]-]*")  # an ssh destination or alias, never an option or a space
 
 
@@ -67,12 +70,17 @@ class Site:
     )
 
 
-def ssh_argv(host: str) -> tuple[str, ...]:
+def ssh_argv(host: str, config: str | None = None) -> tuple[str, ...]:
     """The ssh argv that reaches `host`, ready for one remote command word after it; ValueError for a host that could
-    be read as an option or split by a shell."""
+    be read as an option or split by a shell. With `config` (a site's own ssh config file, an absolute path checked
+    private where the site is read), `-F config` and then `StrictHostKeyChecking=yes` before the usual options."""
     if not isinstance(host, str) or HOST.fullmatch(host) is None:
         raise ValueError("a site's host is an ssh destination or alias: letters, digits and . _ - @ : only")
-    return ("ssh", *SSH_OPTIONS, "--", host)
+    if config is None:
+        return ("ssh", *SSH_OPTIONS, "--", host)
+    if not isinstance(config, str) or not config.startswith("/"):
+        raise ValueError("a site's ssh config file is an absolute path")
+    return ("ssh", "-F", config, *STRICT_OPTIONS, *SSH_OPTIONS, "--", host)
 
 
 def remote_command(argv: Sequence[str], *, cwd: str | None = None, env_file: str | None = None) -> str:

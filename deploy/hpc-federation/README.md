@@ -1735,7 +1735,10 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   the account's default Slurm account may be another project's) and `settings` (the shard settings file on the login
   node, which the worker's launch and the identity read there use; required when `[controller]` names `settings`). Everything the controller does at the site is one ssh call, each with
   `-o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=20 -o ServerAliveCountMax=3` and never a setting that
-  weakens host-key checking, the remote command `cd <fleet> && set -a && . <env_file> && set +a && exec <argv>` with
+  weakens host-key checking (a site may name `ssh_config`, an absolute path to a private 0600 ssh config file of this
+  host's, uncommitted, holding its alias, key, known hosts or jump host: the call is then `ssh -F <file> -o
+  StrictHostKeyChecking=yes ...`, and ssh reads the command line's options before any file, so the file cannot weaken
+  the checking; a file that is missing, a link, or readable by others is refused), the remote command `cd <fleet> && set -a && . <env_file> && set +a && exec <argv>` with
   every word quoted (a login shell that is not POSIX cannot use `env_file`), each call killed with its process group
   at its bound: the read (`observe`), `fleet.py up`/`add`/`down`, `collect`, the worker's launch, the identity read
   (`fleetidentity.py read`) and the dispatcher's exchange and archive pulls. A call that fails or times out is the

@@ -51,6 +51,7 @@ import argparse
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -81,9 +82,9 @@ from fleetexecute import (  # noqa: E402
 COMMANDS = ("observe", "control", "drain", "ended", "join", "settle")
 CONTROLLER_KEYS = ("evidence", "interval_s", "log", "archives", "settings", "study")
 SITE_KEYS = ("fleet", "transport", "interpreter", "deploy", "channel", "host", "env_file", "settings", "kind",
-             *fleetcompose.KEYS)  # fmt: skip
+             "ssh_config", *fleetcompose.KEYS)  # fmt: skip
 KINDS = ("hpc", fleetcompose.KIND)
-SSH_ONLY_KEYS = ("host", "env_file", "settings")
+SSH_ONLY_KEYS = ("host", "env_file", "settings", "ssh_config")
 DISPATCH_S = 30.0  # `elastic.dispatch.TICK_S`: with a dispatcher the loop goes round this often
 TRANSPORTS = ("local", "ssh")
 OBSERVE_TIMEOUT_S = 600.0
@@ -186,8 +187,9 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
             python = str(_absolute(python, f"site {settings.label}: interpreter"))
         elif any(key in own for key in SSH_ONLY_KEYS):
             raise ConfigError(f"site {settings.label}: {', '.join(SSH_ONLY_KEYS)} belong to an ssh site")
+        config = private_file(own["ssh_config"], f"site {settings.label}: ssh_config") if "ssh_config" in own else None
         sites.append(SiteConfig(settings, fleet, own.get("transport", "local"), python, deploy, channel, host,
-                                env_file, shard_settings, compose))  # fmt: skip
+                                env_file, shard_settings, compose, config))  # fmt: skip
     if not sites or len({s.label for s in sites}) != len(sites):
         raise ConfigError("the sites file needs at least one [[site]], each label once")
     labels = [s.label for s in sites]
@@ -202,6 +204,19 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
     if len({fleet_identity(s.fleet, s.host) for s in sites}) != len(sites):
         raise ConfigError("two sites name one fleet directory: each fleet is one site's, read and acted on once")
     return controller, sites
+
+
+def private_file(value: Any, what: str) -> str:
+    """An absolute path to a regular file of this user that no group or other can read or write (an ssh config file:
+    it names the key and the known hosts), never a link."""
+    path = _absolute(value, what)
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise ConfigError(f"{what} is not there") from None
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ConfigError(f"{what} must be a regular file of this user of mode 0600, not a link")
+    return str(path)
 
 
 def compose_of(label: Any, own: Mapping[str, Any], remote: bool, dispatched: bool) -> Optional[Any]:
@@ -343,7 +358,7 @@ def dispatcher_of(ledger: Any, controller: Controller, sites: Sequence[SiteConfi
     from expcore.campaign.elastic.dispatch import Dispatcher
     from expcore.campaign.elastic.transport import RoutedTransport, Site, ssh_argv
 
-    named = [Site(s.label, str(s.channel), ssh_argv(s.host) if s.remote else (), (s.python, "-I", "-B"),
+    named = [Site(s.label, str(s.channel), ssh_argv(s.host, s.ssh_config) if s.remote else (), (s.python, "-I", "-B"),
                   str(s.fleet) if s.remote else None, s.env_file) for s in sites]  # fmt: skip
     cwds = {s.label: str(s.fleet) for s in sites if not s.remote}
     transport = hooks.dispatch(cwds) if hooks.dispatch is not None else RoutedTransport(cwds)

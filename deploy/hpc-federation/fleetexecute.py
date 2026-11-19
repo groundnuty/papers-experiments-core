@@ -77,6 +77,7 @@ class SiteConfig:
     env_file: Optional[str] = None  # an ssh site's site.env, a path on its login node, sourced before each command
     shard_settings: Optional[Path] = None  # an ssh site's shard settings file, a path on its login node
     compose: Optional[Any] = None  # a Compose site's own (`fleetcompose.ComposeSite`): its static members on a host
+    ssh_config: Optional[str] = None  # an ssh site's own ssh config file (`ssh -F`): private, this host's, uncommitted
 
     @property
     def label(self) -> str:

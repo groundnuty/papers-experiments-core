@@ -9,6 +9,7 @@ PATH that answers `ps` from a table of containers per project and logs every cal
 import dataclasses
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -548,4 +549,56 @@ def test_site_labels_one_of_which_begins_with_another_and_a_dash_are_refused(dep
     second = second.replace(str(vm.fleet), str(vm.fleet) + "-x")
     (vm.tmp / "sites.toml").write_text(text + second, encoding="utf-8")
     with pytest.raises(deploy.control.ConfigError, match="begin with another site's label"):
+        deploy.control.load_config(vm.tmp / "sites.toml")
+
+
+# ------------------------------------------------------------------------------------------------ a site's ssh config
+def test_a_sites_own_ssh_config_file_is_passed_with_host_key_checking_forced_after_it(deploy, vm, tmp_path):
+    """`ssh_config` (a private file of this host's: the site's alias, key, known hosts, a jump host): every call goes
+    `ssh -F <file> -o StrictHostKeyChecking=yes -o BatchMode=yes ...`, so no file can weaken host-key checking."""
+    from expcore.campaign.elastic.transport import SSH_OPTIONS, ssh_argv
+
+    config = tmp_path / "ssh.config"
+    config.write_text(f"Host {HOST}\n  IdentitiesOnly yes\n", encoding="utf-8")
+    config.chmod(0o600)
+    text = (vm.tmp / "sites.toml").read_text(encoding="utf-8")
+    (vm.tmp / "sites.toml").write_text(text + f'ssh_config = "{config}"\n', encoding="utf-8")
+    _, (site,) = deploy.control.load_config(vm.tmp / "sites.toml")
+    argv = ssh_argv(HOST, site.ssh_config)
+    assert argv == ("ssh", "-F", str(config), "-o", "StrictHostKeyChecking=yes", *SSH_OPTIONS, "--", HOST)
+    assert deploy.control.observe_site(vm.transport, site, None).error is None
+    (call,) = [c for c in vm.fake.calls() if "observe" in c["command"][0]]
+    assert call["config"] == str(config)
+    assert call["options"][:2] == ["StrictHostKeyChecking=yes", "BatchMode=yes"]
+
+
+@pytest.mark.skipif(shutil.which("ssh") is None, reason="no ssh client to read its effective configuration")
+def test_the_command_lines_host_key_checking_wins_over_a_config_file_that_weakens_it(tmp_path):
+    """ssh's own resolution (`ssh -G`, which connects nowhere): a file saying `StrictHostKeyChecking no` and
+    `BatchMode no` still gives yes and yes, since the command line's options are read first."""
+    from expcore.campaign.elastic.transport import ssh_argv
+
+    config = tmp_path / "weak.config"
+    config.write_text("Host *\n  StrictHostKeyChecking no\n  BatchMode no\n", encoding="utf-8")
+    config.chmod(0o600)
+    argv = list(ssh_argv("vm-alias.invalid", str(config)))
+    done = subprocess.run([argv[0], "-G", *argv[1:]], capture_output=True, text=True, timeout=30, check=False)
+    assert done.returncode == 0, done.stderr
+    effective = dict(line.split(" ", 1) for line in done.stdout.splitlines() if " " in line)
+    assert (effective["stricthostkeychecking"], effective["batchmode"]) == ("true", "yes")
+
+
+@pytest.mark.parametrize("trouble", ["missing", "world-readable", "link"])
+def test_an_ssh_config_that_is_not_a_private_file_is_refused(deploy, vm, tmp_path, trouble):
+    config = tmp_path / "ssh.config"
+    if trouble != "missing":
+        real = tmp_path / "real.config"
+        real.write_text("Host x\n", encoding="utf-8")
+        real.chmod(0o644 if trouble == "world-readable" else 0o600)
+        config = real if trouble == "world-readable" else config
+        if trouble == "link":
+            config.symlink_to(real)
+    text = (vm.tmp / "sites.toml").read_text(encoding="utf-8")
+    (vm.tmp / "sites.toml").write_text(text + f'ssh_config = "{config}"\n', encoding="utf-8")
+    with pytest.raises(deploy.control.ConfigError, match="ssh_config"):
         deploy.control.load_config(vm.tmp / "sites.toml")

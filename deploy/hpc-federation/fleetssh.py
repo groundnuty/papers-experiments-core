@@ -77,6 +77,13 @@ def _entries(manifest: Path) -> List[Tuple[str, int, str]]:
     return found
 
 
+def site_ssh(site: Any) -> Tuple[str, ...]:
+    """The site's ssh argv: its host, through its own ssh config file when it names one (`ssh_config`)."""
+    from expcore.campaign.elastic.transport import ssh_argv
+
+    return ssh_argv(site.host, getattr(site, "ssh_config", None))
+
+
 def redact(site: Any, text: str) -> str:
     """`text` with the site's host (and the host part of a `user@host`) replaced: for what is logged, printed or said,
     never for what is parsed."""
@@ -113,10 +120,10 @@ class SshSiteTransport:
         return code, out, redact(site, err)  # stdout is what the controller parses: it is never altered here
 
     def run(self, site: Any, argv: Any, timeout: float) -> Tuple[int, str, str]:
-        from expcore.campaign.elastic.transport import remote_command, ssh_argv
+        from expcore.campaign.elastic.transport import remote_command
 
         command = remote_command(list(argv), cwd=str(site.fleet), env_file=site.env_file)
-        done = self._run([*ssh_argv(site.host), command], env=self.environ, stdin=subprocess.DEVNULL,
+        done = self._run([*site_ssh(site), command], env=self.environ, stdin=subprocess.DEVNULL,
                          capture_output=True, text=True, errors="replace", timeout=timeout, check=False)  # fmt: skip
         return self._said(site, done.returncode, done.stdout, done.stderr)
 
@@ -124,9 +131,9 @@ class SshSiteTransport:
         """The standard output of the command `argv` run at the site (as `elastic.transport.SshTransport.stream`: the
         site's own ssh, no prefix) into the new file `local`, within `timeout_s` (the fetch bound by default); raises
         `Unreachable` or `Missing` as a pull does."""
-        from expcore.campaign.elastic.transport import Site, SshTransport, ssh_argv
+        from expcore.campaign.elastic.transport import Site, SshTransport
 
-        remote = Site(site.label, str(site.fleet), ssh=ssh_argv(site.host), python=())
+        remote = Site(site.label, str(site.fleet), ssh=site_ssh(site), python=())
         SshTransport(run=self._run, fetch_timeout_s=self.fetch_timeout_s).stream(remote, list(argv), local,
                                                                                 timeout_s=timeout_s)  # fmt: skip
 
@@ -134,11 +141,11 @@ class SshSiteTransport:
         """The copy at `remote_dir` of the site into `local_dir` (the module's docstring); (0, said, "") when it is here
         whole, else (1, "", why). A `local_dir` that already holds a copy with this manifest is not fetched again; one
         that holds another is never replaced."""
-        from expcore.campaign.elastic.transport import Missing, Site, SshTransport, Unreachable, ssh_argv
+        from expcore.campaign.elastic.transport import Missing, Site, SshTransport, Unreachable
 
         local_dir = Path(local_dir)
         reader = SshTransport(run=self._run, fetch_timeout_s=self.fetch_timeout_s)
-        remote = Site(site.label, str(site.fleet), ssh=ssh_argv(site.host), python=())
+        remote = Site(site.label, str(site.fleet), ssh=site_ssh(site), python=())
         stage: Optional[Path] = None
         try:
             if local_dir.is_symlink():
