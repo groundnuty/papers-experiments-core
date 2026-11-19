@@ -11,8 +11,11 @@ fleet's shard settings, `fleetplan.read_settings`).
   None (the join waits and is decided again), never a guess; a read that worked is kept for the member.
 - `locator(evidence)`: `(site, Settle) -> (out/, source)` or None, for `fleetexecute.dead_store_reader`: the lost
   lease's store as a place `lease-<id>/` holds it (`PLACES`): in the federation's channel on the site's shared file
-  system (`root`, offered only while the decision shows the member's root, that is while it still holds the jobs the
-  federation joined with) or in the evidence the controller collected from the member (`pulled`). A place holds
+  system (`root`, whatever the member's root: the channel is outside it and outlives the member's down, and at a settle
+  the member's job is proven ended, so its journal there is the final one) or, where the place is gone or holds no
+  snapshot that verifies (never after a failed call: read again next tick), in the evidence the controller collected
+  from the member (`pulled`; at an ssh site its retirement pulled the member's places there before its down,
+  `fleetssh.SshSiteTransport.pull_places`). A place holds
   either `study/out/` with the lease's `spend.jsonl` beside `study/` (put there by an operator), or what the worker
   leaves while the lease runs (C46): `snapshots/` and `spend.jsonl`. For those the newest snapshot that verifies
   (`out_snapshot.restore`, each in turn, newest first) is restored into a private directory on this host with the
@@ -32,7 +35,6 @@ import atexit
 import contextlib
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -152,15 +154,6 @@ def identity_reader(
     return read
 
 
-def remote_snapshots(transport: Any, site: Any, directory: str, scratch: Path) -> Optional[list]:
-    """The names of the snapshots in `directory` on an ssh site's login node, newest first; None when the listing fails
-    (a directory that is not there lists nothing, as `ls` fails on it: None as well, read again next tick)."""
-    listing = scratch / "snapshots.txt"
-    transport.stream(site, ["ls", "-1", "--", directory], listing)
-    names = [n for n in listing.read_text(encoding="utf-8").split("\n") if re.fullmatch(r"snap-[0-9]{6,}", n)]
-    return sorted(names, key=lambda name: int(name[5:]), reverse=True)
-
-
 def locator(evidence: Path, transport: Any = None) -> Callable[[Any, Any], Optional[Tuple[Path, str]]]:
     """The spend reader's `locate` (module docstring): where a lost lease's store is, or None. `transport` reaches an
     ssh site's login node (`fleetexecute.SiteTransport`)."""
@@ -195,10 +188,13 @@ def locator(evidence: Path, transport: Any = None) -> Callable[[Any, Any], Optio
             return private / "study" / "out"
         return None
 
-    def from_remote(site: Any, action: Any) -> Optional[Path]:
+    def from_remote(site: Any, action: Any) -> Tuple[Optional[Path], bool]:
         """A lost lease's place on an ssh site's login node, fetched into a private directory here and read as a local
-        place is; None for any failure or timeout of a call (read again next tick), and for a place with no snapshot
-        that verifies."""
+        place is: (its `out/`, False) when found; (None, False) when the place is not there (the answer of a listing,
+        never a failed call's) or holds no snapshot that verifies; (None, True) for any failure or timeout of a call,
+        which is read again next tick and never taken for no place."""
+        from fleetssh import SNAPSHOT_NAME
+
         from expcore.campaign import out_snapshot
         from expcore.campaign.elastic import channel as ch
         from expcore.campaign.elastic.snapshots import SNAPSHOTS
@@ -209,9 +205,12 @@ def locator(evidence: Path, transport: Any = None) -> Callable[[Any, Any], Optio
         private = Path(tempfile.mkdtemp(prefix="expcore-fetch-"))  # 0700, ours
         mirror = private / "place"
         try:
-            names = remote_snapshots(transport, site, f"{there}/{SNAPSHOTS}", private)
+            if not transport.exists(site, "-d", there):
+                return None, False
+            names = sorted(transport.names(site, f"{there}/{SNAPSHOTS}", SNAPSHOT_NAME), key=lambda n: int(n[5:]),
+                           reverse=True)  # fmt: skip
             if not names:
-                return None
+                return None, False
             (mirror / SNAPSHOTS).mkdir(parents=True)
             with contextlib.suppress(Missing):  # a journal not there is read as none; a failed or timed-out call is not
                 transport.stream(site, ["cat", "--", f"{there}/{LEASE_JOURNAL}"], mirror / LEASE_JOURNAL)
@@ -223,10 +222,10 @@ def locator(evidence: Path, transport: Any = None) -> Callable[[Any, Any], Optio
                 tar.unlink()
                 found = from_snapshot(mirror)
                 if found is not None:
-                    return found
-            return None
+                    return found, False
+            return None, False
         except (OSError, tarfile.TarError, ValueError, subprocess.SubprocessError):
-            return None
+            return None, True
         finally:
             shutil.rmtree(private, ignore_errors=True)
 
@@ -238,12 +237,26 @@ def locator(evidence: Path, transport: Any = None) -> Callable[[Any, Any], Optio
         name = ch.place_name(action.lease_id)
         candidates = []
         remote = getattr(site, "remote", False)
-        if action.root is not None and site.channel is not None and remote and transport is not None:
-            found = from_remote(site, action)
+        # the channel first, whatever the member's root: it is outside the root, outlives the member's down, and at a
+        # settle its job is proven ended (and KillWait passed), so its journal is the final one. The pulled copy is
+        # read where the place is gone or holds no snapshot that verifies, never after a failed call: it was taken
+        # earlier, so a spend written after it would be missed, and a settled charge is final
+        if site.channel is not None and remote and transport is not None:
+            found, failed = from_remote(site, action)
             if found is not None:
                 return found, "root"
-        elif action.root is not None and site.channel is not None and not remote:
-            candidates.append((ch.federation_dir(str(site.channel), action.label) / PLACES / name, "root"))
+            if failed:
+                return None
+        elif site.channel is not None and not remote:
+            place = ch.federation_dir(str(site.channel), action.label) / PLACES / name
+            try:
+                place.stat()
+            except FileNotFoundError:
+                pass  # gone
+            except OSError:
+                return None  # a read that failed
+            else:
+                candidates.append((place, "root"))
         pulled = Path(evidence) / f"{site.label}-{action.member}"
         candidates.append((pulled / PLACES / name, "pulled"))
         for place, source in candidates:

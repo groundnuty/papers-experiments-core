@@ -4,6 +4,8 @@ sshd does), to stub scripts standing in for the deploy directory on the login no
 stay on this host. A call that fails or hangs is the site unread, never ended; the host is in no log, error or
 record."""
 
+import dataclasses
+import hashlib
 import json
 import os
 import shutil
@@ -18,11 +20,17 @@ from control_site_support import FakeSite, Job, observed
 from elastic_support import FINGERPRINT, FakeClock, config, plan
 from fake_ssh_bin import install_fake_ssh
 from hpc_fleet_support import fleet_modules
+from leased_support import killed_mid_lease, ran_for_real
+from study_support import clean_environment
 
-from expcore.campaign.elastic import Ledger
-from expcore.campaign.elastic.control import Drain, Retire, SiteSettings
+from expcore.campaign.elastic import Ledger, SiteReading
+from expcore.campaign.elastic.control import Drain, Retire, Settle, SiteSettings
+from expcore.campaign.ledger_read import read_ledger, take_ledger_snapshot
 
 HOST = "zz-login-7f3a.invalid"
+SITE_LABEL = "site-a"  # the label of both the ledger's site (`elastic_support.SITE`) and the controller's
+__all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
+
 ROOT_ONLY = "expcore-hpc-root-archives/1"
 STEM = "federation"
 FILES = {f"{STEM}.root.tar": b"the root's evidence archive", f"{STEM}.root.json": b'{"its": "manifest"}'}
@@ -435,10 +443,167 @@ def test_the_dry_run_prints_the_ssh_retirement_as_the_steps_it_runs(deploy, logi
     assert printed.index("collect") < printed.index("# pulled to this host") < printed.index("verify-copy")
     assert printed.index("verify-copy") < printed.index("down")
     assert HOST not in printed + json.dumps(entry)
+    with_channel = dataclasses.replace(login.config, channel=Path("/channels"))
+    entry = deploy.fleetexecute.described(retire(), deploy.fleetexecute.render(retire(), with_channel, Path("/ev"),
+                                                                              Path("/ledger.sqlite")))  # fmt: skip
+    assert entry["places"] == ["site", "pull", "pull-places", "here", "site"]
+    printed = deploy.fleetexecute.printed(entry)
+    assert (
+        printed.index("# pulled to this host")
+        < printed.index("/channels/site-a-fed-1/places")
+        < printed.index("verify-copy")
+    )
     drain = Drain("site-a", "fed-1", "site-a-fed-1", "its end is near")
     (step,) = deploy.fleetexecute.render(drain, login.config, Path("/ev"), Path("/ledger.sqlite")).steps
     assert step[0] == sys.executable
     assert str(login.scripts) not in step[3]  # the ledger is this host's: never the login node's interpreter or deploy
+
+
+# ------------------------------------------------------------------------------------ the places of a retired member
+def lay_place(channel: Path, lease_id: int = 1, snapshots: int = 3) -> Path:
+    """A lease's place on the site's shared file system, as a worker leaves it: snapshots and its spend journal."""
+    place = channel / "site-a-fed-1" / "places" / f"lease-{lease_id:012d}"
+    for number in range(1, snapshots + 1):
+        (place / "snapshots" / f"snap-{number:06d}").mkdir(parents=True)
+        (place / "snapshots" / f"snap-{number:06d}" / "state.bin").write_text(f"store {number}", encoding="utf-8")
+    (place / "spend.jsonl").write_text('{"kind": "header"}\n', encoding="utf-8")
+    return place
+
+
+def retired_after_a_kill(deploy, login, tmp_path, env) -> SimpleNamespace:
+    """A federation killed in the middle of its real lease at an ssh site, drained and retired (its root evidence and
+    its channel's places pulled, down), its end proven and KillWait passed: only the settle is left to run."""
+    leased, kept = ran_for_real(tmp_path, env, "site-a-fed-1")
+    killed_mid_lease(kept, tmp_path)
+    ledger, clock, lease = leased.ledger, leased.now, leased.lease
+    config = dataclasses.replace(login.config, channel=Path(leased.site.root))
+    log = deploy.fleetexecute.Log(None)
+    evidence = tmp_path / "evidence"
+    spend = deploy.fleetexecute.dead_store_reader(
+        deploy.fleetidentity.locator(evidence, login.transport), leased.loaded
+    )
+    executor = deploy.fleetexecute.Executor(ledger, tmp_path / "ledger.sqlite", {SITE_LABEL: config}, login.transport,
+                                            evidence, log, spend=spend, clock=lambda: clock[0])  # fmt: skip
+    clock[0] += 4000.0  # past the lease's term: no heartbeat, it expires
+    ledger.observe_site(SITE_LABEL, SiteReading())
+    ledger.drain("site-a-fed-1")
+    retire = Retire(SITE_LABEL, "fed-1", "site-a-fed-1", "/a root", True, "drained, and no lease in flight")
+    assert executor.retire_refused(retire) is None
+    assert executor.site_steps(retire, config) is True
+    assert (login.scripts / "downed").exists()
+    ledger.prove_ended("site-a-fed-1", "cancelled")  # the down was verified: the end is proven only now
+    clock[0] += 181.0  # KillWait
+    lost = Settle(SITE_LABEL, "fed-1", "site-a-fed-1", lease.lease_id, None, "lost")  # the member's root is gone
+
+    def pulled_only():  # the read of the copy the retirement pulled, as the settle makes it when the channel gives none
+        read = deploy.fleetexecute.dead_store_reader(deploy.fleetidentity.locator(evidence), leased.loaded)
+        return read(dataclasses.replace(config, channel=None), lost)
+
+    return SimpleNamespace(kept=kept, log=log, executor=executor, lost=lost, lease=lease, ledger=ledger,
+                           pulled_only=pulled_only)  # fmt: skip
+
+
+def settled(after: SimpleNamespace, tmp_path: Path) -> dict:
+    """The settle's result line, once the lease is settled: the ledger holds that charge, and no lease of the run is
+    left unsettled for the merge by run to refuse."""
+    done = [r for r in after.log.lines if r.get("action") == "Settle"][-1]
+    assert done["ok"] is True, done
+    assert after.ledger.lease(after.lease.lease_id).charge_micro == done["spend_micro"]
+    snapshot = tmp_path / "ledger-snapshot.sqlite"
+    take_ledger_snapshot(after.ledger.path, snapshot)
+    data = snapshot.read_bytes()
+    assert read_ledger(data, hashlib.sha256(data).hexdigest()).unsettled(after.lease.run_key) == []
+    return done
+
+
+def test_c47_a_member_killed_mid_lease_settles_from_the_places_its_retirement_pulled_if_the_channel_is_gone(
+    deploy, login, tmp_path, clean_environment
+):
+    """C47: a federation killed in the middle of its lease is drained and retired with its root gone; the retirement
+    pulled its channel's places beside its evidence, so when the channel's place is gone by the settle the lease is
+    settled at the journal's spend read from the pulled place (never left charged its whole grant), and the merge by
+    run has no unsettled lease of the run to refuse."""
+    after = retired_after_a_kill(deploy, login, tmp_path, clean_environment)
+    shutil.rmtree(after.kept.parent)  # the channel cleaned up since
+    after.executor.in_ledger(after.lost)
+    done = settled(after, tmp_path)
+    assert done["source"] == "pulled"
+    assert 0 < done["spend_micro"] < 5_000_000  # the journal's spend, not the grant of the model (5 USD)
+
+
+def test_c47_a_spend_appended_to_the_channels_journal_after_the_retirements_pull_is_counted_in_the_settle(
+    deploy, login, tmp_path, clean_environment
+):
+    """C47: the settle reads the member's place from its channel whatever its root, over ssh, in preference to the
+    copy pulled at the retirement: by then its job is proven ended and KillWait has passed, so the journal there is
+    the final one, and a probe charge written after the pull is in the lease's charge."""
+    after = retired_after_a_kill(deploy, login, tmp_path, clean_environment)
+    journal = after.kept / "spend.jsonl"
+    header = json.loads(journal.read_text(encoding="utf-8").splitlines()[0])
+    probe = {"kind": "probe", "campaign": header["campaign"], "shard": header["shard"], "event_id": 10**6,
+             "model": after.lease.model, "usd": 0.25}  # fmt: skip
+    pulled_spend = after.pulled_only()[0]
+    with journal.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(probe, sort_keys=True) + "\n")
+    after.executor.in_ledger(after.lost)
+    done = settled(after, tmp_path)
+    assert done["source"] == "root"
+    assert done["spend_micro"] == pulled_spend + 250_000
+
+
+def test_c47_a_failed_read_of_the_channel_leaves_the_lease_charged_and_never_settles_it_from_the_older_pulled_copy(
+    deploy, login, tmp_path, clean_environment
+):
+    """C47: the pulled copy was taken before the job's end was proven, so a settle from it after a call at the channel
+    failed or hung could miss a spend written since, and a settled charge is final: the lease stays charged its grant
+    and the next tick, the call answering, settles it from the channel's journal."""
+    after = retired_after_a_kill(deploy, login, tmp_path, clean_environment)
+    assert after.pulled_only() is not None  # the pulled copy is whole and readable
+    login.fake.rule("echo yes", "fail")
+    grant = after.ledger.lease(after.lease.lease_id).charge_micro
+    after.executor.in_ledger(after.lost)
+    assert after.ledger.lease(after.lease.lease_id).charge_micro == grant
+    assert [r["ok"] for r in after.log.lines if r.get("action") == "Settle"] == [False]
+    login.fake.clear()
+    after.executor.in_ledger(after.lost)
+    assert settled(after, tmp_path)["source"] == "root"
+
+
+@pytest.mark.parametrize(("call", "trouble"), [("tar -C", "fail"), ("echo yes", "fail"), ("echo yes", "garbage")])
+def test_c47_a_place_that_cannot_be_pulled_stops_the_retirement_before_down_and_a_retry_pulls_it_whole(
+    deploy, login, tmp_path, call, trouble
+):
+    """C47: the places of the member's leases are pulled after its evidence and before verify-copy and down (the
+    newest two snapshots of each place and its journal): a snapshot that cannot be streamed, a directory that cannot
+    be told from one that is not there, and an answer that is not whole each stop the retirement with nothing taken
+    down and no part of the places here, and the retry, over the evidence already here, pulls them whole."""
+    config = dataclasses.replace(login.config, channel=tmp_path / "channels")
+    lay_place(config.channel)
+    login.fake.rule(call, trouble)
+    executor = login.executor(tmp_path)
+    assert executor.site_steps(retire(), config) is False
+    assert not (login.scripts / "downed").exists()
+    assert not (whole_copy(tmp_path) / "places").exists()
+    assert not list(whole_copy(tmp_path).glob(".*"))  # no staging directory is left in the copy
+    assert login.log.lines[-1]["ok"] is False
+    assert HOST not in json.dumps(login.log.lines)
+    login.fake.clear()
+    assert executor.site_steps(retire(), config) is True
+    assert (login.scripts / "downed").exists()
+    place = whole_copy(tmp_path) / "places" / "lease-000000000001"
+    assert sorted(p.name for p in (place / "snapshots").iterdir()) == ["snap-000002", "snap-000003"]
+    assert (place / "snapshots" / "snap-000003" / "state.bin").read_text(encoding="utf-8") == "store 3"
+    assert (place / "spend.jsonl").read_text(encoding="utf-8") == '{"kind": "header"}\n'
+
+
+def test_c47_a_member_with_no_places_pulls_none_and_is_still_taken_down(deploy, login, tmp_path):
+    """C47: a joined member whose channel holds no place (no lease ever ran there) has nothing to pull, and that is
+    no failure: it goes down with its evidence copy as any other."""
+    config = dataclasses.replace(login.config, channel=tmp_path / "channels")
+    executor = login.executor(tmp_path)
+    assert executor.site_steps(retire(), config) is True
+    assert (login.scripts / "downed").exists()
+    assert not (whole_copy(tmp_path) / "places").exists()
 
 
 # ------------------------------------------------------------------------------------------------ join and worker

@@ -3,6 +3,7 @@ lost lease's store is found where a place holds it (deploy/hpc-federation/fleete
 ledger, the transport and the interpreter are stand-ins; nothing reaches a cluster."""
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -204,11 +205,9 @@ def test_the_read_command_prints_the_one_json_line_the_controller_of_an_ssh_site
     assert capsys.readouterr().out == ""
 
 
-def test_a_lost_leases_store_is_found_in_its_channel_only_while_the_member_shows_and_in_the_pulled_evidence(
-    deploy, tmp_path
-):
-    """The store as a place holds it: `study/out/` of `lease-<id>`, in the federation's channel (`root`, offered only
-    when the decision shows the member's root) or in the evidence collected from the member (`pulled`)."""
+def test_a_lost_leases_store_is_found_in_its_channel_and_failing_that_in_the_pulled_evidence(deploy, tmp_path):
+    """The store as a place holds it: `study/out/` of `lease-<id>`, in the federation's channel (`root`, whatever the
+    member's root) or, failing that, in the evidence collected from the member (`pulled`)."""
     locate = deploy.fleetidentity.locator(tmp_path / "evidence")
     config = deploy.fleetexecute.SiteConfig(
         SiteSettings("site-a", 7, 1e12, 47.0), tmp_path / "fleet", channel=tmp_path / "channels"
@@ -225,4 +224,6 @@ def test_a_lost_leases_store_is_found_in_its_channel_only_while_the_member_shows
     (channel / "state.sqlite").write_bytes(b"x")
     assert locate(config, settle) == (channel, "root")
     gone = Settle("site-a", "fed-1", "site-a-fed-1", 7, None, "lost")  # the site no longer shows the member
-    assert locate(config, gone) == (pulled, "pulled")
+    assert locate(config, gone) == (channel, "root")  # its channel outlives it: still read first
+    shutil.rmtree(channel.parents[2])
+    assert locate(config, gone) == (pulled, "pulled")  # the channel's place gone: the copy pulled at its retirement
