@@ -15,7 +15,16 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from merge_by_run_support import ENVIRONMENT, HEALTHY, FakeClock, Fleet, build_fleet, by_run_study, make_running
+from merge_by_run_support import (
+    DECLARED,
+    ENVIRONMENT,
+    HEALTHY,
+    FakeClock,
+    Fleet,
+    build_fleet,
+    by_run_study,
+    make_running,
+)
 from shard_support import make_study, write_meta
 from study_support import Campaign, clean_environment, cli, copy_campaign, finish
 
@@ -263,6 +272,23 @@ def test_c45_the_analysis_reports_the_balance_and_the_federation_rerun_beside_th
     assert set(federation) == {"fits", "unadjusted", "sensitivity", "sensitivity_refused"}
     assert "## Balance over sites and federations" in merged.report
     assert "## Sensitivity analysis: site and federation effects" in merged.report
+
+
+def test_c48_the_ledgers_declaration_log_is_in_merge_json_the_export_and_the_report_with_its_time(merged):
+    """C48: the declaration made mid-campaign is in merge.json's log with its time, actor and reason, the export
+    carries the log for the analysis, and the report lists it."""
+    model, fingerprint, reason, actor = DECLARED
+    (entry,) = document_of(merged)["declarations"]
+    assert (entry["model"], entry["fingerprint"], entry["actor"], entry["reason"]) == (
+        model,
+        fingerprint,
+        actor,
+        reason,
+    )
+    assert entry["at_utc"].endswith("Z")
+    assert merged.read("export.json")["fingerprint_declarations"] == [entry]
+    assert "## Fingerprint declarations" in merged.report
+    assert f"| {model} | {fingerprint} | {entry['at_utc']} | {actor} | {reason} |" in merged.report
 
 
 def test_c45_the_report_says_what_unsettled_leases_lock_at_the_ledgers_snapshot(merged, fleet):

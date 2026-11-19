@@ -62,6 +62,14 @@ class FakeClock:
         return self.now
 
 
+DECLARED = (
+    "alpha-stub",
+    "deploy-late",
+    "a deployment joined mid-campaign",
+    "operator-1",
+)  # model, fingerprint, why, who
+
+
 def by_run_study(base: Path, name: str) -> Path:
     """A stamped copy of the example that declares the federation rerun (every copy of a fleet is made here, so all
     plan one campaign)."""
@@ -207,6 +215,8 @@ def build_fleet(base: Path, env: dict[str, str]) -> Fleet:
     ledger = Ledger.open(path, clock)
     try:
         fleet.exhausted, fleet.exhausted_leases = _exhaust_a_run(ledger, clock, sha)
+        clock.now += 60.0
+        ledger.declare(DECLARED[0], DECLARED[1], DECLARED[2], DECLARED[3])  # mid-campaign, for the merge's log (C48)
         _lease_every_run(fleet, ledger)
         lx, ly = doomed["fed-x"], doomed["fed-y"]
         fleet.stores[lx.lease_id] = run_lease(base, env, lx, sha)
