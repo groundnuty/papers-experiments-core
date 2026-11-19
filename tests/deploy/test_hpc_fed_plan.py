@@ -220,6 +220,37 @@ def test_a_step_network_with_a_space_or_a_shell_character_is_refused_naming_the_
         hpc.settings.Site.from_json({**recorded, "step_network": value})
 
 
+def test_the_site_may_name_a_node_domain_and_by_default_names_none(hpc):
+    """HPC_NODE_DOMAIN is optional and empty by default, so a site that sets nothing is unchanged; one or more DNS
+    labels are kept as given and recorded in the state's site record, and a record written before it still loads."""
+    assert hpc.settings.site_from_environment(SITE_ENVIRON).node_domain == ""
+    assert hpc.settings.site_from_environment({**SITE_ENVIRON, "HPC_NODE_DOMAIN": ""}).node_domain == ""
+    for value in ("nodes.example", "cluster", "a-b.c-d.example", "x" * 63 + ".example"):
+        site = hpc.settings.site_from_environment({**SITE_ENVIRON, "HPC_NODE_DOMAIN": value})
+        assert site.node_domain == value
+        assert hpc.settings.Site.from_json(site.to_json()) == site
+    old = hpc.settings.site_from_environment(SITE_ENVIRON).to_json()
+    del old["node_domain"]
+    assert hpc.settings.Site.from_json(old).node_domain == ""
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["-a.example", "a-.example", "a..example", ".example", "example.", "a b.example", "a_b.example", "<node-domain>",
+     "a.b;id", "$(id)", "x" * 64 + ".example", ".".join(["a" * 60] * 4)],
+    ids=lambda value: repr(value)[:20],
+)  # fmt: skip
+def test_a_node_domain_that_is_no_dns_name_is_refused_naming_the_variable_not_the_value(hpc, value):
+    """The value becomes the domain of every node's FQDN and rides every step's environment, so it is DNS labels
+    only, short enough that `<short>.<domain>` is a name; the message names HPC_NODE_DOMAIN and never repeats it."""
+    with pytest.raises(hpc.settings.SettingsError, match="HPC_NODE_DOMAIN") as refused:
+        hpc.settings.site_from_environment({**SITE_ENVIRON, "HPC_NODE_DOMAIN": value})
+    assert value not in str(refused.value)
+    recorded = hpc.settings.site_from_environment(SITE_ENVIRON).to_json()
+    with pytest.raises(hpc.settings.SettingsError, match="HPC_NODE_DOMAIN"):
+        hpc.settings.Site.from_json({**recorded, "node_domain": value})
+
+
 @pytest.mark.parametrize("value", [None, False, True, 0, 5, [], ["no_vni"], {}, {"no_vni": 1}, b"no_vni"], ids=repr)
 def test_a_step_network_in_the_state_that_is_not_a_string_is_refused_naming_the_variable(hpc, value):
     """O57: a state record is read back as data, so `step_network` must be a string: a false, a null, a number or a

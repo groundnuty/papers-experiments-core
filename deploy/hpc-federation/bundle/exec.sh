@@ -22,5 +22,7 @@ cleanup() { chmod -R u+rwX -- "$D" 2>/dev/null || true; rm -rf --one-file-system
 trap cleanup EXIT
 trap 'exit 143' TERM INT
 rc=0
-apptainer exec --containall --no-home --pwd /root --workdir "$D" "$W/rootfs" /usr/bin/env HOME=/root "$@" < /dev/null || rc=$?
+naming=()
+hosts_bind "$W" naming   # the service's own hosts file, so the names it resolves resolve here too (O73)
+apptainer exec --containall --no-home --pwd /root --workdir "$D" "${naming[@]}" "$W/rootfs" /usr/bin/env HOME=/root "$@" < /dev/null || rc=$?
 exit "$rc"

@@ -810,12 +810,12 @@ section 3).
   shows by a count that none of it remains (the previous section), and removes the root. After a partial `up` it finds the
   job by its recorded id, or by its allocation's exact name.
 - **Every step** is `srun --jobid --exact` with a name, its size, `--chdir=/` and `/usr/bin/env -i PATH=... LC_ALL=C
-  TMPDIR=<node tmpfs>` (and `--network=<value>` when `site.env` sets `HPC_STEP_NETWORK`, on every step `up`, `down` and
+  TMPDIR=<node tmpfs>` (and `HPC_NODE_DOMAIN=<domain>` when `site.env` sets it, and `--network=<value>` when `site.env` sets `HPC_STEP_NETWORK`, on every step `up`, `down` and
   the service verbs launch; the line `shards.py lines` prints for a shard step is the manifest's own and does not carry
   it), and every Python in it runs with `-I -B`; no step uses `--overlap`; a control step's srun client is ended only
   once its step is gone from `squeue -s`, and one still listed at its bound is cancelled by its own id.
 - **The site** comes from `site.env` (`HPC_ACCOUNT`, `HPC_PARTITION`, `SH`, `L`, and optionally `HPC_STEP_PATH`,
-  `HPC_NODE_TMP`, `HPCOP_PY`, `HPC_CORE_PYTHON`, `HPC_QUEUE_WAIT_S`, `HPC_ADMIN_MAIL`, `HPC_BILLING_MEM_WEIGHT`, `HPC_STEP_NETWORK`, `HPC_STUDY_ARTIFACTS`, and the four keys of the
+  `HPC_NODE_TMP`, `HPCOP_PY`, `HPC_CORE_PYTHON`, `HPC_QUEUE_WAIT_S`, `HPC_ADMIN_MAIL`, `HPC_BILLING_MEM_WEIGHT`, `HPC_STEP_NETWORK`, `HPC_NODE_DOMAIN`, `HPC_STUDY_ARTIFACTS`, and the four keys of the
   provider storage on scratch), recorded in the state file at `up` (of the storage keys, only `HPC_STORAGE_ROOT`; `HPC_QUEUE_WAIT_S` is `up`'s own bound and is not recorded), so `down` and the service verbs need no environment. `HPC_CORE_PYTHON` (a venv of this checkout on the
   shared filesystem) is required with an agent's node: `down`'s sweep reaps the sandbox's runs with the core's reaper.
   **Install that venv's interpreter under the site directory** (`UV_PYTHON_INSTALL_DIR=<site dir>/python uv sync`),
@@ -1665,15 +1665,39 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   `interval_s` and `log` (the JSON log: one line per tick with the targets, limits, queue waits and actions, and one
   per result); one `[[site]]` per site with `label` (an operator's label, never a site's name), `fleet` (one site's
   only: two sites never share a fleet), `transport`
-  (`local` only: commands run on this host, so step 5 runs where the login node and the ledger are one; a remote site
-  is step 6's), optionally `interpreter` and `deploy` (the Python and this directory on its login node), and the
-  settings above (`max_federations`, `allowance_units` and `rate_units_per_hour` required). With `archives` in
+  (`local`: commands run on this host, where the login node and the ledger are one; or `ssh`, below), optionally
+  `interpreter` and `deploy` (the Python and this directory on its login node), and the settings above (`max_federations`, `allowance_units` and `rate_units_per_hour` required). With `archives` in
   `[controller]` (absolute: where the dispatcher keeps the archives it pulls) and a `channel` in every site (that site's
   channel root on its shared file system), the controller also runs the elastic dispatcher
   (`expcore.campaign.elastic.dispatch`, DESIGN.md) in its own loop: the ledger's lock admits one holder, so the loop goes
   round every 30 s, dispatching each site through its local transport and deciding every `interval_s`. With `settings`
   (absolute: the fleet's shard settings file, `plan --manifest`'s keys, and `home_files`) it launches each joining
   federation's worker and reads the identity it joins with and where a lost lease's store is.
+- **A remote site** (`transport = "ssh"`, `fleetssh.py`; one campaign drives one site: the controller and its ledger,
+  a SQLite file in WAL mode that never goes on NFS or Lustre, stay on this host's local disk). The site names `host`
+  (an ssh destination or alias that the operator's own ssh config resolves; it is never logged, printed or recorded:
+  logs say the site's label), and `interpreter` and `deploy` (absolute, on the login node; that interpreter imports
+  the core), `env_file` (its `site.env` on the login node: required, sourced before each command and the dispatcher's
+  exchange, so a missing or unreadable file fails the call and a command never runs on the login shell's defaults, where
+  the account's default Slurm account may be another project's) and `settings` (the shard settings file on the login
+  node, which the worker's launch and the identity read there use; required when `[controller]` names `settings`). Everything the controller does at the site is one ssh call, each with
+  `-o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=20 -o ServerAliveCountMax=3` and never a setting that
+  weakens host-key checking, the remote command `cd <fleet> && set -a && . <env_file> && set +a && exec <argv>` with
+  every word quoted (a login shell that is not POSIX cannot use `env_file`), each call killed with its process group
+  at its bound: the read (`observe`), `fleet.py up`/`add`/`down`, `collect`, the worker's launch, the identity read
+  (`fleetidentity.py read`) and the dispatcher's exchange and archive pulls. A call that fails or times out is the
+  site unread for the tick, exactly as a failed local call: no proof, no retirement. (The exchange runs from the
+  fleet's directory with `env_file` sourced; a pull is a plain `cat`, never prefixed.) A retirement is collect (at the
+  site, into `<fleet>/collected/<member>`), the pull of that copy to `<evidence>/<site>-<member>` here (the manifest
+  first, its SHA-256 checked against collect's, then each file it names against its size and SHA-256, moved in by one
+  rename), `verify-copy` on this host over the pulled copy, and only then `down`; it waits while the ledger holds a
+  lease of its federation that is `reported`, whose archive the dispatcher has not pulled here yet. A lost lease's
+  place at a remote site (`<channel>/<label>/places/lease-<id>/`, on the login node) is fetched over ssh to a private
+  0700 directory here, removed afterwards: `ls` of its snapshots, then each of the newest two as a `tar` stream
+  (extracted with the `data` filter, so a member that is absolute, a link out or a device is refused) and the journal
+  `spend.jsonl`; each snapshot is verified in turn, newest first, and the lease settles at the journal's spend. A call
+  that fails or times out reads nothing that tick: the lease stays charged its grant and is read again next tick, never
+  taken for a place with nothing in it. Nothing of it has run live.
 
 ## The elastic fleet's worker (`fleetworker.py`, `fleetidentity.py`)
 
@@ -1716,7 +1740,7 @@ Step 6 of #462, the Helios-only path of the elastic fleet wired end to end. Noth
   `snapshots/` and `spend.jsonl`. For those the newest snapshot that verifies (each tried in turn, newest first) is
   restored into a private directory on this host with the journal copied beside it, and read as the first form is; the
   directory is removed at the next read and at exit. Where a place holds neither, the lease stays charged its grant.
-- **Not built**: ssh to a remote site (the dispatcher's and the controller's calls are local), `Ledger.drain` refusing
+- **Not built**: `Ledger.drain` refusing
   past a job's end, the watchdog's `--on-out` command, and measured login-memory shares.
 
 `tests/deploy/test_hpc_fleet_dispatch.py`, `test_hpc_fleet_worker.py`, `test_hpc_fleet_worker_launch.py` and

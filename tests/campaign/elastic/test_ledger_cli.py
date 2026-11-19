@@ -1,5 +1,5 @@
-"""`python -m expcore.campaign.elastic`: an operator's `create`, `status` and `raise-ceiling`; the last two run while a
-dispatcher holds the ledger."""
+"""`python -m expcore.campaign.elastic`: an operator's `create`, `status`, `raise-ceiling` and `set-cap`; the last
+three run while a dispatcher holds the ledger."""
 
 import hashlib
 import sqlite3
@@ -160,3 +160,33 @@ def test_c46_create_makes_a_campaigns_ledger_from_its_study_and_refuses_an_exist
     assert main(args) != 0
     assert "already holds a ledger" in capsys.readouterr().err
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+
+
+def test_c42_create_writes_the_starting_caps_and_refuses_a_model_the_study_does_not_plan(
+    tmp_path, capsys, clean_environment
+):
+    """C42: each `--cap MODEL=N` is the model's starting cap (pinned, and in force until a change); a model the study
+    does not plan would cap nothing and is refused with no ledger made, and so are a cap below 1 and a model named
+    twice."""
+    study = make_copy(tmp_path, "study")
+    models = sorted(pricing_of(load_study(study)).models)
+    path = ledger_path(tmp_path)
+    args = ["create", str(path), "--study", str(study), "--hard-term-s", "5400"]
+    assert main([*args, "--cap", "nobody=2"]) == 1
+    assert "does not plan" in capsys.readouterr().err
+    assert not path.exists()
+    for bad in (f"{models[0]}=0", "no-number"):
+        with pytest.raises(SystemExit) as usage:  # a usage error, as argparse ends it
+            main([*args, "--cap", bad])
+        assert usage.value.code == 2
+    assert main([*args, "--cap", f"{models[0]}=1", "--cap", f"{models[0]}=2"]) == 2
+    assert "more than once" in capsys.readouterr().err
+    assert not path.exists()
+    chosen = {model: 2 + index for index, model in enumerate(models[:2])}
+    assert main([*args, *(a for model, cap in chosen.items() for a in ("--cap", f"{model}={cap}"))]) == 0
+    assert "cap" in capsys.readouterr().out
+    reader = LedgerReader(path)
+    try:
+        assert (dict(reader.config.caps), reader.caps(), reader.status().caps) == (chosen, chosen, chosen)
+    finally:
+        reader.close()

@@ -290,12 +290,14 @@ in the process that drives the ledger (the ledger's lock admits one), and keeps 
   `fleet.py down --member`, whose `hpcfed.py down` still refuses evidence not collected and cancels only the ids its up
   recorded. The ledger is checked again just before: drained or proven ended, and no lease issued or sent. The proof
   `cancelled` comes only once the record shows the down verified.
-- **Step 6 (Helios-only, local transport).** The dispatcher ticks in this process, on the ledger the controller holds
-  (the ledger's lock admits one holder), and a joining federation's worker is launched from the controller
-  (`fleetworker.py`, README, "The elastic fleet's worker"), with the identity it joins with and the reader of a lost
-  lease's spend (`fleetidentity.py`). **Not built:** a remote site's transport (ssh to its login node) and the copy back
-  over it, `--time` per up, and the watchdog's command. `fleet.py`'s commands are unchanged; the controller only
-  adds to a fleet `up` made.
+- **Step 6 (Helios, local transport; a remote site over ssh).** The dispatcher ticks in this process, on the ledger the
+  controller holds (the ledger's lock admits one holder), and a joining federation's worker is launched from the
+  controller (`fleetworker.py`, README, "The elastic fleet's worker"), with the identity it joins with and the reader of
+  a lost lease's spend (`fleetidentity.py`). A site with `transport = "ssh"` (`fleetssh.py`) is one remote campaign's:
+  the ledger and the archives stay on this host's local disk and every call at the site is one bounded ssh call whose
+  failure is the site unread; a retirement there is collect, the pull of its copy here, `verify-copy` here, then
+  `down` (README, "A remote site"); a lost lease's place on the login node is fetched over ssh for the spend reader.
+  **Not built:** `--time` per up, and the watchdog's command. `fleet.py`'s commands are unchanged; the controller only adds to a fleet `up` made.
 
 ## 2. Sizing: service steps, control steps, and the node
 
@@ -442,7 +444,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   "command": ["<python>", "-I", "-B", "<.../hpcfed.py>", "--layout", "<path>", "--root", "<root>"],
   "site": {"account": "...", "partition": "...", "images": "...", "logs": "...", "step_path": "...",
            "node_tmp": "/tmp", "node_python": "python3.11", "core_python": "...", "admin_mail": "...",
-           "billing_weight": null, "step_network": "", "study_artifacts": "<directory, or empty>",
+           "billing_weight": null, "step_network": "", "node_domain": "", "study_artifacts": "<directory, or empty>",
            "storage_root": "<scratch root, or empty>"},
   "study_artifacts_tree_sha256": "<64 hex: the digest of that directory's tree, taken in the preflight (section 8); absent without one>",
   "storage": {"root": "<the site's scratch root>", "parent": "<root>/<allocation name>", "token": "<32 hex>",

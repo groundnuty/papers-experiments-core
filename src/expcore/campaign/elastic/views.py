@@ -9,11 +9,13 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign.elastic import caps as cap_table
 from expcore.campaign.elastic import schema
 from expcore.campaign.elastic.ceilings import effective, history
 from expcore.campaign.elastic.config import PRIOR_RUNS, LedgerConfig
 from expcore.campaign.elastic.records import (
     HELD,
+    CapChange,
     Ceiling,
     Ceilings,
     Demand,
@@ -130,7 +132,7 @@ class LedgerViews:
 
     def demand(self) -> Demand:
         """The current set, its pending runs per model, and the cap slots held per model: what a controller's target
-        reads (with `config.caps`)."""
+        reads (with `caps()`)."""
         current = self.db.execute("SELECT MIN(set_index) FROM runs WHERE state='pending'").fetchone()[0]
         rows = self.db.execute(
             "SELECT model, COUNT(*) FROM runs WHERE state='pending' AND set_index=? GROUP BY model", (current,)
@@ -144,6 +146,14 @@ class LedgerViews:
     def ceiling_history(self) -> list[Ceiling]:
         """Every raise of a ceiling, oldest first, with its time, reason and actor."""
         return history(self.db)
+
+    def caps(self) -> dict[str, int]:
+        """The caps in force: the pinned ones, or as changed (`set_cap`)."""
+        return cap_table.effective(self.db, self.config)
+
+    def cap_history(self) -> list[CapChange]:
+        """Every change of a cap, oldest first, with its time, reason and actor."""
+        return cap_table.history(self.db)
 
     def settlements(self) -> list[Settlement]:
         """Every lost lease whose spend was settled, by lease id, with its time and source."""
@@ -184,6 +194,8 @@ class LedgerViews:
             model_ceiling_micro=dict(in_force.per_model_micro),
             model_remaining_micro={m: c - per_model.get(m, 0) for m, c in in_force.per_model_micro.items()},
             ceilings=tuple(self.ceiling_history()),
+            caps=self.caps(),
+            cap_changes=tuple(self.cap_history()),
         )
 
 

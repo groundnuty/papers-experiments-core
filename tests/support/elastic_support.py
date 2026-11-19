@@ -175,8 +175,10 @@ def assert_invariants(ledger: Ledger) -> None:
     for lease in leases:
         assert lease.charge_micro <= lease.grant_micro or lease.state in ("counted", "superseded", "returned")
     slots = Counter(lease.model for lease in leases if lease.slot)
-    for model, cap in cfg.caps.items():
-        assert slots[model] <= cap, f"model {model} holds {slots[model]} slots over its cap {cap}"
+    for model in ledger.caps():
+        # a lowered cap revokes nothing: a model may hold more slots than its cap in force, never than its largest
+        ever = max([cfg.caps.get(model, 0), *(c.new for c in ledger.cap_history() if c.model == model)])
+        assert slots[model] <= ever, f"model {model} holds {slots[model]} slots over its cap {ever}"
     done = Counter(lease.run_key for lease in leases if lease.state == "counted" and lease.completion_state == "done")
     assert all(count == 1 for count in done.values()), "a run counted done twice"
     for run in runs.values():
