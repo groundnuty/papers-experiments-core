@@ -190,7 +190,9 @@ was read before it was rendered, the rendered platform's fingerprint, each pin t
 the egress shim, the egress collector, oneclient's bundle, the REST layout's 443 mapper), and, when the site declares
 `HPC_STUDY_ARTIFACTS`, the digest of that directory's tree (`study_artifacts_tree_sha256`; no path of the directory). A
 manifest that declares `expect_render_identity`, a path
-of the study (`render-identity.expected.json` at its root, say: a federation's record copied there), makes every line
+of the study (`render-identity.expected.json` at its root, say: a federation's record copied there, or a JSON array of
+such records, one for each platform a campaign declares, C50: the step accepts the federation's when it is any one of
+them, and the record it archives below says which), makes every line
 carry `--expect-render-identity REL --expect-render-identity-sha256 HEX` (`plan` and `lines` read the file by the
 guard's path rules, refuse one that is not a well-formed record, and record its hash; with none declared the line and
 the plan are what they were). `step` compares first, before the pre-step guard and before anything else is made: it
@@ -1446,7 +1448,7 @@ def pinned(plan: Plan) -> Plan:
     if plan.expect_render_identity is not None:
         name = expected_identity_name(plan.expect_render_identity)
         raw = read_study_file(plan.study, name, plan.expect_render_identity)
-        parse_render_identity(raw, name)
+        parse_expected_identities(raw, name)
         found["expect_render_identity_sha256"] = hashlib.sha256(raw).hexdigest()
     if plan.home_files is not None:  # a tree the step would refuse refuses `plan` and `lines` first
         if problem := home_files_overlap_problem(plan.home_files, plan.study):
@@ -3607,6 +3609,26 @@ def parse_render_identity(raw: bytes, name: str) -> dict[str, str]:
     return record
 
 
+def parse_expected_identities(raw: bytes, name: str) -> list[dict[str, str]]:
+    """The records an expected render identity file holds, `ShardsError` naming `name` if it holds none: one record
+    (`parse_render_identity`), or a JSON array of at least one, each well formed and each once: the set a campaign
+    declares, one record for each platform its members run on (C50). The error says nothing of the content."""
+    try:
+        found = json.loads(raw, object_pairs_hook=no_duplicate_keys)
+    except (ValueError, RecursionError):
+        raise ShardsError(f"{name} is not a well-formed render identity: it is not JSON") from None
+    if not isinstance(found, list):
+        return [parse_render_identity(raw, name)]
+    if not found:
+        raise ShardsError(f"{name} is not a well-formed set of render identities: it is empty")
+    for index, record in enumerate(found):
+        if problem := identity_problem(record):
+            raise ShardsError(f"{name} is not a well-formed set of render identities: [{index}]: {problem}")
+    if len({canonical_render_identity(record) for record in found}) != len(found):
+        raise ShardsError(f"{name} is not a well-formed set of render identities: a record is in it twice")
+    return found
+
+
 def read_federation_identity(root: str) -> bytes | None:
     """The bytes of the render identity `up` wrote in the federation's root `root`: None when the root holds none, and
     `ShardsError` when it cannot be taken: a root that cannot be opened, is not this user's or can be written by its
@@ -3682,7 +3704,7 @@ def check_render_identity(args: argparse.Namespace) -> bytes | None:
     if hashlib.sha256(raw).hexdigest() != wanted:
         raise StepRefused(f"{name} is not the file the plan hashed")
     try:
-        expected = parse_render_identity(raw, name)
+        expected = parse_expected_identities(raw, name)
         if not root:
             raise ShardsError(
                 f"EXPCORE_FED_ROOT names no federation, so its render identity cannot be compared with {name}"
@@ -3696,9 +3718,12 @@ def check_render_identity(args: argparse.Namespace) -> bytes | None:
         actual = parse_render_identity(held, f"the federation's render identity record ({RENDER_IDENTITY})")
     except ShardsError as error:
         raise StepRefused(str(error)) from None
-    if differing := [key for key in RENDER_IDENTITY_KEYS if expected.get(key) != actual.get(key)]:
+    apart = [[key for key in RENDER_IDENTITY_KEYS if record.get(key) != actual.get(key)] for record in expected]
+    if all(apart):  # C50: a set is met by any one of its records; the nearest names what differs
+        differing = min(apart, key=len)
+        which = "the expected one" if len(expected) == 1 else f"any of the {len(expected)} expected (the nearest)"
         raise StepRefused(
-            f"the federation's render identity is not the expected one ({path}): it differs in {', '.join(differing)}"
+            f"the federation's render identity is not {which} ({path}): it differs in {', '.join(differing)}"
         )
     return canonical_render_identity(actual)
 

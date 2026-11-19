@@ -159,6 +159,7 @@ def create_ledger(
         max_usd=max_usd,
         caps=caps or {},
         grants_usd={model: lease_grant_usd(spec, pricing.limits) for model, spec in pricing.models.items()},
+        platforms=loaded.campaign.platform_fingerprints,
     )
     declared = {model: spec.accepted_fingerprints for model, spec in pricing.models.items()}
     Ledger.create(path, runs, config, clock=time.time, declared=declared).close()
@@ -193,6 +194,8 @@ def _status(args: argparse.Namespace) -> int:
     reader = LedgerReader(args.ledger)
     try:
         print(format_status(reader.status()))
+        for platform, environment in sorted(reader.platform_environments().items()):  # C50: one pin per platform
+            print(f"platform {platform}: environment {environment}")
     finally:
         reader.close()
     return 0

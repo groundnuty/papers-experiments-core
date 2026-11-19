@@ -6,6 +6,7 @@ The file is validated when it is loaded, with messages that name the file and th
     order_seed = 20260101         # the seed of the run order (C08)
     seeds = [1, 2]                # the integer seeds of the plan
     models = ["model-a", "model-b"]   # model keys of models.toml
+    platform_fingerprints = ["<64 hex>", "<64 hex>"]   # optional: the members' platforms it accepts (C50)
 
     [agent]                       # the loop's caps for every run
     max_tool_rounds = 8
@@ -42,6 +43,11 @@ sum, at least 2, and `run --shard i/N` must give that N. Each such shard runs on
 models on one unit are that unit's concurrent runs: a sum above the unit's `[scheduler.unit_caps]` cap is refused. The
 layout is in the campaign's caps, so in the fingerprint every shard shares; without the table nothing changes.
 
+`platform_fingerprints` declares the platforms a campaign's members may run on, each by the SHA-256 of its
+fingerprint (`StudyPlugin.platform`, the `platform` a member's identity read prints): the campaign
+fingerprint then holds the sorted set in the platform's place, and a start on another platform is refused
+(`study.declared_platforms`, C50).
+
 An `[agent]` that gives no ceiling has one of 3 times `time_cap_s`. The ceiling bounds a run's whole time, waits on
 infrastructure included, and a platform that mints tokens for a run lives them as long as it (study guide, "Caps on a
 run's time"). It is in the campaign's caps, so in the fingerprint: another ceiling is another experiment.
@@ -49,6 +55,7 @@ run's time"). It is in the campaign's caps, so in the fingerprint: another ceili
 
 import dataclasses
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -61,7 +68,18 @@ from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.config.models import Limits
 from expcore.loop.config import MALFORMED_POLICIES, AgentConfig
 
-_TOP_KEYS = ("order_seed", "seeds", "models", "agent", "scheduler", "budget", "endpoints", "shards")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_TOP_KEYS = (
+    "order_seed",
+    "seeds",
+    "models",
+    "agent",
+    "scheduler",
+    "budget",
+    "endpoints",
+    "shards",
+    "platform_fingerprints",
+)
 _AGENT_KEYS = ("max_tool_rounds", "time_cap_s", "token_budget", "output_cap_chars", "max_output_tokens")
 _CEILING_KEYS = ("ceiling_s", "ceiling_factor")  # optional, and at most one of them
 # The key the per-call bound had before its scope was fixed (L17): it capped every tool call, the code tool's too, which
@@ -104,6 +122,7 @@ class CampaignConfig:
     scheduler: SchedulerConfig
     endpoints: Mapping[str, Endpoint] = field(default_factory=dict)
     shards: ModelShards | None = None  # `[shards] per_model`: shard by model first (C32)
+    platform_fingerprints: tuple[str, ...] = ()  # the members' platforms, sorted; empty: the platform's own (C50)
 
     def caps(self) -> dict[str, Any]:
         """The campaign-wide caps as plain data, for the fingerprint: the loop's, the attempt limit and the budget, and
@@ -283,4 +302,20 @@ def load_campaign(path: str | os.PathLike[str]) -> CampaignConfig:
         scheduler=scheduler,
         endpoints=endpoints,
         shards=_shards(root, models, scheduler, endpoints),
+        platform_fingerprints=_platforms(root),
     )
+
+
+def _platforms(root: Section) -> tuple[str, ...]:
+    """`platform_fingerprints`: at least one SHA-256 (64 lower-case hex digits), each once, sorted; none when absent."""
+    found = root.strings("platform_fingerprints")
+    if "platform_fingerprints" in root.data and not found:
+        raise root.fail(
+            "platform_fingerprints", "must list at least one platform fingerprint; leave it out to declare none"
+        )
+    for value in found:
+        if not _HEX64.fullmatch(value):
+            raise root.fail("platform_fingerprints", "must hold SHA-256 digests, 64 lower-case hex digits each")
+    if len(set(found)) != len(found):
+        raise root.fail("platform_fingerprints", "lists a platform fingerprint more than once")
+    return tuple(sorted(found))

@@ -15,6 +15,7 @@ from expcore.campaign.elastic.control import Join, Settle, SiteSettings
 
 FINGERPRINT = "f" * 64
 IDENTITY = {"layout": "a" * 64, "platform": "b" * 64}
+PLATFORM = "c" * 64  # C50: the federation's own platform fingerprint, as a read prints it
 
 
 @pytest.fixture(scope="module")
@@ -146,11 +147,11 @@ def test_the_identity_is_read_beside_the_federations_own_platform_file_by_the_ma
         seen.update(
             argv=list(argv), env=dict(kwargs["env"]), cwd=kwargs["cwd"], platform=(copy / "platform.toml").read_text()
         )
-        out = json.dumps({"fingerprint": FINGERPRINT, "environment": IDENTITY})
+        out = json.dumps({"fingerprint": FINGERPRINT, "environment": IDENTITY, "platform": PLATFORM})
         return subprocess.CompletedProcess(argv, seen.get("code", 0), out, "")
 
     found = deploy.fleetidentity.read_identity(fleet, "fed-1", settings, runner)
-    assert found == (FINGERPRINT, IDENTITY)
+    assert found == (FINGERPRINT, IDENTITY, PLATFORM)
     assert seen["argv"][:4] == ["/venv/bin/python", "-I", "-B", "-c"]
     assert seen["platform"] == '[space]\nname = "s"\n'
     allowed = {"PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT", "TMPDIR"}
@@ -185,7 +186,7 @@ def test_the_read_command_prints_the_one_json_line_the_controller_of_an_ssh_site
     deploy.fleetrecord.Record(fleet).save(record)
 
     def runner(argv, **kwargs):
-        out = json.dumps({"fingerprint": FINGERPRINT, "environment": IDENTITY})
+        out = json.dumps({"fingerprint": FINGERPRINT, "environment": IDENTITY, "platform": PLATFORM})
         return subprocess.CompletedProcess(argv, 0, out, "")
 
     words = ["read", "--fleet", str(fleet), "--settings", str(settings)]
@@ -200,7 +201,7 @@ def test_the_read_command_prints_the_one_json_line_the_controller_of_an_ssh_site
         def run(self, site, argv, timeout):
             return 0, printed, ""
 
-    assert deploy.fleetidentity.read_identity_remote(Said(), config, "fed-1") == (FINGERPRINT, IDENTITY)
+    assert deploy.fleetidentity.read_identity_remote(Said(), config, "fed-1") == (FINGERPRINT, IDENTITY, PLATFORM)
     assert deploy.fleetidentity.main([*words, "--member", "fed-9"], runner) == 1
     assert capsys.readouterr().out == ""
 
@@ -227,3 +228,26 @@ def test_a_lost_leases_store_is_found_in_its_channel_and_failing_that_in_the_pul
     assert locate(config, gone) == (channel, "root")  # its channel outlives it: still read first
     shutil.rmtree(channel.parents[2])
     assert locate(config, gone) == (pulled, "pulled")  # the channel's place gone: the copy pulled at its retirement
+
+
+def test_c50_the_read_program_of_an_earlier_core_prints_no_platform_and_does_not_fail(deploy, tmp_path):
+    """C50 (Codex round 1): the program the read runs in the study's Python falls back to `campaign_identity` where
+    the core has no `campaign_member_identity`, printing a null platform, so a campaign that declares none still
+    joins."""
+    import sys
+
+    core = tmp_path / "earlier-core"
+    (core / "expcore" / "study").mkdir(parents=True)
+    (core / "expcore" / "campaign").mkdir(parents=True)
+    for package in ("expcore", "expcore/study", "expcore/campaign"):
+        (core / package / "__init__.py").write_text("")
+    (core / "expcore" / "campaign" / "manifest.py").write_text("def fingerprint_sha256(f):\n    return 'f' * 64\n")
+    (core / "expcore" / "study" / "pipeline.py").write_text(
+        "def campaign_identity(path):\n    return {'a': 1}, {'layout': 'b' * 64}\n"
+    )
+    done = subprocess.run([sys.executable, "-B", "-c", deploy.fleetidentity.PROGRAM, str(tmp_path)], cwd=str(tmp_path),
+                          env={"PYTHONPATH": str(core), "PATH": "/usr/bin:/bin"}, capture_output=True, text=True,
+                          check=False)  # fmt: skip
+    assert done.returncode == 0, done.stderr
+    said = json.loads(done.stdout.strip().splitlines()[-1])
+    assert deploy.fleetidentity.said_identity(said) == ("f" * 64, {"layout": "b" * 64}, None)

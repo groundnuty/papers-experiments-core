@@ -31,6 +31,15 @@ from expcore.campaign.elastic.records import (
 from expcore.campaign.elastic.settling import read as read_settlements
 
 _LEASE_SQL = "SELECT l.*, f.ended_at AS fed_ended FROM leases l JOIN federations f ON f.label = l.federation"
+# The meta key of the environment pinned at the first join: one for the campaign, or with declared platforms (C50) one
+# for each, under this prefix and the platform's SHA-256.
+ENVIRONMENT_KEY = "environment"
+ENVIRONMENT_PREFIX = ENVIRONMENT_KEY + ":"
+
+
+def environment_key(platform: str | None) -> str:
+    """Where the first join pins the environment: the campaign's one key, or the platform's own (C50)."""
+    return ENVIRONMENT_KEY if platform is None else ENVIRONMENT_PREFIX + platform
 
 
 class LedgerViews:
@@ -42,6 +51,12 @@ class LedgerViews:
     def _meta(self, key: str) -> str | None:
         row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return None if row is None else row[0]
+
+    def platform_environments(self) -> dict[str, str]:
+        """Each declared platform's environment digest as its first join pinned it (C50); empty without a set or before
+        a join on it."""
+        rows = self.db.execute("SELECT key, value FROM meta WHERE key LIKE ?", (ENVIRONMENT_PREFIX + "%",))
+        return {key[len(ENVIRONMENT_PREFIX) :]: value for key, value in rows}
 
     def committed_micro(self) -> tuple[int, dict[str, int]]:
         """What the budget counts: every lease's charge, in micro-dollars, in total and per model."""
