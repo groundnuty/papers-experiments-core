@@ -6,6 +6,7 @@ import time
 
 import pytest
 from apptainer_support import make_settings, start
+from cell_bound_live import NEXT_LINE, problems, run_scenario
 from cgroup_v1_support import OWN, v1_host
 from fake_node import FakeNode, Unrecorded
 from loop_support import CellBoundContext
@@ -382,3 +383,25 @@ def test_l18_under_the_study_s_cell_limit_a_cell_killed_at_it_is_told_and_the_ne
     node.cell_handler = lambda cell: CmdResult(0, "next\n", "")
     after = asyncio.run(tool.execute("python", {"code": "print('next')"}, timeout_s=30, ctx=NO_WAITS))
     assert (after.is_error, after.text) == (False, "next\n")
+
+
+def test_l18_the_live_scenario_runs_over_the_apptainer_sandbox_on_its_fake_node(node, box):
+    """L18, O34: the scenario of the live proof (tests/support/cell_bound_live.py) over the real Apptainer sandbox on
+    its fake node: the first cell is killed by the harness's timer at the 2 s bound, the next cell runs, and the facts
+    have no problem. The independent look at the node's processes is scripted here; on a node it is `ps`."""
+    looks = []
+
+    def look():
+        looks.append(1)
+        return ["101 python marker", "102 python marker"] if len(looks) == 1 else []
+
+    def cells(cell):
+        if "cell started" in cell.program:
+            _until_dead(cell.procs[1])
+            return CmdResult(137, "cell started\n", "")
+        return CmdResult(0, f"{NEXT_LINE}\n", "")
+
+    node.cell_handler = cells
+    facts = run_scenario(box, look, bound_s=2.0, look_for_s=5)
+    assert problems(facts) == []
+    assert facts["deadline"]["outcome"] == DL.KILLED

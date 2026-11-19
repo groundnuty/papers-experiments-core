@@ -157,6 +157,26 @@ def test_c43_observe_reads_members_jobs_nodes_and_quota_and_asks_slurm_only_of_i
     assert sorted(call[4] for call in site.calls if call[0] == "scontrol") == ["41", "42", "43", "44", "45"]
 
 
+def test_c54_observe_says_which_member_a_down_could_not_sweep_and_the_controller_takes_it_down_no_more(
+    deploy, tmp_path, site
+):
+    """C54: a member whose down could not sweep a node of it (its kept state records `unswept`) reads `unswept`, so
+    the controller retires it no more and leaves it to an operator's explicit down; one whose down failed otherwise
+    reads nothing of it and is taken down again."""
+    for label in ("fed-1", "fed-2"):
+        site.add_member(label, status="down-failed", phase="down")
+    root = site.deploy.fleetrecord.root_of(site.fleet, "fed-1")
+    state = site.deploy.hpcstate.load(root)
+    site.deploy.hpcstate.save(root, {**state, "unswept": ["the agent's node"]})
+    members = {m["label"]: m for m in observed(site)["members"]}
+    assert members["fed-1"]["unswept"] is True
+    assert "unswept" not in members["fed-2"]
+    bench = Bench(tmp_path, deploy, [site])
+    assert bench.tick() == 0
+    downs = [c for c in site.commands if "down" in c]
+    assert [c[c.index("--member") + 1] for c in downs] == ["fed-2"]
+
+
 @pytest.mark.parametrize("broken", ["scontrol", "sinfo", "state"])
 def test_c43_a_read_that_fails_anywhere_fails_whole_and_the_site_is_dark(deploy, tmp_path, site, broken):
     """C43: a job read that times out, sinfo failing, or a job state the controller does not read makes the whole
@@ -385,7 +405,8 @@ def test_c43_with_every_model_at_its_cap_idle_federations_are_drained_then_taken
 def test_c43_todays_fleet_commands_are_unchanged_and_the_controllers_calls_are_theirs(deploy, tmp_path, monkeypatch):
     """C43: fleet.py keeps exactly today's commands; the controller's add and down are those commands' own argv
     (`--fleet F add K`, `--fleet F down --member fed-k`), parsed by fleet.py's own parser, and its collect and
-    verify-copy are shards.py's."""
+    verify-copy are shards.py's. C54: the controller's down never carries `--node-checked`, which is the operator's
+    word alone."""
     assert deploy.fleet.COMMANDS == ("up", "add", "plan", "step", "step-stop", "status", "down")
     settings = SiteSettings("site-a", 7, 1e12, 47.0)
     config_ = deploy.fleetexecute.SiteConfig(settings, tmp_path / "fleet")
@@ -395,14 +416,17 @@ def test_c43_todays_fleet_commands_are_unchanged_and_the_controllers_calls_are_t
     assert add[3].endswith("fleet.py")
     assert list(add[4:]) == ["--fleet", str(tmp_path / "fleet"), "add", "2"]
     assert list(retire[-1][4:]) == ["--fleet", str(tmp_path / "fleet"), "down", "--member", "fed-3"]
+    assert not any("--node-checked" in step for step in retire)
     assert [step[4] for step in retire[:2]] == ["collect", "verify-copy"]
     seen = []
     monkeypatch.setattr(deploy.fleet.Fleet, "add", lambda self, count: seen.append(("add", count)) or 0)
-    monkeypatch.setattr(deploy.fleet.Fleet, "down", lambda self, only: seen.append(("down", only)) or 0)
+    monkeypatch.setattr(
+        deploy.fleet.Fleet, "down", lambda self, only, checked=None: seen.append(("down", only, checked)) or 0
+    )
     hooks = SimpleNamespace()
     for argv in (add[4:], retire[-1][4:]):
         assert deploy.fleet.main(list(argv), {}, hooks) == 0
-    assert seen == [("add", 2), ("down", "fed-3")]
+    assert seen == [("add", 2), ("down", "fed-3", None)]
 
 
 # ------------------------------------------------------------------------------------------------ the additions

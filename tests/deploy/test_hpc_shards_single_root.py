@@ -576,7 +576,7 @@ def _stopped_rig(hpc, tmp_path, site):
 def _gated(rig, **options):
     """The state after down's gate: down is stopped right after it, so that the gate is all that is run."""
 
-    def stopped():
+    def stopped(node_checked=None):
         raise RuntimeError("stopped for the test, after the gate")
 
     rig.driver.take_down = stopped

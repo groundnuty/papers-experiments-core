@@ -877,6 +877,14 @@ class Slurm:
             raise SlurmError("refusing to cancel something that is not one step id")
         self._call(["scancel", step_id])
 
+    def term_step(self, step_id: str) -> None:
+        """Send TERM to one step's processes by its id, without cancelling it: on the site a step's cancel was an
+        outright kill, no trap run (K1), and a step's own TERM cleanup (the worker's removal of its directory) runs
+        only on a signal it is sent."""
+        if not STEP_ID.fullmatch(step_id):
+            raise SlurmError("refusing to signal something that is not one step id")
+        self._call(["scancel", "--signal=TERM", step_id])
+
     def step_status(self, job: str, name: str) -> Optional[int]:
         """A finished step's exit status, by its name, from the accounting; None when it is not recorded."""
         done = self.runner.run(["sacct", "-j", job, "-n", "-P", "-o", "JobID,JobName,ExitCode"], self.command_timeout_s)

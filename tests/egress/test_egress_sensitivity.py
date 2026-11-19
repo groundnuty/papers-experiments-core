@@ -139,3 +139,19 @@ def test_a_rerun_the_kernel_refuses_keeps_the_primary_and_says_why(prereg, monke
     done = egress_analysis(runs_for(rows, lambda i: outside() if i == 0 else clean()), rows, [], prereg)
     assert done.sensitivity is None
     assert done.refused == "a treatment attempt's outcome is None"
+
+
+def test_the_rerun_keeps_a_package_index_only_run_and_leaves_out_an_outside_one(prereg):
+    """O95: under declared indexes, a run whose only hit is a plain `pip install` is kept; an outside connection is
+    still left out, whatever its code installed."""
+    rows = rows_of_pairs(4)
+    runs = [
+        (record(run_key=row.run_key, instruments=outside() if i == 0 else clean(), cells=["!pip install pandas"]),
+         row.condition)
+        for i, row in enumerate(rows)
+    ]  # fmt: skip
+    done = egress_analysis(runs, rows, [], prereg, package_indexes=["pypi.org"])
+    assert [run.run_key for run in done.flagged] == [rows[0].run_key]
+    assert done.sensitivity.contrast("a-vs-b").n_pairs == 3
+    assert done.counts()["package_index"] == len(rows)
+    assert "package_index" not in egress_analysis(runs, rows, [], prereg).counts()

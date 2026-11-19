@@ -232,6 +232,8 @@ def member_view(directory: Path, member: Mapping[str, Any], slurm: Slurm, wall: 
     view.update(jobs=sorted(set(jobs.values())), linked=(state or {}).get("phase") == LINKED)
     view["verified"] = bool(state) and verified(state)
     view["relay"], view["relay_beat_at"] = relay_view(root, state, slurm.runner, wall)
+    if (state or {}).get("unswept"):  # C54: a down could not sweep a node of it: never taken down again by itself
+        view["unswept"] = True
     return {**view, **combined(views)}
 
 
