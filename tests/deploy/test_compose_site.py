@@ -601,6 +601,33 @@ def test_c53_two_campaigns_on_one_host_never_run_two_workers_on_one_federation(d
         second.close()
 
 
+def test_c53_a_worker_that_holds_no_claim_keeps_another_campaign_off_its_federation(deploy, vm, tmp_path):
+    """C53: a worker launched before claims existed holds none: another campaign reads its federation free and joins,
+    but its launch finds that worker on the root and refuses, so no second worker starts there."""
+    clock = FakeClock(time.time())
+    first = new_ledger(tmp_path, clock)
+    other = campaign(vm, "c")
+    second = Ledger.create(tmp_path / "out-c" / "ledger.sqlite", plan(tasks=1), config(), clock=clock)
+    try:
+        tick(deploy, vm, first, clock)
+        (vm.roots["fed-1"] / deploy.site.rootclaim.CLAIM).unlink()  # as a launch before claims left it
+        tick_as(deploy, vm, other, second, clock)
+        assert not (other.fleet / "members" / "fed-1" / "worker.json").exists()
+        assert "site-a-fed-1" not in {f.label for f in second.federations()}
+    finally:
+        for path in other.fleet.glob("members/*/worker.json"):
+            deploy.site.stop_tagged(json.loads(path.read_text(encoding="utf-8"))["tag"], 0.0)
+        second.close()
+
+
+def test_c53_a_compose_site_takes_no_shared_site_file(deploy, vm):
+    """C53: a Compose site's members are shared through their roots' claims: a shared maximum for it is refused."""
+    text = (vm.tmp / "sites.toml").read_text(encoding="utf-8")
+    (vm.tmp / "sites.toml").write_text(text + f'shared_site_file = "{vm.tmp / "shared.json"}"\n', encoding="utf-8")
+    with pytest.raises(deploy.control.ConfigError, match="takes no shared_site_file"):
+        deploy.control.load_config(vm.tmp / "sites.toml")
+
+
 def test_site_labels_one_of_which_begins_with_another_and_a_dash_are_refused(deploy, vm):
     """`a-b`'s member `c` and `a`'s member `b-c` would be one ledger label: such sites never share a sites file."""
     text = (vm.tmp / "sites.toml").read_text(encoding="utf-8")

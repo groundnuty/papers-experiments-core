@@ -135,6 +135,9 @@ def test_c53_waiting_is_leases_wanted_less_free_federations_and_a_shared_cap_alo
     shared = SharedCaps((core, other), {"m1": 2})
     shared.refresh()
     assert waiting_of(core, clock(), shared, own_slots={}).count == 0  # the other ledger holds both shared slots
+    outside = SharedCaps((other,), {"m1": 2})
+    outside.refresh()
+    assert waiting_of(core, clock(), outside, own_slots={}).count == 3  # not a sibling: its own caps alone
     shared.siblings = (core, tmp_path / "gone.sqlite")
     shared.refresh()
     assert waiting_of(core, clock(), shared, own_slots={}).count == 3  # a sibling unread: its own caps alone

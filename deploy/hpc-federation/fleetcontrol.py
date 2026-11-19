@@ -199,6 +199,8 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
             raise ConfigError(f"site {settings.label}: {', '.join(SSH_ONLY_KEYS)} belong to an ssh site")
         config = private_file(own["ssh_config"], f"site {settings.label}: ssh_config") if "ssh_config" in own else None
         if "shared_site_file" in own:
+            if compose is not None:  # its static members are shared through their roots' claims, never a maximum
+                raise ConfigError(f"site {settings.label}: a Compose site takes no shared_site_file")
             site_files[settings.label] = own["shared_site_file"]
         sites.append(SiteConfig(settings, fleet, own.get("transport", "local"), python, deploy, channel, host,
                                 env_file, shard_settings, prepare, compose, config))  # fmt: skip

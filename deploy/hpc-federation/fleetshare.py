@@ -91,7 +91,7 @@ def sharing_of(table: Mapping[str, Any], site_files: Mapping[str, Any], dispatch
     for label, value in site_files.items():
         if not isinstance(value, str) or not os.path.isabs(value):
             raise ValueError(f"site {label}: shared_site_file must be an absolute path on this host")
-        files[label] = Path(os.path.normpath(value))
+        files[label] = Path(os.path.realpath(value))  # one lock file whatever link names it
     if len({os.path.realpath(p) for p in files.values()}) != len(files):
         raise ValueError("two sites name one shared_site_file: each site's file is its own")
     return Sharing(siblings, dict(caps), defer, files)
@@ -152,7 +152,12 @@ def locked(path: Path, timeout_s: float = LOCK_TIMEOUT_S) -> Iterator[None]:
 
 
 def _number(value: Any, whole: bool) -> bool:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        if not math.isfinite(value) or value < 0:
+            return False
+    except OverflowError:  # an integer too large for a float
         return False
     return isinstance(value, int) if whole else True
 
@@ -277,7 +282,8 @@ def decide(now: float, views: Any, reads: Sequence[Tuple[Any, Any]], busy: froze
         shared.refresh()
         extra["shared_caps"] = shared.state()
         if shared.unread != state.unread:
-            say(f"fleetshare: {len(shared.unread)} sibling ledger(s) not read: their shared models issue nothing")
+            say(f"fleetshare: {len(shared.unread)} sibling ledger(s) not read: their shared models issue nothing"
+                if shared.unread else "fleetshare: every sibling ledger read again")  # fmt: skip
             state.unread = shared.unread
     view = ledger_view(views)
     defer = deferral(now, sharing, views) if sharing.defer_to else None

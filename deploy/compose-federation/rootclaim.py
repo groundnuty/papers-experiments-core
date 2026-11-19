@@ -7,7 +7,8 @@ claim lock, before the worker starts, and refuses a root another site directory 
 site directory the members naming one root keep their own rules (`composesite.root_holder`, `observe`'s order). Only
 `retired` releases it, for the member that holds it (after the worker is proven gone and its evidence collected), or a
 launch whose worker ended at once with nothing of it left. `observe` reads a root another campaign claims as `down`:
-not joinable, not counted. A claim that cannot be read is another campaign's: fail closed. A campaign that never
+not joinable, not counted. A claim that cannot be read is another campaign's: fail closed. A root with no claim but a
+worker on it (launched before claims existed: `composesite.workers_on`) refuses a launch too. A campaign that never
 retires its member (its controller is gone for good) holds the root until its operator removes the claim. Root
 evidence is an allow-list, so the claim is never archived.
 """

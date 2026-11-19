@@ -167,6 +167,26 @@ def names_run(cmdline: bytes, run: str) -> bool:
     return any(word in (f"{run}/study", f"{run}/work") or lease.fullmatch(word) for word in words)
 
 
+def workers_on(root: Path) -> list[int]:
+    """Every process of this user that is a Compose worker's on the root, of any campaign: its environment carries a
+    worker tag and the root (`worker_env`). What a launch reads where the root holds no claim (C53): a worker
+    launched before claims existed holds none."""
+    tag, here = f"{WORKER_TAG}=".encode(), f"EXPCORE_FED_ROOT={root}".encode()
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.stat().st_uid != os.getuid() or start_tick(int(entry.name)) is None:
+                continue
+            words = (entry / "environ").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if here in words and any(word.startswith(tag) for word in words):
+            found.append(int(entry.name))
+    return found
+
+
 def worker_gone(record: dict) -> bool:
     """The proof of a worker's end: its own process (pid and start tick) is not running, and no process of this user
     is the worker's (`tagged`)."""
@@ -515,6 +535,8 @@ def launch(args: argparse.Namespace) -> int:
             raise SiteError(f"{args.member}: the worker of {holder} still runs on its root; one worker per federation")
         if rootclaim.elsewhere(root, fleet):
             raise SiteError(f"{args.member}: another campaign's member holds its federation; one worker per federation")
+        if rootclaim.holder(root) is None and workers_on(root):
+            raise SiteError(f"{args.member}: a worker with no claim runs on its federation; one worker per federation")
         if record is not None:
             raise SiteError(f"{args.member}: its worker of this campaign ended; it is retired, never started again")
         if not live(root, project_of(root)) or not (root / PLATFORM).is_file():

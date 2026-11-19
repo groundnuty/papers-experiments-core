@@ -33,7 +33,7 @@ from expcore.campaign.elastic.records import Lease, Wait
 from expcore.campaign.elastic.views import LedgerReader, LedgerViews
 
 READ_TIMEOUT_S = 2.0
-UNREADABLE = (OSError, sqlite3.Error, ValueError, KeyError)  # what a read of another ledger may raise: it is unread
+UNREADABLE = (OSError, sqlite3.Error, ValueError, KeyError, TypeError)  # a read of another ledger that fails: unread
 
 
 def identity(path: Path) -> str:
@@ -186,10 +186,11 @@ def waiting_of(
     timeout_s: float = READ_TIMEOUT_S,
 ) -> Waiting:
     """How many of the ledger's runs at `path` wait for capacity now (the module's docstring), read in one read-only
-    transaction. With `shared` (this controller's shared caps) read whole, each shared model of that ledger is also
-    held to what the shared cap leaves of every ledger's slots (`own_slots`, this controller's own, and each
-    sibling's), so a ledger held back by a shared cap alone does not read as waiting. Raises what an unreadable ledger
-    raises (`UNREADABLE`)."""
+    transaction. When that ledger is one of this controller's siblings and `shared` (its shared caps) was read whole,
+    each shared model of that ledger is also held to what the shared cap leaves of every ledger's slots (`own_slots`,
+    this controller's own, and each sibling's), so a ledger held back by a shared cap alone does not read as waiting;
+    a ledger outside the sharing is read under its own caps alone. Raises what an unreadable ledger raises
+    (`UNREADABLE`)."""
     reader = ReadOnlyLedger(path, timeout_s)
     try:
         reader.db.execute("BEGIN")
@@ -199,8 +200,8 @@ def waiting_of(
             reader.db.execute("COMMIT")
     finally:
         reader.close()
-    if shared is not None and not shared.unread:
-        view = dataclasses.replace(view, caps=_held_to_shared(view.caps, view.demand.slots, path, shared, own_slots))
+    if shared is not None and not shared.unread and identity(path) in shared.by_sibling:
+        view = dataclasses.replace(view, caps=_held_to_shared(view.caps, view.demand.slots, shared, own_slots))
     free = sum(
         1
         for fed in view.federations.values()
@@ -212,15 +213,12 @@ def waiting_of(
 def _held_to_shared(
     caps: Mapping[str, int],
     slots: Mapping[str, int],
-    path: Path,
     shared: SharedCaps,
     own_slots: Mapping[str, int] | None,
 ) -> dict[str, int]:
-    """A ledger's caps with each shared model held to its own slots plus what the shared cap leaves of all slots."""
+    """A sibling's caps with each shared model held to its own slots plus what the shared cap leaves of all slots."""
     out = dict(caps)
     counted: Iterable[Mapping[str, int]] = [*shared.by_sibling.values(), own_slots or {}]
-    if identity(path) not in shared.by_sibling:
-        counted = [*counted, slots]
     for model, cap in shared.caps.items():
         total = sum(each.get(model, 0) for each in counted)
         held = slots.get(model, 0) + max(cap - total, 0)
