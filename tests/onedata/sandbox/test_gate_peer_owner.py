@@ -115,7 +115,11 @@ def write_answer(world, port) -> int:
 def bytes_from(port, send=b"") -> bytes:
     """Everything a raw client receives from a listener before it closes: a refused connection gives none."""
     got = b""
-    with socket.create_connection(("127.0.0.1", port), timeout=10) as raw:
+    try:
+        raw = socket.create_connection(("127.0.0.1", port), timeout=10)
+    except (ConnectionResetError, ConnectionAbortedError):
+        return got  # the gate's reset arrived before connect() returned (seen under load): refused, nothing received
+    with raw:
         raw.settimeout(10)
         if send:
             with contextlib.suppress(OSError):  # the gate may have reset it already
