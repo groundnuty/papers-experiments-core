@@ -189,6 +189,8 @@ def _status(args: argparse.Namespace) -> int:
     reader = LedgerReader(args.ledger)
     try:
         print(format_status(reader.status()))
+        for platform, environment in sorted(reader.platform_environments().items()):  # C50: one pin per platform
+            print(f"platform {platform}: environment {environment}")
     finally:
         reader.close()
     return 0

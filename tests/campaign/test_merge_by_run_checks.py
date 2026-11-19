@@ -131,3 +131,57 @@ def test_c45_without_a_budget_an_unsettled_lost_lease_makes_the_spend_unknown(tm
     totals = spend_micro(facts, [], [Evidence(row, "expired", None)])
     assert totals[None] is None
     assert totals[row.model] is None
+
+
+# -- C50: with declared platforms, the environment is compared within each platform --------------------------------
+
+APPTAINER, DOCKER = "a" * 64, "d" * 64
+ENV_HPC, ENV_VM = {"layout": "1" * 64}, {"layout": "2" * 64}
+
+
+def two_platforms(tmp_path: Path):
+    """A ledger declaring two platforms, with an HPC federation and a VM one joined (their environments pinned) and a
+    lease issued on each: the facts and the two leases."""
+    from expcore.campaign.merge_by_run import environment_digest
+
+    ledger, clock = make(tmp_path, plan(tasks=2), platforms=(APPTAINER, DOCKER))
+    for label, platform, environment in (("fed-hpc", APPTAINER, ENV_HPC), ("fed-vm", DOCKER, ENV_VM)):
+        ledger.join(label, site=SITE, job_ids=(f"job-{label}",), job_end_at=clock() + 86_400.0,
+                    fingerprint=ledger.config.fingerprint, environment=environment_digest(environment),
+                    kill_wait_s=180.0, platform=platform)  # fmt: skip
+    on_hpc, on_vm = leased(ledger, "fed-hpc"), leased(ledger, "fed-vm")
+    facts = facts_of(tmp_path, ledger.path)
+    ledger.close()
+    return facts, on_hpc, on_vm
+
+
+def store_on(lease, environment) -> LeaseStore:
+    run = RunLease(lease.run_key, lease.lease_id, 0, 0, "0" * 64, "2099-01-01T00:00:00Z")
+    here = Path(".")
+    return LeaseStore(here, here, "", run, "", environment, {}, {lease.run_key: {}}, {lease.run_key: "done"})
+
+
+def test_c50_the_merge_accepts_two_platforms_stores_each_with_its_platforms_environment(tmp_path):
+    from expcore.campaign.merge_by_run import check_platform_environments
+
+    facts, on_hpc, on_vm = two_platforms(tmp_path)
+    check_platform_environments([store_on(on_hpc, ENV_HPC), store_on(on_vm, ENV_VM)], facts)
+
+
+@pytest.mark.parametrize("vm_environment", [ENV_HPC, {"layout": "3" * 64}])
+def test_c50_the_merge_refuses_a_store_whose_environment_is_not_its_platforms_pin(tmp_path, vm_environment):
+    """C50: a VM store that ran against the HPC environment, or another one, is not its platform's: refused."""
+    from expcore.campaign.merge_by_run import check_platform_environments
+
+    facts, on_hpc, on_vm = two_platforms(tmp_path)
+    with pytest.raises(MergeRefused, match="first join on its platform"):
+        check_platform_environments([store_on(on_hpc, ENV_HPC), store_on(on_vm, vm_environment)], facts)
+
+
+def test_c50_the_merge_refuses_two_stores_of_one_platform_whose_environments_differ(tmp_path):
+    from expcore.campaign.merge_by_run import check_platform_environments
+
+    facts, on_hpc, _ = two_platforms(tmp_path)
+    other = store_on(on_hpc, {"layout": "4" * 64})
+    with pytest.raises(MergeRefused, match="another environment than"):
+        check_platform_environments([store_on(on_hpc, ENV_HPC), other], facts)

@@ -8,9 +8,15 @@ fleet's shard settings, `fleetplan.read_settings`).
   beside it, as a shard step places it, and the manifest's Python (`-I -B`, an environment of the allowlist and a home
   of its own) asks the core for what a start there pins (`expcore.study.pipeline.campaign_member_identity`): the
   fingerprint (hashed as the lease's `campaign_sha256` is), the environment identity a lease store pins, whose digest
-  the ledger pins at its first join, and the SHA-256 of the federation's own platform fingerprint, which a campaign
-  that declares its platforms admits or refuses (C50). A read that fails is None (the join waits and is decided
-  again), never a guess; a read that worked is kept for the member.
+  the ledger pins at its first join (on its platform, with declared platforms), and the SHA-256 of the federation's
+  own platform fingerprint, which a campaign that declares its platforms admits or refuses (C50). A read that fails
+  is None (the join waits and is decided again), never a guess; a read that worked is kept for the member.
+- **The read's contract**, for every site kind's read (one JSON line): `fingerprint` (the campaign fingerprint's
+  SHA-256), `environment` (the identity, names to digests) and `platform`, the SHA-256 of the member's platform
+  fingerprint as `expcore.study.declared_platforms.own_sha256` takes it: the value its root's `render-identity.json`
+  holds as `platform_fingerprint_sha256` (`hpcidentity.fingerprint_sha256_of`, the same hash of the same
+  fingerprint). A read with no `platform` (an earlier core) joins a campaign that declares none, and is refused by
+  one that declares its platforms.
 - `locator(evidence)`: `(site, Settle) -> (out/, source)` or None, for `fleetexecute.dead_store_reader`: the lost
   lease's store as a place `lease-<id>/` holds it (`PLACES`): in the federation's channel on the site's shared file
   system (`root`, whatever the member's root: the channel is outside it and outlives the member's down, and at a settle

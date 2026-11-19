@@ -82,3 +82,43 @@ def test_c50_each_run_of_a_batch_merged_by_run_names_the_platform_it_ran_under()
     runs = by_run_export(joined, leases)["runs"]
     assert [run.get(PLATFORM_KEY) for run in runs] == [APPTAINER, None]
     assert runs[0]["site"] == "site-a"
+
+
+ENV_HPC = hashlib.sha256(b"an HPC member's environment").hexdigest()
+ENV_VM = hashlib.sha256(b"a VM member's environment").hexdigest()
+
+
+def join_with(ledger, clock, label: str, platform: str, environment: str) -> None:
+    ledger.join(label, site=SITE, job_ids=(f"job-{label}",), job_end_at=clock() + 86_400.0, fingerprint=FINGERPRINT,
+                environment=environment, kill_wait_s=180.0, platform=platform)  # fmt: skip
+
+
+def test_c50_each_declared_platform_pins_the_environment_of_its_first_join(tmp_path, capsys):
+    """C50: an HPC member and a VM member whose environment identities differ (each holds its backend's own digests)
+    both join; a second member on the HPC platform with another environment is refused; `status` shows each pin."""
+    from expcore.campaign.elastic.__main__ import main
+
+    ledger, clock = make(tmp_path, platforms=(APPTAINER, DOCKER))
+    join_with(ledger, clock, "fed-hpc", APPTAINER, ENV_HPC)
+    join_with(ledger, clock, "fed-vm", DOCKER, ENV_VM)
+    join_with(ledger, clock, "fed-hpc-2", APPTAINER, ENV_HPC)
+    with pytest.raises(JoinRefused, match="first join on its platform"):
+        join_with(ledger, clock, "fed-hpc-3", APPTAINER, ENV_VM)
+    assert ledger.platform_environments() == {APPTAINER: ENV_HPC, DOCKER: ENV_VM}
+    assert ledger.db.execute("SELECT value FROM meta WHERE key='environment'").fetchone() is None
+    ledger.close()
+    assert facts_of(tmp_path).environments == {APPTAINER: ENV_HPC, DOCKER: ENV_VM}
+    assert main(["status", str(ledger_path(tmp_path))]) == 0
+    shown = capsys.readouterr().out
+    assert f"platform {APPTAINER}: environment {ENV_HPC}" in shown
+    assert f"platform {DOCKER}: environment {ENV_VM}" in shown
+
+
+def test_c50_without_a_set_the_first_join_pins_the_one_environment_as_before(tmp_path):
+    """C50: no set, one pin under the key it always had, and another environment is refused whatever its platform."""
+    ledger, clock = make(tmp_path)
+    join_with(ledger, clock, "fed-a", APPTAINER, ENV_HPC)
+    with pytest.raises(JoinRefused, match=r"pinned at the first join$"):
+        join_with(ledger, clock, "fed-b", DOCKER, ENV_VM)
+    assert ledger.db.execute("SELECT value FROM meta WHERE key='environment'").fetchone()[0] == ENV_HPC
+    assert ledger.platform_environments() == {}

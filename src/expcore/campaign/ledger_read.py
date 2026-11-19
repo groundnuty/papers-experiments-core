@@ -93,6 +93,7 @@ class LedgerFacts:
     locked_micro: int = 0  # what unsettled leases hold as their grants (`elastic.records.Status.locked_micro`)
     contradicted: frozenset[int] = frozenset()  # leases whose settlement later evidence showed too low
     declarations: tuple[Declaration, ...] | None = None  # the declaration log (C48); None: a ledger made before it
+    environments: Mapping[str, str] = field(default_factory=dict)  # each declared platform's pinned environment (C50)
 
     def unsettled(self, run_key: str) -> list[LeaseRow]:
         """The run's leases in flight, expired, reported or lost that no settlement gave its charged attempts: any of
@@ -165,6 +166,7 @@ def read_ledger(data: bytes, sha256: str, where: object = LEDGER_SNAPSHOT) -> Le
             views = _Views(db, config)  # the ledger's own reads of its money and settlements, over the snapshot
             in_force, settled, locked = views.ceilings(), views.settlements(), views.status().locked_micro
             logged = views.declaration_log()
+            environments = views.platform_environments()
             proven = {lease.lease_id for lease in views.leases() if lease.proven}
         except (sqlite3.Error, KeyError, TypeError, ValueError) as error:
             raise LedgerRefused(f"{where}: cannot read the ledger ({type(error).__name__}: {error})") from None
@@ -176,7 +178,7 @@ def read_ledger(data: bytes, sha256: str, where: object = LEDGER_SNAPSHOT) -> Le
     }
     by_lease = {settlement.lease_id: settlement for settlement in settled}
     facts = LedgerFacts(sha256, config, meta.get("environment"), runs, leases, in_force, by_lease, locked)
-    facts = replace(facts, declarations=None if logged is None else tuple(logged))
+    facts = replace(facts, declarations=None if logged is None else tuple(logged), environments=environments)
     _replay(facts, events, where)
     low = frozenset(e["lease_id"] for e in events if e["kind"] in ("settle_contradicted", "cap_failed"))
     return replace(facts, contradicted=low)

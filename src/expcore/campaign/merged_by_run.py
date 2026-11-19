@@ -34,6 +34,7 @@ from expcore.campaign.shard import MERGE_FILE
 _DOCUMENT_KEYS = {"schema", "fingerprint", "rule", "environment_identity", "ledger_sha256", "runs", "leases"}
 _DOCUMENT_KEYS |= {"evidence", "spend", "exhausted"}
 DECLARATIONS_KEY = "declarations"  # the ledger's declaration log (C48), in a merge of a ledger that keeps one
+PLATFORM_ENVIRONMENTS_KEY = "platform_environments"  # each declared platform's pinned environment digest (C50)
 
 
 # --- merge.json -----------------------------------------------------------------------------------------------------
@@ -45,6 +46,8 @@ def by_run_document(merged: ByRun) -> dict[str, Any]:
     totals = spend_micro(ledger, merged.counted, merged.evidence)
     settled = set(ledger.settlements)
     logged = {} if ledger.declarations is None else {DECLARATIONS_KEY: [_declared(d) for d in ledger.declarations]}
+    if ledger.config.platforms:  # C50: every platform's environment, as the ledger pinned it
+        logged[PLATFORM_ENVIRONMENTS_KEY] = dict(sorted(ledger.environments.items()))
     return {
         **logged,
         "schema": MERGE_BY_RUN_SCHEMA,
@@ -150,7 +153,7 @@ def read_by_run(raw: bytes, where: object) -> dict[str, Any]:
     if (
         not isinstance(document, dict)
         or document.get("schema") != MERGE_BY_RUN_SCHEMA
-        or set(document) - {DECLARATIONS_KEY} != _DOCUMENT_KEYS
+        or set(document) - {DECLARATIONS_KEY, PLATFORM_ENVIRONMENTS_KEY} != _DOCUMENT_KEYS
     ):
         raise MergeRefused(f"{where}: not an {MERGE_BY_RUN_SCHEMA} merge file")
     logged = document.get(DECLARATIONS_KEY, [])
