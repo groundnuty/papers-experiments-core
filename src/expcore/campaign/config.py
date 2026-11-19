@@ -40,6 +40,9 @@ The file is validated when it is loaded, with messages that name the file and th
     [shards]                      # optional: shard by model first, `expcore-shard/3` (C32)
     per_model = { model-a = 2, model-b = 1 }
 
+    [egress]                      # optional: the package indexes an agent may install from (O95)
+    package_indexes = ["files.pythonhosted.org", "pypi.org"]
+
 `[shards] per_model` gives every model of the plan, in the order its shards take, how many shards serve it; N is the
 sum, at least 2, and `run --shard i/N` must give that N. Each such shard runs one run at a time, so the counts of the
 models on one unit are that unit's concurrent runs: a sum above the unit's `[scheduler.unit_caps]` cap is refused. The
@@ -49,6 +52,10 @@ layout is in the campaign's caps, so in the fingerprint every shard shares; with
 fingerprint (`StudyPlugin.platform`, the `platform` a member's identity read prints): the campaign
 fingerprint then holds the sorted set in the platform's place, and a start on another platform is refused
 (`study.declared_platforms`, C50).
+
+`[egress] package_indexes` names, by bare host, the package indexes whose installs the egress check reports in their
+own class instead of flagging (`expcore.egress.package_index`). The sorted list is in the campaign's caps, so in the
+fingerprint, and only when the table is given; without it nothing changes.
 
 An `[agent]` that gives no ceiling has one of 3 times `time_cap_s`. The ceiling bounds a run's whole time, waits on
 infrastructure included, and a platform that mints tokens for a run lives them as long as it (study guide, "Caps on a
@@ -68,6 +75,9 @@ from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.shard import SHARDS_CAP, ModelShards
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.config.models import Limits
+from expcore.egress.package_index import CAP as EGRESS_CAP
+from expcore.egress.package_index import KEY as PACKAGE_INDEXES
+from expcore.egress.package_index import index_hosts
 from expcore.loop.config import MALFORMED_POLICIES, AgentConfig
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -81,6 +91,7 @@ _TOP_KEYS = (
     "endpoints",
     "shards",
     "platform_fingerprints",
+    "egress",
 )
 _AGENT_KEYS = ("max_tool_rounds", "time_cap_s", "token_budget", "output_cap_chars", "max_output_tokens")
 _CEILING_KEYS = ("ceiling_s", "ceiling_factor")  # optional, and at most one of them
@@ -126,10 +137,11 @@ class CampaignConfig:
     endpoints: Mapping[str, Endpoint] = field(default_factory=dict)
     shards: ModelShards | None = None  # `[shards] per_model`: shard by model first (C32)
     platform_fingerprints: tuple[str, ...] = ()  # the members' platforms, sorted; empty: the platform's own (C50)
+    package_indexes: tuple[str, ...] = ()  # `[egress] package_indexes`, sorted; empty: none declared (O95)
 
     def caps(self) -> dict[str, Any]:
         """The campaign-wide caps as plain data, for the fingerprint: the loop's, the attempt limit and the budget, and
-        the `[shards]` layout only when the campaign declares one."""
+        the `[shards]` layout and the `[egress]` package indexes only when the campaign declares them."""
         budget = self.scheduler.budget
         caps = {
             "agent": self.agent.as_dict(),
@@ -138,6 +150,8 @@ class CampaignConfig:
         }
         if self.shards is not None:
             caps[SHARDS_CAP] = self.shards.to_json()
+        if self.package_indexes:
+            caps[EGRESS_CAP] = {PACKAGE_INDEXES: list(self.package_indexes)}
         return caps
 
 
@@ -306,7 +320,22 @@ def load_campaign(path: str | os.PathLike[str]) -> CampaignConfig:
         endpoints=endpoints,
         shards=_shards(root, models, scheduler, endpoints),
         platform_fingerprints=_platforms(root),
+        package_indexes=_egress(root),
     )
+
+
+def _egress(root: Section) -> tuple[str, ...]:
+    """`[egress] package_indexes`: bare host names, each once, sorted; none when the table is absent."""
+    if "egress" not in root.data:
+        return ()
+    section = _table(root, "egress")
+    section.reject_unknown([PACKAGE_INDEXES])
+    if PACKAGE_INDEXES not in section.data:
+        raise section.fail(PACKAGE_INDEXES, "is required: the host names of the package indexes, such as pypi.org")
+    try:
+        return index_hosts(section.data[PACKAGE_INDEXES])
+    except ValueError as error:
+        raise section.fail(PACKAGE_INDEXES, str(error)) from None
 
 
 def _platforms(root: Section) -> tuple[str, ...]:
