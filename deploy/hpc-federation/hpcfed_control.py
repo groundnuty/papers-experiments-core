@@ -87,7 +87,8 @@ line, the evidence of the stop, and appends the same object to `stops` in the st
 end after its SIGTERM, as teardown measured it on the node (null when unreadable). `seconds` runs from just before the
 control step to the verb's verdict: the step confirmed gone, or, for a stop not confirmed, the verb giving up; so every
 stop's duration is kept, and `stopped` says which it was. A service already `stopped` whose step is not listed answers
-`ended: "none"` and `seconds: 0` at once and changes nothing.
+`ended: "none"` and `seconds: 0` at once and changes nothing (with `"holder": "failed"` when the state records a
+holder the step list does not show, O96).
 
 **start** of a service whose step is listed and whose process is alive launches nothing and exits 0 (recording the
 step's id and `running` for a start whose step was listed after its wait); a listed step whose process is not alive is
@@ -108,18 +109,20 @@ something outside the core, on three federations where no process of ours was le
 2026: after about 8, 11 and up to 34 minutes; the restore then failed at once and the member was lost), and never
 beside a process of ours (a sleep step held one 40 minutes). So a stop that runs teardown also launches, just before
 teardown's control step, a holder on the service's node: `sleep` until the allocation's end, a detached step named
-`<allocation>-hold-<service>` (`holder_name`), `--overlap` with one core and 64 MB, so it holds back no control or
+`<allocation>-<service>-hold` (`holder_name`), `--overlap` with one core and 64 MB, so it holds back no control or
 service step (`hpclaunch.Launcher.holder`). One already listed under that name (a stop tried again) is kept. The
-state records `services.<n>.holder` (`name`, and `id` once listed) in the stop's own two changes. The holder is shown
-by the step list, waited for from its launch for the launch wait + `HOLDER_LISTED_WAIT_S` while its srun client runs,
-which ends inside the time a stop already takes. A holder not shown leaves the stop as it is (its exit status and
-`stopped` are teardown's and the step's) and adds `"holder": "failed"` to its evidence, in `stops` and on stdout,
-where the injector's driver reads it (`expcore_onedata.fault_hpc`) and fails the injection, so the provider is
-brought back while its directory is still there; a warning goes to stderr. A start ends the holder only once its new
+state records `services.<n>.holder` (`name`, and `id` once listed) in the stop's own two changes. The holder, the one
+launched or the one kept, is shown by the step list after teardown, waited for from its launch for the launch wait +
+`HOLDER_LISTED_WAIT_S` while its srun client runs, which ends inside the time a stop already takes. A holder not
+shown leaves the stop as it is (its exit status and `stopped` are teardown's and the step's) and adds `"holder":
+"failed"` to its evidence, in `stops` and on stdout, where the injector's driver reads it (`expcore_onedata.fault_hpc`)
+and fails the injection, so the provider is brought back while its directory is still there; a warning goes to
+stderr. A start ends the holder only once its new
 service step reads running by its exact id (`observed`), so a process of ours is on the node all the while: TERM by
 the exact id the step list shows under the holder's name, its cancel by that id when it still runs
 `HOLDER_TERM_WAIT_S` later, and its record removed once it reads ended. Every doubt keeps it (a new step that does
-not read running in `HOLDER_RUNNING_WAIT_S`, a holder that does not end, a read that fails), and none fails the
+not read running in `HOLDER_RUNNING_WAIT_S`, a holder that does not end, a read or a write that fails, a start with
+less than these waits left of its own worst case, which the relay's bound for it is made of), and none fails the
 start: a sleep that overlaps every step costs nothing, and down ends it. A status of a service with a holder recorded
 adds `"holder"`: the id the step list shows it under now, or null.
 
@@ -382,9 +385,10 @@ def _stop_line(stdout: str) -> Tuple[Optional[str], Optional[float]]:
 
 
 def holder_name(prefix: str, service: str) -> str:
-    """A kept stop's holder's step name, `<allocation>-hold-<service>`: no control word and no tag, so neither the
-    relay's late-step watch nor any name a verb or down looks for by pattern matches it."""
-    return "%s-hold-%s" % (prefix, service)
+    """A kept stop's holder's step name, `<allocation>-<service>-hold`: its last word is no control word, no tag and
+    no launch number, so it equals no other step's name (a service's run step and every control step end in digits,
+    down's own in another word), and neither the relay's late-step watch nor any name down looks for matches it."""
+    return "%s-%s-hold" % (prefix, service)
 
 
 def _holder_record(doc: Dict[str, Any], service: str) -> Optional[Dict[str, Any]]:
@@ -392,21 +396,19 @@ def _holder_record(doc: Dict[str, Any], service: str) -> Optional[Dict[str, Any]
     return record if isinstance(record, dict) and isinstance(record.get("name"), str) else None
 
 
-def _launch_holder(target: Target, launcher: Any, until: int, err: Any) -> Tuple[str, Optional[str]]:
-    """The holder of a kept stop (O96), launched or found: (its name, its id when it is already listed). One already
-    listed under the exact name (a stop tried again) is kept, never doubled. A launch that fails is said, by its
-    error's type only; whether a holder runs is decided by its listing after teardown (`_holder_listed`)."""
+def _launch_holder(target: Target, launcher: Any, until: int, err: Any) -> None:
+    """The holder of a kept stop (O96), launched unless one is already listed under the exact name (a stop tried
+    again), which is kept, never doubled. A launch that fails is said, by its error's type only; whether a holder runs
+    is decided by its listing after teardown (`_holder_listed`), whichever it is."""
     name = holder_name(target.prefix, target.service)
     try:
-        listed = launcher.listed(name)
-        if listed is not None:
-            return name, str(listed)
+        if launcher.listed(name) is not None:
+            return
         seconds = max(1, until - int(_STAMP()))  # to the allocation's end, as the kept work directory is
         log = str(Path(_site_value(target.site, "logs")) / (name + ".log"))
         launcher.holder(target.node, seconds, name=name, log=log)
     except Exception as error:  # the stop goes on: its evidence says the holder failed
         _say(err, "the holder step could not be launched (%s)" % type(error).__name__)
-    return name, None
 
 
 def _holder_listed(launcher: Any, state: Any, name: str, deadline: float) -> Optional[str]:
@@ -424,6 +426,15 @@ def _holder_listed(launcher: Any, state: Any, name: str, deadline: float) -> Opt
         _SLEEP(POLL_S)
 
 
+def _listed_or_none(launcher: Any, name: str) -> Optional[str]:
+    """The id the step list shows under `name`, or None, a list that cannot be read included."""
+    try:
+        found = launcher.listed(name)
+    except Exception:
+        return None
+    return str(found) if found is not None else None
+
+
 def _wait_reads(launcher: Any, step_id: str, name: str, running: bool, seconds: float) -> bool:
     """Whether the step reads `running` (True or False) by its exact id within `seconds`; a read that cannot tell is
     no answer, and any error is none either."""
@@ -439,15 +450,31 @@ def _wait_reads(launcher: Any, step_id: str, name: str, running: bool, seconds: 
         _SLEEP(POLL_S)
 
 
-def _end_holder(target: Target, launcher: Any, state: Any, step: Tuple[str, str], err: Any) -> None:
+def _end_holder(target: Target, launcher: Any, state: Any, step: Tuple[str, str], err: Any, began: float) -> None:
     """A start's end of the service's holder (O96), once its new service step `(id, name)` reads running by its exact
     id, so a process of ours is on the node all the while: the holder is sent TERM by its exact id, cancelled by it if
     it is still running `HOLDER_TERM_WAIT_S` later, and its record removed once it reads ended. Every doubt keeps it
-    (a sleep that overlaps every step holds nothing back; down ends it), and nothing here fails the start."""
+    (a sleep that overlaps every step holds nothing back; down ends it), and nothing here fails the start. It runs
+    only inside the start's own worst case from `began` (a status step, then the service step's listing, each with
+    its launch wait), which the relay's bound for a start is made of (`fault_hpc.verb_inner_worst_s`): a start with
+    less than its waits left keeps the holder."""
+    try:
+        _end_holder_now(target, launcher, state, step, err, began)
+    except Exception as error:  # the holder's bookkeeping never fails a start whose service runs
+        _say(err, "the holder could not be ended (%s): it is kept in the state" % type(error).__name__)
+
+
+def _end_holder_now(
+    target: Target, launcher: Any, state: Any, step: Tuple[str, str], err: Any, began: float
+) -> None:  # fmt: skip
     record = _holder_record(state.read(), target.service)
     if record is None:
         return
     name = record["name"]
+    worst = began + 2 * target.launch_wait_s + STATUS_TIMEOUT_S + START_LISTED_WAIT_S
+    if worst - _MONOTONIC() < HOLDER_RUNNING_WAIT_S + HOLDER_TERM_WAIT_S + CANCEL_WAIT_S:
+        _say(err, "the start has no time left to end the service's holder inside its bound: the holder is kept")
+        return
     try:
         if not _wait_reads(launcher, step[0], step[1], True, HOLDER_RUNNING_WAIT_S):
             _say(err, "the new service step does not read running yet: its holder is kept")
@@ -575,8 +602,7 @@ def _status(target: Target, launcher: Any, state: Any, mounts: Any, out: Any, er
         record["domain_wait_s"] = waited
     holder = _holder_record(target.doc, target.service)
     if holder is not None:  # O96: the id the step list shows the service's holder under now, or null
-        found = launcher.listed(holder["name"])
-        record["holder"] = str(found) if found is not None else None
+        record["holder"] = _listed_or_none(launcher, holder["name"])
     _emit(out, record)
     return 0
 
@@ -584,18 +610,20 @@ def _status(target: Target, launcher: Any, state: Any, mounts: Any, out: Any, er
 def _stop(target: Target, launcher: Any, state: Any, stop_seconds: int, out: Any, err: Any) -> int:
     if target.state == "stopped" and (not target.step_name or launcher.listed(target.step_name) is None):
         now = _stamp(_utcnow())
-        _emit(
-            out,
-            {
-                "service": target.service,
-                "stopped": True,
-                "ended": "none",
-                "seconds": 0.0,
-                "service_seconds": None,
-                "requested_utc": now,
-                "confirmed_utc": now,
-            },
-        )
+        evidence = {
+            "service": target.service,
+            "stopped": True,
+            "ended": "none",
+            "seconds": 0.0,
+            "service_seconds": None,
+            "requested_utc": now,
+            "confirmed_utc": now,
+        }
+        held = _holder_record(target.doc, target.service)
+        if held is not None and _listed_or_none(launcher, held["name"]) is None:  # O96: a stop asked again
+            evidence["holder"] = HOLDER_FAILED
+            _say(err, "WARNING: the stopped service's holder step is not shown beside its kept work directory")
+        _emit(out, evidence)
         return 0
     try:
         until = _epoch(target.ends)
@@ -607,7 +635,7 @@ def _stop(target: Target, launcher: Any, state: Any, stop_seconds: int, out: Any
     _set(state, target.service, state="stopping", holder=holder)  # recorded before the stop is attempted
     requested = _utcnow()
     started = _MONOTONIC()
-    holder_id = _launch_holder(target, launcher, until, err)[1]  # before teardown: never a moment with none of ours
+    _launch_holder(target, launcher, until, err)  # before teardown: never a moment with none of ours
     argv = target.script("teardown.sh", "--keep", "--keep-until", str(until), "--timeout", str(stop_seconds))
     ended, service_seconds, teardown_ok = None, None, False
     try:
@@ -637,8 +665,7 @@ def _stop(target: Target, launcher: Any, state: Any, stop_seconds: int, out: Any
             step_gone = False
             _say(err, "a start's step that was never listed may still be made: its srun client runs")
     stopped = teardown_ok and step_gone
-    if holder_id is None:
-        holder_id = _holder_listed(launcher, state, name, started + target.launch_wait_s + HOLDER_LISTED_WAIT_S)
+    holder_id = _holder_listed(launcher, state, name, started + target.launch_wait_s + HOLDER_LISTED_WAIT_S)
     confirmed = _utcnow()
     evidence = {
         "service": target.service,
@@ -676,6 +703,7 @@ def _stop(target: Target, launcher: Any, state: Any, stop_seconds: int, out: Any
 
 
 def _start(target: Target, launcher: Any, state: Any, err: Any) -> int:
+    began = _MONOTONIC()
     listed = launcher.listed(target.step_name) if target.step_name else None
     if listed is not None:
         reading = _status_reading(target, launcher)
@@ -694,7 +722,7 @@ def _start(target: Target, launcher: Any, state: Any, err: Any) -> int:
                 return doc
 
             state.update(running_now)
-        _end_holder(target, launcher, state, (str(listed), target.step_name), err)  # O96: the service runs again
+        _end_holder(target, launcher, state, (str(listed), target.step_name), err, began)  # O96: the service runs
         return 0  # running: nothing to start
     if target.state not in STARTABLE:
         raise Refusal("the service is '%s', which a start does not follow: stop it first" % (target.state,), 1)
@@ -747,7 +775,7 @@ def _start(target: Target, launcher: Any, state: Any, err: Any) -> int:
         return doc
 
     state.update(listed_now)
-    _end_holder(target, launcher, state, (step_id, name), err)  # O96: only once the new step reads running
+    _end_holder(target, launcher, state, (step_id, name), err, began)  # O96: only once the new step reads running
     return 0
 
 

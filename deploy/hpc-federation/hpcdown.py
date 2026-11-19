@@ -211,6 +211,9 @@ class Down:
         if info is not None and info.get("JobState") == "RUNNING":
             try:
                 self.end_holders(state)
+            except (RuntimeError, OSError) as error:  # never fatal: wait_steps and the job's cancel end what is left
+                self.say(f"the kept stops' holders could not be ended ({error}); the services' teardown goes on")
+            try:
                 unverified += self.stop_services(job)
             except (RuntimeError, OSError, ValueError) as error:
                 self.say(f"stopping the services failed ({error}); the held job is cancelled all the same")
