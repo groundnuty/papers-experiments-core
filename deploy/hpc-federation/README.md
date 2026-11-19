@@ -1708,6 +1708,32 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   locking the budget, and dispatch resumes. A run
   the loss's conservative charge exhausted may reopen when its settle shows fewer attempts, so while such a lease is
   unsettled the controller keeps one idle federation for each such run instead of retiring it.
+- **A member's prepare** (`fleetprepare.py`; the site names `prepare` and `prepare_timeout_s`). A member joins only
+  once it is up, linked and verified (a `verify-data` marker for every ingested space), and nothing in the fleet ingests
+  a study's data, so a site whose layout ingests data names the study's own command, and the controller runs it for
+  each member that is up, linked and running with its data unverified: once, on the site's login node, through the
+  site's transport (the ssh prefix with `env_file` at an ssh site, local otherwise), from the site's deploy directory,
+  one at a time for a member. It is an argv list (`prepare = ["uv", "run", ..., "--root", "{root}"]`): `{root}` in a word
+  is the member's federation root and `{layout}` the fleet's layout file, replaced by a plain text replace by
+  `fleetprepare.py` from the fleet's record (no other placeholder; other braces are kept); `prepare_timeout_s` bounds it
+  (required with `prepare`, refused without it). The core never reads what the command does. `fleetprepare.py` claims
+  `<fleet>/logs/<member>.prepare.json` by an exclusive create (a member's prepare is started at most once), runs the
+  command in a session of its own with its standard input closed and its output in `<fleet>/logs/<member>.prepare.log`
+  (0600, at the site: never printed, sent back or logged by the controller), kills the command's whole process group at
+  the timeout (TERM, then KILL after 10 s), and records the start, the end, the exit status, the outcome (`ok`, `failed`,
+  `timeout`, `aborted`) and the duration. **Success** is the member then reading verified: the marker is the proof, not
+  the exit status, and the member joins as before. **Failure** (a non-zero exit, the timeout, or exit 0 with no verified
+  marker; also a non-zero exit with a marker left) retires the member unjoined through the retirement path (collect, pull,
+  verify-copy, down), and the usual add replaces it where the site has room. **A restart:** a prepare found started and
+  never ended, with no run of this controller's, is failed (the controller that started it died, or its call dropped):
+  the member is retired the same way, after `fleetprepare.py abort` ends the command's process group (only while the
+  process there has the start tick the record names), unless the member already reads verified, which joins. A member
+  whose prepare is in flight is still counted as on its way (no extra add for it), and takes `verify_mb` of the login node's memory: that is
+  the figure a member up, linked and unverified takes already, so a prepare in flight needs none of its own; raise
+  `verify_mb` where the ingest is heavier than a verify-data run. The controller's log keeps the member, the outcome, the
+  exit status, the times and the duration of each prepare, and no command, output, host or path. A site with no `prepare`
+  is unchanged. The executor runs each prepare on one of its eight worker threads for as long as it takes, up to its
+  timeout, beside adds and retirements. Nothing of it has run live.
 - **By hand.** `--dry-run` prints each action as the commands above, one per line, under a comment naming where it runs
   and why; the live tick runs exactly those. The ledger's half has its own verbs: `fleetcontrol.py drain --ledger L
   --label X`, `ended --ledger L --label X --proof cancelled|terminal`, `join --ledger L --label X --site S --jobs
@@ -1719,7 +1745,7 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   per result); one `[[site]]` per site with `label` (an operator's label, never a site's name), `fleet` (one site's
   only: two sites never share a fleet), `transport`
   (`local`: commands run on this host, where the login node and the ledger are one; or `ssh`, below), optionally
-  `interpreter` and `deploy` (the Python and this directory on its login node), and the settings above (`max_federations`, `allowance_units` and `rate_units_per_hour` required). With `archives` in
+  `interpreter` and `deploy` (the Python and this directory on its login node), `prepare` and `prepare_timeout_s` (above), and the settings above (`max_federations`, `allowance_units` and `rate_units_per_hour` required). With `archives` in
   `[controller]` (absolute: where the dispatcher keeps the archives it pulls) and a `channel` in every site (that site's
   channel root on its shared file system), the controller also runs the elastic dispatcher
   (`expcore.campaign.elastic.dispatch`, DESIGN.md) in its own loop: the ledger's lock admits one holder, so the loop goes

@@ -32,6 +32,7 @@ UP_MB = 256.0  # an up in flight on the login node (declared, not measured)
 VERIFY_MB = 1024.0  # a verify-data in flight (declared: one at about 3.9 GB was killed before it streamed)
 LOGIN_RESERVE_MB = 512.0  # the rest of what the account runs there: the controller, the dispatcher's ssh sessions
 RELAY_STATES = ("none", "here", "elsewhere", "gone")  # no relay; beating here; beating on another login node; gone
+PREPARE_STATES = ("running", "ok", "failed")  # a member's prepare as its site's record shows it (no record: None)
 
 
 def _positive(name: str, value: float, zero: bool = False) -> float:
@@ -55,7 +56,10 @@ class SiteSettings:
     the ledger's hard term), collect time and margin, and the login node's memory budget: the account's cap there
     (None: not declared, no budget), each fault relay's share, a reserve for each up and each verify-data in flight,
     and one for everything else the account runs there; `login_node` names the login node the site's commands run on
-    (sites that name one share one budget: one cgroup), None for one of its own."""
+    (sites that name one share one budget: one cgroup), None for one of its own; `prepare_timeout_s` bounds the
+    site's prepare command (the study's ingest and verify-data of a member that has come up: the deploy side holds the
+    command), None when the site has none. A prepare in flight takes `verify_mb`: it is the verify-data in flight the
+    budget already counts for every member that is up, linked and not yet verified."""
 
     label: str
     max_federations: int
@@ -75,6 +79,7 @@ class SiteSettings:
     verify_mb: float = VERIFY_MB
     login_reserve_mb: float = LOGIN_RESERVE_MB
     login_node: str | None = None
+    prepare_timeout_s: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.label, str) or not self.label or len(self.label) > 40:
@@ -96,6 +101,8 @@ class SiteSettings:
             _positive(name, getattr(self, name), zero=True)
         if self.login_node is not None and (not isinstance(self.login_node, str) or not self.login_node):
             raise ValueError("login_node must be a non-empty operator label")
+        if self.prepare_timeout_s is not None:
+            _positive("prepare_timeout_s", self.prepare_timeout_s)
         if self.relay_mb + self.up_mb <= 0:
             raise ValueError("relay_mb and up_mb cannot both be 0: a federation takes some of the login node")
 
@@ -108,7 +115,9 @@ class Member:
     the earliest submit, the latest start and the earliest recorded end (seconds since the epoch), whether its up
     finished (linked) and whether every ingested space is verified; and its fault relay: `none` (its up recorded none
     serving), `here` (beating, a process of this login node), `elsewhere` (beating, on another login node), `gone`
-    (its up recorded it serving and no live heartbeat is left), with its last heartbeat."""
+    (its up recorded it serving and no live heartbeat is left), with its last heartbeat; and its prepare, as the site's
+    record of it shows: None (never started), `running` (started and not ended), `ok` (exit 0) or `failed` (a non-zero
+    exit, the timeout, or aborted)."""
 
     label: str
     status: str
@@ -122,10 +131,13 @@ class Member:
     verified: bool = False
     relay: str = "none"
     relay_beat_at: float | None = None
+    prepare: str | None = None
 
     def __post_init__(self) -> None:
         if self.relay not in RELAY_STATES:
             raise ValueError(f"a member's relay is one of {', '.join(RELAY_STATES)}, not {self.relay!r}")
+        if self.prepare is not None and self.prepare not in PREPARE_STATES:
+            raise ValueError(f"a member's prepare is one of {', '.join(PREPARE_STATES)} or none, not {self.prepare!r}")
 
     @property
     def waiting(self) -> bool:
