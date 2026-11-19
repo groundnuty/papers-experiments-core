@@ -13,9 +13,13 @@ import json
 from collections.abc import Callable, Collection, Iterable, Mapping
 from typing import Any
 
+from expcore.models.fleetheaders import deployment_switched
 from expcore.models.served import MIXED_FINGERPRINTS, is_mixed
 
 ACCEPTED_META = "accepted_fingerprints"  # the store's meta key of the declared sets and their confirmations
+# the store's meta key of what a lease's run saw that its lease's declared set does not declare (C48): by model, each
+# fingerprint (or null: a reply with none) once, in the order seen; the worker reports them to the ledger
+UNDECLARED_META = "undeclared_fingerprints"
 
 
 class DeploymentsUnreadable(ValueError):
@@ -37,6 +41,19 @@ def deployment_shares(declared: Mapping[str, Any], analysed: Iterable[tuple[str,
         raise DeploymentsUnreadable(f"the deployment record cannot be read ({type(error).__name__}: {error})") from None
 
 
+def deployments_switched(transcript: Iterable[Mapping[str, Any]]) -> bool:
+    """Tell whether the turns of an attempt show more than one deployment (B20): a turn without the id among turns with
+    it counts as one more, all turns without it are no switch. Visibility only."""
+    return deployment_switched(turn.get("deployment_id") or None for turn in transcript)
+
+
+def deployment_ids(transcript: Iterable[Mapping[str, Any]]) -> str | None:
+    """The deployments the turns of an attempt named (`deployment_id`, B20): the distinct ids as a sorted JSON list, or
+    None when no turn named one. Unlike the fingerprint mix this is kept for any model that sets `deployment_header`."""
+    found = sorted({turn["deployment_id"] for turn in transcript if turn.get("deployment_id")})
+    return json.dumps(found) if found else None
+
+
 def fingerprint_order(accepted: Collection[str]) -> Callable[[str | None], tuple]:
     """The order of a model's fingerprints in its entry: the declared ones by name, then the others, then None (the
     turns no fingerprint served)."""
@@ -45,6 +62,7 @@ def fingerprint_order(accepted: Collection[str]) -> Callable[[str | None], tuple
 
 def _model_shares(model: str, entry: Mapping[str, Any], attempts: list[Any]) -> dict[str, Any]:
     accepted, confirmed = list(entry["accepted"]), dict(entry["confirmed"])
+    none_declared = entry.get("none_declared") is True  # a lease's set that declares "none" (C48)
     mixes = [json.loads(a["deployments"]) for a in attempts if a["deployments"] is not None]
     turns: collections.Counter[str | None] = collections.Counter()
     runs: collections.Counter[str | None] = collections.Counter()
@@ -67,7 +85,9 @@ def _model_shares(model: str, entry: Mapping[str, Any], attempts: list[Any]) -> 
         "fingerprints": [
             {
                 "fingerprint": name,
-                "accepted": name is not None and all(p in accepted for p in name.split(MIXED_FINGERPRINTS)),
+                "accepted": none_declared
+                if name is None
+                else all(p in accepted for p in name.split(MIXED_FINGERPRINTS)),
                 "confirmed_by": confirmed.get(name, {}).get("by"),
                 "confirming_run": confirmed.get(name, {}).get("run"),
                 "turns": turns[name],

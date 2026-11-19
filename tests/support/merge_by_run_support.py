@@ -40,6 +40,7 @@ from expcore.campaign.elastic import (
 from expcore.campaign.manifest import fingerprint_sha256
 from expcore.campaign.markers import MARKER_NAME
 from expcore.campaign.merge_by_run import environment_digest
+from expcore.campaign.run_lease import declared_json
 from expcore.campaign.selection_ledger import spend_of
 from expcore.study.config import load_study
 from expcore.study.pipeline import campaign_fingerprint
@@ -60,6 +61,14 @@ class FakeClock:
 
     def __call__(self) -> float:
         return self.now
+
+
+DECLARED = (
+    "alpha-stub",
+    "deploy-late",
+    "a deployment joined mid-campaign",
+    "operator-1",
+)  # model, fingerprint, why, who
 
 
 def by_run_study(base: Path, name: str) -> Path:
@@ -115,6 +124,7 @@ def run_lease(base: Path, env: dict[str, str], lease: Lease, sha: str) -> Campai
         "grant_micro_usd": lease.grant_micro,
         "campaign_sha256": sha,
         "expires_utc": FAR,
+        **({} if lease.declared is None else {"declared": declared_json(lease.declared)}),  # as the channel sends it
     }
     path = base / f"lease-{lease.lease_id}.json"
     path.write_text(json.dumps(document), encoding="utf-8")
@@ -173,6 +183,8 @@ def _new_ledger(base: Path, sha: str, clock: FakeClock) -> tuple[Ledger, Path]:
     path = base / "orchestrator" / "ledger" / "ledger.sqlite"
     path.parent.mkdir(parents=True)
     ledger = Ledger.create(path, ledger_runs(study.manifest, study.schema), config, clock)
+    for model in study.campaign.models:  # the stubs emit no fingerprint (C48)
+        ledger.declare(model, None, "the stub emits no system_fingerprint", "operator-1")
     for label, site in {**HEALTHY, **DOOMED}.items():
         ledger.join(
             label,
@@ -207,6 +219,8 @@ def build_fleet(base: Path, env: dict[str, str]) -> Fleet:
     ledger = Ledger.open(path, clock)
     try:
         fleet.exhausted, fleet.exhausted_leases = _exhaust_a_run(ledger, clock, sha)
+        clock.now += 60.0
+        ledger.declare(DECLARED[0], DECLARED[1], DECLARED[2], DECLARED[3])  # mid-campaign, for the merge's log (C48)
         _lease_every_run(fleet, ledger)
         lx, ly = doomed["fed-x"], doomed["fed-y"]
         fleet.stores[lx.lease_id] = run_lease(base, env, lx, sha)

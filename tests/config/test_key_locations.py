@@ -76,8 +76,9 @@ def test_k13_a_table_with_no_key_location_keeps_the_identity_and_fingerprint_it_
     assert tree == tree_hash(study_dir, CodeScope.of(study.scope.roots))
     assert models_sha == hashlib.sha256(raw).hexdigest()
     entries = {k: dataclasses.asdict(study.models.resolve(k)) for k in study.campaign.models}
-    assert fingerprint["models"] == {  # every field as it is; accepted_fingerprints only when declared (B18)
-        k: digest({f: v for f, v in entry.items() if f != "accepted_fingerprints" or v}) for k, entry in entries.items()
+    optional = ("accepted_fingerprints", "session_header", "deployment_header")
+    assert fingerprint["models"] == {  # every field as it is; accepted_fingerprints and the fleet headers only when set
+        k: digest({f: v for f, v in entry.items() if f not in optional or v}) for k, entry in entries.items()
     }
     (study_dir / "models.toml").write_bytes(raw + KEYED.encode())
     keyed_tree, keyed_sha, _ = identity(study_dir)

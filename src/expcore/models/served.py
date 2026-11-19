@@ -43,6 +43,7 @@ from __future__ import annotations
 import re
 import threading
 from collections.abc import Collection, Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 NOT_REPORTED = "not reported"
@@ -100,8 +101,31 @@ def outside_accepted(accepted: Collection[str], fingerprint: str | None) -> bool
     return not all(part in accepted for part in fingerprint_parts(fingerprint))
 
 
-def _fingerprint_of(resp: Any) -> str | None:
-    """Read a reply's system fingerprint; several (a list) are joined into one mixed value."""
+@dataclass(frozen=True)
+class DeclaredSet:
+    """A model's declared fingerprints as a lease carries them (C48): the elastic ledger's declaration log for the
+    model at the lease's issue. `fingerprints` are the declared fingerprints, and `none` says whether "none" is
+    declared, so that a reply carrying no fingerprint is the model.
+
+    Under a declared set every reply is judged, one that carries no fingerprint included. Such a reply is the model
+    only when "none" is declared, and one that carries several fingerprints only when each of them is declared.
+    Declaring "none" admits no fingerprint, and declaring a fingerprint does not admit a reply without one. The
+    models.toml set (`outside_accepted`) keeps the lenient rule of B18, which a hand-run campaign keeps."""
+
+    fingerprints: tuple[str, ...] = ()
+    none: bool = False
+
+    def undeclared(self, fingerprint: str | None) -> list[str | None]:
+        """What a reply's fingerprint shows that the set does not declare: its undeclared parts, each once, or
+        [None] for a reply that carried none when "none" is not declared; [] when the set declares all of it."""
+        if not fingerprint:
+            return [] if self.none else [None]
+        return [part for part in dict.fromkeys(fingerprint_parts(fingerprint)) if part not in self.fingerprints]
+
+
+def fingerprint_of_reply(resp: Any) -> str | None:
+    """Read a reply's system fingerprint; several (a list) are joined into one mixed value. A turn and the probe's
+    collector (`Served.note`) read it so, so a run and its admission see the same values."""
     found = getattr(resp, "system_fingerprint", None)
     if isinstance(found, (list, tuple)):
         distinct = list(dict.fromkeys(str(f) for f in found if f))
@@ -152,7 +176,7 @@ class Served:
         mid = getattr(resp, "model", None)
         if mid:
             self.ids.add(str(mid))
-        fingerprint = _fingerprint_of(resp)
+        fingerprint = fingerprint_of_reply(resp)
         if fingerprint and fingerprint not in self.fingerprints:
             self.fingerprints.append(fingerprint)
         reported = dict(getattr(resp, "model_extra", None) or {})

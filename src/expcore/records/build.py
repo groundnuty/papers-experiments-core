@@ -30,6 +30,7 @@ from expcore.loop.timer import AgentTimer
 from expcore.loop.toolbox import ToolBox
 from expcore.models import spend
 from expcore.models.adapters import ModelBackend, ModelTurn
+from expcore.models.fleetheaders import deployment_switched
 from expcore.models.route import sdk_version
 from expcore.plugin import ToolProvider, ToolSpec
 from expcore.prompt.templates import RenderedPrompt, sha256_of
@@ -210,6 +211,17 @@ def capped_totals(
     return {name: value for name, value in given.items() if value is not None}
 
 
+def switched_totals(
+    turns: Sequence[Mapping[str, Any]], schema_version: str, schemas: Sequence[SchemaVersion] = SCHEMAS
+) -> dict[str, bool]:
+    """The optional total that says the attempt's turns show more than one deployment (B20): `deployment_switched`,
+    written only when it is true (absent otherwise, and for a version that predates it), from the turns' own ids."""
+    switched = deployment_switched(turn.get("deployment_id") for turn in turns)
+    if switched and "deployment_switched" in fields_of("totals", schema_version, schemas):
+        return {"deployment_switched": True}
+    return {}
+
+
 def tool_entry(spec: ToolSpec) -> dict[str, Any]:
     """Return a tool spec as the record keeps it: as the provider gave it, before the cap sentence is added."""
     return {
@@ -261,7 +273,7 @@ def turn_entry(
 ) -> dict[str, Any]:
     """Return one model turn as the record keeps it: the neutral and the native message, and what surrounded them."""
     turn = captured.turn
-    return {
+    entry = {
         "index": index,
         "neutral": {
             "text": turn.text,
@@ -281,6 +293,9 @@ def turn_entry(
         "waits_left_open": loop_turn.waits_left_open,
         "infra_wait_by_kind": plain(loop_turn.infra_wait_by_kind),
     }
+    if loop_turn.deployment_id is not None and "deployment_id" in fields_of("turn", schema_version):
+        entry["deployment_id"] = loop_turn.deployment_id  # optional, last: written only when the reply named one (B20)
+    return entry
 
 
 def route_entry(info: Mapping[str, Any], settings: Mapping[str, Any]) -> dict[str, Any]:
@@ -476,6 +491,7 @@ def _build_record(
             "abandoned_threads": result.abandoned_threads,
             "final_text": result.final_text,
             **capped_totals(reserved_capped, reply_cap_unheld, schema_version, schemas),
+            **switched_totals(turns, schema_version, schemas),
         },
         "instruments": plain(dict(instruments or {})),
         "scores": {},

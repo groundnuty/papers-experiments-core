@@ -53,6 +53,7 @@ from expcore.campaign import liveness, prerun
 from expcore.campaign.after_loop import settle_usage
 from expcore.campaign.attempts import BegunAttempt, classify, is_charged, unverified
 from expcore.campaign.defect_log import Chained, DefectLog
+from expcore.campaign.deployments import deployment_ids, deployments_switched
 from expcore.campaign.executor import (
     BackendFactory,
     DeclaredSecrets,
@@ -73,6 +74,7 @@ from expcore.campaign.markers import AttemptResult, write_marker
 from expcore.campaign.no_request import EVENT as ZERO_EVENT
 from expcore.campaign.no_request import REASON as ZERO_REASON
 from expcore.campaign.no_request import settle_unsent
+from expcore.campaign.session_bind import bind_session
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.start_diagnostic import WITHHELD_ERROR, snapshot_of
 from expcore.campaign.store import Store
@@ -330,6 +332,7 @@ class AttemptRunner:
         # checks more, never less.
         decided = p.reserved_capped(key)
         begun, run_dir = self._begin(row, lease, admission=admission, reserved_capped=decided)
+        bind_session(backend, p.store, key, begun.number, p.lease_id)  # B20: the opaque id of this attempt, if sent
         live = contextlib.nullcontext() if p.campaign is None else liveness.running(p.campaign, begun.id)
         with live:  # the attempt is live from its row to its result: the executor and the post-run check inside it
             guard = None
@@ -380,6 +383,8 @@ class AttemptRunner:
                     defects(error, result.outcome.defect)
             result, moved = self._judge(result, record, model, key, begun)
             mix = None if record is None else p.identities.deployment_mix(model, record.transcript)  # B18
+            named = None if record is None else deployment_ids(record.transcript)  # B20
+            switched = record is not None and deployments_switched(record.transcript)
 
             def bookkeeping() -> None:  # in the transaction of the result: both stand, or neither does
                 self._bookkeeping(model, endpoint, key, result, kinds, targets, moved)
@@ -387,6 +392,8 @@ class AttemptRunner:
                     p.store.event(p.stamp(), ZERO_EVENT, model, f"{key}: {ZERO_REASON}; charged 0, basis measured")
                 if mix is not None:
                     p.store.record_deployments(begun.id, mix)
+                if named is not None:
+                    p.store.record_deployment_ids(begun.id, named, switched)
                 if (
                     result.post_run_health is not None
                 ):  # the reading, with the result: both stand, or neither does (O90)
@@ -507,11 +514,17 @@ class AttemptRunner:
         if change is None:
             return result, False
         p.store.event(p.stamp(), "served_identity_changed", model, f"{key}: {json.dumps(change, sort_keys=True)}")
-        if result.outcome.set_aside:
+        # Under a lease's declared set nothing undeclared is ever scored (C48), so a treatment fault it would score is
+        # replaced as an instrument's refusal replaces one; a hand-run campaign keeps an outcome already set aside.
+        treated = result.outcome.set_aside and p.identities.leased(model)
+        if treated and classify(result, result.treatment_kinds, result.treatment_targets).state != "done":
+            treated = False
+        if result.outcome.set_aside and not treated:
             return result, True  # already set aside: the event and the unit's failure are what is left to do
         text = "the endpoint's served identity changed during the run"
         outcome = Outcome("infrastructure", text, infra_kind=p.settings.identity_kind)
-        return dataclasses.replace(result, outcome=outcome), True
+        changes = {"recorded_treatment": False} if treated else {}  # the record flagged a treatment it no longer is
+        return dataclasses.replace(result, outcome=outcome, **changes), True
 
     def _keep_reading(self, result: AttemptResult, note: Any, model: str, key: str) -> AttemptResult:
         """The structured reading the post-run check noted for this try (`prerun.HEALTH_READING`), kept in the result

@@ -45,6 +45,7 @@ from expcore.config.loading import ConfigError, Section, close_match, load_toml_
 from expcore.config.model_checks import base_url_problems, sampling_problems, thinking_problems
 from expcore.config.price_table import read_price
 from expcore.config.prices import Price, TieredPrice
+from expcore.models.fleetheaders import header_name_problem
 from expcore.models.served import MIXED_FINGERPRINTS
 
 BACKENDS = ("openai_compat", "anthropic", "stub")  # the backends the core builds; a plugin's factory serves others
@@ -134,6 +135,10 @@ class ModelSpec:
     free: bool = False  # a model that costs nothing per token (hosted by the study): priced without a price
     # the deployments' fingerprints the study declares the same model (B18); () checks against a baseline (C16)
     accepted_fingerprints: tuple[str, ...] = ()
+    # openai_compat behind a fleet's front (B20): the request header that carries one opaque id per attempt, and the
+    # response header that names the deployment that served a reply; None sends nothing and reads nothing
+    session_header: str | None = None
+    deployment_header: str | None = None
 
     def __post_init__(self) -> None:
         """Keep the accepted fingerprints sorted, then refuse an entry whose settings break a rule, before any request
@@ -311,6 +316,14 @@ def _request_problems(spec: ModelSpec) -> list[str]:
             problems.append("echo_reasoning_field must be a plain field name")
     if spec.free and spec.price is not None:
         problems.append("a model is free or has a price, not both")
+    for name in ("session_header", "deployment_header"):
+        value = getattr(spec, name)
+        if value is None:
+            continue
+        if spec.backend != "openai_compat":
+            problems.append(f"{name} applies to openai_compat models only")
+        elif problem := header_name_problem(value, request=name == "session_header"):
+            problems.append(f"{name} {problem}")
     if spec.prompt_cache_ttl is not None:
         if spec.backend != "anthropic":
             problems.append("prompt_cache_ttl applies to anthropic models only")
@@ -415,6 +428,8 @@ _ENTRY_KEYS = (
     "price",
     "free",
     "accepted_fingerprints",
+    "session_header",
+    "deployment_header",
 )
 
 
@@ -483,6 +498,8 @@ def _entry_args(section: Section, key: str, backend: str) -> dict[str, Any]:
         "price": read_price(section),
         "free": _flag(section, "free"),
         "accepted_fingerprints": _accepted(section),
+        "session_header": section.optional_string("session_header"),
+        "deployment_header": section.optional_string("deployment_header"),
     }
 
 

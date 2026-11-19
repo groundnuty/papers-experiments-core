@@ -20,7 +20,9 @@ channel's inbox (`elastic.channel`) by listing it, and for each lease, in lease-
    SHA-256, the last attempt's state, this store's attempts, the highest attempt number it used and its charged attempts
    (the lease's base not included), and its spend as the budget gate counts it (`selection_ledger.spend_of`), in
    micro-dollars rounded up (the grant, its bound, when that is unknown). A lease that began no attempt (refused by the
-   kernel, or held before any attempt) is returned, with what its store spent. A run that ended with an attempt still
+   kernel, or held before any attempt) is returned, with what its store spent. Both name what the store saw that the
+   lease's declared set does not declare (`undeclared_fingerprints`, C48; a fingerprint, or null: a reply with none),
+   which pauses the model in the ledger. A run that ended with an attempt still
    `running` is reported by neither: the worker stops with `running.json` in place, so no other lease runs here, and the
    ledger expires the lease.
 4. Waits for the next. After a drain (`inbox/drain.json`, the login watchdog's), it returns any lease not yet taken,
@@ -32,6 +34,7 @@ Live-unproven: the worker was run against a temp-dir channel only; its launch in
 import argparse
 import contextlib
 import hashlib
+import json
 import os
 import shutil
 import socket
@@ -46,6 +49,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from expcore.campaign import out_snapshot
+from expcore.campaign.deployments import UNDECLARED_META
 from expcore.campaign.elastic import channel as ch
 from expcore.campaign.elastic.config import micro_up, usd_of
 from expcore.campaign.elastic.snapshots import SNAPSHOT_S, SNAPSHOTS, LeaseSnapshots, Take
@@ -119,6 +123,7 @@ class Outcome:
     state: str | None
     spend_micro_usd: int
     spend_known: bool
+    undeclared: tuple[str | None, ...] = ()  # what its replies showed that the lease does not declare (C48)
 
 
 def store_outcome(study: Path, lease: RunLease) -> Outcome | None:
@@ -131,6 +136,7 @@ def store_outcome(study: Path, lease: RunLease) -> Outcome | None:
     try:
         rows = connection.execute("SELECT attempt, state, charged FROM attempts ORDER BY id").fetchall()
         spend = _spend(study, lambda sql, args=(): connection.execute(sql, args).fetchall())
+        kept = connection.execute("SELECT value FROM meta WHERE key=?", (UNDECLARED_META,)).fetchone()
     finally:
         connection.close()
     known = spend is not None
@@ -141,7 +147,23 @@ def store_outcome(study: Path, lease: RunLease) -> Outcome | None:
         state=rows[-1]["state"] if rows else None,
         spend_micro_usd=micro_up(spend) if spend is not None else lease.grant_micro_usd,
         spend_known=known,
+        undeclared=_undeclared(None if kept is None else kept[0]),
     )
+
+
+def _undeclared(raw: str | None) -> tuple[str | None, ...]:
+    """What the store kept seen undeclared (`identity.UNDECLARED_META`), every model's, each value once. A record that
+    cannot be read is an error: a lease store that saw an undeclared deployment must not be reported as one that
+    did not."""
+    if raw is None:
+        return ()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = None
+    if not isinstance(data, dict) or not all(isinstance(values, list) for values in data.values()):
+        raise WorkerError(f"the store's {UNDECLARED_META} is not a record of undeclared fingerprints by model")
+    return tuple(dict.fromkeys(value for values in data.values() for value in values))
 
 
 def _spend(study: Path, query: Callable[..., Any]) -> float | None:
@@ -336,7 +358,15 @@ class Worker:
         except OSError as error:
             print(f"worker {self.label}: lease {lease_id}'s beat {counter} was not written: {error}", file=sys.stderr)
 
-    def _return(self, lease_id: int, run_key: Any, spend: int, reason: str, status: int | None) -> None:
+    def _return(
+        self,
+        lease_id: int,
+        run_key: Any,
+        spend: int,
+        reason: str,
+        status: int | None,
+        undeclared: tuple[str | None, ...] = (),
+    ) -> None:
         ch.write_json(
             self.outbox / ch.return_name(lease_id),
             {
@@ -348,6 +378,7 @@ class Worker:
                 "spend_usd": usd_of(spend),
                 "reason": reason,
                 "exit_status": status,
+                "undeclared_fingerprints": list(undeclared),
             },
         )
 
@@ -385,8 +416,8 @@ class Worker:
         snapshots.finish()  # the store its dispatcher left, before the archive and the completion that names it
         found = self.outcome(copy, lease)
         if found is None or found.attempts == 0:
-            spend = 0 if found is None else found.spend_micro_usd
-            self._return(lease_id, lease.run_key, spend, "no attempt began", status)
+            spend, undeclared = (0, ()) if found is None else (found.spend_micro_usd, found.undeclared)
+            self._return(lease_id, lease.run_key, spend, "no attempt began", status, undeclared)
             return "returned"
         if found.state not in ("done", "infra_fail", "harness_error", "interrupted", "outage_discarded"):
             raise WorkerError(
@@ -413,6 +444,7 @@ class Worker:
                 "spend_usd": usd_of(found.spend_micro_usd),
                 "spend_known": found.spend_known,
                 "exit_status": status,
+                "undeclared_fingerprints": list(found.undeclared),
             },
         )
         return "ran"

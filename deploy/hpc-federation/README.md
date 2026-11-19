@@ -891,6 +891,7 @@ import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs
 | `egresslog.c` | agent's cell | the agent's egress shim: logs each destination, never a payload |
 | `egress-collector.py` | sandbox step | receives the shim's records outside the cell and writes the run's egress log |
 | `shards.py` | login node, sandbox step | a campaign's shards, one per federation: the step lines, the step, its snapshots, the archives the merge takes |
+| `fleethop.py` | sandbox step, node | the ssh hop to the group's LLM fleet that a step or a worker keeps open while its dispatcher runs (O93); standard library only, loaded by `shards.py` and `fleetworker.py` from beside them, so it goes wherever they go |
 | `nodefacts.py` | control step | a node's FQDN, its IPv4 address, the job's uid and gid, and its OS release, glibc and kernel as `readings` (O87; recorded, never refused), as JSON (`hpcfed.py up`) |
 | `leftovers.py` | control step | how many work directories of ours of one kind the node's tmpfs holds, as JSON (`hpcfed.py down`, for a service whose step ended before naming one) |
 | `zone-export.sh` | control step on the zone's node | the zone's passphrase or the Onedata test CA on stdout, for the federation's root (`hpcfed.py up`) |
@@ -1425,6 +1426,58 @@ the report list it. A start without `--resume` of a shard with a snapshot is ref
 another shard (by its whole spec, so the same label in another partition too) or campaign is refused, naming it. A
 snapshot holds the whole of `out/` but the live store's own files, which its backup stands for, and copies it whole
 each time: size `snapshot_every_s` to what the shared filesystem can take.
+
+### The fleet hop: a job reaches the group's LLM fleet (`fleethop.py`, O93)
+
+A study may run its models on the group's own OpenAI-compatible front, which listens on a unix socket of a login node.
+A compute node reaches it through one ssh tunnel, so the study's `models.toml` keeps `base_url =
+"http://127.0.0.1:<port>/v1"` and the manifest's optional `fleet_hop` (and the fleet's shard settings of that name, for
+the elastic worker) makes it reachable:
+
+    fleet_hop = { login = "<host>", socket = "<abs path of the front's socket on that login node>",
+                  key = "<abs path of the forward-only key>", known_hosts = "<abs path>", local_port = 30051,
+                  backup_socket = "<abs path of another front's socket on that login node>" }  # the last is optional
+
+`plan` and `lines` refuse, naming `fleet_hop` and the reason and never a value, a table that is not these five values
+(and perhaps `backup_socket`, which must be another socket), a `login` that could add an option to the command (it
+starts with `-`, or holds anything but letters, digits, dot, dash, underscore and one `@`), a socket or a known-hosts
+path with a colon or white space where ssh would split it (the forward's own separator, an option's list of files), a
+path that is not absolute or has a `.`, `..` or empty part or a control character, and a port outside 1024 to 65535.
+Each line then ends in `--fleet-hop <the table as one JSON argument>`; `plan` shows the table as `<hidden>` in the
+line's `argv` (a plan is read and kept) and says `fleet_hop: true`; `lines` prints the whole line, which is what is run.
+Before its dispatcher (or the worker) starts, `step` (and `fleetworker.py node`) runs, as a child of its own,
+
+    ssh -F /dev/null -i KEY -o IdentitiesOnly=yes -o IdentityAgent=none -o UserKnownHostsFile=KNOWN \
+        -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes -o CheckHostIP=no -o BatchMode=yes \
+        -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -N -L 127.0.0.1:PORT:SOCKET LOGIN
+
+with its output discarded (an ssh that fails says the host and the paths). A port that already accepts a connection is
+held by something else, and the step is refused at once, before any ssh runs. It waits up to 60 s for 127.0.0.1:PORT to
+accept a connection and for its own ssh to be still running 1.5 s later (a listener of someone else's with the hop's ssh
+gone is no hop). If it does not, the step ends with 76 (`FLEET_HOP_FAILED`) and a message naming `fleet_hop` only, and
+no dispatcher or worker is started. The worker's launch (`fleetworker.py launch`) watches its step for 20 s, and for the
+hop's whole wait on top (for each socket) when the settings have a `fleet_hop`, so a worker whose hop never opens is no launch (it records
+none) and the controller's join, which launches first, waits instead of joining a federation with no worker. Two steps
+of one node that name the same `local_port` cannot both keep a hop: the second is refused with 76. While the dispatcher
+runs, a thread starts the hop again when it exits, no faster than once per 10 s (the interval doubles to 60 s for a hop
+that dies again quickly). The hop is killed the moment the dispatcher exits and again on every way out of the step, in a
+`finally` with the stop signals held, and a stop signal ends the step through that cleanup, as with `home_files`; a step
+killed outright leaves its ssh to the scheduler's step teardown. A log says `fleet_hop: true (restarts: N)`, the step's
+owner record `fleet_hop: true`, and nothing records a host, a path or a port. A manifest without the key changes
+nothing.
+
+**The backup socket.** A dead tunnel leaves its socket file behind, so `ssh -L` still comes up and its port still
+accepts: only a request through it shows. With a `backup_socket` the hop is therefore also judged by a keyless HTTP GET
+/v1/models through the forward (the key is never sent): any HTTP status, 401 included, is alive, and no answer within 5
+s is dead. The start takes the primary socket if its forward comes up and answers, else the backup the same way (each
+with its own 60 s bound), and is refused, with 76, when neither does. While the dispatcher runs the hop is probed every
+60 s, and after two dead probes in a row its forward is restarted on the other socket; a hop that exits is started again
+on the primary when it had answered, and on the other socket when it never did. The log says `fleet_hop: true (restarts:
+N, fleet_hop_backup: true|false, switches: M)` and never a path. Without a `backup_socket` none of this is done.
+
+`python -I -B deploy/hpc-federation/fleethop.py probe --fleet-hop JSON [--path /v1/models]` runs the same hop, makes one
+keyless GET through it and prints the HTTP status alone: a front that refuses a request without its key answers 401,
+which shows the whole path without the key. The file imports nothing outside the standard library.
 
 ## A fleet of federations (`fleet.py`)
 

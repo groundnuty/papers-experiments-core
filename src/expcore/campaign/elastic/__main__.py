@@ -9,18 +9,26 @@
   `DIR` is the study as a federation runs it (its `platform.toml` beside `study.toml`, where the study has one). It
   refuses a ledger that exists; the ledger is closed when it is made, so a controller can open it. Each `--cap` is a
   model's starting cap on the leases it holds at once (a whole number from 1; a model not named has none), and the
-  model must be one the study plans.
+  model must be one the study plans. Each model's `accepted_fingerprints` in models.toml are its first declared
+  fingerprints (C48), recorded with the actor `models.toml`; a model with none declares nothing yet.
 - `status LEDGER`: the ceiling, what is committed, left and locked in the grants of unsettled leases (in flight,
   expired, lost), each model's own ceiling, and the history of raises; each model's cap in force and the history of
-  its changes.
+  its changes; each model's declared fingerprints, the models paused by an undeclared one seen, and the declaration
+  log.
 - `raise-ceiling LEDGER --usd N --reason TEXT --actor NAME [--model M]`: raise the campaign's dollar ceiling (or model
   M's) to N dollars, rounded down to a micro-dollar. It is never lowered or set below what is committed.
 - `set-cap LEDGER --model M --cap N --reason TEXT --actor NAME`: set model M's cap on its leases in flight or held
   back to N (a whole number from 1), up or down. A lower cap revokes no lease: it only stops new ones until the model
   is under it. M must have runs in the ledger.
+- `declare LEDGER --model M (--fingerprint F | --none) --reason TEXT --actor NAME`: declare fingerprint F of model M,
+  or "none" (M's replies that carry no fingerprint), in the append-only declaration log (C48). Nothing is ever removed
+  or changed; a value already declared is refused, as is a model with no runs in the ledger. Each lease carries its
+  model's declared set at its issue, and a model whose lease's run saw a value its set did not declare is paused (no
+  new lease; leases out run to their end) until every value seen is declared. The campaign fingerprint never changes.
 
-`status`, `raise-ceiling` and `set-cap` work on the ledger file under its own write lock and not the dispatcher's, so
-they run while a dispatcher holds the ledger, and the dispatcher's next lease reads a raise or a cap. Exit status: 0
+`status`, `raise-ceiling`, `set-cap` and `declare` work on the ledger file under its own write lock and not the
+dispatcher's, so they run while a dispatcher holds the ledger, and the dispatcher's next lease reads a raise, a cap or
+a declaration. Exit status: 0
 done, 1 refused by the ledger (or, for `create`, by the study: not loadable, or code that is not known), 2 a usage
 error or a file that is not a ledger.
 """
@@ -37,6 +45,7 @@ from pathlib import Path
 from expcore.campaign.elastic.caps import set_in_file
 from expcore.campaign.elastic.ceilings import raise_in_file
 from expcore.campaign.elastic.config import MICRO, LedgerConfig, lease_grant_usd, ledger_runs, micro_down
+from expcore.campaign.elastic.declarations import declare_in_file
 from expcore.campaign.elastic.ledger import Ledger
 from expcore.campaign.elastic.records import LedgerError, Status
 from expcore.campaign.elastic.views import LedgerReader
@@ -82,7 +91,34 @@ def format_status(status: Status) -> str:
                 f"  #{changed.cap_id} {when} model {changed.model} {before} -> {changed.new}"
                 f" by {changed.actor}: {changed.reason}"
             )
-    return "\n".join(lines)
+    return "\n".join(lines + _declaration_lines(status))
+
+
+def _value(fingerprint: str | None) -> str:
+    return "none" if fingerprint is None else fingerprint
+
+
+def _declaration_lines(status: Status) -> list[str]:
+    """Each model's declared fingerprints, the paused models and the declaration log (C48); one line for a ledger made
+    before the log."""
+    if status.declared is None or status.declarations is None:
+        return ["declarations: none kept (this ledger was made before the declaration log)"]
+    lines = []
+    for model, values in sorted(status.declared.items()):
+        shown = ", ".join(_value(v) for v in values) if values else "nothing"
+        lines.append(f"model {model}: declared {shown}")
+    for model, values in sorted(status.paused.items()):
+        lines.append(f"model {model}: paused: undeclared fingerprint(s) seen: {', '.join(_value(v) for v in values)}")
+    if not status.declarations:
+        return [*lines, "declaration history: none"]
+    lines.append("declaration history:")
+    for found in status.declarations:
+        when = datetime.fromtimestamp(found.at, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        lines.append(
+            f"  #{found.declaration_id} {when} model {found.model} {_value(found.fingerprint)} by {found.actor}: "
+            f"{found.reason}"
+        )
+    return lines
 
 
 def create_ledger(
@@ -119,7 +155,8 @@ def create_ledger(
         caps=caps or {},
         grants_usd={model: lease_grant_usd(spec, pricing.limits) for model, spec in pricing.models.items()},
     )
-    Ledger.create(path, runs, config, clock=time.time).close()
+    declared = {model: spec.accepted_fingerprints for model, spec in pricing.models.items()}
+    Ledger.create(path, runs, config, clock=time.time, declared=declared).close()
     return config
 
 
@@ -167,6 +204,15 @@ def _set_cap(args: argparse.Namespace) -> int:
     changed = set_in_file(args.ledger, args.model, args.cap, args.reason, args.actor)
     before = "none" if changed.old is None else changed.old
     print(f"set model {changed.model}'s cap: {before} -> {changed.new} (cap change #{changed.cap_id})")
+    return 0
+
+
+def _declare(args: argparse.Namespace) -> int:
+    fingerprint = None if args.none else args.fingerprint
+    found, paused = declare_in_file(args.ledger, args.model, fingerprint, args.reason, args.actor)
+    print(f"declared model {found.model}: {_value(found.fingerprint)} (declaration #{found.declaration_id})")
+    if paused:
+        print(f"model {found.model} stays paused: undeclared fingerprint(s) seen: {', '.join(map(_value, paused))}")
     return 0
 
 
@@ -224,6 +270,14 @@ def _parser() -> argparse.ArgumentParser:
     capping.add_argument("--cap", required=True, type=_cap_of, help="the new cap, a whole number from 1")
     capping.add_argument("--reason", required=True, help="why it is set, recorded")
     capping.add_argument("--actor", required=True, help="who sets it (an operator or an agent), recorded")
+    declaring = commands.add_parser("declare", help="declare a model's fingerprint, or none, in the append-only log")
+    declaring.add_argument("ledger", type=Path, help="the ledger file (out/ledger.sqlite)")
+    declaring.add_argument("--model", required=True, help="the model (it must have runs in the ledger)")
+    value = declaring.add_mutually_exclusive_group(required=True)
+    value.add_argument("--fingerprint", help="the system fingerprint declared")
+    value.add_argument("--none", action="store_true", help="declare the model's replies that carry no fingerprint")
+    declaring.add_argument("--reason", required=True, help="why it is declared, recorded")
+    declaring.add_argument("--actor", required=True, help="who declares it (an operator or an agent), recorded")
     return parser
 
 
@@ -241,7 +295,7 @@ def _dollars(text: str) -> Decimal:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one command; print its result or its error, and return the exit status."""
     args = _parser().parse_args(argv)
-    commands = {"create": _create, "status": _status, "raise-ceiling": _raise, "set-cap": _set_cap}
+    commands = {"create": _create, "status": _status, "raise-ceiling": _raise, "set-cap": _set_cap, "declare": _declare}
     try:
         return commands[args.command](args)
     except LedgerError as error:

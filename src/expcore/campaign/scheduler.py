@@ -317,7 +317,10 @@ class Scheduler:
         )
         self.stops = HarnessStops(store, cfg.harness_stop)
         self.reconcile_accounting()
-        self.identities = ServedIdentities(store, self.stamp, {m: self.models.resolve(m) for m in self.plan_models})
+        lease = self.shard.spec if self.shard is not None and isinstance(self.shard.spec, RunLease) else None
+        leased = None if lease is None or lease.declared is None else dict.fromkeys(self.plan_models, lease.declared)
+        specs = {m: self.models.resolve(m) for m in self.plan_models}
+        self.identities = ServedIdentities(store, self.stamp, specs, leased)  # a lease's declared set (C48)
         self.budget, self.ledger = None, None
         paying = None  # with a budget: the ledger admission's probes are paid from (C26)
         if cfg.budget is not None:
@@ -608,6 +611,11 @@ class Scheduler:
             return Hold("harness_errors", stopped[model], temporary=False)
         if model in self.not_admitted:
             return Hold("not_admitted", self.not_admitted[model], temporary=False)
+        undeclared = self.identities.undeclared(model)
+        if undeclared:  # a lease's run saw a deployment its lease does not declare: the lease ends here (C48)
+            shown = ", ".join("none" if value is None else value for value in undeclared)
+            why = f"{model} was served under undeclared fingerprint(s) {shown}; the ledger pauses it until declared"
+            return Hold("undeclared_fingerprint", why, temporary=False)
         reason = None if budget is None else budget.reason(model)
         return None if reason is None else Hold("budget", reason, temporary=False)
 

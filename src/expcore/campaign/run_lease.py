@@ -25,6 +25,13 @@ run and no other, on the settings the lease sets (`study.lease_start`). A lease 
   A campaign whose fingerprint differs refuses the lease;
 - `expires_utc`: when the lease ends, ISO 8601 UTC to the second with a `Z`. A start at or after it is refused.
 
+A lease the elastic ledger issues carries one more fact, `declared` (C48): the model's declared fingerprints at the
+lease's issue, `{"fingerprints": [...], "none": true|false}` (`expcore.models.served.DeclaredSet`). The run judges its
+replies against it (`campaign.identity`): a reply under a fingerprint it does not declare, or with no fingerprint when
+"none" is not declared, makes the run infrastructure, and the lease store holds the model so the lease ends. A lease
+without it (one written by hand, or by a ledger made before the declaration log) is judged by models.toml's set, as
+before.
+
 The file adds a `schema` key, `LEASE_SCHEMA`. A store pins the lease as its shard spec (`META_SHARD`, `to_json`) under
 `RULE_LEASE`, which is none of `shard.RULES`, as a selection's is not: a merge by run reads it by its rule, and today's
 merge refuses it by name (`merge.facts_of`). Nothing here is read unless `--lease` is given.
@@ -40,6 +47,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.shard import ShardError, usd_of
+from expcore.models.served import MIXED_FINGERPRINTS, DeclaredSet
 
 RULE_LEASE = "expcore-shard/5: one run of the campaign on a lease, in a store of its own"
 """The rule of a lease store; kept with every lease spec, never accepted by `ShardSpec` or `SelectionSpec`."""
@@ -54,6 +62,7 @@ META_ATTEMPT_BASE = "lease_attempt_base"
 without it numbers its attempts from 1, as every store did before leases."""
 
 _FACTS = ("run_key", "lease_id", "attempt_base", "grant_micro_usd", "campaign_sha256", "expires_utc")
+DECLARED = "declared"  # the optional fact of a lease the elastic ledger issues (C48)
 _TIME = "%Y-%m-%dT%H:%M:%SZ"
 _SHOWN = 12
 _HEX = frozenset("0123456789abcdef")
@@ -89,6 +98,7 @@ class RunLease:
     campaign_sha256: str
     expires_utc: str
     rule: str = RULE_LEASE
+    declared: DeclaredSet | None = None  # the model's declared fingerprints at issue (C48); None: models.toml's set
 
     def __post_init__(self) -> None:
         """Refuse a lease no ledger gives: each fact has one form."""
@@ -111,6 +121,8 @@ class RunLease:
             raise LeaseError(
                 f"a lease's expires_utc is a UTC time to the second as 2026-11-18T12:30:00Z, not {self.expires_utc!r}"
             )
+        if self.declared is not None and not isinstance(self.declared, DeclaredSet):
+            raise LeaseError("a lease's declared fingerprints are a DeclaredSet")
 
     @property
     def name(self) -> str:
@@ -151,15 +163,40 @@ class RunLease:
             )
 
     def to_json(self) -> dict[str, Any]:
-        """The lease as the store pins it and the export and a merge keep it: the rule and the six facts."""
-        return {"rule": self.rule, **{name: getattr(self, name) for name in _FACTS}}
+        """The lease as the store pins it and the export and a merge keep it: the rule and the six facts, and the
+        declared fingerprints when the lease carries them."""
+        out = {"rule": self.rule, **{name: getattr(self, name) for name in _FACTS}}
+        if self.declared is not None:
+            out[DECLARED] = declared_json(self.declared)
+        return out
 
     @classmethod
     def from_json(cls, data: Mapping[str, Any]) -> RunLease:
         """Read a pinned lease back, refusing missing or extra keys."""
-        if not isinstance(data, Mapping) or set(data) != {"rule", *_FACTS}:
-            raise LeaseError(f"a lease spec has exactly the keys rule, {', '.join(_FACTS)}")
-        return cls(*(data[name] for name in _FACTS), rule=data["rule"])
+        if not isinstance(data, Mapping) or set(data) - {DECLARED} != {"rule", *_FACTS}:
+            raise LeaseError(f"a lease spec has exactly the keys rule, {', '.join(_FACTS)} (and {DECLARED})")
+        declared = declared_of(data[DECLARED]) if DECLARED in data else None
+        return cls(*(data[name] for name in _FACTS), rule=data["rule"], declared=declared)
+
+
+def declared_json(declared: DeclaredSet) -> dict[str, Any]:
+    """A declared set as a lease file and the ledger write it: the fingerprints in order, and whether "none" is."""
+    return {"fingerprints": list(declared.fingerprints), "none": declared.none}
+
+
+def declared_of(value: Any) -> DeclaredSet:
+    """Read a declared set (`declared_json`), refusing any other form: a fingerprint that is empty, not a string, given
+    twice or several joined into one, a `none` that is not a boolean, or another key."""
+    if not isinstance(value, Mapping) or set(value) != {"fingerprints", "none"}:
+        raise LeaseError(f"a lease's {DECLARED} is an object with exactly the keys fingerprints and none")
+    fingerprints, none = value["fingerprints"], value["none"]
+    if not isinstance(none, bool):
+        raise LeaseError(f"a lease's {DECLARED}.none is true or false, not {none!r}")
+    if not isinstance(fingerprints, list) or not all(isinstance(f, str) and f for f in fingerprints):
+        raise LeaseError(f"a lease's {DECLARED}.fingerprints is a list of non-empty strings")
+    if len(set(fingerprints)) != len(fingerprints) or any(MIXED_FINGERPRINTS in f for f in fingerprints):
+        raise LeaseError(f"a lease's {DECLARED}.fingerprints names each fingerprint once, one per entry")
+    return DeclaredSet(tuple(sorted(fingerprints)), none)
 
 
 def _refuse_constant(text: str) -> Any:
@@ -167,7 +204,8 @@ def _refuse_constant(text: str) -> Any:
 
 
 def read_lease(path: str | Path) -> RunLease:
-    """Read a lease file: a JSON object with exactly the keys `schema` (`LEASE_SCHEMA`) and the six facts.
+    """Read a lease file: a JSON object with exactly the keys `schema` (`LEASE_SCHEMA`) and the six facts, and the
+    optional `declared` (C48).
 
     Refuses, naming the problem, a file that cannot be read or is not a JSON object, a key missing or extra, another
     schema, a fact of another form (a grant that is not a whole number of micro-dollars, a float included), and NaN or
@@ -183,19 +221,23 @@ def read_lease(path: str | Path) -> RunLease:
         raise LeaseError("the lease file is not JSON") from None
     if not isinstance(data, dict):
         raise LeaseError("the lease file is not a JSON object")
-    if set(data) != {"schema", *_FACTS}:
-        raise LeaseError(f"a lease file has exactly the keys schema, {', '.join(_FACTS)}")
+    if set(data) - {DECLARED} != {"schema", *_FACTS}:
+        raise LeaseError(f"a lease file has exactly the keys schema, {', '.join(_FACTS)} (and {DECLARED})")
     if data["schema"] != LEASE_SCHEMA:
         raise LeaseError(f"the lease file's schema is {data['schema']!r}, and this core reads {LEASE_SCHEMA!r}")
-    return RunLease(*(data[name] for name in _FACTS))
+    declared = declared_of(data[DECLARED]) if DECLARED in data else None
+    return RunLease(*(data[name] for name in _FACTS), declared=declared)
 
 
 __all__ = [
+    "DECLARED",
     "LEASE_JOURNAL",
     "LEASE_SCHEMA",
     "META_ATTEMPT_BASE",
     "RULE_LEASE",
     "LeaseError",
     "RunLease",
+    "declared_json",
+    "declared_of",
     "read_lease",
 ]

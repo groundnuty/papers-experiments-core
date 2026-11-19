@@ -59,10 +59,16 @@ def config(**changes) -> LedgerConfig:
     return LedgerConfig(**fields)
 
 
-def make(tmp_path: Path, runs: Sequence[LedgerRun] | None = None, **changes) -> tuple[Ledger, FakeClock]:
-    """A new ledger under `tmp_path/out` on a fake clock."""
+def make(
+    tmp_path: Path,
+    runs: Sequence[LedgerRun] | None = None,
+    declared: Mapping[str, Sequence[str]] | None = None,
+    **changes,
+) -> tuple[Ledger, FakeClock]:
+    """A new ledger under `tmp_path/out` on a fake clock, with each model's first declared fingerprints (C48)."""
     clock = FakeClock()
-    ledger = Ledger.create(ledger_path(tmp_path), plan() if runs is None else runs, config(**changes), clock=clock)
+    path, planned = ledger_path(tmp_path), plan() if runs is None else runs
+    ledger = Ledger.create(path, planned, config(**changes), clock=clock, declared=declared)
     return ledger, clock
 
 
