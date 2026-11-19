@@ -278,7 +278,8 @@ def test_c48_the_ledgers_declaration_log_is_in_merge_json_the_export_and_the_rep
     """C48: the declaration made mid-campaign is in merge.json's log with its time, actor and reason, the export
     carries the log for the analysis, and the report lists it."""
     model, fingerprint, reason, actor = DECLARED
-    (entry,) = document_of(merged)["declarations"]
+    log = document_of(merged)["declarations"]
+    (entry,) = [e for e in log if e["fingerprint"] is not None]
     assert (entry["model"], entry["fingerprint"], entry["actor"], entry["reason"]) == (
         model,
         fingerprint,
@@ -286,7 +287,11 @@ def test_c48_the_ledgers_declaration_log_is_in_merge_json_the_export_and_the_rep
         reason,
     )
     assert entry["at_utc"].endswith("Z")
-    assert merged.read("export.json")["fingerprint_declarations"] == [entry]
+    assert {e["model"] for e in log if e["fingerprint"] is None} == {"alpha-stub", "beta-stub"}  # "none", at the start
+    export = merged.read("export.json")
+    assert export["fingerprint_declarations"] == log
+    shares = {entry["model"]: entry["accepted_fingerprints"] for entry in export["deployment_shares"]}
+    assert shares == {"alpha-stub": [fingerprint], "beta-stub": []}  # each counted lease's set at its issue
     assert "## Fingerprint declarations" in merged.report
     assert f"| {model} | {fingerprint} | {entry['at_utc']} | {actor} | {reason} |" in merged.report
 

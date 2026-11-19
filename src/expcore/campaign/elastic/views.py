@@ -136,14 +136,13 @@ class LedgerViews:
 
     def demand(self) -> Demand:
         """The current set, its pending runs per model, and the cap slots held per model: what a controller's target
-        reads (with `caps()`). A paused model's runs are not counted pending: no lease of them can be issued (C48)."""
+        reads (with `caps()`). A paused model's runs still count (C48): its federations stay up through the pause, so
+        its leases go out the moment it is declared."""
         current = self.db.execute("SELECT MIN(set_index) FROM runs WHERE state='pending'").fetchone()[0]
         rows = self.db.execute(
             "SELECT model, COUNT(*) FROM runs WHERE state='pending' AND set_index=? GROUP BY model", (current,)
         ).fetchall()
-        paused = declarations.paused(self.db)
-        pending = {model: n for model, n in rows if model not in paused}
-        return Demand(set_index=current, pending=pending, slots=self.slots())
+        return Demand(set_index=current, pending=dict(rows), slots=self.slots())
 
     def ceilings(self) -> Ceilings:
         """The dollar ceilings in force: the pinned ones, or as raised (`raise_ceiling`)."""

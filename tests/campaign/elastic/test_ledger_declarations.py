@@ -29,8 +29,8 @@ def _seen_by(ledger, lease, *undeclared, state="infra_fail", charged=1):
 
 def test_c48_an_undeclared_fingerprint_pauses_its_model_alone_and_leaves_leases_in_flight_running(tmp_path):
     """C48: m1's first lease reports fp-new, undeclared: m1 gets no new lease (a free federation takes m2's run, and
-    one more waits, saying why), the controller counts none of m1's runs, m1's other lease in flight runs on and
-    counts, and status shows the pause with the value."""
+    one more waits, saying why), the controller still counts m1's run (its federations stay up through the pause),
+    m1's other lease in flight runs on and counts, and status shows the pause with the value."""
     ledger, clock = make(tmp_path, **TWO)
     for label in ("fed-1", "fed-2", "fed-3", "fed-4"):
         join(ledger, clock, label)
@@ -45,7 +45,7 @@ def test_c48_an_undeclared_fingerprint_pauses_its_model_alone_and_leaves_leases_
     held = ledger.issue("fed-4")
     assert isinstance(held, Wait)
     assert "model m1 is paused: undeclared fingerprint(s) seen: fp-new" in held.reason
-    assert ledger_view(ledger).demand.pending == {}
+    assert ledger_view(ledger).demand.pending == {"m1": 1}
     assert ledger.lease(still.lease_id).state == "issued"
     assert finish(ledger, ledger.lease(still.lease_id)) == "counted"
     assert ledger.run(still.run_key).state == "done"

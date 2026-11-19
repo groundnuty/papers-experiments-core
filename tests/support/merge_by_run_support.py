@@ -40,6 +40,7 @@ from expcore.campaign.elastic import (
 from expcore.campaign.manifest import fingerprint_sha256
 from expcore.campaign.markers import MARKER_NAME
 from expcore.campaign.merge_by_run import environment_digest
+from expcore.campaign.run_lease import declared_json
 from expcore.campaign.selection_ledger import spend_of
 from expcore.study.config import load_study
 from expcore.study.pipeline import campaign_fingerprint
@@ -123,6 +124,7 @@ def run_lease(base: Path, env: dict[str, str], lease: Lease, sha: str) -> Campai
         "grant_micro_usd": lease.grant_micro,
         "campaign_sha256": sha,
         "expires_utc": FAR,
+        **({} if lease.declared is None else {"declared": declared_json(lease.declared)}),  # as the channel sends it
     }
     path = base / f"lease-{lease.lease_id}.json"
     path.write_text(json.dumps(document), encoding="utf-8")
@@ -181,6 +183,8 @@ def _new_ledger(base: Path, sha: str, clock: FakeClock) -> tuple[Ledger, Path]:
     path = base / "orchestrator" / "ledger" / "ledger.sqlite"
     path.parent.mkdir(parents=True)
     ledger = Ledger.create(path, ledger_runs(study.manifest, study.schema), config, clock)
+    for model in study.campaign.models:  # the stubs emit no fingerprint (C48)
+        ledger.declare(model, None, "the stub emits no system_fingerprint", "operator-1")
     for label, site in {**HEALTHY, **DOOMED}.items():
         ledger.join(
             label,
