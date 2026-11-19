@@ -25,7 +25,7 @@ not hide it. Field names are generic: a run is named by its key, its condition, 
 file is written to a temporary file in its directory and moved into place, so a reader sees the old file or the new
 one; it is owner-only (0600), because an export can carry study data.
 
-Each analysed attempt whose turns named the deployment that served them (the model entry's `deployment_header`, F02) says
+Each analysed attempt whose turns named the deployment that served them (the model entry's `deployment_header`, B20) says
 which, in `deployment_ids`: the distinct ids, sorted, after `admission` and before `lease_id`; an attempt none of whose
 turns named one has no such key, so an export of a campaign without it is what it was. A merged batch's rows carry it
 as they carry the rest.
@@ -488,7 +488,7 @@ def _dispatch(attempt: Any) -> dict[str, Any]:
 
 
 def _deployment_ids(attempt: Any) -> dict[str, list[str]]:
-    """The deployments the analysed attempt's turns named (`deployment_ids`, a sorted list; F02), for the analysis to
+    """The deployments the analysed attempt's turns named (`deployment_ids`, a sorted list; B20), for the analysis to
     use the deployment as a sensitivity factor. There is no key for an attempt none of whose turns named one, and for
     a snapshot made before the column: never an empty list or a null."""
     # a sqlite3.Row's `in` tests its values, not its column names, so the names are asked for explicitly

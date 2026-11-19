@@ -105,7 +105,7 @@ class ModelTurn:
     # reads no such fields), and the record then has no field; an adapter that read a usage object gives {} and 0.
     usage_extra: dict[str, int | float] | None = None
     usage_extra_cut: int | None = None
-    # the deployment the reply's `deployment_header` named (F02, `expcore.models.fleetheaders`); None when the model sets
+    # the deployment the reply's `deployment_header` named (B20, `expcore.models.fleetheaders`); None when the model sets
     # no such header or the reply had none. Recorded only, beside the system fingerprint.
     deployment_id: str | None = None
 
@@ -301,7 +301,7 @@ class OpenAICompatAdapter(_SdkBackend):
         self._client = client
         self._messages: list[dict] = []
         self._tools: list[dict] = []
-        self._session: str | None = None  # the opaque id of the attempt, when the entry sets `session_header` (F01)
+        self._session: str | None = None  # the opaque id of the attempt, when the entry sets `session_header` (B20)
 
     @property
     def session_header(self) -> str | None:

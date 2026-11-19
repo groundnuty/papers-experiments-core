@@ -135,7 +135,7 @@ class ModelSpec:
     free: bool = False  # a model that costs nothing per token (hosted by the study): priced without a price
     # the deployments' fingerprints the study declares the same model (B18); () checks against a baseline (C16)
     accepted_fingerprints: tuple[str, ...] = ()
-    # openai_compat behind a fleet's front (F01, F02): the request header that carries one opaque id per attempt, and the
+    # openai_compat behind a fleet's front (B20): the request header that carries one opaque id per attempt, and the
     # response header that names the deployment that served a reply; None sends nothing and reads nothing
     session_header: str | None = None
     deployment_header: str | None = None

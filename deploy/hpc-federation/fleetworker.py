@@ -5,7 +5,7 @@ gives its lease runs the operator's key files.
     <python> -I -B deploy/hpc-federation/fleetworker.py launch --fleet DIR --member fed-k --settings FILE \
         --federation LABEL --channel DIR --job-end EPOCH
     <python> -I -B deploy/hpc-federation/fleetworker.py node --federation LABEL --channel DIR --study DIR --tmpfs DIR \
-        --root DIR [--home-files DIR]
+        --root DIR [--home-files DIR] [--fleet-hop JSON]
 
 `launch` runs on the site's login node (the controller's join runs it, before the federation joins the ledger): it
 starts `node` as a detached `srun` step of the federation's held job (`login_line`), once (a worker whose recorded
@@ -24,6 +24,12 @@ the operator's key tree is read once (`shards.read_home_files`) and staged in `h
 `shards.stage_home_files`), and the worker runs with that HOME. The whole directory, the home first and explicitly, is
 removed on every way out: the worker's end, a failed start, a stop signal (held while the removal runs, as a shard
 step's is). Nothing prints a path, a name or a size of the tree: only `home_files: true` and a count.
+
+With `--fleet-hop` (the fleet's `fleet_hop` setting, O93) `node` keeps the hop to the group's LLM fleet open while the
+worker runs (`fleethop.HopKeeper`): started after the key files and before the worker, which is not started (the exit
+status is `shards.FLEET_HOP_FAILED`) when its port does not open, started again if it exits, and killed on every way
+out with the stop signals held. The owner record says `fleet_hop: true`; nothing else of the hop is printed or recorded
+but its restart count.
 """
 
 import argparse
@@ -75,6 +81,8 @@ def login_line(
             "--study", settings["study"], "--tmpfs", settings["tmpfs"], "--root", str(root)]  # fmt: skip
     if settings.get("home_files"):  # the path alone rides here: `node` reads the tree itself
         node += ["--home-files", settings["home_files"]]
+    if settings.get("fleet_hop"):  # the table rides here as one JSON argument, as the shard step's line carries it
+        node += ["--fleet-hop", json.dumps(settings["fleet_hop"], sort_keys=True, separators=(",", ":"))]
     minutes = max(1, -(-int(time_s) // 60))
     group = [f"--het-group={fed['het_group']}"] if fed.get("het_group") else []
     return ["srun", f"--jobid={fed['job']}", *group, "--exact", "-N1", "-n1", "-w", fed["node"],
@@ -100,12 +108,13 @@ def _apart(work_root: Path, root: Path, home: Path) -> Optional[str]:
     return None
 
 
-def _owner(directory: Path, args: argparse.Namespace, count: int) -> None:
+def _owner(directory: Path, args: argparse.Namespace, count: int, hop: bool = False) -> None:
     shards = _shards()
     record = {"format": shards.OWNER_FORMAT, "shard": {OWNER_FORMAT_KEY: args.federation}, "pid": os.getpid(),
               "start": shards._start_of(os.getpid()), "root": args.root, "results": args.channel, "base": None,
               "phase": shards.RUNNING,
-              **({"home_files": True, "home_files_count": count} if count else {})}  # fmt: skip
+              **({"home_files": True, "home_files_count": count} if count else {}),
+              **({"fleet_hop": True} if hop else {})}  # fmt: skip
     descriptor = os.open(directory / shards.OWNER, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
@@ -124,13 +133,17 @@ def run_worker(argv: Sequence[str], env: Mapping[str, str], cwd: Path) -> int:
     return 128 - code if code < 0 else code
 
 
-def node(args: argparse.Namespace, runner: Any = None) -> int:
-    """`node`: the worker on this node, as the module's docstring says; its exit status, or 2 for a start refused
-    with nothing made."""
+def node(args: argparse.Namespace, runner: Any = None, hop_keeper: Any = None) -> int:
+    """`node`: the worker on this node, as the module's docstring says; its exit status, 2 for a start refused with
+    nothing made, or `shards.FLEET_HOP_FAILED` when the hop did not open. `hop_keeper` makes the keeper of `--fleet-hop`
+    (`fleethop.HopKeeper` by default)."""
     shards = _shards()
     runner = runner or run_worker
     tmpfs, study = Path(args.tmpfs), Path(args.study)
     try:
+        hop = None
+        if getattr(args, "fleet_hop", None):
+            hop = shards._sibling("fleethop").parse_hop(args.fleet_hop)
         tree = None
         if args.home_files:
             problem = shards.home_files_path_problem(args.home_files) or shards.home_files_overlap_problem(
@@ -151,7 +164,7 @@ def node(args: argparse.Namespace, runner: Any = None) -> int:
             work_root is not None
         ):  # the sandbox refuses to start without it: made here, 0700, on the tmpfs, as a step does
             shards.make_work_root(work_root, tmpfs)
-    except (shards.ShardsError, OSError) as error:  # OSError: the tmpfs cannot take the sandbox's work root
+    except (shards.ShardsError, shards._sibling("fleethop").HopRefused, OSError) as error:  # OSError: no work root
         print(f"fleetworker: ERROR: {error}; the worker is not started, with nothing made", file=sys.stderr)
         return REFUSED
     count = 0 if tree is None else len(tree.files)
@@ -159,14 +172,14 @@ def node(args: argparse.Namespace, runner: Any = None) -> int:
         print(f"fleetworker: home_files: true ({count} file(s) go to federation {args.federation}'s worker; a count: "
               "no name or content is shown)", file=sys.stderr)  # fmt: skip
     directory = Path(tempfile.mkdtemp(prefix=f"{shards.WORK_PREFIX}worker-{args.federation}.", dir=tmpfs))
-    disarm = None
+    disarm = keeper = None
     try:
         directory.chmod(0o700)
         problem = _apart(work_root, Path(args.root), directory) if work_root is not None else None
         if problem:
             print(f"fleetworker: ERROR: {problem}; the worker is not started", file=sys.stderr)
             return REFUSED
-        _owner(directory, args, count)
+        _owner(directory, args, count, hop is not None)
         for name in ("home", "tmp", "work", *(f"home/{sub}" for sub in shards.HOME_DIRS)):
             (directory / name).mkdir(mode=0o700)
         copy = directory / "study"
@@ -185,17 +198,35 @@ def node(args: argparse.Namespace, runner: Any = None) -> int:
             except shards.ShardsError as error:
                 print(f"fleetworker: ERROR: {error}; the worker is not started", file=sys.stderr)
                 return REFUSED
+        if hop is not None:  # after the key files, before the worker: its port accepts when the worker starts
+            fleethop = shards._sibling("fleethop")
+            keeper = (hop_keeper or fleethop.HopKeeper)(hop)
+            try:
+                keeper.start()
+            except fleethop.HopRefused as error:
+                print(f"fleetworker: ERROR: {error}; the worker is not started", file=sys.stderr)
+                return shards.FLEET_HOP_FAILED
         words = [sys.executable, "-I", "-B", "-m", WORKER_MODULE, "--federation", args.federation,
                  "--channel", args.channel, "--study", str(copy), "--work", str(directory / "work")]  # fmt: skip
-        return runner(words, env, directory)
+        try:
+            return runner(words, env, directory)
+        finally:
+            if keeper is not None:  # the worker has ended (or is being stopped): the hop is of no use to anyone
+                with shards._stop_held():
+                    keeper.stop()
+                print(f"fleetworker: {keeper.status()}", file=sys.stderr)
     finally:
         try:
             try:
                 with shards._stop_held():
+                    if keeper is not None:
+                        keeper.stop()  # on every way out; a no-op once the worker has ended
                     shards._clean_step(directory, False, True)
             except (
                 SystemExit
             ):  # a stop that landed before the signals were held: the cleanup it cut short is made whole
+                if keeper is not None:
+                    keeper.stop()
                 shards._clean_step(directory, False, True)
                 raise
         finally:
@@ -272,6 +303,7 @@ def parser() -> argparse.ArgumentParser:
         one.add_argument(f"--{key}", required=True)
     one.add_argument("--federation", required=True)
     one.add_argument("--home-files", dest="home_files", default=None)
+    one.add_argument("--fleet-hop", dest="fleet_hop", default=None)
     login = sub.add_parser("launch")
     for key in ("fleet", "member", "settings", "federation", "channel"):
         login.add_argument(f"--{key}", required=True)

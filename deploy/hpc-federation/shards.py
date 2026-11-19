@@ -86,6 +86,16 @@ unlinked, never walked). So every campaign ends with `down` (or `shards.py sweep
 no `home_files` nothing is read or written and the line, the plan and every record are what they were. Not covered:
 the fleet's shard settings (`fleet.py`) do not take the key.
 
+**The hop to the group's LLM fleet (`fleet_hop`, O93).** The manifest's optional `fleet_hop = { login, socket, key,
+known_hosts, local_port }` (also a setting of the fleet's, for the elastic worker) makes each step run one ssh child
+that forwards 127.0.0.1:`local_port` to the fleet front's unix socket on the login node (`fleethop.py`, which says
+exactly what it runs). It is started after the key files and before the dispatcher; if its port does not accept within
+60 s the step ends with `FLEET_HOP_FAILED` (76) and a message naming `fleet_hop` only, with no dispatcher. While the
+dispatcher runs the hop is started again if it exits (no more than once per 10 s), and it is killed once the
+dispatcher has exited and on every way out, in a `finally` with the stop signals held, as the key files are. The line
+carries the table as one `--fleet-hop` JSON argument; the plan, the step's owner record and its words say `fleet_hop:
+true` and the restart count, never a host, a path or a port. With no `fleet_hop` nothing changes.
+
 **The operator's own variables (`pass_env`, O63).** The one addition to that environment is what the manifest
 declares: variables of the operator's the study needs in its dispatcher's environment, such as the operator's half of a
 fault sanction (`pass_env = ["NAME", ...]`, names only). `plan`, `lines` and `resume-line` read each name's value from
@@ -373,6 +383,9 @@ found = core_identity.current()
 print(json.dumps({"known": found.known, "stale": found.stale, "why": found.why}))
 """
 ARCHIVE_FAILED = 75  # the dispatcher ended but its out/ could not be archived: kept on the node's tmpfs
+FLEET_HOP_FAILED = (
+    76  # the manifest's `fleet_hop` did not open before the dispatcher: nothing run (`fleethop.py`'s too)
+)
 PRE_STEP_REFUSED = 73  # a script the study declared refused the step, or could not be run as declared, or the
 # federation's render identity is not the expected one (or could not be compared with it): nothing made
 POST_RUN_FAILED = 74  # the dispatcher exited 0 and the study's post-run script did not: archived, marked not final
@@ -545,6 +558,7 @@ class Plan:
     pass_env: tuple[str, ...] = ()  # the variables the manifest declares: names only
     pass_env_pins: tuple[tuple[str, str], ...] | None = None  # each name's value, read by `pin_pass_env`
     home_files: str | None = None  # the operator's key tree: an absolute path, put in the dispatcher's home (O63)
+    fleet_hop: str | None = None  # the hop to the LLM fleet's front as canonical JSON, kept before the dispatcher (O93)
 
 
 # ------------------------------------------------------------------------------------------------ the manifest
@@ -826,7 +840,7 @@ def load_plan(path: Path) -> Plan:
         raise ShardsError(f"the manifest could not be read ({type(error).__name__})") from None
     keys = {"study", "python", "core_src", "results", "tmpfs", "step_path", "cpus", "memory", "shards"}
     optional = {"snapshot_every_s", "pre_step", "pre_step_timeout_s", "post_run", "post_run_timeout_s",
-                "expect_render_identity", "pass_env", "home_files"}  # fmt: skip
+                "expect_render_identity", "pass_env", "home_files", "fleet_hop"}  # fmt: skip
     if not keys <= set(data) <= keys | optional:
         raise ShardsError(
             f"the manifest's keys must be: {', '.join(sorted(keys))}, and perhaps {', '.join(sorted(optional))}"
@@ -848,6 +862,8 @@ def load_plan(path: Path) -> Plan:
     declared = pass_env_names(data["pass_env"]) if "pass_env" in data else ()
     if "home_files" in data and (problem := home_files_path_problem(data["home_files"])):
         raise ShardsError(f"home_files {problem}")
+    if "fleet_hop" in data and (problem := _sibling("fleethop").hop_problem(data["fleet_hop"])):
+        raise ShardsError(f"fleet_hop {problem}")
     for key in sorted({"study", "python", "core_src", "results", "tmpfs"}):  # a step starts in / (`--chdir=/`)
         if not isinstance(data[key], str) or not data[key].startswith("/"):
             raise ShardsError(f"{key} must be an absolute path")
@@ -874,7 +890,9 @@ def load_plan(path: Path) -> Plan:
                 Path(data["tmpfs"]), str(data["step_path"]), data["cpus"], data["memory"], tuple(shards),
                 float(every), data.get("pre_step"), None, float(bounds["pre_step"]), data.get("post_run"), None,
                 float(bounds["post_run"]), data.get("expect_render_identity"), pass_env=declared,
-                home_files=data.get("home_files"))  # fmt: skip
+                home_files=data.get("home_files"),
+                fleet_hop=json.dumps(data["fleet_hop"], sort_keys=True, separators=(",", ":"))
+                if "fleet_hop" in data else None)  # fmt: skip
 
 
 def federation(shard: Shard) -> dict[str, Any]:
@@ -1089,6 +1107,8 @@ def step_argv(
                  plan.expect_render_identity_sha256]  # fmt: skip
     if plan.home_files is not None:  # the operator's key tree: `step` reads it itself, so the path alone rides here
         step += ["--home-files", plan.home_files]
+    if plan.fleet_hop is not None:  # the hop to the LLM fleet: `step` runs it before its dispatcher (`fleethop.py`)
+        step += ["--fleet-hop", plan.fleet_hop]
     for name in plan.pass_env:  # the declaration: `step` passes a name only when its line says so, with its value
         step += ["--pass-env", name]
     return [
@@ -3738,6 +3758,18 @@ def check_home_files(args: argparse.Namespace) -> HomeTree | None:
         raise StepRefused(str(error)) from None
 
 
+def check_fleet_hop(args: argparse.Namespace) -> dict[str, Any] | None:
+    """The hop to the LLM fleet the line names (`--fleet-hop`, JSON), as `fleethop.parse_hop` reads it: None when the
+    line names none. `StepRefused` naming `fleet_hop` and never a value."""
+    text = getattr(args, "fleet_hop", None)
+    if text is None:
+        return None
+    try:
+        return _sibling("fleethop").parse_hop(text)
+    except _sibling("fleethop").HopRefused as error:
+        raise StepRefused(str(error)) from None
+
+
 def check_pass_env_stable(args: argparse.Namespace, passed: Mapping[str, str]) -> None:
     """The variables this step passes are the ones the shard's first step passed, each with the same value
     (`check_pass_env_origin`, on the shard's directory of `--results`): `StepRefused` naming each that is not, never a
@@ -3793,10 +3825,12 @@ def step(
     core_found: Callable[[Path], bool] = imports_core_from,
     snapshots: Snapshots | None = None,
     node: Any = None,
+    hop_keeper: Callable[[Mapping[str, Any]], Any] | None = None,
 ) -> int:
     """One shard on its node (the module's docstring): copy, restore, run, archive, clean up; the dispatcher's exit
     status. `snapshots` says when `out/` is snapshotted; by default every `--snapshot-every` seconds and at each run's
-    end, into `<results>/<label>/snapshots/`. `node` is what the reaper of the sandbox's work root acts on (the
+    end, into `<results>/<label>/snapshots/`. `hop_keeper` makes the keeper of the line's `--fleet-hop`
+    (`fleethop.HopKeeper` by default). `node` is what the reaper of the sandbox's work root acts on (the
     Apptainer backend's `NodeOps`; `LocalNode` by default). Its first acts are the check of the variables its line
     declares (`check_pass_env`), the check of the federation's render identity against the one the line expects
     (`check_render_identity`) and then the study's pre-step guard, when its line declares one (`start_hooks`): nothing
@@ -3813,6 +3847,7 @@ def step(
         identity = check_render_identity(args)  # the federation's render is the plan's, before the study's own guard
         guard, post_hook = start_hooks(args)
         home = check_home_files(args)  # the operator's key tree, read once: held, and written after the home exists
+        hop = check_fleet_hop(args)  # the hop to the LLM fleet: read here, started just before the dispatcher
     except StepRefused as error:
         print(f"shards: ERROR: {error}; the step is refused, with nothing made", file=sys.stderr)
         return PRE_STEP_REFUSED
@@ -3857,7 +3892,7 @@ def step(
         except ShardsError as error:
             print(f"shards: ERROR: {error}; the step is refused before its dispatcher starts", file=sys.stderr)
             return PRE_STEP_REFUSED
-        return _run_step(args, spec, runner, snapshots, node, identity, guard, post_hook, passed, home)
+        return _run_step(args, spec, runner, snapshots, node, identity, guard, post_hook, passed, home, hop, hop_keeper)
     finally:
         release_running(args, mark)
 
@@ -3873,6 +3908,8 @@ def _run_step(
     post_hook: Hook | None,
     passed: Mapping[str, str],
     home: HomeTree | None = None,
+    hop: Mapping[str, Any] | None = None,
+    hop_keeper: Callable[[Mapping[str, Any]], Any] | None = None,
 ) -> int:
     """`step` once its checks passed and it holds the shard's running mark: its directory on the tmpfs first (so a
     sweep finds a step of ours here before its work root is used), the sandbox's work root made and its killed runs
@@ -3880,7 +3917,8 @@ def _run_step(
     step's first acts found (the federation's render identity as validated, the pre-step guard that passed, the
     post-run script declared, the variables its line gave the dispatcher with their values); `home` is the operator's
     key tree it read (`check_home_files`), written into the dispatcher's home just before the dispatcher starts and
-    removed once the dispatcher and the post-run script have ended."""
+    removed once the dispatcher and the post-run script have ended. `hop` is the line's hop to the LLM fleet (O93):
+    kept, after the key files and before the dispatcher, until the dispatcher exits, and killed on every way out."""
     from expcore.campaign import out_snapshot
 
     snapdir = args.results / args.label / SNAPSHOTS
@@ -3888,6 +3926,7 @@ def _run_step(
     work = Path(tempfile.mkdtemp(prefix=f"{WORK_PREFIX}{args.label}.", dir=args.tmpfs))
     keep = False
     disarm: Callable[[], None] | None = None
+    keeper: Any = None
     try:
         work.chmod(0o700)
         owner = {"format": OWNER_FORMAT, "shard": spec, "pid": os.getpid(), "start": _start_of(os.getpid()),
@@ -3895,6 +3934,7 @@ def _run_step(
                  "phase": RUNNING, **({"pre_step": guard} if guard is not None else {}),
                  **({"pass_env": dict(passed)} if passed else {}),
                  **({"home_files": True, "home_files_count": len(home.files)} if home is not None else {}),
+                 **({"fleet_hop": True} if hop is not None else {}),
                  **({"post_run": {"path": post_hook.path, "sha256": post_hook.sha256, "ran": False, "exit_status": None,
                                   "final": False}} if post_hook is not None else {})}  # fmt: skip
         (work / OWNER).write_text(json.dumps(owner, sort_keys=True) + "\n", encoding="utf-8")
@@ -3940,13 +3980,24 @@ def _run_step(
                 getattr(args, "snapshot_every", SNAPSHOT_EVERY_S),
                 progress=lambda: out_snapshot.ended_attempts(out),
             )
-        if home is not None:  # the operator's key files, last before the dispatcher; a stop in between cleans up
+        if home is not None or hop is not None:  # a stop before the dispatcher runs still ends through the cleanup
             disarm = _unwind_on_stop()
+        if home is not None:  # the operator's key files, last before the dispatcher; a stop in between cleans up
             try:
                 stage_home_files(home, work / "home")
             except ShardsError as error:
                 print(f"shards: ERROR: {error}; the step is refused before its dispatcher starts", file=sys.stderr)
                 return PRE_STEP_REFUSED
+        if (
+            hop is not None
+        ):  # the hop to the LLM fleet, after the key files: its port accepts before the dispatcher starts
+            fleethop = _sibling("fleethop")
+            keeper = (hop_keeper or fleethop.HopKeeper)(hop)
+            try:
+                keeper.start()
+            except fleethop.HopRefused as error:
+                print(f"shards: ERROR: {error}; the step is refused before its dispatcher starts", file=sys.stderr)
+                return FLEET_HOP_FAILED
         note_step_started(os.environ.get("EXPCORE_FED_ROOT"), spec)  # `down` learns that a step ran from this
         snapshots.start(out)
         try:
@@ -3955,6 +4006,10 @@ def _run_step(
         finally:
             live.clear()  # the dispatcher has exited: the last snapshot reads a private copy of the store
             snapshots.stop(out)
+            if keeper is not None:  # the dispatcher no longer needs the hop: killed, with the stop signals held
+                with _stop_held():
+                    keeper.stop()
+                print(f"shards: shard {args.label}: {keeper.status()}", file=sys.stderr)
         settle_quietly(out)
         if not out.is_dir() or {entry.name for entry in out.iterdir()} <= {STUDY_STATE}:  # the record alone is none
             print(f"shards: shard {args.label} left no out/ to archive (exit status {status})", file=sys.stderr)
@@ -3990,14 +4045,19 @@ def _run_step(
         return status
     finally:
         try:
+            held = home is not None or hop is not None
             try:
-                with _stop_held() if home is not None else contextlib.nullcontext():
-                    _clean_step(work, keep, home is not None)
+                with _stop_held() if held else contextlib.nullcontext():
+                    if keeper is not None:
+                        keeper.stop()  # on every way out (a no-op once the dispatcher has ended)
+                    _clean_step(work, keep, held)
             except SystemExit:
-                if home is None:
+                if not held:
                     raise
                 # a stop that landed before the signals were held: its handler now ignores them all, so the cleanup
                 # that it cut short is made whole here, and the stop goes on
+                if keeper is not None:
+                    keeper.stop()
                 _clean_step(work, keep, True)
                 raise
         finally:
@@ -4069,6 +4129,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     one.add_argument("--expect-render-identity", dest="expect_render_identity", default=None)  # with its hash: both
     one.add_argument("--expect-render-identity-sha256", dest="expect_render_identity_sha256", default=None)
     one.add_argument("--home-files", dest="home_files", default=None)  # the operator's key tree: `lines` writes it
+    one.add_argument(
+        "--fleet-hop", dest="fleet_hop", default=None
+    )  # the hop to the LLM fleet's front: `lines` writes it
     one.add_argument("--pass-env", dest="pass_env", action="append", default=None, metavar="NAME",
                      help="a variable the manifest declares: its value is among the line's env words")  # fmt: skip
     left = sub.add_parser("sweep")
@@ -4153,6 +4216,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 record["pass_env"] = dict(plan.pass_env_pins)
             if plan.home_files is not None:
                 record["home_files"] = True  # the line holds the path; the plan says only that the tree was read
+            if plan.fleet_hop is not None:
+                record["fleet_hop"] = True  # the line holds the table; the plan says only that there is a hop
             built.append((line, record))
         refusal = core_refusal(identify_core(plan))  # last: it runs the manifest's interpreter, as the step will
         if refusal:

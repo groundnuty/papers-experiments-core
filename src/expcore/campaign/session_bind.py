@@ -1,5 +1,5 @@
 # Provenance: new
-"""Tell a backend that sends a session header which attempt it serves (F01).
+"""Tell a backend that sends a session header which attempt it serves (B20).
 
 A model entry that sets `session_header` makes its adapter send one opaque id on every request of an attempt
 (`expcore.models.fleetheaders`). The adapter is built before the attempt has its number, so the attempt binds the id

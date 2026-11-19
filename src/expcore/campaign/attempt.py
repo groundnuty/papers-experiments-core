@@ -332,7 +332,7 @@ class AttemptRunner:
         # checks more, never less.
         decided = p.reserved_capped(key)
         begun, run_dir = self._begin(row, lease, admission=admission, reserved_capped=decided)
-        bind_session(backend, p.store, key, begun.number, p.lease_id)  # F01: the opaque id of this attempt, if sent
+        bind_session(backend, p.store, key, begun.number, p.lease_id)  # B20: the opaque id of this attempt, if sent
         live = contextlib.nullcontext() if p.campaign is None else liveness.running(p.campaign, begun.id)
         with live:  # the attempt is live from its row to its result: the executor and the post-run check inside it
             guard = None
@@ -383,7 +383,7 @@ class AttemptRunner:
                     defects(error, result.outcome.defect)
             result, moved = self._judge(result, record, model, key, begun)
             mix = None if record is None else p.identities.deployment_mix(model, record.transcript)  # B18
-            named = None if record is None else deployment_ids(record.transcript)  # F02
+            named = None if record is None else deployment_ids(record.transcript)  # B20
 
             def bookkeeping() -> None:  # in the transaction of the result: both stand, or neither does
                 self._bookkeeping(model, endpoint, key, result, kinds, targets, moved)

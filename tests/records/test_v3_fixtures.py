@@ -498,7 +498,7 @@ def test_c41_the_twelfth_fixture_pins_the_lease_an_attempt_ran_on_and_the_eleven
 
 
 def test_f02_the_thirteenth_fixture_pins_the_deployment_a_turn_names_and_the_twelve_before_it_hold_none():
-    """F02 and R03: the thirteenth merge point adds one optional field to a turn, `deployment_id`: the deployment a
+    """B20 and R03: the thirteenth merge point adds one optional field to a turn, `deployment_id`: the deployment a
     front named in the reply's header, the last field of the turn, absent for a turn whose reply named none. Its fixture
     is the fifth's record with a name on its second turn, written by the code of that merge; it validates and replays
     to its own bytes (the parametrized tests above). None of the twelve before it holds the key, and none is filled in

@@ -1,5 +1,5 @@
 # Provenance: new
-"""The two optional headers of an `openai_compat` model behind a fleet's front (F01, F02).
+"""The two optional headers of an `openai_compat` model behind a fleet's front (B20).
 
 `session_header` names a request header that carries one opaque id for the whole of an attempt, so the front can keep
 an attempt's requests together. The id is `session_id`: a SHA-256 over the campaign, the run, the attempt and the lease,

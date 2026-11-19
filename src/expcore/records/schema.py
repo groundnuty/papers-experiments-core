@@ -37,7 +37,7 @@ Version 3 also says which lease an attempt ran on, in one more optional field of
 fencing token of the lease that took the run (`campaign.run_lease`), a whole number from 1. It is absent for an attempt
 that ran on no lease, which is every attempt of an unsharded campaign, a shard and a selection. Two leases of one run
 can each have an attempt of one number, so the lease id, with the run key and the attempt, names an attempt.
-Version 3 also says, in one more optional field of a turn, which deployment served its reply (F02): `deployment_id`,
+Version 3 also says, in one more optional field of a turn, which deployment served its reply (B20): `deployment_id`,
 what a front named in the response header the model entry's `deployment_header` names, beside `system_fingerprint`.
 It is the last field of a turn, absent for a turn whose reply named none (never a null), and a present one is plain
 printable text of 1 to 128 characters (`expcore.models.fleetheaders`).
@@ -480,7 +480,7 @@ def _check_turn(turn: dict, version: str, where: str, schemas: Sequence[SchemaVe
     check_section("neutral", turn["neutral"], version, f"{where}.neutral", schemas)
     _check_list("neutral_call", turn["neutral"]["tool_calls"], version, f"{where}.neutral.tool_calls", schemas)
     check_section("usage", turn["usage"], version, f"{where}.usage", schemas)
-    if "deployment_id" in turn and not deployment_id_ok(turn["deployment_id"]):  # optional, from version 3 (F02)
+    if "deployment_id" in turn and not deployment_id_ok(turn["deployment_id"]):  # optional, from version 3 (B20)
         raise RecordError(f"{where}.deployment_id: plain printable text of 1 to {DEPLOYMENT_ID_MAX} characters")
     if "extra" in turn["usage"] or "extra_cut" in turn["usage"]:  # optional, from version 3
         _check_usage_extra(turn["usage"], f"{where}.usage")

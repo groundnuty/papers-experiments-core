@@ -282,7 +282,7 @@ def turn_entry(
         "infra_wait_by_kind": plain(loop_turn.infra_wait_by_kind),
     }
     if loop_turn.deployment_id is not None and "deployment_id" in fields_of("turn", schema_version):
-        entry["deployment_id"] = loop_turn.deployment_id  # optional, last: written only when the reply named one (F02)
+        entry["deployment_id"] = loop_turn.deployment_id  # optional, last: written only when the reply named one (B20)
     return entry
 
 

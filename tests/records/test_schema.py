@@ -115,7 +115,7 @@ def test_R02_version_three_marks_the_fields_it_adds_optional_and_no_older_versio
     """R02: until v0.1.0 an extension of version 3 is additive, so a field it adds is optional: a record of version 3
     written before the field existed lacks it, and is valid. Version 3 adds the extra usage fields, the target of a
     fault, the outcome's and the declared ones, the refusal of an instrument's post-run check, the lease an attempt ran
-    on (C41), the deployment that served a turn's reply (F02), the two totals that
+    on (C41), the deployment that served a turn's reply (B20), the two totals that
     say whether the attempt was held to the reservation R, the elapsed time of a tool call, and a code tool's check of
     the exec that ran the call's program (O55), each fact of which is optional too."""
     from expcore.records import schema as rules

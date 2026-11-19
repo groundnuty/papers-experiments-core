@@ -1,4 +1,4 @@
-"""F01 and F02: an `openai_compat` model behind a fleet's front can send an opaque session header and read the
+"""B20 and B20: an `openai_compat` model behind a fleet's front can send an opaque session header and read the
 deployment that served each reply. Both are optional per-model settings; the real SDK runs against an
 `httpx.MockTransport`, so what the front would see on the wire and what the adapter reads back is the SDK's own. No
 network."""
@@ -84,7 +84,7 @@ def two_turns(model):
 
 
 def test_f01_every_request_of_an_attempt_carries_the_same_opaque_session_id_and_it_is_not_a_setting(make_spec, limits):
-    """F01: a model with `session_header` sends it on every request of the attempt, one id, 32 hex characters; the id is
+    """B20: a model with `session_header` sends it on every request of the attempt, one id, 32 hex characters; the id is
     not in the settings the record keeps (they must not differ from attempt to attempt)."""
     front = Front((200, {}), (200, {}))
     model = backend(make_spec(session_header=SESSION), limits, front)
@@ -98,7 +98,7 @@ def test_f01_every_request_of_an_attempt_carries_the_same_opaque_session_id_and_
 
 
 def test_f01_attempts_of_a_run_get_different_ids_a_lease_tells_two_attempts_of_one_number_apart():
-    """F01: the id is a function of the campaign, the run, the attempt and the lease, and nothing else."""
+    """B20: the id is a function of the campaign, the run, the attempt and the lease, and nothing else."""
     one = session_id("f" * 64, "run-key", 1)
     assert one == session_id("f" * 64, "run-key", 1)
     assert len({one, session_id("f" * 64, "run-key", 2), session_id("e" * 64, "run-key", 1)}) == 3
@@ -112,7 +112,7 @@ def test_f01_attempts_of_a_run_get_different_ids_a_lease_tells_two_attempts_of_o
 def test_f01_a_model_with_no_session_header_sends_none_and_calls_the_client_as_before(
     make_spec, limits, completion, fake_client
 ):
-    """F01: unset, the request carries no extra header and the client is called exactly as it always was."""
+    """B20: unset, the request carries no extra header and the client is called exactly as it always was."""
     client = fake_client(completion())
     plain = OpenAICompatAdapter(make_spec(), 7, limits, client=client, sleep=_no_sleep)
     plain.begin("", "go", [])
@@ -126,7 +126,7 @@ def test_f01_a_model_with_no_session_header_sends_none_and_calls_the_client_as_b
 
 
 def test_f01_a_backend_nobody_bound_still_sends_one_stable_id_of_its_own(make_spec, limits):
-    """F01: an admission probe builds the same adapter with no attempt. A header the model sets is sent with an id of
+    """B20: an admission probe builds the same adapter with no attempt. A header the model sets is sent with an id of
     the instance's own (one backend is one attempt), stable across its requests, never an error."""
     front = Front((200, {}), (200, {}))
     model = backend(make_spec(session_header=SESSION), limits, front)
@@ -142,7 +142,7 @@ def test_f01_a_backend_nobody_bound_still_sends_one_stable_id_of_its_own(make_sp
 
 
 def test_f01_a_retried_request_carries_the_same_session_id(make_spec, limits):
-    """F01: the retry layer resends the request: the resend is the same attempt's, so it carries the same id."""
+    """B20: the retry layer resends the request: the resend is the same attempt's, so it carries the same id."""
     front = Front((503, {}), (200, {}))
     model = backend(make_spec(session_header=SESSION), limits, front)
     model.bind_session("0123456789abcdef0123456789abcdef")
@@ -153,7 +153,7 @@ def test_f01_a_retried_request_carries_the_same_session_id(make_spec, limits):
 
 
 def test_f02_the_deployment_header_of_each_reply_is_recorded_on_its_turn(make_spec, limits):
-    """F02: with `deployment_header` set the adapter reads that response header (any case) on every reply: each turn
+    """B20: with `deployment_header` set the adapter reads that response header (any case) on every reply: each turn
     names the deployment that served it, and what else the turn holds is what it always held."""
     front = Front((200, {"HPCBURST-Deployment-Id": "dep-1"}), (200, {"hpcburst-deployment-id": "dep-2"}))
     model = backend(make_spec(deployment_header=DEPLOYMENT), limits, front)
@@ -170,7 +170,7 @@ def test_f02_the_deployment_header_of_each_reply_is_recorded_on_its_turn(make_sp
 
 
 def test_f02_a_reply_without_the_header_has_no_deployment_and_is_no_error(make_spec, limits):
-    """F02: the header absent from a reply is None; so is one that is empty, too long, or not printable."""
+    """B20: the header absent from a reply is None; so is one that is empty, too long, or not printable."""
     long = "x" * 129
     front = Front((200, {}), (200, {DEPLOYMENT: "  "}), (200, {DEPLOYMENT: long}))
     model = backend(make_spec(deployment_header=DEPLOYMENT), limits, front)
@@ -185,7 +185,7 @@ def test_f02_a_reply_without_the_header_has_no_deployment_and_is_no_error(make_s
 
 
 def test_f02_a_model_with_no_deployment_header_records_no_deployment(make_spec, limits):
-    """F02: unset, the reply's headers are not read: a front that sends one changes nothing."""
+    """B20: unset, the reply's headers are not read: a front that sends one changes nothing."""
     front = Front((200, {DEPLOYMENT: "dep-1"}))
     model = backend(make_spec(), limits, front)
     model.begin("", "go", [])
@@ -193,7 +193,7 @@ def test_f02_a_model_with_no_deployment_header_records_no_deployment(make_spec, 
 
 
 def test_f02_the_deployment_comes_from_the_reply_that_was_taken_not_from_a_failed_try(make_spec, limits):
-    """F02: a reply the retry layer set aside names no deployment of the turn: the turn's is the one that answered."""
+    """B20: a reply the retry layer set aside names no deployment of the turn: the turn's is the one that answered."""
     front = Front((503, {DEPLOYMENT: "dep-bad"}), (200, {DEPLOYMENT: "dep-good"}))
     model = backend(make_spec(deployment_header=DEPLOYMENT), limits, front)
     model.begin("", "go", [])
@@ -203,7 +203,7 @@ def test_f02_the_deployment_comes_from_the_reply_that_was_taken_not_from_a_faile
 
 
 def test_f02_a_failing_request_fails_the_way_it_did_without_the_setting(make_spec, limits):
-    """F02: the raw-response path raises the SDK's own error: a 400 is the same refusal with the setting as without."""
+    """B20: the raw-response path raises the SDK's own error: a 400 is the same refusal with the setting as without."""
     errors = []
     for extra in ({}, {"deployment_header": DEPLOYMENT, "session_header": SESSION}):
         model = backend(make_spec(**extra), limits, Front((400, {})))

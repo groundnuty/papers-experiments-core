@@ -1426,6 +1426,42 @@ another shard (by its whole spec, so the same label in another partition too) or
 snapshot holds the whole of `out/` but the live store's own files, which its backup stands for, and copies it whole
 each time: size `snapshot_every_s` to what the shared filesystem can take.
 
+### The fleet hop: a job reaches the group's LLM fleet (`fleethop.py`, O93)
+
+A study may run its models on the group's own OpenAI-compatible front, which listens on a unix socket of a login node.
+A compute node reaches it through one ssh tunnel, so the study's `models.toml` keeps `base_url =
+"http://127.0.0.1:<port>/v1"` and the manifest's optional `fleet_hop` (and the fleet's shard settings of that name, for
+the elastic worker) makes it reachable:
+
+    fleet_hop = { login = "<host>", socket = "<abs path of the front's socket on that login node>",
+                  key = "<abs path of the forward-only key>", known_hosts = "<abs path>", local_port = 30051 }
+
+`plan` and `lines` refuse, naming `fleet_hop` and the reason and never a value, a table that is not exactly these five
+values, a `login` that could add an option to the command (it starts with `-`, or holds anything but letters, digits,
+dot, dash, underscore and one `@`), a `socket` with a colon (the forward's own separator), a path that is not absolute or
+has a `.`, `..` or empty part or a control character, and a port outside 1024 to 65535. Each line then ends in
+`--fleet-hop <the table as one JSON argument>`; `plan` prints it in the line's `argv` and says `fleet_hop: true`.
+Before its dispatcher (or the worker) starts, `step` (and `fleetworker.py node`) runs, as a child of its own,
+
+    ssh -F /dev/null -i KEY -o IdentitiesOnly=yes -o IdentityAgent=none -o UserKnownHostsFile=KNOWN \
+        -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes -o CheckHostIP=no -o BatchMode=yes \
+        -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -N -L 127.0.0.1:PORT:SOCKET LOGIN
+
+with its output discarded (an ssh that fails says the host and the paths), and waits up to 60 s for 127.0.0.1:PORT to
+accept a connection and for its own ssh to be still running 1.5 s later (a listener of someone else's with the hop's ssh
+gone is no hop). If it does not, the step ends with 76 (`FLEET_HOP_FAILED`) and a message naming `fleet_hop` only, and no
+dispatcher or worker is started; the worker's launch watches its step for 20 s only, so a refusal after that is seen in
+the member's worker log and the controller's join waits. While the dispatcher runs, a thread starts the hop again when it
+exits, no faster than once per 10 s (the interval doubles to 60 s for a hop that dies again quickly). The hop is killed
+the moment the dispatcher exits and again on every way out of the step, in a `finally` with the stop signals held, and a
+stop signal ends the step through that cleanup, as with `home_files`; a step killed outright leaves its ssh to the
+scheduler's step teardown. A log says `fleet_hop: true (restarts: N)`, the step's owner record `fleet_hop: true`, and
+nothing records a host, a path or a port. A manifest without the key changes nothing.
+
+`python -I -B deploy/hpc-federation/fleethop.py probe --fleet-hop JSON [--path /v1/models]` runs the same hop, makes one
+keyless GET through it and prints the HTTP status alone: a front that refuses a request without its key answers 401,
+which shows the whole path without the key. The file imports nothing outside the standard library.
+
 ## A fleet of federations (`fleet.py`)
 
 A campaign's shards run in parallel, one shard per federation and one federation per held job (O68; DESIGN.md,

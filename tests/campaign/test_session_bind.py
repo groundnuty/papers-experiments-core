@@ -1,4 +1,4 @@
-"""F01: the scheduler gives a backend that sends a session header its attempt's opaque id, once the attempt has its
+"""B20: the scheduler gives a backend that sends a session header its attempt's opaque id, once the attempt has its
 number: the campaign, the run, the attempt and the lease decide it, and a backend that sends none is not touched."""
 
 import re
@@ -37,7 +37,7 @@ class SessionFactory(Factory):
 
 
 def test_f01_each_attempt_of_a_run_is_bound_to_its_own_opaque_id(tmp_path):
-    """F01: two attempts of one run get two ids, each the function of the stored campaign fingerprint, the run key and
+    """B20: two attempts of one run get two ids, each the function of the stored campaign fingerprint, the run key and
     the attempt number; the run key is not in either."""
     schema = make_schema()
     key = key_of(schema, "mount-read")
@@ -56,7 +56,7 @@ def test_f01_each_attempt_of_a_run_is_bound_to_its_own_opaque_id(tmp_path):
 
 
 def test_f01_a_backend_that_names_no_session_header_is_never_bound(tmp_path):
-    """F01: the stub backends of every other test name no header and have no `bind_session`: nothing is called."""
+    """B20: the stub backends of every other test name no header and have no `bind_session`: nothing is called."""
     factory = Factory()
     with build(tmp_path, factory=factory, plan=SMALL) as run:
         run.run()
@@ -64,7 +64,7 @@ def test_f01_a_backend_that_names_no_session_header_is_never_bound(tmp_path):
 
 
 def test_f01_a_backend_whose_header_is_unset_is_left_alone(tmp_path):
-    """F01: a backend that can be bound but whose model sets no header (`session_header` None) is not bound."""
+    """B20: a backend that can be bound but whose model sets no header (`session_header` None) is not bound."""
 
     class Unset(SessionBackend):
         session_header = None

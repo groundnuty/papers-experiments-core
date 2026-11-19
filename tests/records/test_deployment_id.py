@@ -1,4 +1,4 @@
-"""F02: a turn names the deployment that served it, as an optional field of version 3, `deployment_id`.
+"""B20: a turn names the deployment that served it, as an optional field of version 3, `deployment_id`.
 
 A front that spreads one model over several deployments names the one that answered in a response header
 (`deployment_header` in the model entry). The adapter reads it on every reply and the record keeps it on the turn,
@@ -66,7 +66,7 @@ def test_f02_a_deployment_that_is_not_plain_printable_text_of_at_most_128_charac
 
 
 def test_f02_a_record_of_turns_that_name_deployments_replays_to_its_own_bytes_and_one_without_gains_none():
-    """F02 with R03: the replay serves each turn's deployment as recorded, and fills none in where there is none."""
+    """B20 with R03: the replay serves each turn's deployment as recorded, and fills none in where there is none."""
     with_ids = recorded("dep-1", "dep-2")
     assert [t["deployment_id"] for t in with_ids.transcript] == ["dep-1", "dep-2"]
     assert replay_record(with_ids).dumps() == with_ids.dumps()

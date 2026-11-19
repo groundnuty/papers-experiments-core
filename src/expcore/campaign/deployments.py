@@ -38,7 +38,7 @@ def deployment_shares(declared: Mapping[str, Any], analysed: Iterable[tuple[str,
 
 
 def deployment_ids(transcript: Iterable[Mapping[str, Any]]) -> str | None:
-    """The deployments the turns of an attempt named (`deployment_id`, F02): the distinct ids as a sorted JSON list, or
+    """The deployments the turns of an attempt named (`deployment_id`, B20): the distinct ids as a sorted JSON list, or
     None when no turn named one. Unlike the fingerprint mix this is kept for any model that sets `deployment_header`."""
     found = sorted({turn["deployment_id"] for turn in transcript if turn.get("deployment_id")})
     return json.dumps(found) if found else None

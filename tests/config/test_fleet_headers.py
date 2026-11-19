@@ -1,4 +1,4 @@
-"""F01 and F02: `session_header` and `deployment_header` in a model entry of `models.toml`: how they are declared, what
+"""B20 and B20: `session_header` and `deployment_header` in a model entry of `models.toml`: how they are declared, what
 they are refused for, and that an entry that sets neither keeps the digest it had in the campaign fingerprint (C06)."""
 
 import textwrap
@@ -25,7 +25,7 @@ def table(tmp_path, extra: str = ""):
 
 
 def test_f01_a_model_names_its_two_headers_and_an_entry_that_names_none_has_none(tmp_path):
-    """F01, F02: both keys are optional; absent they are None."""
+    """B20: both keys are optional; absent they are None."""
     assert table(tmp_path).resolve("relay").session_header is None
     assert table(tmp_path).resolve("relay").deployment_header is None
     spec = table(tmp_path, 'session_header = "X-Session-Id"\ndeployment_header = "hpcburst-deployment-id"\n')
@@ -46,13 +46,13 @@ def test_f01_a_model_names_its_two_headers_and_an_entry_that_names_none_has_none
     ],
 )
 def test_f01_a_header_name_that_is_no_token_or_would_override_the_client_is_refused(tmp_path, line, fragment):
-    """F01, F02: a header name is an HTTP token, never one the client sets itself (the key rides in Authorization)."""
+    """B20: a header name is an HTTP token, never one the client sets itself (the key rides in Authorization)."""
     with pytest.raises(ConfigError, match=fragment):
         table(tmp_path, line + "\n")
 
 
 def test_f01_only_an_openai_compat_model_takes_the_headers(tmp_path):
-    """F01, F02: the Messages API adapter reads no deployment and sends no session, so the keys are refused there."""
+    """B20: the Messages API adapter reads no deployment and sends no session, so the keys are refused there."""
     for key in ("session_header", "deployment_header"):
         with pytest.raises(ConfigError, match=f"{key} applies to openai_compat models only"):
             ModelSpec(
@@ -66,7 +66,7 @@ def test_f01_only_an_openai_compat_model_takes_the_headers(tmp_path):
 
 
 def test_f01_a_model_that_sets_neither_header_keeps_the_digest_it_had_in_the_fingerprint():
-    """F01, F02, C06: the digest of an entry without the two keys is byte for byte the one it had before they existed
+    """B20, C06: the digest of an entry without the two keys is byte for byte the one it had before they existed
     (the literal is the digest of this entry on the commit before), so a campaign started before them resumes; an
     entry that sets either has another, since the header decides what the front sees and what a record says."""
     spec = ModelSpec(

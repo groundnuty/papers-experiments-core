@@ -1,4 +1,4 @@
-"""F02: each attempt keeps the set of deployments that served its turns, and the export says it per analysed attempt.
+"""B20: each attempt keeps the set of deployments that served its turns, and the export says it per analysed attempt.
 
 The fingerprint mix of B18 is kept only for a model that declares a set. The deployment a front names in a response
 header is wanted for any model that sets `deployment_header`, so the analysis can use the deployment as a sensitivity
@@ -72,7 +72,7 @@ def test_f02_an_attempt_keeps_the_distinct_deployments_of_its_turns_and_the_expo
 
 
 def test_f02_a_campaign_whose_turns_name_no_deployment_exports_exactly_what_it_did(tmp_path):
-    """F02: no `deployment_ids` key anywhere in the export of a campaign whose replies never named a deployment."""
+    """B20: no `deployment_ids` key anywhere in the export of a campaign whose replies never named a deployment."""
     with build(tmp_path, plan=PLAN) as scheduler:
         scheduler.run()
         export = export_run_state(scheduler.store)
