@@ -123,8 +123,9 @@ class DeclaredSet:
         return [part for part in dict.fromkeys(fingerprint_parts(fingerprint)) if part not in self.fingerprints]
 
 
-def _fingerprint_of(resp: Any) -> str | None:
-    """Read a reply's system fingerprint; several (a list) are joined into one mixed value."""
+def fingerprint_of_reply(resp: Any) -> str | None:
+    """Read a reply's system fingerprint; several (a list) are joined into one mixed value. A turn and the probe's
+    collector (`Served.note`) read it so, so a run and its admission see the same values."""
     found = getattr(resp, "system_fingerprint", None)
     if isinstance(found, (list, tuple)):
         distinct = list(dict.fromkeys(str(f) for f in found if f))
@@ -175,7 +176,7 @@ class Served:
         mid = getattr(resp, "model", None)
         if mid:
             self.ids.add(str(mid))
-        fingerprint = _fingerprint_of(resp)
+        fingerprint = fingerprint_of_reply(resp)
         if fingerprint and fingerprint not in self.fingerprints:
             self.fingerprints.append(fingerprint)
         reported = dict(getattr(resp, "model_extra", None) or {})

@@ -44,11 +44,12 @@ def kept(db: sqlite3.Connection) -> bool:
 
 
 def fingerprint_of(value: Any) -> str | None:
-    """A value to declare: one fingerprint, or None for "none"; ValueError for an empty one or several joined."""
+    """A value to declare: one fingerprint exactly as an endpoint reports it, or None for "none"; ValueError for an
+    empty one or several joined."""
     if value is None:
         return None
-    if not isinstance(value, str) or not value.strip() or value != value.strip():
-        raise ValueError(f"a fingerprint is a non-empty string with no surrounding space, got {value!r}")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"a fingerprint is a non-empty string, got {value!r}")
     if MIXED_FINGERPRINTS in value:
         raise ValueError(f"declare one fingerprint at a time, not several joined by {MIXED_FINGERPRINTS.strip()!r}")
     return value

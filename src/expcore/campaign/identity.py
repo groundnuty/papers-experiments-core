@@ -90,6 +90,10 @@ class ServedIdentities:
         if self._declared:
             self._open_declared(stamp())
 
+    def leased(self, model: str) -> bool:
+        """Whether the model is judged by a lease's declared set (C48)."""
+        return model in self._leased
+
     def undeclared(self, model: str) -> list[str | None]:
         """What the model's replies showed that its lease's declared set does not declare, in the order first seen (a
         fingerprint, or None: a reply that carried none); [] for a model not run on a lease's set (C48)."""

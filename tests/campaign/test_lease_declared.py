@@ -5,12 +5,18 @@ the store for the worker. A set from models.toml keeps its lenient rule (B18).""
 import dataclasses
 import json
 
-from campaign_support import NOW, planned_store
+from campaign_support import NOW, make_fingerprint, make_manifest, planned_store, treatment_schema
 from elastic_support import SITE, completion, join, make, plan
 from elastic_support import leased as leased_to
+from scheduler_support import Factory, FakeExecutor, attempts_of, key_of, models_for, seed_store, settings_for
 
 from expcore.campaign.elastic import SiteReading, Wait
+from expcore.campaign.executor import Endpoint
 from expcore.campaign.identity import UNDECLARED_META, ServedIdentities
+from expcore.campaign.manifest import Manifest, fingerprint_sha256
+from expcore.campaign.run_lease import RunLease
+from expcore.campaign.scheduler import Scheduler
+from expcore.campaign.shard_run import ShardStart
 from expcore.config.models import ModelSpec
 from expcore.models.served import DeclaredSet
 
@@ -68,3 +74,46 @@ def test_c48_a_run_mixing_declared_values_is_the_model_and_an_undeclared_none_in
     assert ledger.verify_archive(lease.lease_id, found.archive_sha256) == "counted"
     assert ledger.paused() == {"m1": (None,)}
     assert isinstance(ledger.issue("fed-1"), Wait)
+
+
+def _lease_scheduler(root, behaviours, declared):
+    """A scheduler over the one run of a lease of the treated condition, the lease carrying `declared`."""
+    schema = treatment_schema(("endpoint",), "api-none")
+    treated = key_of(schema, "api-none")
+    plan = {"tasks": ("task-a",), "models": ("m1",), "seeds": (1,)}
+    whole = make_manifest(schema, 7, **plan)
+    (row,) = [row for row in whole.rows if row.key.text == treated]
+    fingerprint = make_fingerprint(schema, task_ids=("task-a",), model_keys=("m1",), seed_ids=(1,))
+    lease = RunLease(treated, 1, 0, 0, fingerprint_sha256(fingerprint), "2099-01-01T00:00:00Z", declared=declared)
+    seed_store(root, schema)
+    executor = FakeExecutor({treated: behaviours})
+    scheduler = Scheduler(
+        root,
+        schema,
+        Manifest(whole.order_seed, (row,)),
+        fingerprint,
+        executor,
+        agent_config=executor.config,
+        models=models_for("m1", free=True),
+        endpoints={"m1": Endpoint("m1", "unit-m1", "https://llm.example.invalid/m1")},
+        settings=settings_for(identity_kind="knowledge"),  # a changed endpoint can never be the treatment's kind
+        backend_factory=Factory(),
+        shard=ShardStart(lease, {}, {"unit_caps": {"unit-m1": 1}, "budget": None}),
+    )
+    return scheduler, treated
+
+
+def test_c48_a_treatment_fault_served_by_an_undeclared_deployment_is_never_scored(tmp_path):
+    """C48: under a lease's set, a run of a condition whose treatment is an endpoint fault meets the fault after a
+    reply with no fingerprint, "none" undeclared: the treatment would be scored, so the attempt is set aside as the
+    endpoint's changed identity instead, uncounted, and the lease store holds the model after it."""
+    scheduler, treated = _lease_scheduler(tmp_path, [("infra_after_turn", "endpoint")], DeclaredSet(("fp-a",)))
+    with scheduler:
+        summary = scheduler.run()
+        store = scheduler.store
+        assert summary.statuses == {"pending": 1}
+        assert attempts_of(store, treated) == [("infra_fail", 1, 1)]
+        row = store.q("SELECT treatment, infra_kind FROM attempts WHERE run_key=?", (treated,))[0]
+        assert (row["treatment"], row["infra_kind"]) == (0, "knowledge")
+        assert summary.holds["m1"].kind == "undeclared_fingerprint"
+        assert json.loads(store.get_meta(UNDECLARED_META)) == {"m1": [None]}
