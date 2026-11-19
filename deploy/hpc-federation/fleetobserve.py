@@ -14,6 +14,9 @@ It reads, and never writes, submits or cancels:
 - the account's inode usage and quota (`hpcquota.read_quota`, the guard's own read) and one federation's estimate
   (`hpcquota.estimate_inodes`, the guard's own), when the providers' storage is on scratch (`HPC_STORAGE_ROOT`);
 - one federation's nodes (the layout's roles: services and the agent's node) and its `--time`;
+- each member's prepare (`fleetprepare.py`'s record `<fleet>/logs/<member>.prepare.json`, only where there is one):
+  `running` (started, not ended), `ok` (exit 0) or `failed`; read before the state file, so a prepare that ended with
+  exit 0 is read with the marker it left (it wrote the marker before it ended);
 - each fault relay its member's up recorded serving: its heartbeat file in the root
   (`<root>/fault-relay/heartbeat.json`, on the shared filesystem) and whether the process it names (pid and start
   tick) is one of this login node's. A heartbeat older than the relay's own staleness bound, or none, is `gone`; a
@@ -38,6 +41,7 @@ for _path in (HERE, HERE.parents[1] / "deploy" / "compose-federation"):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
+import fleetprepare  # noqa: E402
 import hpcdata  # noqa: E402
 import hpcquota  # noqa: E402
 import hpcstate  # noqa: E402
@@ -202,6 +206,12 @@ def member_view(directory: Path, member: Mapping[str, Any], slurm: Slurm, wall: 
     view = {"label": label, "status": status, "root": str(root), "jobs": [], "linked": False, "verified": False}
     if status in HOLDS_NOTHING:  # taken or down hold nothing; a claimed slot is not made yet: nothing to read
         return {**view, **combined([])}
+    try:
+        prepare = fleetprepare.status(directory, label)  # before the state: see the module's docstring
+    except OSError:
+        raise ObserveError(f"{label}: its prepare record cannot be read") from None
+    if prepare is not None:
+        view["prepare"] = prepare
     reason, _name = identity(directory, dict(member))  # the fleet's own check: its root, its state, its jobs
     if reason is not None:
         raise ObserveError(f"a member is not the federation this fleet made ({reason})")
