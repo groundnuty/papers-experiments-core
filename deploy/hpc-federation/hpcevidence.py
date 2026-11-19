@@ -626,7 +626,9 @@ def _plain_file(path: Path) -> bytes:
         raise EvidenceError(f"{path.name} cannot be read ({type(error).__name__})") from None
 
 
-def verified_pair(results: Path, stem: str, label: str, root_id: str | None = None) -> RootArchive:
+def verified_pair(
+    results: Path, stem: str, label: str, root_id: str | None = None, required: tuple[str, ...] = REQUIRED
+) -> RootArchive:
     """The root archive `<stem>.root.tar` of `results` and its manifest `<stem>.root.json`, shown to be one
     another's: the manifest names the archive's SHA-256 and size and this shard's `label` (and, with `root_id`, this
     federation's root), and lists exactly the files the archive holds with their sizes and hashes, the required ones
@@ -640,7 +642,7 @@ def verified_pair(results: Path, stem: str, label: str, root_id: str | None = No
         valid = valid and manifest["sha256"] == hashlib.sha256(tar).hexdigest() and manifest["bytes"] == len(tar)
         with tarfile.open(fileobj=io.BytesIO(tar)) as opened:
             held = {m.name: opened.extractfile(m).read() for m in opened.getmembers() if m.isfile()}
-        valid = valid and set(held) == set(listed) and all(name in held for name in REQUIRED)
+        valid = valid and set(held) == set(listed) and all(name in held for name in required)
         valid = valid and all(listed[n] == (len(held[n]), hashlib.sha256(held[n]).hexdigest()) for n in held)
         other = root_id is not None and manifest.get("root_id") != root_id
     except (ValueError, KeyError, TypeError, AttributeError, tarfile.TarError, OSError):

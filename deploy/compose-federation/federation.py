@@ -331,6 +331,7 @@ def reset_clean(layout: Layout) -> str:
         for leftover in layout.journal.iterdir():
             leftover.unlink()
         write_facts(layout, boot, *given)
+        write_render_identity(layout, study_artifacts)  # the file was rendered again: its record with it
     finally:
         rest.close()
     return timer.summary("reset --clean")

@@ -46,6 +46,7 @@ here).
 
 import argparse
 import contextlib
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -76,7 +77,9 @@ WORKER_MODULE = "expcore.campaign.elastic.worker"
 PLATFORM, FACTS, LINKS = "platform.toml", "facts.json", "link-check.json"
 PIDFILE, RETIRED, RUN = "worker.json", "retired.json", "run"
 MEMBER = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
-HORIZON_S = 7 * 86400.0
+GENERATION = "-g"  # a static member's later generations: <member>-g2, <member>-g3, ... (each a new ledger label)
+MAX_GENERATIONS = 9
+HORIZON_S = 3650 * 86400.0  # a member has no walltime: its recorded end is never reached in a campaign
 SETTLE_S = 20.0  # a worker that ends this soon after its start is no launch
 GRACE_S = 120.0  # after TERM, before KILL: a lease run's teardown (its sandbox) takes this long at most
 KILL_WAIT_S = 15.0
@@ -116,18 +119,27 @@ def start_tick(pid: int) -> int | None:
     return int(fields[19])
 
 
-def tagged(tag: str) -> list[int]:
-    """Every process of this user whose environment carries `WORKER_TAG=<tag>` (a zombie, whose environment is gone,
-    is no process that can spend). A process whose environment cannot be read is not one of a worker's: each runs as
-    this user and is readable to it."""
+def tagged(tag: str, marker: str | None = None) -> list[int]:
+    """Every process of this user that is the worker's: its environment carries `WORKER_TAG=<tag>`, or its command
+    line holds `marker` (the worker's run directory, which the worker's and every lease run's command lines name). The
+    command line is read even where the environment cannot be (a process that is not dumpable), and names the run
+    whatever environment a process was given, so neither hides a lease run. A zombie is no process that can spend."""
     needle = f"{WORKER_TAG}={tag}".encode()
+    mark = None if marker is None else marker.encode()
     found = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
         try:
-            if entry.stat().st_uid != os.getuid():
+            if entry.stat().st_uid != os.getuid() or start_tick(int(entry.name)) is None:
                 continue
+            line = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if mark is not None and mark in line:
+            found.append(int(entry.name))
+            continue
+        try:
             words = (entry / "environ").read_bytes().split(b"\0")
         except OSError:
             continue
@@ -138,10 +150,10 @@ def tagged(tag: str) -> list[int]:
 
 def worker_gone(record: dict) -> bool:
     """The proof of a worker's end: its own process (pid and start tick) is not running, and no process of this user
-    carries its tag."""
+    is the worker's (`tagged`)."""
     pid, start = record.get("pid"), record.get("start")
     alive = isinstance(pid, int) and start is not None and start_tick(pid) == start
-    return not alive and not tagged(record["tag"])
+    return not alive and not tagged(record["tag"], record.get("run"))
 
 
 # ------------------------------------------------------------------------------------------------ records
@@ -240,57 +252,116 @@ def channel_dir(channel: str, site: str, member: str) -> str:
     return str(Path(channel) / f"{site}-{member}")
 
 
+def generation(member: str, k: int) -> str:
+    return member if k == 1 else f"{member}{GENERATION}{k}"
+
+
+def is_retired(fleet: Path, label: str, here: str, worker: dict | None) -> bool:
+    """Retired for this channel, its worker (if any) proven gone."""
+    record = read_record(member_dir(fleet, label) / RETIRED)
+    return record is not None and record.get("channel") == here and (worker is None or worker_gone(worker))
+
+
 def member_view(fleet: Path, site: str, channel: str, member: str, root: Path, now: float, horizon: float) -> dict:
-    """One member as the controller reads it (the module's docstring). A member whose worker was launched for this
-    channel stays `RUNNING` while a service of it is merely stopped (an injected outage), and is `BROKEN` only once its
-    project is down (a service with no container, or the root's mark gone) while its worker lives."""
+    """One member (one generation of a configured member) as the controller reads it (the module's docstring). A
+    member whose worker was launched for this channel stays `RUNNING` while a service of it is merely stopped (an
+    injected outage), and is `BROKEN` only once its project is down (a service with no container, or the root's mark
+    gone) while its worker lives. `retired` (dropped from what is printed) says it was retired for this channel."""
     here = channel_dir(channel, site, member)
     project = project_of(root)
     view = {"label": member, "root": str(root), "jobs": [f"compose-{project or member}"], "linked": False,
             "verified": False, "relay": "none", "relay_beat_at": None, "submitted_at": None, "started_at": None,
-            "ends_at": None, "state": None}  # fmt: skip
+            "ends_at": None, "state": None, "retired": False, "launched": False}  # fmt: skip
     worker = worker_of(fleet, member, here)
-    gone = worker is not None and worker_gone(worker)
-    retired = read_record(member_dir(fleet, member) / RETIRED)
-    if retired is not None and retired.get("channel") == here and (worker is None or gone):
-        return {**view, "status": "down"}
+    if is_retired(fleet, member, here, worker):
+        return {**view, "status": "down", "retired": True}
     running, present = services_state(root, project)
+    joined = linked(root)
     if worker is None:
         if not running:
             return {**view, "status": "down"}  # not in the pool: never launched, and not up to join
-        joined = linked(root)
         return {**view, "status": "up", "state": "RUNNING", "linked": joined, "verified": joined,
                 "ends_at": now + horizon}  # fmt: skip
-    state = "GONE" if gone else ("RUNNING" if present else "BROKEN")
-    joined = linked(root)
-    return {**view, "status": "up", "state": state, "linked": joined, "verified": joined, "ends_at": now + horizon}
+    state = "GONE" if worker_gone(worker) else ("RUNNING" if present else "BROKEN")
+    return {**view, "status": "up", "state": state, "linked": joined, "verified": joined, "ends_at": now + horizon,
+            "launched": True}  # fmt: skip
+
+
+def has_records(fleet: Path, label: str) -> bool:
+    here = member_dir(fleet, label)
+    return (here / PIDFILE).exists() or (here / RETIRED).exists()
+
+
+def chain(fleet: Path, site: str, channel: str, member: str, root: Path, now: float, horizon: float,
+          last: bool) -> list[dict]:  # fmt: skip
+    """A configured member's generations, oldest first, ending at its current one. Once a generation is retired for
+    this channel, the next is read: one already launched or retired, or, for the last configured member naming the
+    root, a new one when the root reads live and linked again, so a federation whose worker died (or that was
+    retired) joins again under a new ledger label with its own channel, records and copy. An earlier configured
+    member naming the same root never starts a new generation: a later one in the sites file takes over the root."""
+    views = []
+    for k in range(1, MAX_GENERATIONS + 1):
+        view = member_view(fleet, site, channel, generation(member, k), root, now, horizon)
+        views.append(view)
+        if not view["retired"]:
+            return views
+        following = generation(member, k + 1)
+        if has_records(fleet, following):
+            continue
+        if not (last and live(root, project_of(root)) and linked(root)):
+            return views
+    return views
 
 
 def observe(args: argparse.Namespace) -> dict:
-    """One read of the site, as `expcore.campaign.elastic.control.SiteView` takes it (less its label)."""
+    """One read of the site, as `expcore.campaign.elastic.control.SiteView` takes it (less its label). Members naming
+    one root hold it one at a time, in the sites file's order: a later one is `down` (never joined or launched) until
+    the earlier one is retired, and one found launched while another holds its root fails the read."""
     fleet, now = Path(args.fleet), time.time()
-    members = []
+    pairs = []
     for given in args.member:
         member, _, root = given.partition("=")
         if not root or not os.path.isabs(root):
             raise SiteError(f"--member takes NAME=ROOT with an absolute root, not {member!r}")
-        members.append(member_view(fleet, args.site, args.channel, member, Path(root), now, args.horizon_s))
+        pairs.append((member, Path(root)))
+    lasts = {root: member for member, root in pairs}
+    held: dict[Path, str] = {}
+    members = []
+    for member, root in pairs:
+        views = chain(fleet, args.site, args.channel, member, root, now, args.horizon_s, lasts[root] == member)
+        current = views[-1]
+        if not current["retired"] and root in held:
+            if current["launched"]:
+                raise SiteError(f"{current['label']}: launched while {held[root]} holds its root")
+            views[-1] = {**current, "status": "down", "state": None, "linked": False, "verified": False}
+        elif not current["retired"]:
+            held[root] = current["label"]
+        members += [{k: v for k, v in view.items() if k not in ("retired", "launched")} for view in views]
     return {"idle_nodes": 0, "mixed_nodes": 0, "nodes_per_federation": 0, "time_s": args.horizon_s,
             "inodes_used": None, "inodes_quota": None, "inode_estimate": 0, "inodes_error": None,
             "members": members}  # fmt: skip
 
 
 # ------------------------------------------------------------------------------------------------ the worker
-def private_home(value: str) -> Path:
-    """The worker's HOME: a directory of this user, mode 0700, no link (the key tree is the operator's to place)."""
+def private_dir(value: str, what: str) -> Path:
+    """A directory of this user, mode 0700, no link."""
     path = Path(value)
     try:
         info = path.lstat()
     except OSError:
-        raise SiteError("--home is not there") from None
+        raise SiteError(f"{what} is not there") from None
     if path.is_symlink() or not path.is_dir() or info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise SiteError("--home must be a directory of this user of mode 0700, not a link")
+        raise SiteError(f"{what} must be a directory of this user of mode 0700, not a link")
     return path
+
+
+def apart(home: Path, study: Path, fleet: Path) -> None:
+    """The key home lies neither in the study (copied for each lease and identity read) nor in the site's directory
+    (whose run directories are removed), nor holds either: no key is ever copied or removed."""
+    key, *others = (Path(os.path.realpath(path)) for path in (home, study, fleet))
+    for other in others:
+        if key == other or key.is_relative_to(other) or other.is_relative_to(key):
+            raise SiteError("--home overlaps the study or the site's directory: its keys would be copied or removed")
 
 
 def worker_env(home: Path, run: Path, root: Path, tag: str) -> dict[str, str]:
@@ -323,84 +394,98 @@ def worker_words(federation: str, channel: str, study: Path, work: Path) -> list
             "--study", str(study), "--work", str(work)]  # fmt: skip
 
 
+@contextlib.contextmanager
+def member_lock(here: Path):
+    """One launch, stop or retirement of a member at a time (an exclusive lock on `<member>/lock`)."""
+    here.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(here / "lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
 def launch(args: argparse.Namespace) -> int:
-    fleet, root = Path(args.fleet), Path(args.root)
+    fleet, root, study = Path(args.fleet), Path(args.root), Path(args.study)
     here = member_dir(fleet, args.member)
-    record = worker_of(fleet, args.member, args.channel)
-    if record is not None and not worker_gone(record):
-        print(f"composesite: {args.member}: its worker already runs (pid {record['pid']})")
-        return 0
-    if record is not None:
-        raise SiteError(f"{args.member}: its worker of this campaign ended; it is retired, never started again")
-    home = private_home(args.home)
-    if not live(root, project_of(root)) or not (root / PLATFORM).is_file():
-        raise SiteError(f"{args.member}: its federation is not up (every service running, platform.toml rendered)")
-    run = here / RUN
-    if run.exists():
-        shutil.rmtree(run)  # a run directory no worker of this channel holds: an earlier campaign's or launch's
-    run.mkdir(mode=0o700, parents=True)
-    for name in ("work", "tmp"):
-        (run / name).mkdir(mode=0o700)
-    copy = stage_study(Path(args.study), root, run)
-    tag = hashlib.sha256(os.urandom(32)).hexdigest()[:32]
-    log = fleet / "logs" / f"{args.member}.worker.log"
-    log.parent.mkdir(mode=0o700, exist_ok=True)
-    words = worker_words(args.federation, args.channel, copy, run / "work")
-    with open(log, "ab") as sink:
-        child = subprocess.Popen(words, env=worker_env(home, run, root, tag), cwd=run, stdin=subprocess.DEVNULL,
-                                 stdout=sink, stderr=subprocess.STDOUT, start_new_session=True)  # fmt: skip
-    start = start_tick(child.pid)
-    write_record(here / PIDFILE, {"pid": child.pid, "start": start, "tag": tag, "channel": args.channel,
-                                  "federation": args.federation, "root": str(root), "at": time.time()})  # fmt: skip
-    deadline = time.monotonic() + SETTLE_S
-    while time.monotonic() < deadline:
+    home = private_dir(args.home, "--home")
+    apart(home, study, fleet)
+    with member_lock(here):
+        record = worker_of(fleet, args.member, args.channel)
+        if record is not None and not worker_gone(record):
+            print(f"composesite: {args.member}: its worker already runs (pid {record.get('pid')})")
+            return 0
+        if record is not None:
+            raise SiteError(f"{args.member}: its worker of this campaign ended; it is retired, never started again")
+        if not live(root, project_of(root)) or not (root / PLATFORM).is_file():
+            raise SiteError(f"{args.member}: its federation is not up (every service running, platform.toml rendered)")
+        run = here / RUN
+        if run.exists():
+            shutil.rmtree(run)  # no worker of this channel holds it: an earlier campaign's, or a launch that failed
+        run.mkdir(mode=0o700)
+        for name in ("work", "tmp"):
+            (run / name).mkdir(mode=0o700)
+        copy = stage_study(study, root, run)
+        tag = hashlib.sha256(os.urandom(32)).hexdigest()[:32]
+        log = fleet / "logs" / f"{args.member}.worker.log"
+        log.parent.mkdir(mode=0o700, exist_ok=True)
+        fields = {"tag": tag, "run": str(run), "channel": args.channel, "federation": args.federation,
+                  "root": str(root)}  # fmt: skip
+        write_record(here / PIDFILE, {**fields, "pid": None, "start": None, "at": time.time()})  # the tag first
+        words = worker_words(args.federation, args.channel, copy, run / "work")
+        with open(log, "ab") as sink:
+            child = subprocess.Popen(words, env=worker_env(home, run, root, tag), cwd=run, stdin=subprocess.DEVNULL,
+                                     stdout=sink, stderr=subprocess.STDOUT, start_new_session=True)  # fmt: skip
+        write_record(here / PIDFILE, {**fields, "pid": child.pid, "start": start_tick(child.pid), "at": time.time()})
+        deadline = time.monotonic() + SETTLE_S
+        while time.monotonic() < deadline and child.poll() is None:
+            time.sleep(min(1.0, SETTLE_S))
         if child.poll() is not None:
-            break
-        time.sleep(min(1.0, SETTLE_S))
-    if child.poll() is not None:
-        stop_tagged(tag, 0.0)  # whatever it started goes with it
-        (here / PIDFILE).unlink()
-        raise SiteError(f"{args.member}: its worker ended at once (status {child.returncode}; see {log.name})")
+            if stop_tagged(tag, 0.0, fields["run"]):  # whatever it started goes with it; else the record stays
+                (here / PIDFILE).unlink()
+            raise SiteError(f"{args.member}: its worker ended at once (status {child.returncode}; see {log.name})")
     print(f"composesite: {args.member}: its worker is launched (pid {child.pid}); its log {log.name}")
     return 0
 
 
-def stop_tagged(tag: str, grace_s: float) -> bool:
-    """TERM every process carrying the tag, KILL what is left after `grace_s`; True when none is left."""
+def stop_tagged(tag: str, grace_s: float, marker: str | None = None) -> bool:
+    """TERM every process of the worker (`tagged`), KILL what is left after `grace_s`; True when none is left."""
     for sig, wait in ((signal.SIGTERM, grace_s), (signal.SIGKILL, KILL_WAIT_S)):
-        for pid in tagged(tag):
+        for pid in tagged(tag, marker):
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, sig)
         deadline = time.monotonic() + wait
-        while tagged(tag) and time.monotonic() < deadline:
+        while tagged(tag, marker) and time.monotonic() < deadline:
             time.sleep(0.2)
-    return not tagged(tag)
+    return not tagged(tag, marker)
 
 
 def stop(args: argparse.Namespace) -> int:
+    """The worker's every process ended; its run directory is kept (a lease store there may be the only one)."""
     here = member_dir(Path(args.fleet), args.member)
-    record = read_record(here / PIDFILE)
-    if record is None:
-        print(f"composesite: {args.member}: no worker was launched")
-        return 0
-    pid, start = record.get("pid"), record.get("start")
-    if isinstance(pid, int) and start is not None and start_tick(pid) == start:
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGTERM)
-    if not stop_tagged(record["tag"], args.grace_s) or not worker_gone(record):
-        raise SiteError(f"{args.member}: a process of its worker is still running")
-    if (here / RUN).exists():
-        shutil.rmtree(here / RUN)
+    with member_lock(here):
+        record = read_record(here / PIDFILE)
+        if record is None:
+            print(f"composesite: {args.member}: no worker was launched")
+            return 0
+        pid, start = record.get("pid"), record.get("start")
+        if isinstance(pid, int) and start is not None and start_tick(pid) == start:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGTERM)
+        if not stop_tagged(record["tag"], args.grace_s, record.get("run")) or not worker_gone(record):
+            raise SiteError(f"{args.member}: a process of its worker is still running")
     print(f"composesite: {args.member}: its worker is stopped; no process of it is left")
     return 0
 
 
 def retired(args: argparse.Namespace) -> int:
     here = member_dir(Path(args.fleet), args.member)
-    record = read_record(here / PIDFILE)
-    if record is not None and not worker_gone(record):
-        raise SiteError(f"{args.member}: its worker still runs: stop it before it is retired")
-    write_record(here / RETIRED, {"channel": args.channel, "at": time.time()})
+    with member_lock(here):
+        record = read_record(here / PIDFILE)
+        if record is not None and not worker_gone(record):
+            raise SiteError(f"{args.member}: its worker still runs: stop it before it is retired")
+        write_record(here / RETIRED, {"channel": args.channel, "at": time.time()})
     print(f"composesite: {args.member}: retired; its federation stays up")
     return 0
 
@@ -408,13 +493,15 @@ def retired(args: argparse.Namespace) -> int:
 # ------------------------------------------------------------------------------------------------ identity, collect
 def identity(args: argparse.Namespace) -> int:
     """The member's (fingerprint, environment identity), read in a private copy of the study, as one JSON line."""
-    root, fleet = Path(args.root), Path(args.fleet)
+    root, fleet, study = Path(args.root), Path(args.fleet), Path(args.study)
+    if args.home is not None:
+        apart(private_dir(args.home, "--home"), study, fleet)
     fleet.mkdir(mode=0o700, parents=True, exist_ok=True)
     scratch = Path(tempfile.mkdtemp(prefix="identity-", dir=fleet))
     try:
         for name in ("home", "tmp"):
             (scratch / name).mkdir(mode=0o700)
-        copy = stage_study(Path(args.study), root, scratch)
+        copy = stage_study(study, root, scratch)
         env = {k: os.environ[k] for k in ALLOWLIST if k in os.environ}
         env.update(HOME=str(scratch / "home"), TMPDIR=str(scratch / "tmp"), EXPCORE_FED_ROOT=str(root),
                    EXPCORE_FED_ROOT_PARENT=str(root.parent))  # fmt: skip
@@ -438,17 +525,29 @@ def collect(args: argparse.Namespace) -> int:
         raise SiteError(str(error)) from None
 
 
+def copy_of(into: Path, root: Path, shards: ModuleType, evidence: ModuleType) -> str:
+    """The SHA-256 of the manifest of the whole copy of THIS root that `into` holds (a retry); SiteError for anything
+    else there, which is never replaced: another root's copy, a part of one, a pair that is not one another's."""
+    manifest = into / shards.ARCHIVES_MANIFEST
+    try:
+        digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        whole = not shards.verify_copy(manifest, into, digest).problems
+        stem = shards.ROOT_ONLY_STEM
+        evidence.verified_pair(into, stem, stem, shards.root_id_for(root), required=(FACTS,))
+    except (OSError, ValueError, evidence.EvidenceError, shards.ShardsError):
+        whole = False
+    if not whole:
+        raise SiteError("the directory to collect into holds something that is not this root's whole copy")
+    return digest
+
+
 def collect_into(args: argparse.Namespace, shards: ModuleType, evidence: ModuleType) -> int:
     root = Path(os.path.abspath(args.root))
     if root.is_symlink() or not (root / ROOT_MARKER).is_file() or not (root / FACTS).is_file():
         raise SiteError("the root is not a Compose federation's (its mark and facts.json)")
     into = shards.copy_directory(root, Path(args.into))
-    manifest = into / shards.ARCHIVES_MANIFEST
     if into.exists() and any(into.iterdir()):
-        digest = hashlib.sha256(manifest.read_bytes()).hexdigest() if manifest.is_file() else ""
-        if not digest or shards.verify_copy(manifest, into, digest).problems:
-            raise SiteError("the directory to collect into holds something that is not a whole copy; never replaced")
-        print(digest)  # a retry: the copy is there, whole
+        print(copy_of(into, root, shards, evidence))  # a retry: the copy is there, whole
         return 0
     into.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".collect-", dir=into.parent))
@@ -491,6 +590,7 @@ def parser() -> argparse.ArgumentParser:
     made["observe"].add_argument("--horizon-s", dest="horizon_s", type=float, default=HORIZON_S)
     made["observe"].add_argument("--member", action="append", default=[])
     made["stop"].add_argument("--grace-s", dest="grace_s", type=float, default=GRACE_S)
+    made["identity"].add_argument("--home", default=None)  # checked apart from the study before it is copied
     return found
 
 

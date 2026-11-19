@@ -80,7 +80,9 @@ federations on one host: project `<project>-K` (its network `<project>-K_fed`), 
 refused). Without `EXPCORE_FED_ROOT` its root is `<parent>/<project>-K`, beside the others. Give every command of one
 federation the same `--layout` and `--instance`. The default layout's three instances publish 29443-29446,
 29453-29456 and 29463-29466 on the loopback, clear of a fleet front on 29440. `memory_limit` stays a layout key: it is
-deploy-only, in no fingerprint.
+deploy-only, in no fingerprint. The main study's VM layout sets `memory_limit = "13g"` (a provider's measured peak
+under the study's reads plus 30%), two federations per 32-core, 110 GiB VM. The roots' location is the host's
+(`EXPCORE_FED_ROOT_PARENT`): a data volume where there is one, else the root disk.
 
 **The host's shared CA.** The CA's SHA-256 is in the campaign fingerprint (`[tls] ca_file`'s record), and the elastic
 ledger refuses a federation whose fingerprint is not the campaign's, so federations that each made their own CA (what
@@ -119,10 +121,17 @@ controller runs `composesite.py` here over ssh, from the site's directory with i
   site's 0700 `home` (the study's key tree at its models.toml paths, placed by the operator: never copied), a copy of
   the study with the root's `platform.toml`, and a tag in its environment that every process it starts inherits; a
   pidfile in `<fleet>/members/<member>/worker.json`.
-- **The proof of its end** is that no process of this user carries the tag, the worker's own included: a worker
-  killed with SIGKILL leaves its lease run (a session of its own, still spending) behind, and that run is still
-  found. A worker whose project went down reads broken (drained, then retired), never ended.
-- **stop**, **collect** (the root's allow-listed evidence, `hpcevidence.archive_root` with `facts.json` required),
+- **The proof of its end** is that no process of this user is the worker's: none carries the tag in its environment
+  or names the worker's run directory in its command line (which a lease run's does, and which is readable where its
+  environment is not), the worker's own included. A worker killed with SIGKILL leaves its lease run (a session of its
+  own, still spending) behind, and that run is still found. A worker whose project went down (its containers gone)
+  reads broken (drained, then retired), never ended; a service merely stopped (an injected outage) changes nothing.
+- **Rejoin.** A member retired for the campaign's channel (its worker died, say) whose root reads live and linked
+  again joins as its next generation, `<member>-g2` up to `-g9`: a new ledger label, with its own worker, channel,
+  records and copy. Or the operator adds a member naming the same root after it in the sites file, which takes the
+  root over once the first is retired: members naming one root hold it one at a time, in the file's order.
+- **stop** (the worker's run directory, and any lease store in it, is kept), **collect** (the root's allow-listed
+  evidence, `hpcevidence.archive_root` with `facts.json` required; a retry takes only this root's whole copy),
   **retired**: a retirement stops the worker and proves it gone, collects, and, once the copy is pulled and verified
   on the controller's host, records the member retired for the campaign's channel. **No down**: the federation stays
   up for the next campaign (a new site directory and channel) or the operator's own `down`.

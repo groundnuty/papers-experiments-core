@@ -10,6 +10,7 @@ import dataclasses
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -119,17 +120,22 @@ class Vm:
             self.up(member)
         self.env_file = self.base / "site.env"
         self.env_file.write_text(f"PATH='{self.bin}{os.pathsep}{os.environ['PATH']}'\n", encoding="utf-8")
-        sites = self.tmp / "sites.toml"
-        members_line = ", ".join(f'{m} = "{r}"' for m, r in self.roots.items())
-        sites.write_text("\n".join([
-            "[controller]", f'evidence = "{tmp_path / "evidence"}"', f'archives = "{tmp_path / "archives"}"',
+        self.engine = engine
+        self.sites(dict(self.roots))
+        self.transport = deploy.execute.SiteTransport(dict(os.environ))
+
+    def sites(self, members: dict) -> None:
+        """The sites file with these members (label: root), in this order, read as the controller reads it."""
+        path = self.tmp / "sites.toml"
+        members_line = ", ".join(f'{m} = "{r}"' for m, r in members.items())
+        path.write_text("\n".join([
+            "[controller]", f'evidence = "{self.tmp / "evidence"}"', f'archives = "{self.tmp / "archives"}"',
             "[[site]]", f'label = "{SITE}"', 'kind = "compose"', 'transport = "ssh"', f'host = "{HOST}"',
             f'interpreter = "{sys.executable}"', f'deploy = "{self.scripts}"', f'env_file = "{self.env_file}"',
             f'fleet = "{self.fleet}"', f'channel = "{self.channel}"', f'study = "{self.study}"',
-            f'home = "{self.home}"', f'engine = "{engine}"', f"members = {{ {members_line} }}",
+            f'home = "{self.home}"', f'engine = "{self.engine}"', f"members = {{ {members_line} }}",
         ]) + "\n", encoding="utf-8")  # fmt: skip
-        self.controller, (self.config,) = deploy.control.load_config(sites)
-        self.transport = deploy.execute.SiteTransport(dict(os.environ))
+        self.controller, (self.config,) = self.deploy.control.load_config(path)
 
     def up(self, member: str, services: tuple[str, ...] = ("zone", "pine", "birch"), state: str = "running") -> None:
         """The member's project's containers, each bound to its root, as the engine lists them."""
@@ -160,10 +166,8 @@ class Vm:
 def vm(deploy, tmp_path, monkeypatch):
     found = Vm(tmp_path, monkeypatch, deploy)
     yield found
-    for member in found.roots:  # no stand-in outlives its test
-        path = found.fleet / "members" / member / "worker.json"
-        if path.exists():
-            found.deploy.site.stop_tagged(found.worker(member)["tag"], 0.0)
+    for path in (found.fleet / "members").glob("*/worker.json"):  # no stand-in outlives its test
+        found.deploy.site.stop_tagged(json.loads(path.read_text(encoding="utf-8"))["tag"], 0.0)
 
 
 def wait_gone(pid: int, wait_s: float = 10.0) -> None:
@@ -222,7 +226,7 @@ def test_a_compose_site_that_is_not_whole_is_refused(deploy, vm, change, match):
 
 # ------------------------------------------------------------------------------------------------ join and lease
 def test_two_static_members_of_one_site_join_and_each_takes_a_lease(deploy, vm, tmp_path):
-    """C49: both members up and linked: one tick launches each one's worker on the host (detached, in a session of
+    """C50: both members up and linked: one tick launches each one's worker on the host (detached, in a session of
     its own, with HOME the site's 0700 home and the member's own root and channel) and joins both, under one
     fingerprint; the ledger then issues each a lease. Their roots, projects and channels are their own."""
     clock = FakeClock(time.time())  # the host reads its own clock for a member's end
@@ -268,7 +272,7 @@ def test_the_engine_setting_names_the_engine_of_every_call_on_the_host(deploy, t
 
 # ------------------------------------------------------------------------------------------------ proof of end
 def test_a_worker_killed_is_proven_ended_only_once_no_process_of_it_is_left(deploy, vm, tmp_path):
-    """C49: a worker killed with SIGKILL leaves its lease run behind, in a session of its own and still spending: the
+    """C50: a worker killed with SIGKILL leaves its lease run behind, in a session of its own and still spending: the
     member is not proven ended while it lives. Once it is gone too, the read shows the member ended and the
     controller proves its end; the federation itself is untouched."""
     clock = FakeClock(time.time())  # the host reads its own clock for a member's end
@@ -311,7 +315,7 @@ def test_a_stopped_service_keeps_a_member_but_a_project_taken_down_under_its_wor
 def test_c49_a_member_whose_worker_died_settles_its_lost_lease_from_the_channel_on_the_host(
     deploy, vm, tmp_path, clean_environment
 ):
-    """C49: a member's worker dies mid-lease and is proven ended (no process of it left): the lost lease is settled
+    """C50: a member's worker dies mid-lease and is proven ended (no process of it left): the lost lease is settled
     at the spend its place's journal shows, read over ssh from the channel on the host's disk, not left charged its
     whole grant."""
     leased_run, kept = ran_for_real(tmp_path, clean_environment, "site-a-fed-1")
@@ -335,7 +339,7 @@ def test_c49_a_member_whose_worker_died_settles_its_lost_lease_from_the_channel_
 
 # ------------------------------------------------------------------------------------------------ the retirement
 def test_a_retirement_stops_the_worker_collects_and_pulls_and_leaves_the_project_up(deploy, vm, tmp_path):
-    """C49: a drained member with no lease in flight is retired: its worker stopped and shown gone, its root's evidence
+    """C50: a drained member with no lease in flight is retired: its worker stopped and shown gone, its root's evidence
     collected (no secret in it), pulled and verified here, the member recorded retired; no engine call but reads, the
     root and its containers stay, and the member reads `down` from then on (its end proven `cancelled`)."""
     clock = FakeClock(time.time())  # the host reads its own clock for a member's end
@@ -375,15 +379,15 @@ def test_the_dry_run_prints_a_compose_retirement_with_no_down(deploy, vm):
 
 
 # ------------------------------------------------------------------------------------------------ on the host
-def test_stop_ends_every_process_of_the_worker_and_removes_its_directory(deploy, vm, tmp_path):
+def test_stop_ends_every_process_of_the_worker_and_keeps_its_lease_stores(deploy, vm, tmp_path):
     clock = FakeClock(time.time())  # the host reads its own clock for a member's end
     tick(deploy, vm, new_ledger(tmp_path, clock), clock)
     record = vm.worker("fed-2")
     code, _, err = vm.transport.run(vm.config, deploy.compose.stop_argv(vm.config, "fed-2"), 60.0)
     assert (code, err) == (0, "")
     assert deploy.site.worker_gone(record)
-    assert not deploy.site.tagged(record["tag"])
-    assert not (vm.fleet / "members" / "fed-2" / "run").exists()
+    assert deploy.site.tagged(record["tag"], record["run"]) == []
+    assert (vm.fleet / "members" / "fed-2" / "run" / "work").is_dir()  # a lease store there may be the only one
 
 
 def test_a_container_of_the_project_bound_to_another_root_makes_the_site_dark(deploy, vm):
@@ -403,3 +407,116 @@ def test_a_worker_never_starts_without_a_private_home(deploy, vm, tmp_path):
     assert ledger.federations() == []  # the launch failed: the join waits
     assert not (vm.fleet / "members" / "fed-1" / "worker.json").exists()
     assert [r["ok"] for r in vm.log.lines if r.get("action") == "Worker"] == [False, False]
+
+
+# ------------------------------------------------------------------------------------------------ rejoin
+def retire_dead_worker(deploy, vm: Vm, ledger: Ledger, clock, member: str = "fed-1") -> None:
+    """The member's worker and its run killed: its end is proven, and the member retired."""
+    record = vm.worker(member)
+    child = int((vm.fleet / "members" / member / "run" / "tmp" / "child.pid").read_text())
+    for pid in (record["pid"], child):
+        os.kill(pid, signal.SIGKILL)
+        wait_gone(pid)
+    assert [a.proof for a in tick(deploy, vm, ledger, clock) if isinstance(a, ProveEnded)] == ["terminal"]
+    assert [a.member for a in tick(deploy, vm, ledger, clock) if isinstance(a, Retire)] == [member]
+
+
+def test_c50_a_member_whose_worker_died_joins_again_as_its_next_generation(deploy, vm, tmp_path):
+    """C50: on a dedicated host a dead worker never loses the federation for the rest of the campaign: once the member
+    is retired and its root reads live and linked again, it joins as `<member>-g2`, a new ledger label with its own
+    worker, channel and copy."""
+    clock = FakeClock(time.time())
+    ledger = new_ledger(tmp_path, clock)
+    tick(deploy, vm, ledger, clock)
+    retire_dead_worker(deploy, vm, ledger, clock)
+    joins = [a for a in tick(deploy, vm, ledger, clock) if type(a).__name__ == "Join"]
+    assert [a.label for a in joins] == ["site-a-fed-1-g2"]
+    assert vm.worker("fed-1-g2")["channel"] == str(vm.channel / "site-a-fed-1-g2")
+    assert vm.worker("fed-1-g2")["root"] == str(vm.roots["fed-1"])
+    feds = {f.label: f for f in ledger.federations()}
+    assert feds["site-a-fed-1"].end_proof == "terminal"
+    assert feds["site-a-fed-1-g2"].ended_at is None
+    assert {m: v.status for m, v in vm.view().items()} == {"fed-1": "down", "fed-1-g2": "up", "fed-2": "up"}
+
+
+def test_c50_a_new_member_naming_a_retired_members_root_joins_cleanly(deploy, vm, tmp_path):
+    """C50: the operator's path: a new member key naming the same root, listed after the first, reads down while the
+    first holds the root, and joins as its own ledger label (its own channel and collect directory) once the first is
+    retired; the first, no longer the root's last, starts no generation of its own."""
+    clock = FakeClock(time.time())
+    ledger = new_ledger(tmp_path, clock)
+    tick(deploy, vm, ledger, clock)
+    vm.sites({"fed-1": vm.roots["fed-1"], "fed-1b": vm.roots["fed-1"], "fed-2": vm.roots["fed-2"]})
+    assert vm.view()["fed-1b"].status == "down"
+    assert not [a for a in tick(deploy, vm, ledger, clock) if getattr(a, "member", None) == "fed-1b"]
+    retire_dead_worker(deploy, vm, ledger, clock)
+    joins = [a for a in tick(deploy, vm, ledger, clock) if type(a).__name__ == "Join"]
+    assert [a.label for a in joins] == ["site-a-fed-1b"]
+    assert vm.worker("fed-1b")["channel"] == str(vm.channel / "site-a-fed-1b")
+    assert "fed-1-g2" not in vm.view()
+    assert (vm.fleet / "collected" / "fed-1").is_dir()
+    assert not (vm.fleet / "collected" / "fed-1b").exists()
+
+
+@pytest.mark.parametrize(
+    ("label", "members", "match"),
+    [(SITE, {"fed-1": "/r/1", "fed-1-g2": "/r/2"}, "later generation"),
+     ("s" * 30, {"f" * 35: "/r/1"}, "64 characters")],
+)  # fmt: skip
+def test_member_labels_that_meet_a_generation_or_the_ledger_limit_are_refused(deploy, label, members, match):
+    with pytest.raises(ValueError, match=match):
+        deploy.compose.compose_site(label, {"members": members, "study": "/s", "home": "/h"})
+
+
+# ------------------------------------------------------------------------------------------------ fail closed
+HIDDEN = """
+import ctypes, sys, time
+ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE 0: its environment is no longer readable to this user
+time.sleep(60)
+"""
+
+
+def test_a_lease_run_whose_environment_cannot_be_read_is_still_found_by_its_run_directory(deploy, tmp_path):
+    """A process of the worker's whose environment cannot be read (not dumpable), or was replaced, is still the
+    worker's by its command line, which names the worker's run directory: no proof of the end while it lives."""
+    run = tmp_path / "members" / "fed-1" / "run"
+    hidden = subprocess.Popen([sys.executable, "-c", HIDDEN, str(run / "work" / "lease-1" / "study")],
+                              env={"PATH": os.environ["PATH"]})  # fmt: skip
+    try:
+        record = {"tag": "its-tag", "pid": None, "start": None, "run": str(run)}
+        deadline = time.monotonic() + 10
+        while hidden.pid not in deploy.site.tagged("its-tag", str(run)) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert hidden.pid in deploy.site.tagged("its-tag", str(run))
+        assert not deploy.site.worker_gone(record)
+        assert hidden.pid not in deploy.site.tagged("its-tag", str(tmp_path / "another-run"))
+    finally:
+        hidden.kill()
+        hidden.wait()
+    assert deploy.site.worker_gone(record)
+
+
+def test_a_key_home_inside_the_study_is_refused_and_nothing_is_copied(deploy, vm, tmp_path):
+    inside = vm.study / "keys"
+    inside.mkdir(mode=0o700)
+    vm.config = dataclasses.replace(vm.config, compose=dataclasses.replace(vm.config.compose, home=str(inside)))
+    clock = FakeClock(time.time())
+    ledger = new_ledger(tmp_path, clock)
+    tick(deploy, vm, ledger, clock)
+    assert ledger.federations() == []
+    assert not (vm.fleet / "members" / "fed-1" / "run").exists()
+    code, _, err = vm.transport.run(vm.config, deploy.compose.identity_argv(vm.config, "fed-1"), 60.0)
+    assert code != 0
+    assert "overlaps" in err
+
+
+def test_a_retry_of_collect_never_takes_another_roots_copy_for_this_ones(deploy, vm):
+    into = vm.fleet / "collected" / "fed-1"
+    argv = deploy.compose.collect_argv(vm.config, str(vm.roots["fed-1"]), str(into))
+    code, out, err = vm.transport.run(vm.config, argv, 60.0)
+    assert (code, err) == (0, "")
+    assert vm.transport.run(vm.config, argv, 60.0)[1] == out  # a retry: the same copy, the same hash
+    other = deploy.compose.collect_argv(vm.config, str(vm.roots["fed-2"]), str(into))
+    code, _, err = vm.transport.run(vm.config, other, 60.0)
+    assert code != 0
+    assert "not this root's whole copy" in err

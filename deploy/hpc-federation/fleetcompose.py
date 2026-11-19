@@ -6,12 +6,18 @@ A `[[site]]` of the sites file with `kind = "compose"` is an ssh site (`host`, `
 here the host's `deploy/compose-federation`) with `fleet` (the site's own 0700 directory on the host, one per campaign),
 `channel` (its channel root there, one per campaign) and:
 
-- `members`: a table of the static members, each its label (`[a-z0-9-]`) and its root (absolute, on the host);
+- `members`: a table of the static members, each its label (`[a-z0-9-]`) and its root (absolute, on the host; the
+  roots' location is the site's: a host's data volume, or its root disk). A member retired for the campaign's channel
+  whose root reads live and linked again joins again as its next generation (`<member>-g2`, ... `-g9`: a new ledger
+  label, its own channel, records and copy); the operator may instead add a new member naming the same root, listed
+  after it, which takes the root over once the earlier one is retired (members naming one root hold it one at a
+  time, in the file's order);
 - `study`: the study's directory on the host, which each worker runs a copy of;
 - `home`: the workers' HOME on the host, a 0700 directory holding the study's key tree at its models.toml paths, which
   the operator placed there (never copied by anything here);
-- `engine` (`docker` by default, `podman` accepted and untested) and `horizon_s` (a member's end, from its join: it
-  has no walltime; 7 days by default).
+- `engine` (`docker` by default, `podman` accepted and untested) and `horizon_s` (a member's recorded end, from its
+  join: it has no walltime, so 10 years by default; a shorter one drains it that long after its join, less the
+  cut-off).
 
 Its `SiteSettings` need none of an HPC site's sizes: `max_federations` and `warm_pool` default to the number of members
 (no static member is drained for being idle: a ledger label joins once), `allowance_units` to 0 and
@@ -29,8 +35,10 @@ KIND = "compose"
 KEYS = ("members", "study", "home", "engine", "horizon_s")
 SCRIPT = "composesite.py"
 ENGINES = ("docker", "podman")  # `feddocker.ENGINES`
-HORIZON_S = 7 * 86400.0
+HORIZON_S = 3650 * 86400.0  # `composesite.HORIZON_S`: a member has no walltime, so its end is never reached
 MEMBER = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
+GENERATION = re.compile(r"(.+)-g([2-9])")  # `composesite.generation`: a member's later generation, its own label
+LABEL_MAX = 64  # the ledger's label limit
 # The seam for a member's prepare hook (the prepare-hook lane's): argv run on the host after the identity read and
 # before the worker's launch, each in order, a failure making the join wait. None is configured in this cut.
 PREPARE: Tuple[Tuple[str, ...], ...] = ()
@@ -48,7 +56,11 @@ class ComposeSite:
     horizon_s: float = HORIZON_S
 
     def root(self, member: str) -> str:
+        """A member's root; a later generation's (`<member>-g<k>`, `composesite.chain`) is its member's."""
         found = dict(self.members).get(member)
+        later = GENERATION.fullmatch(member)
+        if found is None and later is not None:
+            found = dict(self.members).get(later.group(1))
         if found is None:
             raise ValueError(f"{member} is no member of the site")
         return found
@@ -70,15 +82,20 @@ def compose_site(label: str, own: Mapping[str, Any]) -> ComposeSite:
         if not isinstance(name, str) or not MEMBER.fullmatch(name):
             raise ValueError(f"site {label}: members: {name!r} is not a member label ([a-z0-9-])")
         pairs.append((name, _absolute(root, f"site {label}: members.{name}")))
-    roots = [root for _, root in pairs]
-    if len(set(roots)) != len(roots):
-        raise ValueError(f"site {label}: two members name one root")
+    names = [name for name, _ in pairs]
+    for name in names:
+        later = GENERATION.fullmatch(name)
+        if later is not None and later.group(1) in names:
+            raise ValueError(f"site {label}: members: {name} would be a later generation of {later.group(1)}")
+        if len(label) + 1 + len(name) + 3 > LABEL_MAX:
+            raise ValueError(f"site {label}: members: {name}: its ledger label (and a generation's) would pass "
+                             f"{LABEL_MAX} characters")  # fmt: skip
     engine = own.get("engine", "docker")
     if engine not in ENGINES:
         raise ValueError(f"site {label}: engine must be one of {', '.join(ENGINES)}")
     horizon = own.get("horizon_s", HORIZON_S)
-    if isinstance(horizon, bool) or not isinstance(horizon, (int, float)) or not 3600 <= horizon <= 90 * 86400:
-        raise ValueError(f"site {label}: horizon_s must be from 3600 to {90 * 86400} seconds")
+    if isinstance(horizon, bool) or not isinstance(horizon, (int, float)) or not 3600 <= horizon <= HORIZON_S:
+        raise ValueError(f"site {label}: horizon_s must be from 3600 to {HORIZON_S:.0f} seconds")
     return ComposeSite(tuple(pairs), _absolute(own.get("study"), f"site {label}: study"),
                        _absolute(own.get("home"), f"site {label}: home"), engine, float(horizon))  # fmt: skip
 
@@ -121,7 +138,7 @@ def launch_steps(action: Any, site: Any) -> Tuple[Tuple[str, ...], ...]:
 
 def identity_argv(site: Any, member: str) -> List[str]:
     return script(site, "identity", "--fleet", str(site.fleet), "--root", site.compose.root(member), "--study",
-                  site.compose.study)  # fmt: skip
+                  site.compose.study, "--home", site.compose.home)  # fmt: skip
 
 
 def stop_argv(site: Any, member: str) -> List[str]:
