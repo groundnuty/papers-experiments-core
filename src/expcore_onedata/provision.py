@@ -1250,9 +1250,10 @@ class Provisioner:
         and how many earlier ones are left out: every one scheduled since is kept, and every one scheduled before it
         too, unless the log noted before the mark that it ended (`note_ended`) with a finish time after 0 and before
         `before`, the transfer walk's cutoff (the window's start less the clock-skew allowance and the margin,
-        `transferlog.py`). That is the walk's own proof that a harness job is absent from the listing by design
-        (`TransferLog._ended_before_cutoff`), read from the wait that saw the job end rather than asked of every
-        provider again: the change log is kept across runs, and its every earlier job read again at each run's end cost
+        `transferlog.py`). That is the walk's criterion for a harness job absent from the listing by design
+        (`TransferLog._ended_before_cutoff`), met by ONE provider's final record, the one the wait that saw the job end
+        read, where the walk asks every tracked provider's and requires them to agree: the change log is kept across
+        runs, and its every earlier job read again at each run's end cost
         about 40 minutes a run once it held thousands. A job that ended after the cutoff, or whose end was not noted,
         is kept, so its absence from the listing still flags the listing. One reading of the log gives both."""
         lines = self._lines()

@@ -61,8 +61,9 @@ listing incomplete, and what else it misses could be into any provider: every bo
 counts them. The probes hand over only the jobs that bear on the run (`Provisioner.transfers_from`): those scheduled
 since its start, and earlier ones unless the log noted, before the start, their end with a finish time before the
 cutoff (`Provisioner.note_ended`, written when a wait of the provisioner's own saw them end, as a reset's eviction
-batches and a replication's do): the proof `_ended_before_cutoff` asks of a job's records, so such a job is absent from
-the listing by design, and the log, kept across runs, is not read again job by job. Those it hands over may include
+batches and a replication's do): the criterion `_ended_before_cutoff` applies, met by the one provider's final record
+that wait read rather than by every tracked provider's agreeing, so such a job is absent from the listing by design,
+and the log, kept across runs, is not read again job by job. Those it hands over may include
 jobs from before the run, and
 the ended walk never keeps a job that ended before the cutoff, so for each harness job the listing lacks, its record is
 read on every tracked provider. The job is absent by design and flags nothing (`harness_before_window` counts them)
