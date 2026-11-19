@@ -40,8 +40,12 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-import hpcslurm
-import hpcstate
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:  # python -I leaves the script's directory out of sys.path, as hpcfed.py notes
+    sys.path.insert(0, str(HERE))
+
+import hpcslurm  # noqa: E402
+import hpcstate  # noqa: E402
 
 FORMAT = "expcore-hpc-observe/1"
 KINDS = ("oz", "op")  # the services of the federation: the zone and the providers
