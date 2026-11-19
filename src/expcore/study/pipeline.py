@@ -220,7 +220,7 @@ def _digest(value: Any) -> str:
 
 def model_digest(spec: ModelSpec) -> str:
     """The digest of a model entry in the campaign fingerprint: every field of it (its checkpoint, sampling and request
-    settings), each key location as its placeholder (K13), its two fleet headers only when it sets them (B20), and
+    settings), each key location as its placeholder (K13), its fleet headers only when it sets them (B20), and
     never its declared set of accepted fingerprints (C48): deployments of one checkpoint and its flags are
     interchangeable, so a set that grows is the same experiment, and an elastic campaign keeps the set in its ledger's
     declaration log. An entry that names no key location and sets no header keeps the digest it had before them,
@@ -234,12 +234,12 @@ def _counted_digest(spec: ModelSpec) -> str:
 
 
 # the keys a model entry leaves out of its digest while it sets none: each came after the first digests were taken
-_OPTIONAL_DIGEST_KEYS = ("session_header", "deployment_header")
+_OPTIONAL_DIGEST_KEYS = ("session_header", "deployment_header", "extra_headers")
 
 
 def _fingerprinted(entry: Mapping[str, Any]) -> dict[str, Any]:
-    """A model entry as its digest takes it: never with `accepted_fingerprints` (C48), and without `session_header` or
-    `deployment_header` when it sets none (B20), so an entry from before them keeps its digest."""
+    """A model entry as its digest takes it: never with `accepted_fingerprints` (C48), and without `session_header`,
+    `deployment_header` or `extra_headers` when it sets none (B20), so an entry from before them keeps its digest."""
     return {k: v for k, v in entry.items() if k != "accepted_fingerprints" and (k not in _OPTIONAL_DIGEST_KEYS or v)}
 
 
