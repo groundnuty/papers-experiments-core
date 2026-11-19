@@ -109,16 +109,29 @@ def serves_a_tool_server(provider: ToolProvider) -> bool:
     return getattr(provider, "tool_server", False) is True
 
 
+def serves_code_cells(provider: ToolProvider) -> bool:
+    """Tell whether a provider's tools run the agent's code cells, which is what the declared per-cell limit is for
+    (L18). A provider says so with a true `code_cell` attribute (`CodeExecutionProvider` does), read as
+    `serves_a_tool_server` reads its own, so that a test double needs no inheritance."""
+    return getattr(provider, "code_cell", False) is True
+
+
 class ToolBox:
     """The tools one run exposes, from any number of providers, and the cap that applies to all of them.
 
     `tool_servers` names the tools that are a tool server's, for a box that is not told by its providers: a replay,
     whose one provider serves every recorded call, is given the names the record holds. By default they are the tools
-    of the providers that say they serve a tool server (`serves_a_tool_server`).
+    of the providers that say they serve a tool server (`serves_a_tool_server`). `code_cells` does the same for the
+    tools that run code cells (`serves_code_cells`).
     """
 
     def __init__(
-        self, providers: Sequence[ToolProvider], *, cap_chars: int, tool_servers: Collection[str] | None = None
+        self,
+        providers: Sequence[ToolProvider],
+        *,
+        cap_chars: int,
+        tool_servers: Collection[str] | None = None,
+        code_cells: Collection[str] | None = None,
     ):
         if cap_chars <= 0:
             raise ValueError(f"the output cap must be a positive number of characters, got {cap_chars!r}")
@@ -137,6 +150,12 @@ class ToolBox:
             else set(tool_servers) & self._specs.keys()
         )
         self._tool_servers = frozenset(served)
+        cells = (
+            {name for name, provider in self._providers.items() if serves_code_cells(provider)}
+            if code_cells is None
+            else set(code_cells) & self._specs.keys()
+        )
+        self._code_cells = frozenset(cells)
         self._definitions = [self._definition(self._specs[name]) for name in sorted(self._specs)]
         # What the model is told is the definitions; the hash also covers which tools end the attempt, which the
         # model is not told, because a tool that is terminal changes what a run does (L06, L09).
@@ -163,6 +182,15 @@ class ToolBox:
     def is_tool_server(self, name: str) -> bool:
         """Tell whether the named tool is a tool server's; False for a name that is not a tool."""
         return name in self._tool_servers
+
+    @property
+    def code_cell_names(self) -> list[str]:
+        """The names of the tools that run code cells, sorted: the only tools the declared cell limit reaches (L18)."""
+        return sorted(self._code_cells)
+
+    def is_code_cell(self, name: str) -> bool:
+        """Tell whether the named tool runs code cells; False for a name that is not a tool."""
+        return name in self._code_cells
 
     def abandoned_threads(self) -> int:
         """How many threads that calls were cancelled out of may still be running, from the providers that say (L15)."""
@@ -201,7 +229,8 @@ class ToolBox:
 
     async def run(self, call: ToolCall, *, timeout_s: float, ctx: CallContext = NO_WAITS) -> ToolRun:
         """Run one call and return its outcome. `timeout_s` is passed on unchanged: the run's remaining time (L05), or,
-        for a call to a tool server under a declared bound, the bound when that is shorter (L17). `ctx` is the call
+        for a call to a tool server under a declared bound, or to a code cell under a declared limit, the bound when
+        that is shorter (L17, L18). `ctx` is the call
         context through which the provider marks its waits on infrastructure (L04).
 
         The provider is handed a deep copy of the arguments; the call keeps the original for the record. An exception

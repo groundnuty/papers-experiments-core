@@ -78,6 +78,7 @@ if str(HERE) not in sys.path:  # `-I` leaves the script's own directory off the 
     sys.path.insert(0, str(HERE))
 
 import fedverify  # noqa: E402
+import rootclaim  # noqa: E402
 from feddocker import ENGINE_ENV, ENGINES, project_containers  # noqa: E402
 from fedlayout import ROOT_MARKER  # noqa: E402
 
@@ -164,6 +165,27 @@ def names_run(cmdline: bytes, run: str) -> bool:
     lease = re.compile(re.escape(run) + r"/work/lease-[0-9]{12}/study")
     words = [word.decode(errors="replace") for word in cmdline.split(b"\0")]
     return any(word in (f"{run}/study", f"{run}/work") or lease.fullmatch(word) for word in words)
+
+
+def workers_on(root: Path) -> list[int]:
+    """Every process of this user that is a Compose worker's on the root, of any campaign: its environment carries a
+    worker tag and the root (`worker_env`). What a launch reads where the root holds no claim (C53): a worker
+    launched before claims existed holds none."""
+    tag, key, here = os.fsencode(f"{WORKER_TAG}="), b"EXPCORE_FED_ROOT=", os.path.realpath(root)
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.stat().st_uid != os.getuid() or start_tick(int(entry.name)) is None:
+                continue
+            words = (entry / "environ").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        roots = [os.path.realpath(os.fsdecode(word[len(key) :])) for word in words if word.startswith(key)]
+        if here in roots and any(word.startswith(tag) for word in words):  # however the root was spelled there
+            found.append(int(entry.name))
+    return found
 
 
 def worker_gone(record: dict) -> bool:
@@ -332,6 +354,8 @@ def member_view(fleet: Path, site: str, channel: str, member: str, root: Path, n
         view["prepare"] = prepare
     if is_retired(fleet, member, here, worker):
         return {**view, "status": "down", "retired": True}
+    if worker is None and rootclaim.elsewhere(root, fleet):
+        return {**view, "status": "down"}  # another campaign's member holds the federation (C53)
     running, present = services_state(root, project)
     joined = linked(root)
     verified = joined and data_verified(root)  # fail closed on a declared data manifest
@@ -508,7 +532,9 @@ def launch(args: argparse.Namespace) -> int:
     extra = passed(args.pass_env)  # before anything is staged: an unset or refused variable starts nothing
     # the root's data lock too: no check can invalidate the marker between its last read here and the worker's start
     data_lock = fedverify.locked(root) if root.is_dir() and not root.is_symlink() else contextlib.nullcontext()
-    with member_lock(fleet / "launch"), member_lock(here), data_lock:
+    # and its claim (C53): one campaign's worker at a time on the federation, taken after the data lock
+    claim_lock = rootclaim.locked(root) if root.is_dir() and not root.is_symlink() else contextlib.nullcontext()
+    with member_lock(fleet / "launch"), member_lock(here), data_lock, claim_lock:
         record = worker_of(fleet, args.member, args.channel)
         if record is not None and not worker_gone(record):
             print(f"composesite: {args.member}: its worker already runs (pid {record.get('pid')})")
@@ -516,6 +542,10 @@ def launch(args: argparse.Namespace) -> int:
         holder = root_holder(fleet, root, args.member)
         if holder is not None:
             raise SiteError(f"{args.member}: the worker of {holder} still runs on its root; one worker per federation")
+        if rootclaim.elsewhere(root, fleet):
+            raise SiteError(f"{args.member}: another campaign's member holds its federation; one worker per federation")
+        if rootclaim.holder(root) is None and workers_on(root):
+            raise SiteError(f"{args.member}: a worker with no claim runs on its federation; one worker per federation")
         if record is not None:
             raise SiteError(f"{args.member}: its worker of this campaign ended; it is retired, never started again")
         if not live(root, project_of(root)) or not (root / PLATFORM).is_file() or not data_verified(root):
@@ -533,6 +563,7 @@ def launch(args: argparse.Namespace) -> int:
         fields = {"tag": tag, "run": str(run), "channel": args.channel, "federation": args.federation,
                   "root": str(root)}  # fmt: skip
         write_record(here / PIDFILE, {**fields, "pid": None, "start": None, "at": time.time()})  # the tag first
+        rootclaim.take(root, fleet, args.member, args.channel, args.federation)  # no other campaign's from now on
         words = worker_words(args.federation, args.channel, copy, run / "work")
         with open(log, "ab") as sink:
             child = subprocess.Popen(words, env=worker_env(home, run, root, tag, extra), cwd=run,
@@ -544,6 +575,7 @@ def launch(args: argparse.Namespace) -> int:
             time.sleep(min(1.0, SETTLE_S))
         if child.poll() is not None:
             if stop_tagged(tag, 0.0, fields["run"]):  # whatever it started goes with it; else the record stays
+                rootclaim.release(root, fleet, args.member)
                 (here / PIDFILE).unlink()
             raise SiteError(f"{args.member}: its worker ended at once (status {child.returncode}; see {log.name})")
     print(f"composesite: {args.member}: its worker is launched (pid {child.pid}); its log {log.name}")
@@ -587,6 +619,10 @@ def retired(args: argparse.Namespace) -> int:
         if record is not None and not worker_gone(record):
             raise SiteError(f"{args.member}: its worker still runs: stop it before it is retired")
         write_record(here / RETIRED, {"channel": args.channel, "at": time.time(), "drained": args.drained})
+        root = Path(record["root"]) if record is not None and record.get("root") else None
+        if root is not None and root.is_dir() and not root.is_symlink():
+            with rootclaim.locked(root):  # its worker is gone and retired: another campaign's member may take it
+                rootclaim.release(root, Path(args.fleet), args.member)
     print(f"composesite: {args.member}: retired; its federation stays up")
     return 0
 

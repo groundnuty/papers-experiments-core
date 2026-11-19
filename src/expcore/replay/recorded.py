@@ -268,7 +268,8 @@ class ReplayToolBox(ToolBox):
     the cap is recomputed, as the loop did.
 
     The one provider of a replay serves every recorded call, so it cannot say which tools were a tool server's; the
-    record does, in the names of `agent_config.tool_server_tools`, and the box is given them (L17).
+    record does, in the names of `agent_config.tool_server_tools`, and the box is given them (L17); likewise the tools
+    that run code cells, in `agent_config.code_cell_tools` (L18).
     """
 
     def __init__(
@@ -278,8 +279,9 @@ class ReplayToolBox(ToolBox):
         cap_chars: int,
         recorded: Sequence[dict[str, Any]],
         tool_servers: Collection[str] = (),
+        code_cells: Collection[str] = (),
     ):
-        super().__init__(providers, cap_chars=cap_chars, tool_servers=tool_servers)
+        super().__init__(providers, cap_chars=cap_chars, tool_servers=tool_servers, code_cells=code_cells)
         self._unrendered = {c["call_id"]: c for c in recorded if not c.get("rendering_verified", True)}
 
     async def run(self, call: ToolCall, *, timeout_s: float, ctx: CallContext = NO_WAITS) -> ToolRun:

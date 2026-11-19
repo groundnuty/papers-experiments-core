@@ -9,6 +9,7 @@ a node's, the documentation range for addresses.
 
 import http.client
 import json
+import re
 import socket
 import ssl
 import threading
@@ -165,8 +166,13 @@ def test_o73_the_log_holds_a_count_and_never_a_name_a_body_or_a_context(tmp_path
         (line,) = _requests(log, 1)
     assert line["node_name_hits"] == 3
     text = log.read_text(encoding="utf-8").lower()
-    for word in (*NAMES, "unreachable", "try", "8443", "description"):
+    for word in (*NAMES, "unreachable", "description"):
         assert word.lower() not in text, word
+    for token in (
+        "try",
+        "8443",
+    ):  # as whole tokens: the digits inside a timestamp or a duration, or "try" in "retry", are not the body's
+        assert re.search(rf"(?<![0-9a-z]){token}(?![0-9a-z])", text) is None, token
 
 
 @pytest.mark.parametrize(
