@@ -10,23 +10,25 @@ command here over ssh, from the site's directory (`--fleet`, 0700, one per campa
     <python> -I -B composesite.py collect --root ROOT --into DIR
     <python> -I -B composesite.py retired --fleet F --member NAME --channel DIR [--drained]
     <python> -I -B composesite.py undrain --fleet F --member NAME
+    <python> -I -B composesite.py verify-data --root ROOT --layout FILE
 
 Each takes `--engine` after its name (the site's setting, `EXPCORE_FED_ENGINE`; docker by default). The members are
 federations the operator brought up with `federation.py up` (static members: none is ever brought up or taken down
 here).
 
-- **observe** reads each member, and writes nothing: live when every service its `facts.json` names has a running
-  container of the root's project (the root's mark names it) bound to that root; linked when its `link-check.json` says
-  ok; verified when linked and every space its `platform.toml` declares data for (`data_manifest`) has a marker in
-  `data-verified.json` naming its id and its manifest's SHA-256 (`data_verified`: fail closed; no Compose command writes
-  one yet, so a member with declared data never joins); its worker, by the pidfile `launch` wrote for this campaign's
-  channel. A member is `up` and `RUNNING` while live and not yet launched, or launched with its worker running and its
-  project there (a service merely stopped, as an injected outage stops one, keeps it so); `GONE` (proven ended) once
-  launched and no process of its worker is left (`worker_gone`), whether the project is up or not; `BROKEN` when its
-  project is down (a service with no container) and the worker still runs (drained, then retired, which stops it);
-  `down` when it is not live and was never launched, or was retired for this channel. Its job id is `compose-<project>`,
-  the same at every read, and its end `--horizon-s` from now: a member has no walltime. The site reports no node, so the
-  controller never adds to it.
+- **observe** reads each member, and writes nothing of the site's (a declared manifest is parsed from a private
+  temporary copy of its bytes): live when every service its `facts.json` names has a running container of the root's
+  project (the root's mark names it) bound to that root; linked when its `link-check.json` says ok; verified when linked
+  and every space its `platform.toml` declares data for (`data_manifest`) has a marker in `data-verified.json` naming
+  its id and its manifest's SHA-256 (`data_verified`: fail closed; no Compose command writes one yet, so a member with
+  declared data never joins); its worker, by the pidfile `launch` wrote for this campaign's channel. A member is `up`
+  and `RUNNING` while live and not yet launched, or launched with its worker running and its project there (a service
+  merely stopped, as an injected outage stops one, keeps it so); `GONE` (proven ended) once launched and no process of
+  its worker is left (`worker_gone`), whether the project is up or not; `BROKEN` when its project is down (a service
+  with no container) and the worker still runs (drained, then retired, which stops it); `down` when it is not live and
+  was never launched, or was retired for this channel. Its job id is `compose-<project>`, the same at every read, and
+  its end `--horizon-s` from now: a member has no walltime. The site reports no node, so the controller never adds to
+  it.
 - **launch** starts the elastic worker once, detached in a session of its own, with an environment of the allowlist
   alone and HOME the site's `--home` (a 0700 directory of this user holding the study's key tree at its models.toml
   paths, placed by the operator: never copied, never read here), in `<fleet>/members/<name>/run/` (the study copied
@@ -65,7 +67,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -76,6 +77,7 @@ HPC = HERE.parent / "hpc-federation"
 if str(HERE) not in sys.path:  # `-I` leaves the script's own directory off the path
     sys.path.insert(0, str(HERE))
 
+import fedverify  # noqa: E402
 from feddocker import ENGINE_ENV, ENGINES, project_containers  # noqa: E402
 from fedlayout import ROOT_MARKER  # noqa: E402
 
@@ -84,8 +86,6 @@ WORKER_TAG = "EXPCORE_COMPOSE_WORKER"  # in every process a worker starts: what 
 WORKER_MODULE = "expcore.campaign.elastic.worker"
 PLATFORM, FACTS, LINKS = "platform.toml", "facts.json", "link-check.json"
 PIDFILE, RETIRED, RUN = "worker.json", "retired.json", "run"
-# A space's data shown to be its declared manifest: what a Compose root holds to read verified (`data_verified`).
-DATA_MARKER, DATA_FORMAT = "data-verified.json", "expcore-compose-data-verified/1"
 MEMBER = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
 GENERATION = "-g"  # a static member's later generations: <member>-g2, <member>-g3, ... (each a new ledger label)
 MAX_GENERATIONS = 9
@@ -272,47 +272,30 @@ def linked(root: Path) -> bool:
         return False
 
 
-def declared_data(root: Path) -> dict[str, tuple[Path, Any]] | None:
-    """Every space of the root's `platform.toml` that declares its data (`data_manifest`, in `[[spaces]]` or the
-    one-space form), by name: (its manifest's path, its id). None when the file cannot be read: nothing is verified."""
-    try:
-        data = tomllib.loads((root / PLATFORM).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    entries = data.get("spaces") if isinstance(data.get("spaces"), list) else [data.get("space")]
-    found = {}
-    for entry in entries:
-        if isinstance(entry, dict) and entry.get("data_manifest"):
-            path = Path(str(entry["data_manifest"]))
-            found[str(entry.get("name"))] = (path if path.is_absolute() else root / path, entry.get("id"))
-    return found
-
-
 def data_verified(root: Path) -> bool:
     """FAIL CLOSED, as an HPC member's verify-data markers are (`fleetobserve.verified`): a member's data is verified
-    only when every space its platform file declares data for has an entry in the root's `data-verified.json` naming
-    that space's id and the SHA-256 of its manifest as it is now. A platform file that declares no data (a probe of the
-    baseline files) is verified once linked; one that cannot be read, a marker missing, of another form, of another
-    manifest or another space, is not. Nothing here writes the marker: a member with data joins only once its data is
-    shown to be the manifest's."""
-    declared = declared_data(root)
+    only when every space its platform file declares data for has an entry in the root's `data-verified.json` (format
+    /2) naming that space's id, its manifest's core digest (`manifest_sha256`, `Manifest.digest()`) and its manifest
+    file's bytes' SHA-256 (`manifest_file_sha256`), both as the file is now; a marker of an earlier format is none. A
+    platform file that declares no data (a probe of the baseline files) is verified once linked; one that cannot be
+    read, a marker missing, of another form, of another manifest or another space, is not. Nothing here writes the
+    marker: a member with data joins only once its data is shown to be the manifest's (`fedverify`, which `verify-data`
+    runs: a Compose site's prepare runs it after the study's ingest)."""
+    declared = fedverify.declared(root)
     if declared is None:
         return False
     if not declared:
         return True
     try:
-        marker = json.loads((root / DATA_MARKER).read_text(encoding="utf-8"))
-        spaces = marker["spaces"] if marker.get("format") == DATA_FORMAT else None
+        marker = json.loads((root / fedverify.MARKER).read_text(encoding="utf-8"))
+        spaces = marker["spaces"] if marker.get("format") == fedverify.FORMAT else None
         for name, (manifest, space_id) in declared.items():
             entry = spaces.get(name)
-            digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
-            if (
-                not isinstance(entry, dict)
-                or entry.get("manifest_sha256") != digest
-                or entry.get("space_id") != space_id
-            ):
+            digest, file_digest = fedverify.digests(manifest)  # both of one read of the file as it is now
+            found = (entry.get("manifest_sha256"), entry.get("manifest_file_sha256"), entry.get("space_id"))
+            if found != (digest, file_digest, space_id):
                 return False
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError):  # a bad manifest too: unverified
         return False
     return True
 
@@ -344,6 +327,9 @@ def member_view(fleet: Path, site: str, channel: str, member: str, root: Path, n
             "verified": False, "relay": "none", "relay_beat_at": None, "submitted_at": None, "started_at": None,
             "ends_at": None, "state": None, "retired": False, "launched": False}  # fmt: skip
     worker = worker_of(fleet, member, here)
+    prepare = _sibling("fleetprepare").status(fleet, member)  # the member's prepare (`fleetprepare.py`), if one ran
+    if prepare is not None:
+        view["prepare"] = prepare
     if is_retired(fleet, member, here, worker):
         return {**view, "status": "down", "retired": True}
     running, present = services_state(root, project)
@@ -442,8 +428,26 @@ def apart(home: Path, study: Path, fleet: Path) -> None:
             raise SiteError("--home overlaps the study or the site's directory: its keys would be copied or removed")
 
 
-def worker_env(home: Path, run: Path, root: Path, tag: str) -> dict[str, str]:
-    env = {k: os.environ[k] for k in ALLOWLIST if k in os.environ}
+def passed(names: list[str] | None) -> dict[str, str]:
+    """The variables the site passes (`--pass-env`), each with this host's value (its site.env's), checked by the
+    shard step's own rules (`shards.pass_env_name_problem`, `pass_env_value_problem`): never a secret-looking name,
+    one the worker sets itself, or a value that is not a plain word or absolute path. SiteError naming the variable,
+    never its value, for one that is unset or refused."""
+    shards = _sibling("shards")
+    found = {}
+    for name in names or ():
+        if problem := shards.pass_env_name_problem(name):
+            raise SiteError(problem)
+        if name not in os.environ:
+            raise SiteError(f"pass_env variable {name} is not set in the site's environment (its site.env)")
+        if problem := shards.pass_env_value_problem(name, os.environ[name]):
+            raise SiteError(problem)
+        found[name] = os.environ[name]
+    return found
+
+
+def worker_env(home: Path, run: Path, root: Path, tag: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+    env = {**(extra or {}), **{k: os.environ[k] for k in ALLOWLIST if k in os.environ}}
     env.update(
         HOME=str(home),
         TMPDIR=str(run / "tmp"),
@@ -501,7 +505,10 @@ def launch(args: argparse.Namespace) -> int:
     here = member_dir(fleet, args.member)
     home = private_dir(args.home, "--home")
     apart(home, study, fleet)
-    with member_lock(fleet / "launch"), member_lock(here):
+    extra = passed(args.pass_env)  # before anything is staged: an unset or refused variable starts nothing
+    # the root's data lock too: no check can invalidate the marker between its last read here and the worker's start
+    data_lock = fedverify.locked(root) if root.is_dir() and not root.is_symlink() else contextlib.nullcontext()
+    with member_lock(fleet / "launch"), member_lock(here), data_lock:
         record = worker_of(fleet, args.member, args.channel)
         if record is not None and not worker_gone(record):
             print(f"composesite: {args.member}: its worker already runs (pid {record.get('pid')})")
@@ -511,8 +518,8 @@ def launch(args: argparse.Namespace) -> int:
             raise SiteError(f"{args.member}: the worker of {holder} still runs on its root; one worker per federation")
         if record is not None:
             raise SiteError(f"{args.member}: its worker of this campaign ended; it is retired, never started again")
-        if not live(root, project_of(root)) or not (root / PLATFORM).is_file():
-            raise SiteError(f"{args.member}: its federation is not up (every service running, platform.toml rendered)")
+        if not live(root, project_of(root)) or not (root / PLATFORM).is_file() or not data_verified(root):
+            raise SiteError(f"{args.member}: its federation is not up and verified (services, platform.toml, data)")
         run = here / RUN
         if run.exists():
             shutil.rmtree(run)  # no worker of this channel holds it: an earlier campaign's, or a launch that failed
@@ -528,8 +535,9 @@ def launch(args: argparse.Namespace) -> int:
         write_record(here / PIDFILE, {**fields, "pid": None, "start": None, "at": time.time()})  # the tag first
         words = worker_words(args.federation, args.channel, copy, run / "work")
         with open(log, "ab") as sink:
-            child = subprocess.Popen(words, env=worker_env(home, run, root, tag), cwd=run, stdin=subprocess.DEVNULL,
-                                     stdout=sink, stderr=subprocess.STDOUT, start_new_session=True)  # fmt: skip
+            child = subprocess.Popen(words, env=worker_env(home, run, root, tag, extra), cwd=run,
+                                     stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT,
+                                     start_new_session=True)  # fmt: skip
         write_record(here / PIDFILE, {**fields, "pid": child.pid, "start": start_tick(child.pid), "at": time.time()})
         deadline = time.monotonic() + SETTLE_S
         while time.monotonic() < deadline and child.poll() is None:
@@ -601,13 +609,14 @@ def identity(args: argparse.Namespace) -> int:
     """The member's (fingerprint, environment identity), read in a private copy of the study, as one JSON line."""
     root, fleet, study = Path(args.root), Path(args.fleet), Path(args.study)
     apart(private_dir(args.home, "--home"), study, fleet)
+    extra = passed(args.pass_env)
     fleet.mkdir(mode=0o700, parents=True, exist_ok=True)
     scratch = Path(tempfile.mkdtemp(prefix="identity-", dir=fleet))
     try:
         for name in ("home", "tmp"):
             (scratch / name).mkdir(mode=0o700)
         copy = stage_study(study, root, scratch)
-        env = {k: os.environ[k] for k in ALLOWLIST if k in os.environ}
+        env = {**extra, **{k: os.environ[k] for k in ALLOWLIST if k in os.environ}}
         env.update(HOME=str(scratch / "home"), TMPDIR=str(scratch / "tmp"), EXPCORE_FED_ROOT=str(root),
                    EXPCORE_FED_ROOT_PARENT=str(root.parent))  # fmt: skip
         done = subprocess.run([sys.executable, "-I", "-B", "-c", _sibling("fleetidentity").PROGRAM, str(copy)],
@@ -618,6 +627,35 @@ def identity(args: argparse.Namespace) -> int:
     if done.returncode != 0:
         raise SiteError(f"the identity could not be read (status {done.returncode})")
     print(done.stdout.strip().splitlines()[-1])
+    return 0
+
+
+def layout_of(root: Path, layout_file: Path) -> Any:
+    """The `fedlayout.Layout` of the member at `root`: the site's layout, as the instance the root's mark names
+    (`<project>-<K>`, `fedspec.instance`), or the layout itself when the mark names its project."""
+    from fedlayout import Layout
+    from fedspec import instance, load_spec
+
+    base, project = load_spec(layout_file), project_of(root)
+    if project == base.project:
+        return Layout(root, root.parent, base)
+    number = project[len(base.project) + 1 :] if project and project.startswith(f"{base.project}-") else ""
+    if not number.isdigit():
+        raise SiteError("the root's mark names no instance of the site's layout")
+    spec = instance(base, int(number))
+    if spec.project != project:
+        raise SiteError("the root's mark names no instance of the site's layout")
+    return Layout(root, root.parent, spec)
+
+
+def verify_data(args: argparse.Namespace) -> int:
+    """The member's declared data read back against its manifests, and its marker written (`fedverify`)."""
+    root = Path(args.root)
+    if project_of(root) is None or root.is_symlink():
+        raise SiteError("the root is not a Compose federation's (its mark)")
+    with fedverify.locked(root):  # one lock from the invalidation through the checks and the marker
+        (root / fedverify.MARKER).unlink(missing_ok=True)
+        print(fedverify.verify_data(layout_of(root, Path(args.layout)), held=True))
     return 0
 
 
@@ -686,7 +724,8 @@ def parser() -> argparse.ArgumentParser:
     commands = {"observe": ("fleet", "site", "channel"), "stop": ("fleet", "member"),
                 "launch": ("fleet", "member", "root", "federation", "channel", "study", "home"),
                 "identity": ("fleet", "root", "study"), "collect": ("root", "into"),
-                "retired": ("fleet", "member", "channel"), "undrain": ("fleet", "member")}  # fmt: skip
+                "retired": ("fleet", "member", "channel"), "undrain": ("fleet", "member"),
+                "verify-data": ("root", "layout")}  # fmt: skip
     made = {}
     for name, keys in commands.items():
         made[name] = sub.add_parser(name, parents=[common])
@@ -697,6 +736,8 @@ def parser() -> argparse.ArgumentParser:
     made["stop"].add_argument("--grace-s", dest="grace_s", type=float, default=GRACE_S)
     made["retired"].add_argument("--drained", action="store_true")
     made["identity"].add_argument("--home", required=True)  # checked apart from the study before it is copied
+    for name in ("identity", "launch"):  # what the study's plugin reads from the site, in both alike
+        made[name].add_argument("--pass-env", dest="pass_env", action="append", default=[])
     return found
 
 
@@ -704,7 +745,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     os.environ[ENGINE_ENV] = args.engine  # every call to the engine, here and in feddocker, names this one
     commands: dict[str, Any] = {"launch": launch, "stop": stop, "identity": identity, "collect": collect,
-                                "retired": retired, "undrain": undrain}  # fmt: skip
+                                "retired": retired, "undrain": undrain, "verify-data": verify_data}  # fmt: skip
     try:
         if args.command == "observe":
             print(json.dumps(observe(args), sort_keys=True))

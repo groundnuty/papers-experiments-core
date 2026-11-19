@@ -1814,8 +1814,11 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   `verify-copy` here and the retired record, with no `down`. A member whose worker died is proven ended (`terminal`)
   and its lost lease settles from the channel on the host as at an ssh site; once retired, a member whose root reads
   live and linked again joins as its next generation (`<member>-g2`, a new ledger label), or a member the operator
-  adds naming the same root takes it over; a member retired after a drain stays out until `composesite.py undrain`. A prepare hook has a seam (`fleetcompose.PREPARE`) and none yet. Nothing
-  of it has run live.
+  adds naming the same root takes it over; a member retired after a drain stays out until `composesite.py undrain`. A Compose site's `prepare` (with `layout`, the members' layout file
+  on the host) runs through `fleetprepare.py run --root R --layout L` (a Compose member has no fleet record), its
+  records in the site's `<fleet>/logs/` as at an HPC site; the study's command ingests and then runs `composesite.py
+  verify-data --root {root} --layout {layout}`, whose marker is what the member joins on. A member retired before it
+  ever joined (its prepare failed, say) stays out like a drained one. Nothing of it has run live.
 
 ## The elastic fleet's worker (`fleetworker.py`, `fleetidentity.py`)
 
@@ -1829,6 +1832,11 @@ Step 6 of #462, the Helios-only path of the elastic fleet wired end to end. Noth
   allowlist alone, the step named `<job name>-worker`; its client is recorded as the member's `worker` in `fleet.json`,
   and a recorded client that lives is not started again. It watches the client for 20 s: a step that ends at once (`node`
   refuses a start it cannot make) is no launch, nothing is recorded, and the join waits. `fleet.py`'s commands are unchanged.
+- **The settings' `pass_env`** (what the study's plugin reads from the site: the main study's artifacts directory,
+  `HPC_STUDY_ARTIFACTS`) reaches the identity read and the worker as it reaches a shard step: each variable with the
+  login node's value (its site.env's), by the shard step's name and value rules, as `env -i` words on the worker's line
+  (`--pass-env NAME` tells `node` to keep it) and in the identity read's environment. An unset or refused variable is
+  no read (the join waits) and no line.
 - **On the node** (`fleetworker.py node`). The sandbox's work root is made as a shard step makes it (0700, on the tmpfs; the
   sandbox refuses to start without it). A private directory on the node's `--tmpfs`, named as a shard step's with the
   same owner record (so `shards.py sweep`, which `down` runs on the node, removes what a killed worker leaves once its

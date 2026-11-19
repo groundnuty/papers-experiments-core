@@ -15,6 +15,13 @@ here the host's `deploy/compose-federation`) with `fleet` (the site's own 0700 d
 - `study`: the study's directory on the host, which each worker runs a copy of;
 - `home`: the workers' HOME on the host, a 0700 directory holding the study's key tree at its models.toml paths, which
   the operator placed there (never copied by anything here);
+- `layout`: the members' layout file on the host, required with `prepare` (the study's own command, `{root}` and
+  `{layout}` in its words, run once per member by `fleetprepare.py` while the member is linked and its declared data
+  not verified: its ingest, then `composesite.py verify-data --root {root} --layout {layout}`, whose marker the member
+  joins on);
+- `pass_env`: variables of the host's site.env the study's plugin reads (its artifacts directory, say), by the shard
+  step's name and value rules: the host gives its own value to the identity read and to the worker, whose lease runs
+  inherit it;
 - `engine` (`docker` by default, `podman` accepted and untested). A member has no walltime: its recorded end is 10
   years from its read, never a setting, so the ledger never proves an end the host does not enforce.
 
@@ -28,10 +35,13 @@ the places, verifies the copy here, and records the member retired, with no `dow
 import os
 import re
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any, List, Mapping, Optional, Tuple
 
+import shards  # this directory's module: the pass_env name rule
+
 KIND = "compose"
-KEYS = ("members", "study", "home", "engine")
+KEYS = ("members", "study", "home", "engine", "layout", "pass_env")
 SCRIPT = "composesite.py"
 ENGINES = ("docker", "podman")  # `feddocker.ENGINES`
 HORIZON_S = 3650 * 86400.0  # `composesite.HORIZON_S`: a member has no walltime, so its end is never reached
@@ -53,6 +63,8 @@ class ComposeSite:
     home: str
     engine: str = "docker"
     horizon_s: float = HORIZON_S
+    layout: Optional[str] = None  # the site's layout file on the host: a prepare's `{layout}`, `verify-data`'s
+    pass_env: Tuple[str, ...] = ()  # variables of the host's site.env the study's plugin reads (`shards`' name rule)
 
     def root(self, member: str) -> str:
         """A member's root; a later generation's (`<member>-g<k>`, `composesite.chain`) is its member's."""
@@ -92,8 +104,16 @@ def compose_site(label: str, own: Mapping[str, Any]) -> ComposeSite:
     engine = own.get("engine", "docker")
     if engine not in ENGINES:
         raise ValueError(f"site {label}: engine must be one of {', '.join(ENGINES)}")
+    layout = _absolute(own["layout"], f"site {label}: layout") if "layout" in own else None
+    try:
+        pass_env = shards.pass_env_names(own.get("pass_env", []))
+    except shards.ShardsError as error:
+        raise ValueError(f"site {label}: {error}") from None
+    if "prepare" in own and layout is None:
+        raise ValueError(f"site {label}: a Compose site's prepare needs layout, the layout file its members are of")
     return ComposeSite(tuple(pairs), _absolute(own.get("study"), f"site {label}: study"),
-                       _absolute(own.get("home"), f"site {label}: home"), engine)  # fmt: skip
+                       _absolute(own.get("home"), f"site {label}: home"), engine, layout=layout,
+                       pass_env=pass_env)  # fmt: skip
 
 
 def settings_defaults(entry: dict, compose: ComposeSite) -> None:
@@ -128,13 +148,20 @@ def launch_steps(action: Any, site: Any) -> Tuple[Tuple[str, ...], ...]:
     compose = site.compose
     launch = script(site, "launch", "--fleet", str(site.fleet), "--member", action.member, "--root",
                     compose.root(action.member), "--federation", action.label, "--channel",
-                    channel_of(site, action.label), "--study", compose.study, "--home", compose.home)  # fmt: skip
+                    channel_of(site, action.label), "--study", compose.study, "--home", compose.home,
+                    *pass_words(compose))  # fmt: skip
     return (*PREPARE, tuple(launch))
+
+
+def pass_words(compose: ComposeSite) -> List[str]:
+    """`--pass-env NAME` for each variable the site passes: the host gives its own value (its site.env's) to the
+    identity read and to the worker, so the study's plugin sees the same value in both."""
+    return [word for name in compose.pass_env for word in ("--pass-env", name)]
 
 
 def identity_argv(site: Any, member: str) -> List[str]:
     return script(site, "identity", "--fleet", str(site.fleet), "--root", site.compose.root(member), "--study",
-                  site.compose.study, "--home", site.compose.home)  # fmt: skip
+                  site.compose.study, "--home", site.compose.home, *pass_words(site.compose))  # fmt: skip
 
 
 def stop_argv(site: Any, member: str) -> List[str]:
@@ -150,6 +177,25 @@ def retired_argv(site: Any, member: str, label: str, drained: bool = False) -> L
     (`composesite.py undrain` brings it back)."""
     return script(site, "retired", "--fleet", str(site.fleet), "--member", member, "--channel",
                   channel_of(site, label), *(("--drained",) if drained else ()))  # fmt: skip
+
+
+def prepare_script(site: Any) -> str:
+    """`fleetprepare.py` on the host: the HPC directory beside the site's `deploy/compose-federation`."""
+    return str(PurePosixPath(str(site.deploy)).parent / "hpc-federation" / "fleetprepare.py")
+
+
+def prepare_argv(site: Any, member: str, timeout_s: float, command: Tuple[str, ...]) -> List[str]:
+    """A member's prepare on the host (`fleetprepare.py run`, its once-only claim and bound), its `{root}` the member's
+    root and `{layout}` the site's layout file: the study's ingest, then `composesite.py verify-data`, which writes the
+    marker the member joins on."""
+    return [site.python, "-I", "-B", prepare_script(site), "run", "--fleet", str(site.fleet), "--member", member,
+            "--timeout", repr(float(timeout_s)), "--root", site.compose.root(member), "--layout",
+            str(site.compose.layout), "--", *command]  # fmt: skip
+
+
+def abort_argv(site: Any, member: str) -> List[str]:
+    return [site.python, "-I", "-B", prepare_script(site), "abort", "--fleet", str(site.fleet), "--member", member,
+            "--root", site.compose.root(member)]  # fmt: skip
 
 
 def is_compose(site: Optional[Any]) -> bool:

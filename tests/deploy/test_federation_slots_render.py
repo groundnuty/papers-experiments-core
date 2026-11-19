@@ -334,6 +334,7 @@ def up_stubbed(fed, monkeypatch, tmp_path, template, layout=LAYOUT):
     monkeypatch.setattr(fed.cli, "Bootstrap", lambda rest, layout: SimpleNamespace(ids=SimpleNamespace(spaces={})))
     monkeypatch.setattr(fed.cli, "Content", lambda boot: SimpleNamespace(reset=lambda timeout: None))
     monkeypatch.setattr(fed.cli, "write_facts", lambda layout, boot, *given: calls.append(("facts", given)) or "ok")
+    monkeypatch.setattr(fed.cli, "write_compose_file", lambda layout: "")  # a root the stand-ins never made
     monkeypatch.setattr(fed.cli, "check_after_up", lambda layout, ids: "links")
     monkeypatch.setattr("expcore_onedata.pin.verify_pin", lambda clone, commit: commit)
     return root, calls

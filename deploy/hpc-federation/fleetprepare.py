@@ -3,11 +3,15 @@ run on the site's login node, through the site's transport, from the site's depl
 
     <python> -I -B deploy/hpc-federation/fleetprepare.py run --fleet DIR --member fed-K --timeout S -- ARGV...
     <python> -I -B deploy/hpc-federation/fleetprepare.py abort --fleet DIR --member fed-K
+    <python> -I -B deploy/hpc-federation/fleetprepare.py run --fleet DIR --member LABEL --timeout S --root ROOT
+        --layout FILE -- ARGV...                                      # a Compose site's member (`fleetcompose.py`)
 
 `ARGV` is the study's own command (its ingest and `hpcfed.py verify-data`, which leaves the marker the controller joins
 on): the core never reads what it does. `{root}` in a word is the member's federation root and `{layout}` the fleet's
 layout file, both read from the fleet's record by the member's label (one text replace of those two names, so other
-braces are kept).
+braces are kept). A Compose site's member has no fleet record: its root and the site's layout file are given
+(`--root`, `--layout`), its label is the site's (`[a-z0-9-]`, a generation's included), and the controller's read
+decided it is up; the records are the same, in `<fleet>/logs/`.
 
 - **Once, and the first end wins.** In `<fleet>/logs/`, `<member>.prepare.json` is the claim, made by an exclusive
   create before the command starts: `run` refuses (status 3) when it is there, so a member's prepare is started at most
@@ -58,6 +62,7 @@ LOOK_S = 1.0  # how often a running prepare looks for an end somebody else wrote
 EXIT_REFUSED, EXIT_FAILED, EXIT_TIMEOUT = 3, 1, 124
 NOT_STARTED = 127  # the exit status recorded for a command that could not be executed at all
 OUTCOMES = ("ok", "failed", "timeout", "aborted")
+COMPOSE_MEMBER = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")  # a Compose site's member label (`composesite.MEMBER`)
 MAX_RECORD = 1 << 16
 PLACEHOLDER = re.compile(r"\{(root|layout)\}")
 
@@ -270,13 +275,17 @@ def say(line: str) -> None:
 
 
 def run(directory: Path, label: str, timeout_s: float, argv: Sequence[str],
-        clock: Callable[[], float] = time.time) -> int:  # fmt: skip
+        clock: Callable[[], float] = time.time, given: Optional[Tuple[Path, str]] = None) -> int:  # fmt: skip
     """The member's prepare: claimed, run bounded with its output in its own log, ended; the status is 0 only for a
-    command that exited 0 and was not ended by another."""
-    record = Record(directory).read()
-    if member_of(record, label)["status"] != "up":
-        raise Refused("the member is not up")
-    words = substituted(argv, root_of(directory, label), record["layout"]["path"])
+    command that exited 0 and was not ended by another. `given` is a Compose member's (root, layout file): it has no
+    fleet record."""
+    if given is None:
+        record = Record(directory).read()
+        if member_of(record, label)["status"] != "up":
+            raise Refused("the member is not up")
+        words = substituted(argv, root_of(directory, label), record["layout"]["path"])
+    else:
+        words = substituted(argv, given[0], given[1])
     (directory / LOGS).mkdir(mode=0o700, exist_ok=True)
     started, began = clock(), time.monotonic()
     try:
@@ -344,8 +353,10 @@ def parser() -> argparse.ArgumentParser:
         verb = sub.add_parser(name)
         verb.add_argument("--fleet", type=Path, required=True)
         verb.add_argument("--member", required=True)
+        verb.add_argument("--root", type=Path, default=None)  # a Compose site's member: its root, no fleet record
         if name == "run":
             verb.add_argument("--timeout", type=float, required=True)
+            verb.add_argument("--layout", default=None)
     return found
 
 
@@ -359,13 +370,18 @@ def main(argv: Optional[Sequence[str]] = None, clock: Callable[[], float] = time
     try:
         if not os.path.isabs(args.fleet):
             raise Refused("--fleet must be an absolute path")
-        if not MEMBER.fullmatch(args.member):
+        if not (MEMBER if args.root is None else COMPOSE_MEMBER).fullmatch(args.member):
             raise Refused("--member must be a federation's label")
         if args.command == "abort":
             return abort(args.fleet, args.member, clock)
         if not command or not all(command) or not math.isfinite(args.timeout) or args.timeout <= 0:
             raise Refused("run takes a positive --timeout and the command after `--`")
-        return run(args.fleet, args.member, args.timeout, command, clock)
+        given = None
+        if args.root is not None:
+            if not os.path.isabs(args.root) or not args.layout or not os.path.isabs(args.layout):
+                raise Refused("a Compose member's run takes an absolute --root and --layout")
+            given = (args.root, args.layout)
+        return run(args.fleet, args.member, args.timeout, command, clock, given)
     except Refused as error:
         print(f"error: {args.command}: {error}", file=sys.stderr)
     except (FleetError, OSError, ValueError) as error:  # their messages may name a path: only the kind is said
