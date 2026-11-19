@@ -115,8 +115,8 @@ The federations a host's operator brought up are one site of the elastic fleet's
 controller runs `composesite.py` here over ssh, from the site's directory with its env file sourced:
 
 - **observe**: a member is up while every service its `facts.json` names has a running container of its project bound
-  to its root, linked while its `link-check.json` says ok; its job id is `compose-<project>` and its end a horizon
-  from now (no walltime); the site reports no node, so nothing is ever added to it.
+  to its root, linked while its `link-check.json` says ok; its job id is `compose-<project>` and its end 10 years
+  from now (no walltime: the ledger never proves an end the host does not enforce); the site reports no node, so nothing is ever added to it.
 - **launch**: the elastic worker, once, detached in a session of its own, with the allowlisted environment, HOME the
   site's 0700 `home` (the study's key tree at its models.toml paths, placed by the operator: never copied), a copy of
   the study with the root's `platform.toml`, and a tag in its environment that every process it starts inherits; a

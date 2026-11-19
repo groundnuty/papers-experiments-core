@@ -42,7 +42,7 @@ def instances(fed, tmp_path, count: int = 3):
 
 
 def test_instances_of_one_layout_have_their_own_project_network_domain_ports_and_root(fed, tmp_path):
-    """C50: three instances on one host: no two share a project (so a network, `<project>_fed`), a domain or a published
+    """C51: three instances on one host: no two share a project (so a network, `<project>_fed`), a domain or a published
     port, none publishes the fleet front's port, and each one's default root is its own, beside the others below the
     parent. The layout file, its digest and its template are the same for all."""
     found = instances(fed, tmp_path)
@@ -112,7 +112,7 @@ def staged(fed, tmp_path, spec, k: int, ca_dir):
 @pytest.mark.skipif(subprocess.run(["which", "openssl"], capture_output=True).returncode != 0, reason="no openssl")
 @pytest.mark.parametrize("shared", [True, False])
 def test_one_template_on_one_shared_ca_renders_one_fingerprint_for_every_instance(fed, tmp_path, shared):
-    """C50: two instances (other ids, urls, domains and roots) rendered from one template: on the host's shared CA their
+    """C51: two instances (other ids, urls, domains and roots) rendered from one template: on the host's shared CA their
     platform files have one campaign fingerprint, and one render identity; on a CA each made, two. The shared CA's
     key stays in its directory: no root holds it. The template's project placeholders name each instance's own."""
     specs = instances(fed, tmp_path, 2)

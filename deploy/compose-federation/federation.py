@@ -37,6 +37,7 @@ pulled, and nothing is pruned.
 """
 
 import argparse
+import fcntl
 import hashlib
 import os
 import shutil
@@ -171,10 +172,15 @@ def make_shared_ca(environ: Mapping[str, str]) -> str:
         raise RuntimeError(str(error)) from None
     private_directory(directory)
     pem, key = directory / SHARED_CA_PEM, directory / SHARED_CA_KEY
-    if pem.exists() != key.exists():
-        raise RuntimeError(f"{CA_DIR_ENV} holds half a CA (a certificate or a key alone); refused")
-    made = not pem.exists()
-    make_ca(pem, key, "expcore shared test CA")
+    lock = os.open(directory / ".ca.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # two `ca` at once: one makes it, the other finds it
+        if pem.exists() != key.exists():
+            raise RuntimeError(f"{CA_DIR_ENV} holds half a CA (a certificate or a key alone); refused")
+        made = not pem.exists()
+        make_ca(pem, key, "expcore shared test CA")
+    finally:
+        os.close(lock)
     digest = hashlib.sha256(pem.read_bytes()).hexdigest()
     return f"ca: {'made' if made else 'already there'}; its certificate's SHA-256 {digest}"
 

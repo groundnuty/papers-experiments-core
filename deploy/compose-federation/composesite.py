@@ -125,7 +125,6 @@ def tagged(tag: str, marker: str | None = None) -> list[int]:
     command line is read even where the environment cannot be (a process that is not dumpable), and names the run
     whatever environment a process was given, so neither hides a lease run. A zombie is no process that can spend."""
     needle = f"{WORKER_TAG}={tag}".encode()
-    mark = None if marker is None else marker.encode()
     found = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -136,7 +135,7 @@ def tagged(tag: str, marker: str | None = None) -> list[int]:
             line = (entry / "cmdline").read_bytes()
         except OSError:
             continue
-        if mark is not None and mark in line:
+        if marker is not None and names_run(line, marker):
             found.append(int(entry.name))
             continue
         try:
@@ -146,6 +145,15 @@ def tagged(tag: str, marker: str | None = None) -> list[int]:
         if needle in words:
             found.append(int(entry.name))
     return found
+
+
+def names_run(cmdline: bytes, run: str) -> bool:
+    """Whether a command line is the worker's or a lease run's of the run directory `run`: one of its words is exactly
+    the worker's study or work directory there, or a lease's study copy (`<run>/work/lease-<id>/study`), never a file
+    below them that another program (an editor, a reader of a log) was given."""
+    lease = re.compile(re.escape(run) + r"/work/lease-[0-9]{12}/study")
+    words = [word.decode(errors="replace") for word in cmdline.split(b"\0")]
+    return any(word in (f"{run}/study", f"{run}/work") or lease.fullmatch(word) for word in words)
 
 
 def worker_gone(record: dict) -> bool:
@@ -161,6 +169,14 @@ def member_dir(fleet: Path, member: str) -> Path:
     if not MEMBER.fullmatch(member):
         raise SiteError(f"{member!r} is not a member's label ([a-z0-9-])")
     return fleet / "members" / member
+
+
+def pidfile(here: Path) -> dict | None:
+    """A member's pidfile; a record that names no run directory is given the member's own (`<member>/run`)."""
+    record = read_record(here / PIDFILE)
+    if record is not None:
+        record.setdefault("run", str(here / RUN))
+    return record
 
 
 def read_record(path: Path) -> dict | None:
@@ -192,7 +208,7 @@ def write_record(path: Path, record: dict) -> None:
 def worker_of(fleet: Path, member: str, channel: str) -> dict | None:
     """The member's pidfile for this channel; None when it has none. One of another channel whose worker still runs
     is refused: another campaign's worker holds the member."""
-    record = read_record(member_dir(fleet, member) / PIDFILE)
+    record = pidfile(member_dir(fleet, member))
     if record is None or record.get("channel") == channel:
         return record
     if not worker_gone(record):
@@ -406,16 +422,31 @@ def member_lock(here: Path):
         os.close(descriptor)
 
 
+def root_holder(fleet: Path, root: Path, member: str) -> str | None:
+    """Another member of the site's directory whose worker on this root still runs (whatever the sites file names
+    now), or None: one worker per federation."""
+    for here in sorted((fleet / "members").glob("*")):
+        if here.name == member or not (here / PIDFILE).is_file():
+            continue
+        record = pidfile(here)
+        if record is not None and record.get("root") == str(root) and not worker_gone(record):
+            return here.name
+    return None
+
+
 def launch(args: argparse.Namespace) -> int:
     fleet, root, study = Path(args.fleet), Path(args.root), Path(args.study)
     here = member_dir(fleet, args.member)
     home = private_dir(args.home, "--home")
     apart(home, study, fleet)
-    with member_lock(here):
+    with member_lock(fleet / "launch"), member_lock(here):
         record = worker_of(fleet, args.member, args.channel)
         if record is not None and not worker_gone(record):
             print(f"composesite: {args.member}: its worker already runs (pid {record.get('pid')})")
             return 0
+        holder = root_holder(fleet, root, args.member)
+        if holder is not None:
+            raise SiteError(f"{args.member}: the worker of {holder} still runs on its root; one worker per federation")
         if record is not None:
             raise SiteError(f"{args.member}: its worker of this campaign ended; it is retired, never started again")
         if not live(root, project_of(root)) or not (root / PLATFORM).is_file():
@@ -465,7 +496,7 @@ def stop(args: argparse.Namespace) -> int:
     """The worker's every process ended; its run directory is kept (a lease store there may be the only one)."""
     here = member_dir(Path(args.fleet), args.member)
     with member_lock(here):
-        record = read_record(here / PIDFILE)
+        record = pidfile(here)
         if record is None:
             print(f"composesite: {args.member}: no worker was launched")
             return 0
@@ -482,7 +513,7 @@ def stop(args: argparse.Namespace) -> int:
 def retired(args: argparse.Namespace) -> int:
     here = member_dir(Path(args.fleet), args.member)
     with member_lock(here):
-        record = read_record(here / PIDFILE)
+        record = pidfile(here)
         if record is not None and not worker_gone(record):
             raise SiteError(f"{args.member}: its worker still runs: stop it before it is retired")
         write_record(here / RETIRED, {"channel": args.channel, "at": time.time()})
@@ -494,8 +525,7 @@ def retired(args: argparse.Namespace) -> int:
 def identity(args: argparse.Namespace) -> int:
     """The member's (fingerprint, environment identity), read in a private copy of the study, as one JSON line."""
     root, fleet, study = Path(args.root), Path(args.fleet), Path(args.study)
-    if args.home is not None:
-        apart(private_dir(args.home, "--home"), study, fleet)
+    apart(private_dir(args.home, "--home"), study, fleet)
     fleet.mkdir(mode=0o700, parents=True, exist_ok=True)
     scratch = Path(tempfile.mkdtemp(prefix="identity-", dir=fleet))
     try:
@@ -590,7 +620,7 @@ def parser() -> argparse.ArgumentParser:
     made["observe"].add_argument("--horizon-s", dest="horizon_s", type=float, default=HORIZON_S)
     made["observe"].add_argument("--member", action="append", default=[])
     made["stop"].add_argument("--grace-s", dest="grace_s", type=float, default=GRACE_S)
-    made["identity"].add_argument("--home", default=None)  # checked apart from the study before it is copied
+    made["identity"].add_argument("--home", required=True)  # checked apart from the study before it is copied
     return found
 
 

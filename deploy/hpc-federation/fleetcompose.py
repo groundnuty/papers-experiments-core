@@ -15,9 +15,8 @@ here the host's `deploy/compose-federation`) with `fleet` (the site's own 0700 d
 - `study`: the study's directory on the host, which each worker runs a copy of;
 - `home`: the workers' HOME on the host, a 0700 directory holding the study's key tree at its models.toml paths, which
   the operator placed there (never copied by anything here);
-- `engine` (`docker` by default, `podman` accepted and untested) and `horizon_s` (a member's recorded end, from its
-  join: it has no walltime, so 10 years by default; a shorter one drains it that long after its join, less the
-  cut-off).
+- `engine` (`docker` by default, `podman` accepted and untested). A member has no walltime: its recorded end is 10
+  years from its read, never a setting, so the ledger never proves an end the host does not enforce.
 
 Its `SiteSettings` need none of an HPC site's sizes: `max_federations` and `warm_pool` default to the number of members
 (no static member is drained for being idle: a ledger label joins once), `allowance_units` to 0 and
@@ -32,11 +31,11 @@ from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, Tuple
 
 KIND = "compose"
-KEYS = ("members", "study", "home", "engine", "horizon_s")
+KEYS = ("members", "study", "home", "engine")
 SCRIPT = "composesite.py"
 ENGINES = ("docker", "podman")  # `feddocker.ENGINES`
 HORIZON_S = 3650 * 86400.0  # `composesite.HORIZON_S`: a member has no walltime, so its end is never reached
-MEMBER = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
+MEMBER = re.compile(r"[a-z0-9][a-z0-9-]{0,36}")  # with a generation's `-g9`, the host's 40 (`composesite.MEMBER`)
 GENERATION = re.compile(r"(.+)-g([2-9])")  # `composesite.generation`: a member's later generation, its own label
 LABEL_MAX = 64  # the ledger's label limit
 # The seam for a member's prepare hook (the prepare-hook lane's): argv run on the host after the identity read and
@@ -93,11 +92,8 @@ def compose_site(label: str, own: Mapping[str, Any]) -> ComposeSite:
     engine = own.get("engine", "docker")
     if engine not in ENGINES:
         raise ValueError(f"site {label}: engine must be one of {', '.join(ENGINES)}")
-    horizon = own.get("horizon_s", HORIZON_S)
-    if isinstance(horizon, bool) or not isinstance(horizon, (int, float)) or not 3600 <= horizon <= HORIZON_S:
-        raise ValueError(f"site {label}: horizon_s must be from 3600 to {HORIZON_S:.0f} seconds")
     return ComposeSite(tuple(pairs), _absolute(own.get("study"), f"site {label}: study"),
-                       _absolute(own.get("home"), f"site {label}: home"), engine, float(horizon))  # fmt: skip
+                       _absolute(own.get("home"), f"site {label}: home"), engine)  # fmt: skip
 
 
 def settings_defaults(entry: dict, compose: ComposeSite) -> None:

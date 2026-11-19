@@ -190,6 +190,11 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
                                 env_file, shard_settings, compose))  # fmt: skip
     if not sites or len({s.label for s in sites}) != len(sites):
         raise ConfigError("the sites file needs at least one [[site]], each label once")
+    labels = [s.label for s in sites]
+    if any(other.startswith(f"{label}-") for label in labels for other in labels):
+        # a member's ledger label is `<site>-<member>`: two sites one of which begins with the other and a dash could
+        # name one federation twice (a-b's c and a's b-c), and one's read prove the other's end
+        raise ConfigError("a site's label may not begin with another site's label and a dash")
     channels = [s.channel is not None for s in sites]
     if (archives is None and any(channels)) or (archives is not None and not all(channels)):
         raise ConfigError("[controller] archives and every site's channel go together: the dispatcher serves each "

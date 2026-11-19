@@ -1760,8 +1760,9 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   static members. It is an ssh site (`host`, `interpreter`, `env_file`, and `deploy` the host's
   `deploy/compose-federation`) with a `channel`, `fleet` (the site's 0700 directory on the host), `members` (a table of
   member labels and their roots), `study` and `home` (the workers' HOME, holding the study's key tree, placed by the
-  operator) on the host, and optionally `engine` and `horizon_s`. `[controller]` names `archives`, and `study` (this
-  host's copy, for a lost lease's settle) where it names no `settings`. `max_federations` and `warm_pool` default to
+  operator) on the host, and optionally `engine` (a member has no walltime: its recorded end is 10 years out).
+  `[controller]` names `archives`, and `study` (this host's copy, for a lost lease's settle) where it names no
+  `settings`. No site's label may begin with another's and a dash (`<site>-<member>` would name two members alike). `max_federations` and `warm_pool` default to
   the members' count, so no member is drained for idling, and nothing is ever added. Each command runs
   `composesite.py` there (its README section, "A Compose site of the elastic fleet"): the read; a join's identity read
   and worker launch; a retirement's stop (the worker proven gone: no process of it left), collect, pull, places pull,

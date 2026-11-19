@@ -226,7 +226,7 @@ def test_a_compose_site_that_is_not_whole_is_refused(deploy, vm, change, match):
 
 # ------------------------------------------------------------------------------------------------ join and lease
 def test_two_static_members_of_one_site_join_and_each_takes_a_lease(deploy, vm, tmp_path):
-    """C50: both members up and linked: one tick launches each one's worker on the host (detached, in a session of
+    """C51: both members up and linked: one tick launches each one's worker on the host (detached, in a session of
     its own, with HOME the site's 0700 home and the member's own root and channel) and joins both, under one
     fingerprint; the ledger then issues each a lease. Their roots, projects and channels are their own."""
     clock = FakeClock(time.time())  # the host reads its own clock for a member's end
@@ -272,7 +272,7 @@ def test_the_engine_setting_names_the_engine_of_every_call_on_the_host(deploy, t
 
 # ------------------------------------------------------------------------------------------------ proof of end
 def test_a_worker_killed_is_proven_ended_only_once_no_process_of_it_is_left(deploy, vm, tmp_path):
-    """C50: a worker killed with SIGKILL leaves its lease run behind, in a session of its own and still spending: the
+    """C51: a worker killed with SIGKILL leaves its lease run behind, in a session of its own and still spending: the
     member is not proven ended while it lives. Once it is gone too, the read shows the member ended and the
     controller proves its end; the federation itself is untouched."""
     clock = FakeClock(time.time())  # the host reads its own clock for a member's end
@@ -315,7 +315,7 @@ def test_a_stopped_service_keeps_a_member_but_a_project_taken_down_under_its_wor
 def test_c49_a_member_whose_worker_died_settles_its_lost_lease_from_the_channel_on_the_host(
     deploy, vm, tmp_path, clean_environment
 ):
-    """C50: a member's worker dies mid-lease and is proven ended (no process of it left): the lost lease is settled
+    """C51: a member's worker dies mid-lease and is proven ended (no process of it left): the lost lease is settled
     at the spend its place's journal shows, read over ssh from the channel on the host's disk, not left charged its
     whole grant."""
     leased_run, kept = ran_for_real(tmp_path, clean_environment, "site-a-fed-1")
@@ -339,7 +339,7 @@ def test_c49_a_member_whose_worker_died_settles_its_lost_lease_from_the_channel_
 
 # ------------------------------------------------------------------------------------------------ the retirement
 def test_a_retirement_stops_the_worker_collects_and_pulls_and_leaves_the_project_up(deploy, vm, tmp_path):
-    """C50: a drained member with no lease in flight is retired: its worker stopped and shown gone, its root's evidence
+    """C51: a drained member with no lease in flight is retired: its worker stopped and shown gone, its root's evidence
     collected (no secret in it), pulled and verified here, the member recorded retired; no engine call but reads, the
     root and its containers stay, and the member reads `down` from then on (its end proven `cancelled`)."""
     clock = FakeClock(time.time())  # the host reads its own clock for a member's end
@@ -421,8 +421,8 @@ def retire_dead_worker(deploy, vm: Vm, ledger: Ledger, clock, member: str = "fed
     assert [a.member for a in tick(deploy, vm, ledger, clock) if isinstance(a, Retire)] == [member]
 
 
-def test_c50_a_member_whose_worker_died_joins_again_as_its_next_generation(deploy, vm, tmp_path):
-    """C50: on a dedicated host a dead worker never loses the federation for the rest of the campaign: once the member
+def test_c51_a_member_whose_worker_died_joins_again_as_its_next_generation(deploy, vm, tmp_path):
+    """C51: on a dedicated host a dead worker never loses the federation for the rest of the campaign: once the member
     is retired and its root reads live and linked again, it joins as `<member>-g2`, a new ledger label with its own
     worker, channel and copy."""
     clock = FakeClock(time.time())
@@ -439,8 +439,8 @@ def test_c50_a_member_whose_worker_died_joins_again_as_its_next_generation(deplo
     assert {m: v.status for m, v in vm.view().items()} == {"fed-1": "down", "fed-1-g2": "up", "fed-2": "up"}
 
 
-def test_c50_a_new_member_naming_a_retired_members_root_joins_cleanly(deploy, vm, tmp_path):
-    """C50: the operator's path: a new member key naming the same root, listed after the first, reads down while the
+def test_c51_a_new_member_naming_a_retired_members_root_joins_cleanly(deploy, vm, tmp_path):
+    """C51: the operator's path: a new member key naming the same root, listed after the first, reads down while the
     first holds the root, and joins as its own ledger label (its own channel and collect directory) once the first is
     retired; the first, no longer the root's last, starts no generation of its own."""
     clock = FakeClock(time.time())
@@ -480,8 +480,12 @@ def test_a_lease_run_whose_environment_cannot_be_read_is_still_found_by_its_run_
     """A process of the worker's whose environment cannot be read (not dumpable), or was replaced, is still the
     worker's by its command line, which names the worker's run directory: no proof of the end while it lives."""
     run = tmp_path / "members" / "fed-1" / "run"
-    hidden = subprocess.Popen([sys.executable, "-c", HIDDEN, str(run / "work" / "lease-1" / "study")],
+    hidden = subprocess.Popen([sys.executable, "-c", HIDDEN, str(run / "work" / "lease-000000000001" / "study")],
                               env={"PATH": os.environ["PATH"]})  # fmt: skip
+    reader = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)", f"{run}/work/lease-1.log"],
+        env={"PATH": os.environ["PATH"]},
+    )  # fmt: skip  (a reader of a file below the run)
     try:
         record = {"tag": "its-tag", "pid": None, "start": None, "run": str(run)}
         deadline = time.monotonic() + 10
@@ -490,9 +494,11 @@ def test_a_lease_run_whose_environment_cannot_be_read_is_still_found_by_its_run_
         assert hidden.pid in deploy.site.tagged("its-tag", str(run))
         assert not deploy.site.worker_gone(record)
         assert hidden.pid not in deploy.site.tagged("its-tag", str(tmp_path / "another-run"))
+        assert reader.pid not in deploy.site.tagged("its-tag", str(run))  # never stopped as the worker's
     finally:
-        hidden.kill()
-        hidden.wait()
+        for process in (hidden, reader):
+            process.kill()
+            process.wait()
     assert deploy.site.worker_gone(record)
 
 
@@ -520,3 +526,26 @@ def test_a_retry_of_collect_never_takes_another_roots_copy_for_this_ones(deploy,
     code, _, err = vm.transport.run(vm.config, other, 60.0)
     assert code != 0
     assert "not this root's whole copy" in err
+
+
+def test_a_member_never_launches_on_a_root_whose_other_members_worker_still_runs(deploy, vm, tmp_path):
+    """One worker per federation, whatever the sites file names now: a sites file rewritten with only a new member
+    for a root whose earlier member's worker runs gets no second worker there (the join waits)."""
+    clock = FakeClock(time.time())
+    ledger = new_ledger(tmp_path, clock)
+    tick(deploy, vm, ledger, clock)
+    vm.sites({"fed-1b": vm.roots["fed-1"], "fed-2": vm.roots["fed-2"]})
+    tick(deploy, vm, ledger, clock)
+    assert "site-a-fed-1b" not in {f.label for f in ledger.federations()}
+    assert not (vm.fleet / "members" / "fed-1b" / "worker.json").exists()
+    assert [r["ok"] for r in vm.log.lines if r.get("action") == "Worker"] == [False]
+
+
+def test_site_labels_one_of_which_begins_with_another_and_a_dash_are_refused(deploy, vm):
+    """`a-b`'s member `c` and `a`'s member `b-c` would be one ledger label: such sites never share a sites file."""
+    text = (vm.tmp / "sites.toml").read_text(encoding="utf-8")
+    second = text[text.index("[[site]]") :].replace(f'label = "{SITE}"', f'label = "{SITE}-x"')
+    second = second.replace(str(vm.fleet), str(vm.fleet) + "-x")
+    (vm.tmp / "sites.toml").write_text(text + second, encoding="utf-8")
+    with pytest.raises(deploy.control.ConfigError, match="begin with another site's label"):
+        deploy.control.load_config(vm.tmp / "sites.toml")
