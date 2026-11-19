@@ -614,7 +614,7 @@ def test_a_joining_federations_identity_is_read_on_the_login_node_and_its_worker
     reads none, so the join waits); the worker's launch names that same file, never the controller's."""
     read = deploy.fleetidentity.identity_reader(Path("/this/hosts/settings.toml"), {"site-a": login.config},
                                                 transport=login.transport)  # fmt: skip
-    assert read("site-a", "fed-1") == ("f" * 64, {"core_commit": "0123abcd"})
+    assert read("site-a", "fed-1") == ("f" * 64, {"core_commit": "0123abcd"}, None)  # C50: a read with no platform
     (call,) = login.calls("identity")
     assert call["argv"][call["argv"].index("--settings") + 1] == str(login.base / "settings.toml")
     login.fake.rule("fleetidentity.py", "fail")

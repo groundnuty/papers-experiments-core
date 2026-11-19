@@ -43,6 +43,11 @@ UNDECLARED_SEEN_SQL = """CREATE TABLE IF NOT EXISTS undeclared_seen(  -- what a 
   fingerprint TEXT,  -- NULL: a reply that carried none
   lease_id INTEGER NOT NULL REFERENCES leases(id))"""
 
+# The platform each federation joined on (C50), when the campaign declares its platforms: the identity each of its
+# runs ran under. A ledger made before the table, or one that declares none, has no rows in it.
+FEDERATION_PLATFORMS_SQL = """CREATE TABLE IF NOT EXISTS federation_platforms(
+  label TEXT PRIMARY KEY REFERENCES federations(label), platform TEXT NOT NULL)"""
+
 _SQL = (
     """
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -91,7 +96,7 @@ CREATE TABLE ceilings(  -- the raises of the dollar ceiling, the campaign's (mod
   old_micro INTEGER NOT NULL, new_micro INTEGER NOT NULL, reason TEXT NOT NULL, actor TEXT NOT NULL,
   CHECK(new_micro > old_micro));
 """
-    + ";\n".join((CAP_CHANGES_SQL, DECLARATIONS_SQL, LEASE_SETS_SQL, UNDECLARED_SEEN_SQL))
+    + ";\n".join((CAP_CHANGES_SQL, DECLARATIONS_SQL, LEASE_SETS_SQL, UNDECLARED_SEEN_SQL, FEDERATION_PLATFORMS_SQL))
     + ";"
 )
 

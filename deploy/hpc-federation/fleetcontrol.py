@@ -8,7 +8,7 @@ controller"). `expcore.campaign.elastic.control` decides; this reads the sites, 
     <python> -I -B deploy/hpc-federation/fleetcontrol.py ended --ledger L --label LABEL --proof cancelled|terminal
     <python> -I -B deploy/hpc-federation/fleetcontrol.py join --ledger L --label LABEL --site S --jobs J[,J]
                                                        --job-end EPOCH --kill-wait S --fingerprint F
-                                                       --environment-file IDENTITY.json
+                                                       --environment-file IDENTITY.json [--platform P]
     <python> -I -B deploy/hpc-federation/fleetcontrol.py settle --ledger L --lease N --spend-micro S
                                                        --source root|pulled --attempts N
 
@@ -416,7 +416,8 @@ def by_hand(args: argparse.Namespace, hooks: Hooks) -> int:
         else:
             jobs = tuple(job for job in args.jobs.split(",") if job)
             ledger.join(args.label, site=args.site, job_ids=jobs, job_end_at=args.job_end, fingerprint=args.fingerprint,
-                        environment=environment_of(args.environment_file), kill_wait_s=args.kill_wait)  # fmt: skip
+                        environment=environment_of(args.environment_file), kill_wait_s=args.kill_wait,
+                        platform=args.platform)  # fmt: skip
     finally:
         ledger.close()
     hooks.say(f"fleetcontrol: {args.command}: {getattr(args, 'label', None) or args.lease}: done")
@@ -462,6 +463,12 @@ def parser() -> argparse.ArgumentParser:
             verb.add_argument("--job-end", dest="job_end", type=float, required=True)
             verb.add_argument("--kill-wait", dest="kill_wait", type=float, required=True)
             verb.add_argument("--fingerprint", required=True)
+            verb.add_argument(
+                "--platform",
+                default=None,
+                help="the SHA-256 of the federation's own platform fingerprint: required when the campaign declares "
+                "its platforms (C50), not read otherwise",
+            )
             verb.add_argument(
                 "--environment-file",
                 dest="environment_file",

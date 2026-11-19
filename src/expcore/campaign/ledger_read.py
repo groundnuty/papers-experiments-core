@@ -63,6 +63,7 @@ class LeaseRow:
     charge_micro: int
     completion: Mapping[str, Any] | None
     proven: bool = False  # its federation's job is proven ended
+    platform: str | None = None  # the platform its federation joined on, when the campaign declares its set (C50)
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,7 @@ def read_ledger(data: bytes, sha256: str, where: object = LEDGER_SNAPSHOT) -> Le
             config = LedgerConfig.from_json(meta["config"])
             runs = {row["run_key"]: _run_row(row) for row in db.execute("SELECT * FROM runs ORDER BY seq")}
             leases = {row["id"]: _lease_row(row) for row in db.execute("SELECT * FROM leases ORDER BY id")}
+            joined_on = _platforms(db)
             events = [dict(row) for row in db.execute("SELECT * FROM events ORDER BY seq")]
             views = _Views(db, config)  # the ledger's own reads of its money and settlements, over the snapshot
             in_force, settled, locked = views.ceilings(), views.settlements(), views.status().locked_micro
@@ -168,7 +170,10 @@ def read_ledger(data: bytes, sha256: str, where: object = LEDGER_SNAPSHOT) -> Le
             raise LedgerRefused(f"{where}: cannot read the ledger ({type(error).__name__}: {error})") from None
     finally:
         db.close()
-    leases = {key: replace(lease, proven=key in proven) for key, lease in leases.items()}
+    leases = {
+        key: replace(lease, proven=key in proven, platform=joined_on.get(lease.federation))
+        for key, lease in leases.items()
+    }
     by_lease = {settlement.lease_id: settlement for settlement in settled}
     facts = LedgerFacts(sha256, config, meta.get("environment"), runs, leases, in_force, by_lease, locked)
     facts = replace(facts, declarations=None if logged is None else tuple(logged))
@@ -183,6 +188,13 @@ class _Views(LedgerViews):
     def __init__(self, db: sqlite3.Connection, config: LedgerConfig) -> None:
         self.db = db
         self.config = config
+
+
+def _platforms(db: sqlite3.Connection) -> dict[str, str]:
+    """Each federation's platform as it joined on it (C50); none in a ledger made before the table or declaring none."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='federation_platforms'").fetchone():
+        return {}
+    return {row["label"]: row["platform"] for row in db.execute("SELECT label, platform FROM federation_platforms")}
 
 
 def _run_row(row: Any) -> RunRow:

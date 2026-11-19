@@ -746,6 +746,29 @@ def test_c43_a_federation_joins_with_the_digest_of_its_environment_identity_by_l
     assert deploy.fleetcontrol.main(argv, {}, bench.hooks()) == 2
 
 
+def test_c50_a_campaign_that_declares_its_platforms_joins_the_one_read_and_refuses_another_by_hand(
+    deploy, tmp_path, site
+):
+    """C50: the loop joins a federation on the platform its identity read gives, which the ledger keeps; by hand, a
+    `join --platform` the campaign does not declare is refused (exit 2) and one it declares joins."""
+    declared, other = "d" * 64, "e" * 64
+    up(site, "fed-1", 41)
+    bench = Bench(tmp_path, deploy, [site], platforms=(declared,))
+    bench.tick(identity=lambda s, m: (FINGERPRINT, IDENTITY, declared))
+    ledger = bench.open()
+    joined = dict(ledger.db.execute("SELECT label, platform FROM federation_platforms").fetchall())
+    ledger.close()
+    assert list(joined.values()) == [declared]
+    path = tmp_path / "identity.json"
+    path.write_text(json.dumps(IDENTITY), encoding="utf-8")
+    argv = ["join", "--ledger", str(bench.ledger), "--label", "site-a-fed-9", "--site", "site-a", "--jobs", "91",
+            "--job-end", str(site.now + 9000), "--kill-wait", "180", "--fingerprint", FINGERPRINT,
+            "--environment-file", str(path), "--platform", other]  # fmt: skip
+    assert deploy.fleetcontrol.main(argv, {}, bench.hooks()) == 2
+    argv[-1] = declared
+    assert deploy.fleetcontrol.main(argv, {}, bench.hooks()) == 0
+
+
 def test_c43_the_dead_store_reader_settles_only_from_a_read_of_that_very_lease(deploy, tmp_path):
     """C43: over step 4's reader of a dead store, a read that is None, of another lease, or of a store nobody located
     settles nothing; one of the lease gives its spend, its source and its charged attempts."""

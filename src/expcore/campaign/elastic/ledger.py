@@ -160,8 +160,11 @@ class Ledger(LedgerViews):
         fingerprint: str,
         environment: str,
         kill_wait_s: float,
+        platform: str | None = None,
     ) -> None:
-        """Record a federation whose `up` finished; refuse another fingerprint or environment, or a label in use."""
+        """Record a federation whose `up` finished; refuse another fingerprint or environment, or a label in use. When
+        the campaign declares its platforms (`LedgerConfig.platforms`, C50), the federation's own (`platform`) must be
+        one of them, and is kept as the identity its runs ran under; otherwise it is not read."""
         for what, name in (("federation label", label), ("site label", site)):
             if not isinstance(name, str) or not _LABEL.fullmatch(name):
                 raise ValueError(f"{what} {name!r} must be 1 to 64 of [a-z0-9-], starting with a letter or digit")
@@ -181,6 +184,12 @@ class Ledger(LedgerViews):
                 raise JoinRefused(
                     f"federation {label}: its environment {environment!r} is not the one pinned at the first join"
                 )
+            declared = self.config.platforms
+            if declared and platform not in declared:
+                raise JoinRefused(
+                    f"federation {label}: its platform fingerprint {platform!r} is not one the campaign's "
+                    "platform_fingerprints declares"
+                )
             if self.db.execute("SELECT 1 FROM federations WHERE label=?", (label,)).fetchone():
                 raise JoinRefused(f"federation {label} has already joined: a label is used once")
             now = self._clock()
@@ -190,7 +199,12 @@ class Ledger(LedgerViews):
                 "INSERT INTO federations(label, site, job_ids, job_end_at, kill_wait_s, joined_at) VALUES(?,?,?,?,?,?)",
                 (label, site, json.dumps(list(job_ids)), float(job_end_at), float(kill_wait_s), now),
             )
-            self._event(now, "join", federation=label, site=site, job_end_at=job_end_at)
+            if declared:
+                self.db.execute(schema.FEDERATION_PLATFORMS_SQL)
+                self.db.execute("INSERT INTO federation_platforms(label, platform) VALUES(?,?)", (label, platform))
+                self._event(now, "join", federation=label, site=site, job_end_at=job_end_at, platform=platform)
+            else:
+                self._event(now, "join", federation=label, site=site, job_end_at=job_end_at)
 
         self._transact(go)
 

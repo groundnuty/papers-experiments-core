@@ -154,6 +154,7 @@ def create_ledger(
         max_usd=max_usd,
         caps=caps or {},
         grants_usd={model: lease_grant_usd(spec, pricing.limits) for model, spec in pricing.models.items()},
+        platforms=loaded.campaign.platform_fingerprints,
     )
     declared = {model: spec.accepted_fingerprints for model, spec in pricing.models.items()}
     Ledger.create(path, runs, config, clock=time.time, declared=declared).close()

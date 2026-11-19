@@ -15,6 +15,7 @@ from expcore.campaign.elastic.control import Join, Settle, SiteSettings
 
 FINGERPRINT = "f" * 64
 IDENTITY = {"layout": "a" * 64, "platform": "b" * 64}
+PLATFORM = "c" * 64  # C50: the federation's own platform fingerprint, as a read prints it
 
 
 @pytest.fixture(scope="module")
@@ -146,11 +147,11 @@ def test_the_identity_is_read_beside_the_federations_own_platform_file_by_the_ma
         seen.update(
             argv=list(argv), env=dict(kwargs["env"]), cwd=kwargs["cwd"], platform=(copy / "platform.toml").read_text()
         )
-        out = json.dumps({"fingerprint": FINGERPRINT, "environment": IDENTITY})
+        out = json.dumps({"fingerprint": FINGERPRINT, "environment": IDENTITY, "platform": PLATFORM})
         return subprocess.CompletedProcess(argv, seen.get("code", 0), out, "")
 
     found = deploy.fleetidentity.read_identity(fleet, "fed-1", settings, runner)
-    assert found == (FINGERPRINT, IDENTITY)
+    assert found == (FINGERPRINT, IDENTITY, PLATFORM)
     assert seen["argv"][:4] == ["/venv/bin/python", "-I", "-B", "-c"]
     assert seen["platform"] == '[space]\nname = "s"\n'
     allowed = {"PATH", "LC_ALL", "EXPCORE_FED_ROOT_PARENT", "EXPCORE_FED_ROOT", "TMPDIR"}
@@ -185,7 +186,7 @@ def test_the_read_command_prints_the_one_json_line_the_controller_of_an_ssh_site
     deploy.fleetrecord.Record(fleet).save(record)
 
     def runner(argv, **kwargs):
-        out = json.dumps({"fingerprint": FINGERPRINT, "environment": IDENTITY})
+        out = json.dumps({"fingerprint": FINGERPRINT, "environment": IDENTITY, "platform": PLATFORM})
         return subprocess.CompletedProcess(argv, 0, out, "")
 
     words = ["read", "--fleet", str(fleet), "--settings", str(settings)]
@@ -200,7 +201,7 @@ def test_the_read_command_prints_the_one_json_line_the_controller_of_an_ssh_site
         def run(self, site, argv, timeout):
             return 0, printed, ""
 
-    assert deploy.fleetidentity.read_identity_remote(Said(), config, "fed-1") == (FINGERPRINT, IDENTITY)
+    assert deploy.fleetidentity.read_identity_remote(Said(), config, "fed-1") == (FINGERPRINT, IDENTITY, PLATFORM)
     assert deploy.fleetidentity.main([*words, "--member", "fed-9"], runner) == 1
     assert capsys.readouterr().out == ""
 

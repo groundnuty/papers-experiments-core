@@ -93,8 +93,14 @@ def _exhausted(lost: LostRun) -> dict[str, Any]:
         "lease_id": last.lease_id,
         "federation": last.federation,
         "site": last.site,
+        **_platform(last),
         "reasons": [_why_ended(lease) for lease in lost.leases],
     }
+
+
+def _platform(row: LeaseRow) -> dict[str, str]:
+    """The platform a lease's federation joined on (C50), as `platform`; nothing when the campaign declares none."""
+    return {} if row.platform is None else {"platform": row.platform}
 
 
 def _why_ended(lease: LeaseRow) -> str:
@@ -121,6 +127,7 @@ def _entry(row: LeaseRow, store: LeaseStore | None, settled: set[int]) -> dict[s
         "run_key": row.run_key,
         "federation": row.federation,
         "site": row.site,
+        **_platform(row),
         "started_utc": None if store is None else store.started_utc,
         "snapshot_sha256": None if store is None else store.snapshot_sha256,
         "spend_usd": usd_of(row.charge_micro),
