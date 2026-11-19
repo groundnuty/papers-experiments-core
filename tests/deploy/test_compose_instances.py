@@ -169,3 +169,22 @@ def test_an_up_without_the_shared_ca_never_makes_a_new_ca_over_the_roots_shared_
         fed.cli.prepare(unset)
     assert layout.ca_pem.read_bytes() == before
     assert not unset.ca_key.exists()
+
+
+def test_c52_up_writes_the_roots_compose_file_as_the_compose_command_prints_it(fed, tmp_path, capsys):
+    """C52: a platform file's `[faults] compose_file = "@hpc_root@/compose.yaml"` needs that file in the root, so `up`
+    writes it: for each instance exactly what `federation.py --layout L --instance K compose` prints, its own project,
+    so the fault backend stops and starts this federation's services and never another instance's."""
+    layout_file = layout_with_template(TEMPLATE, tmp_path / "layout", MINIMAL)
+    specs = instances(fed, tmp_path, count=2)
+    for k, spec in enumerate(specs, start=1):
+        root = tmp_path / "parent" / spec.project
+        root.mkdir(parents=True)
+        layout = fed.layout.Layout(root, tmp_path / "parent", spec)
+        assert fed.cli.write_compose_file(layout) == "; compose.yaml written"
+        assert fed.cli.main(["--layout", str(layout_file), "--instance", str(k), "compose"]) == 0
+        written = (root / "compose.yaml").read_text(encoding="utf-8")
+        assert written == capsys.readouterr().out
+        assert f'name: "{spec.project}"' in written
+        assert f'"{specs[2 - k].project}"' not in written  # never the other instance's project
+        assert not [p.name for p in root.iterdir() if p.name.startswith(".compose.yaml.")]  # no draft left

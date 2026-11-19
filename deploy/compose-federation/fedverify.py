@@ -6,14 +6,16 @@ form) is read back through its owner, every directory listed and every file's by
 reader (`deploy/hpc-federation/hpcdata.content_reader`, built on this directory's bootstrap) and compared with its
 manifest (`hpcdata.differences`: counts, never a path). Only when every such space is exactly its manifest is
 `data-verified.json` written in the root: for each space its id (the one the platform file names, which must be the one
-`up` recorded in `facts.json`) and its manifest's core digest (`Manifest.digest()`, the SHA-256 of its canonical JSON:
-what the campaign fingerprint holds and the study's ingest plans, as `manifest_sha256`). Any difference, an id that
-disagrees, a manifest that cannot be read, refuses, naming the space, and removes an earlier marker first: a re-ingest
-that went wrong never keeps the verdict of the one before. A Compose site's member reads verified only by that marker
-(`composesite.data_verified`)."""
+`up` recorded in `facts.json`), its manifest's core digest (`manifest_sha256`: `Manifest.digest()`, the SHA-256 of its
+canonical JSON, what the campaign fingerprint holds and the study's ingest plans) and the SHA-256 of the manifest file's
+exact bytes (`manifest_file_sha256`), both of one read. The marker holds only while both are the file's now. Any
+difference, an id that disagrees, a manifest that cannot be read, refuses, naming the space, and removes an earlier
+marker first: a re-ingest that went wrong never keeps the verdict of the one before. A Compose site's member reads
+verified only by that marker (`composesite.data_verified`)."""
 
 import contextlib
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -25,7 +27,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-MARKER, FORMAT = "data-verified.json", "expcore-compose-data-verified/1"
+MARKER, FORMAT = "data-verified.json", "expcore-compose-data-verified/2"  # a /1 marker reads unverified
 LOCK = ".data-verified.lock"  # one check, or one invalidation, of a root's data at a time
 PLATFORM, FACTS = "platform.toml", "facts.json"
 HPC_DIR = Path(__file__).resolve().parents[1] / "hpc-federation"
@@ -49,15 +51,6 @@ def declared(root: Path) -> dict[str, tuple[Path, Any]] | None:
                 return None
             found[str(entry.get("name"))] = (path, entry.get("id"))
     return found
-
-
-def manifest_digest(path: Path) -> str:
-    """The core's digest of the manifest at `path` (`importmanifest.Manifest.digest()`: the SHA-256 of its canonical
-    JSON), which the campaign fingerprint holds for the space and the study's ingest plans: never the file's bytes,
-    whose layout two writers may differ in."""
-    from expcore_onedata.importmanifest import load_manifest
-
-    return load_manifest(path).digest()
 
 
 def hpcdata() -> ModuleType:
@@ -90,15 +83,24 @@ def invalidate(root: Path) -> None:
         (root / MARKER).unlink(missing_ok=True)
 
 
-def read_once(path: Path, data: ModuleType) -> tuple[Any, str]:
-    """The manifest at `path` and its core digest (`Manifest.digest()`), both of one parse: read once, from a private
-    copy of its bytes, so a file replaced meanwhile is never checked as one manifest and published as another."""
+def read_once(path: Path, load: Callable[[Path], Any]) -> tuple[Any, str, str]:
+    """The manifest at `path`, its core digest (`Manifest.digest()`) and the SHA-256 of the file's exact bytes, all of
+    one read: parsed from a private copy of those bytes, so a file replaced meanwhile is never checked as one manifest
+    and published as another."""
     raw = path.read_bytes()
     with tempfile.TemporaryDirectory(prefix=".manifest-") as scratch:
         copy = Path(scratch) / path.name
         copy.write_bytes(raw)
-        manifest = data.load_manifest(copy)
-        return manifest, manifest.digest()
+        manifest = load(copy)
+        return manifest, manifest.digest(), hashlib.sha256(raw).hexdigest()
+
+
+def digests(path: Path) -> tuple[str, str]:
+    """(`manifest_sha256`, `manifest_file_sha256`) of the manifest file as it is now: its core digest and its bytes'."""
+    from expcore_onedata.importmanifest import load_manifest
+
+    _, digest, file_digest = read_once(path, load_manifest)
+    return digest, file_digest
 
 
 def write_marker(root: Path, spaces: dict[str, dict[str, str]]) -> None:
@@ -156,12 +158,12 @@ def _check(root: Path, spaces: dict[str, tuple[Path, Any]], data: ModuleType, re
     verdict = {}
     for name, (path, space_id) in spaces.items():
         try:
-            manifest, digest = read_once(path, data)  # the manifest checked is the one whose digest is published
+            manifest, digest, file_digest = read_once(path, data.load_manifest)  # one read: checked as published
         except (OSError, ValueError, RuntimeError) as error:  # the core's ConfigError is a RuntimeError
             raise RuntimeError(f"{name}: its manifest cannot be read ({type(error).__name__}): not verified") from None
         found = data.differences(read(name), manifest)
         if found:
             raise RuntimeError(f"{name} does not hold the data its manifest declares ({found}): not verified")
-        verdict[name] = {"space_id": space_id, "manifest_sha256": digest}
+        verdict[name] = {"space_id": space_id, "manifest_sha256": digest, "manifest_file_sha256": file_digest}
     write_marker(root, verdict)
     return f"data: {len(verdict)} space(s) hold exactly their manifests; {MARKER} written"

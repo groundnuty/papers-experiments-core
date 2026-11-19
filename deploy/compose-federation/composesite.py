@@ -273,12 +273,13 @@ def linked(root: Path) -> bool:
 
 def data_verified(root: Path) -> bool:
     """FAIL CLOSED, as an HPC member's verify-data markers are (`fleetobserve.verified`): a member's data is verified
-    only when every space its platform file declares data for has an entry in the root's `data-verified.json` naming
-    that space's id and the SHA-256 of its manifest as it is now. A platform file that declares no data (a probe of the
-    baseline files) is verified once linked; one that cannot be read, a marker missing, of another form, of another
-    manifest or another space, is not. Nothing here writes the marker: a member with data joins only once its data is
-    shown to be the manifest's (`fedverify`, which `verify-data` runs: a Compose site's prepare runs it after the
-    study's ingest)."""
+    only when every space its platform file declares data for has an entry in the root's `data-verified.json` (format
+    /2) naming that space's id, its manifest's core digest (`manifest_sha256`, `Manifest.digest()`) and its manifest
+    file's bytes' SHA-256 (`manifest_file_sha256`), both as the file is now; a marker of an earlier format is none. A
+    platform file that declares no data (a probe of the baseline files) is verified once linked; one that cannot be
+    read, a marker missing, of another form, of another manifest or another space, is not. Nothing here writes the
+    marker: a member with data joins only once its data is shown to be the manifest's (`fedverify`, which `verify-data`
+    runs: a Compose site's prepare runs it after the study's ingest)."""
     declared = fedverify.declared(root)
     if declared is None:
         return False
@@ -289,12 +290,9 @@ def data_verified(root: Path) -> bool:
         spaces = marker["spaces"] if marker.get("format") == fedverify.FORMAT else None
         for name, (manifest, space_id) in declared.items():
             entry = spaces.get(name)
-            digest = fedverify.manifest_digest(manifest)
-            if (
-                not isinstance(entry, dict)
-                or entry.get("manifest_sha256") != digest
-                or entry.get("space_id") != space_id
-            ):
+            digest, file_digest = fedverify.digests(manifest)  # both of one read of the file as it is now
+            found = (entry.get("manifest_sha256"), entry.get("manifest_file_sha256"), entry.get("space_id"))
+            if found != (digest, file_digest, space_id):
                 return False
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, ImportError):  # unread: unverified
         return False

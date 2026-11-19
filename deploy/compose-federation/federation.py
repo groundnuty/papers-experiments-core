@@ -305,6 +305,7 @@ def up(layout: Layout) -> str:
             timer.mark("baseline")
         written = write_facts(layout, boot, *given)
         written += write_render_identity(layout, study_artifacts)
+        written += write_compose_file(layout)
         links = check_after_up(layout, dict(boot.ids.spaces))  # last: not ready until every pair transfers (#221)
         timer.mark("links")
     finally:
@@ -367,6 +368,24 @@ def reset_replicas(layout: Layout) -> str:
     finally:
         rest.close()
     return "\n".join([timer.summary("reset --replicas"), *(f"{space}: {done}" for space, done in evicted.items())])
+
+
+COMPOSE_FILE = "compose.yaml"  # in the root, for a platform file's `[faults] compose_file = "@hpc_root@/compose.yaml"`
+
+
+def write_compose_file(layout: Layout) -> str:
+    """The root's `compose.yaml`: what `federation.py ... compose` prints for this layout and instance, written whole (a
+    draft beside it, renamed over it), so the fault backend's `docker compose --file <root>/compose.yaml` stops and
+    starts this federation's own services."""
+    import tempfile
+
+    descriptor, draft = tempfile.mkstemp(prefix=f".{COMPOSE_FILE}.", dir=layout.root)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(render_compose(layout.spec))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(draft, layout.root / COMPOSE_FILE)
+    return f"; {COMPOSE_FILE} written"
 
 
 def verify(layout: Layout) -> str:

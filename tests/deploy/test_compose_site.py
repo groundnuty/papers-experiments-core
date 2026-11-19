@@ -625,13 +625,20 @@ def test_c51_a_drained_member_stays_out_until_its_operator_undrains_it(deploy, v
     assert [a.label for a in joins] == ["site-a-fed-1-g2"]
 
 
+def good_marker(manifest: Path) -> dict:
+    """The marker `verify-data` writes for the declared manifest as it is now: format /2, both digests."""
+    from expcore_onedata.importmanifest import load_manifest
+
+    entry = {"space_id": "sid-alpha", "manifest_sha256": load_manifest(manifest).digest(),
+             "manifest_file_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()}  # fmt: skip
+    return {"format": "expcore-compose-data-verified/2", "spaces": {"alpha": entry}}
+
+
 def test_c51_a_member_whose_platform_declares_data_is_verified_only_by_a_marker_of_that_manifest(deploy, vm, tmp_path):
     """C51: verified is never just linked when the member's platform file declares a space's data (a data manifest),
     or a federation with missing or other data would join and score runs. Without a marker it reads unverified and
-    never joins; a marker of another manifest (or another space) is no marker; one naming the space's id and its
-    manifest's core digest as it is now verifies it, exactly as an HPC member's verify-data marker."""
-    from expcore_onedata.importmanifest import load_manifest
-
+    never joins; a marker naming the space's id, its manifest's core digest and its file's bytes' digest as it is now
+    verifies it, exactly as an HPC member's verify-data marker."""
     root = vm.roots["fed-1"]
     manifest = declare_data(vm)
     clock = FakeClock(time.time())
@@ -639,15 +646,33 @@ def test_c51_a_member_whose_platform_declares_data_is_verified_only_by_a_marker_
     assert not vm.view()["fed-1"].verified
     tick(deploy, vm, ledger, clock)
     assert [f.label for f in ledger.federations()] == ["site-a-fed-2"]  # fed-1 waits: its data is not shown
-    marker = {"format": "expcore-compose-data-verified/1", "spaces": {"alpha": {"space_id": "sid-alpha",
-              "manifest_sha256": hashlib.sha256(b"another manifest").hexdigest()}}}  # fmt: skip
-    (root / "data-verified.json").write_text(json.dumps(marker), encoding="utf-8")
-    assert not vm.view()["fed-1"].verified
-    marker["spaces"]["alpha"]["manifest_sha256"] = load_manifest(manifest).digest()  # the core's digest, not the bytes
-    (root / "data-verified.json").write_text(json.dumps(marker), encoding="utf-8")
+    (root / "data-verified.json").write_text(json.dumps(good_marker(manifest)), encoding="utf-8")
     assert vm.view()["fed-1"].verified
     tick(deploy, vm, ledger, clock)
     assert "site-a-fed-1" in {f.label for f in ledger.federations()}
+
+
+@pytest.mark.parametrize(
+    "wrong",
+    ["format /1", "manifest_sha256", "manifest_file_sha256", "space_id", "the file rewritten in another layout"],
+)
+def test_c52_a_marker_is_no_marker_when_any_field_is_not_the_files_now(deploy, vm, wrong):
+    """C52: each field the marker holds must be the declared manifest's as it is now: a marker of the earlier format
+    (/1), another core digest, another file digest, another space id, and a manifest file rewritten with the same
+    entries in another byte layout (its core digest the same, its file digest not) each read unverified."""
+    root = vm.roots["fed-1"]
+    manifest = declare_data(vm)
+    marker = good_marker(manifest)
+    entry = marker["spaces"]["alpha"]
+    if wrong == "format /1":
+        marker["format"] = "expcore-compose-data-verified/1"
+    elif wrong == "the file rewritten in another layout":
+        manifest.write_text(json.dumps(json.loads(manifest.read_text(encoding="utf-8")), indent=4), encoding="utf-8")
+        assert good_marker(manifest)["spaces"]["alpha"]["manifest_sha256"] == entry["manifest_sha256"]
+    else:
+        entry[wrong] = "0" * 64 if wrong != "space_id" else "sid-other"
+    (root / "data-verified.json").write_text(json.dumps(marker), encoding="utf-8")
+    assert not deploy.site.data_verified(root)
 
 
 # ------------------------------------------------------------------------------------------------ declared data
@@ -674,10 +699,12 @@ def test_c52_verify_data_writes_the_marker_only_for_data_that_is_exactly_its_man
     naming the space, and removes the marker an earlier check wrote, so a re-ingest that went wrong never keeps it."""
     import fedverify
 
-    declare_data(vm)
+    manifest = declare_data(vm)
     layout = SimpleNamespace(root=vm.roots["fed-1"])
     whole = ({"data.bin": (4, hashlib.sha256(b"data").hexdigest())}, set())
     assert "1 space(s) hold exactly their manifests" in fedverify.verify_data(layout, read=lambda space: whole)
+    written = json.loads((vm.roots["fed-1"] / "data-verified.json").read_text(encoding="utf-8"))
+    assert written == good_marker(manifest)  # format /2: the core digest and the file's bytes' digest
     assert deploy.site.data_verified(vm.roots["fed-1"])
     other = ({"data.bin": (4, hashlib.sha256(b"dat!").hexdigest())}, set())
     with pytest.raises(RuntimeError, match="alpha does not hold the data its manifest declares"):
@@ -705,12 +732,13 @@ def test_c52_a_manifest_named_by_a_relative_path_is_never_verified(deploy, vm):
 
 
 PREPARE = """
-import json, sys
+import hashlib, json, sys
 from expcore_onedata.importmanifest import load_manifest
 root = sys.argv[1]
-digest = load_manifest(root + "/data-manifests/alpha.json").digest()  # the core's digest, as the ingest plans
-marker = {"format": "expcore-compose-data-verified/1", "spaces": {"alpha": {"space_id": "sid-alpha",
-          "manifest_sha256": digest}}}
+path = root + "/data-manifests/alpha.json"
+marker = {"format": "expcore-compose-data-verified/2", "spaces": {"alpha": {"space_id": "sid-alpha",
+          "manifest_sha256": load_manifest(path).digest(),
+          "manifest_file_sha256": hashlib.sha256(open(path, "rb").read()).hexdigest()}}}
 open(root + "/data-verified.json", "w").write(json.dumps(marker))
 open(root + "/prepare-saw-layout", "w").write(sys.argv[2])
 """

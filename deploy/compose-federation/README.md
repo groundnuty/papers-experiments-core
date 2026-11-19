@@ -128,8 +128,11 @@ controller runs `composesite.py` here over ssh, from the site's directory with i
 
 - **observe**: a member is up while every service its `facts.json` names has a running container of its project bound
   to its root, linked while its `link-check.json` says ok, and verified only when linked AND every space its
-  `platform.toml` declares data for (`data_manifest`) has a marker in the root's `data-verified.json` naming the
-  space's id and its manifest's SHA-256: fail closed, as an HPC member's verify-data markers are. A platform file that
+  `platform.toml` declares data for (`data_manifest`) has a marker in the root's `data-verified.json` (format
+  `expcore-compose-data-verified/2`) naming the space's id, its manifest's core digest (`manifest_sha256`:
+  `Manifest.digest()`, what the campaign fingerprint holds and the study's ingest plans) and the SHA-256 of the
+  manifest file's exact bytes (`manifest_file_sha256`), both from one read and both as the file is now: fail closed,
+  as an HPC member's verify-data markers are; a marker of the earlier format is none. A platform file that
   declares no data (the baseline files) is verified once linked. The marker is written by `verify-data`
   (`federation.py --layout L --instance K verify-data`, or `composesite.py verify-data --root R --layout L`, which
   finds the instance from the root's mark): every declared space read back through its owner, every file's bytes
@@ -274,6 +277,8 @@ journal, `compose_file`) are relative by default, which is right in the root and
 study. A template that writes them `@hpc_root@/ca/federation-ca.pem`, `@hpc_root@/secrets/admin.token`,
 `@hpc_root@/secrets/users`, `@hpc_root@/fault-journal` and `@hpc_root@/outage.compose.yaml` gets the root's absolute
 path (the name is the HPC render's, `hpcboot.hpc_values`, so one template text names the root on either platform).
+`up` writes the root's `compose.yaml` (what `federation.py ... compose` prints for that layout and instance), so a
+template's `compose_file = "@hpc_root@/compose.yaml"` names this federation's own file with no operator step.
 `up` and `reset --clean` refuse it, before writing `facts.json` or `platform.toml`, unless the root is an absolute path
 of an existing directory that carries this federation's mark, with no symbolic link on any component of its path and
 no `"` or `\` or non-printable character (it lands inside a TOML string as it is); a link is refused rather than
