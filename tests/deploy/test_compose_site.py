@@ -7,6 +7,7 @@ as the worker's `ProcessRunner` does) and shortens the launch's settle. The cont
 PATH that answers `ps` from a table of containers per project and logs every call. Nothing reaches Docker."""
 
 import dataclasses
+import hashlib
 import json
 import os
 import shutil
@@ -622,3 +623,31 @@ def test_c51_a_drained_member_stays_out_until_its_operator_undrains_it(deploy, v
     assert (code, err) == (0, "")
     joins = [a for a in tick(deploy, vm, ledger, clock) if type(a).__name__ == "Join"]
     assert [a.label for a in joins] == ["site-a-fed-1-g2"]
+
+
+def test_c51_a_member_whose_platform_declares_data_is_verified_only_by_a_marker_of_that_manifest(deploy, vm, tmp_path):
+    """C51: verified is never just linked when the member's platform file declares a space's data (a data manifest),
+    or a federation with missing or other data would join and score runs. Without a marker it reads unverified and
+    never joins; a marker of another manifest (or another space) is no marker; one naming the space's id and its
+    manifest's SHA-256 as it is now verifies it, exactly as an HPC member's verify-data marker."""
+    root = vm.roots["fed-1"]
+    manifest = root / "data-manifests" / "alpha.json"
+    manifest.parent.mkdir()
+    manifest.write_text('{"files": []}\n', encoding="utf-8")
+    (root / "platform.toml").write_text(
+        '[[spaces]]\nname = "alpha"\nid = "sid-alpha"\ndata_manifest = "data-manifests/alpha.json"\n', encoding="utf-8"
+    )
+    clock = FakeClock(time.time())
+    ledger = new_ledger(tmp_path, clock)
+    assert not vm.view()["fed-1"].verified
+    tick(deploy, vm, ledger, clock)
+    assert [f.label for f in ledger.federations()] == ["site-a-fed-2"]  # fed-1 waits: its data is not shown
+    marker = {"format": "expcore-compose-data-verified/1", "spaces": {"alpha": {"space_id": "sid-alpha",
+              "manifest_sha256": hashlib.sha256(b"another manifest").hexdigest()}}}  # fmt: skip
+    (root / "data-verified.json").write_text(json.dumps(marker), encoding="utf-8")
+    assert not vm.view()["fed-1"].verified
+    marker["spaces"]["alpha"]["manifest_sha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    (root / "data-verified.json").write_text(json.dumps(marker), encoding="utf-8")
+    assert vm.view()["fed-1"].verified
+    tick(deploy, vm, ledger, clock)
+    assert "site-a-fed-1" in {f.label for f in ledger.federations()}

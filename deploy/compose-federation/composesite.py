@@ -16,14 +16,17 @@ federations the operator brought up with `federation.py up` (static members: non
 here).
 
 - **observe** reads each member, and writes nothing: live when every service its `facts.json` names has a running
-  container of the root's project (the root's mark names it) bound to that root; linked when its `link-check.json`
-  says ok; its worker, by the pidfile `launch` wrote for this campaign's channel. A member is `up` and `RUNNING` while
-  live and not yet launched, or launched with its worker running and its project there (a service merely stopped, as
-  an injected outage stops one, keeps it so); `GONE` (proven ended) once launched and no process of its worker is
-  left (`worker_gone`), whether the project is up or not; `BROKEN` when its project is down (a service with no
-  container) and the worker still runs (drained, then retired, which stops it); `down` when it is not live and was
-  never launched, or was retired for this channel. Its job id is `compose-<project>`, the same at every read, and its
-  end `--horizon-s` from now: a member has no walltime. The site reports no node, so the controller never adds to it.
+  container of the root's project (the root's mark names it) bound to that root; linked when its `link-check.json` says
+  ok; verified when linked and every space its `platform.toml` declares data for (`data_manifest`) has a marker in
+  `data-verified.json` naming its id and its manifest's SHA-256 (`data_verified`: fail closed; no Compose command writes
+  one yet, so a member with declared data never joins); its worker, by the pidfile `launch` wrote for this campaign's
+  channel. A member is `up` and `RUNNING` while live and not yet launched, or launched with its worker running and its
+  project there (a service merely stopped, as an injected outage stops one, keeps it so); `GONE` (proven ended) once
+  launched and no process of its worker is left (`worker_gone`), whether the project is up or not; `BROKEN` when its
+  project is down (a service with no container) and the worker still runs (drained, then retired, which stops it);
+  `down` when it is not live and was never launched, or was retired for this channel. Its job id is `compose-<project>`,
+  the same at every read, and its end `--horizon-s` from now: a member has no walltime. The site reports no node, so the
+  controller never adds to it.
 - **launch** starts the elastic worker once, detached in a session of its own, with an environment of the allowlist
   alone and HOME the site's `--home` (a 0700 directory of this user holding the study's key tree at its models.toml
   paths, placed by the operator: never copied, never read here), in `<fleet>/members/<name>/run/` (the study copied
@@ -62,6 +65,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -80,6 +84,8 @@ WORKER_TAG = "EXPCORE_COMPOSE_WORKER"  # in every process a worker starts: what 
 WORKER_MODULE = "expcore.campaign.elastic.worker"
 PLATFORM, FACTS, LINKS = "platform.toml", "facts.json", "link-check.json"
 PIDFILE, RETIRED, RUN = "worker.json", "retired.json", "run"
+# A space's data shown to be its declared manifest: what a Compose root holds to read verified (`data_verified`).
+DATA_MARKER, DATA_FORMAT = "data-verified.json", "expcore-compose-data-verified/1"
 MEMBER = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
 GENERATION = "-g"  # a static member's later generations: <member>-g2, <member>-g3, ... (each a new ledger label)
 MAX_GENERATIONS = 9
@@ -266,6 +272,51 @@ def linked(root: Path) -> bool:
         return False
 
 
+def declared_data(root: Path) -> dict[str, tuple[Path, Any]] | None:
+    """Every space of the root's `platform.toml` that declares its data (`data_manifest`, in `[[spaces]]` or the
+    one-space form), by name: (its manifest's path, its id). None when the file cannot be read: nothing is verified."""
+    try:
+        data = tomllib.loads((root / PLATFORM).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    entries = data.get("spaces") if isinstance(data.get("spaces"), list) else [data.get("space")]
+    found = {}
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("data_manifest"):
+            path = Path(str(entry["data_manifest"]))
+            found[str(entry.get("name"))] = (path if path.is_absolute() else root / path, entry.get("id"))
+    return found
+
+
+def data_verified(root: Path) -> bool:
+    """FAIL CLOSED, as an HPC member's verify-data markers are (`fleetobserve.verified`): a member's data is verified
+    only when every space its platform file declares data for has an entry in the root's `data-verified.json` naming
+    that space's id and the SHA-256 of its manifest as it is now. A platform file that declares no data (a probe of the
+    baseline files) is verified once linked; one that cannot be read, a marker missing, of another form, of another
+    manifest or another space, is not. Nothing here writes the marker: a member with data joins only once its data is
+    shown to be the manifest's."""
+    declared = declared_data(root)
+    if declared is None:
+        return False
+    if not declared:
+        return True
+    try:
+        marker = json.loads((root / DATA_MARKER).read_text(encoding="utf-8"))
+        spaces = marker["spaces"] if marker.get("format") == DATA_FORMAT else None
+        for name, (manifest, space_id) in declared.items():
+            entry = spaces.get(name)
+            digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+            if (
+                not isinstance(entry, dict)
+                or entry.get("manifest_sha256") != digest
+                or entry.get("space_id") != space_id
+            ):
+                return False
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+    return True
+
+
 # ------------------------------------------------------------------------------------------------ observe
 def channel_dir(channel: str, site: str, member: str) -> str:
     """A member's channel directory: `elastic.channel.federation_dir` of its ledger label `<site>-<member>`."""
@@ -297,13 +348,14 @@ def member_view(fleet: Path, site: str, channel: str, member: str, root: Path, n
         return {**view, "status": "down", "retired": True}
     running, present = services_state(root, project)
     joined = linked(root)
+    verified = joined and data_verified(root)  # fail closed on a declared data manifest
     if worker is None:
         if not running:
             return {**view, "status": "down"}  # not in the pool: never launched, and not up to join
-        return {**view, "status": "up", "state": "RUNNING", "linked": joined, "verified": joined,
+        return {**view, "status": "up", "state": "RUNNING", "linked": joined, "verified": verified,
                 "ends_at": now + horizon}  # fmt: skip
     state = "GONE" if worker_gone(worker) else ("RUNNING" if present else "BROKEN")
-    return {**view, "status": "up", "state": state, "linked": joined, "verified": joined, "ends_at": now + horizon,
+    return {**view, "status": "up", "state": state, "linked": joined, "verified": verified, "ends_at": now + horizon,
             "launched": True}  # fmt: skip
 
 
