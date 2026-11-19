@@ -61,7 +61,7 @@ from expcore_onedata.client import OnezoneClient, PlatformError
 from expcore_onedata.placement import Range, held_bytes, merged, uncovered
 from expcore_onedata.provision import Listings, Provisioner
 from expcore_onedata.readretry import ONE_ATTEMPT
-from expcore_onedata.transferlog import DEADLINE, MAX_LISTED, PAGE_LIMIT, TransferLog, deadline_at
+from expcore_onedata.transferlog import DEADLINE, MAX_LISTED, TransferLog, deadline_at
 from expcore_onedata.transferorder import STOP_MARGIN_S
 from expcore_onedata.transferrecord import state_of
 from expcore_onedata.transferwindow import Window, split_gained
@@ -194,13 +194,14 @@ class PlatformProbes:
         transfers: Callable[[], Iterable[tuple[str, str, str]]] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], float] = time.time,
-        page_limit: int = PAGE_LIMIT,
+        page_limit: int | None = None,
         max_listed: int = MAX_LISTED,
     ) -> None:
         """Track `files` (label to space-relative path) on `providers`; transfers default to the provisioner's log.
 
         `now` is the epoch clock the run's window is read on. `page_limit` ids are asked for per page of the space's
-        transfer listing, and past `max_listed` distinct ids the listing is unknown.
+        transfer listing (by default `[placement] transfer_page_limit`, 1000), and past `max_listed` distinct ids the
+        listing is unknown.
         """
         self._client, self._provisioner = client, provisioner
         # One instrument per space: with several declared, each has a namespace of its own (`platform_probes_space1`
@@ -228,7 +229,7 @@ class PlatformProbes:
             self._probe,
             sleep=sleep,
             now=now,
-            page_limit=page_limit,
+            page_limit=provisioner.settings.transfer_page_limit if page_limit is None else page_limit,
             max_listed=max_listed,
         )
         self._before: dict[str, dict[str, ProbeResult]] | None = None

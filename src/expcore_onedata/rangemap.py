@@ -36,6 +36,7 @@ provider_concurrency = 16       # the most of a reset's per-file reads in flight
 wait_mode = "fixed"             # the reset's occupancy wait: "fixed" (the lag) or "event" (read at once, O46; `reset.py`)
 evict_batch = 500               # the most per-file evictions the reset has scheduled at once (`eviction.py`)
 transfer_walk_deadline_s = 600  # the longest the probes' transfer walk may take, or it fails closed (`transferlog.py`)
+transfer_page_limit = 1000      # ids per page of the probes' transfer listing, 1 to 1000 (`probes.py`)
 
 [[placement.map]]               # a row (inline instead of `map = ...`); top-level [[map]] in the study's file
 file = "dir/file.bin"           # relative to the space root
@@ -124,6 +125,9 @@ class PlacementSettings:
     # The longest the probes' transfer walk (the harness's records and the space's listing) may take before it fails
     # closed (`transferlog.py`).
     transfer_walk_deadline_s: float = 600.0
+    # The ids per page of the probes' transfer listing (1 to 1000): the walk reads every record of the page that holds
+    # its stop and of the page past it (O32), so a smaller page reads fewer records of the space's older history.
+    transfer_page_limit: int = 1000
 
     def reset_settings(self) -> dict[str, Any]:
         """The settings the core records at a start and compares at a resume, `StudyPlugin(reset_settings=...)` (C35).
@@ -227,6 +231,14 @@ def _number(section: Section, key: str, default: float, *, minimum: float, integ
     kind = int if integer else (int, float)
     if isinstance(value, bool) or not isinstance(value, kind) or not math.isfinite(value) or value < minimum:
         raise section.fail(key, f"must be {'an integer' if integer else 'a number'} of at least {minimum:g}")
+    return value
+
+
+def _page_limit(section: Section) -> int:
+    """Read `transfer_page_limit`: a whole number of ids from 1 to 1000, the most a page of the listing holds."""
+    value = _number(section, "transfer_page_limit", 1000, minimum=1, integer=True)
+    if value > 1000:
+        raise section.fail("transfer_page_limit", "must be an integer of at most 1000, the listing's largest page")
     return value
 
 
@@ -339,6 +351,7 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
             "wait_mode",
             "evict_batch",
             "transfer_walk_deadline_s",
+            "transfer_page_limit",
         )
     )
     holder = table.string("holder")
@@ -385,6 +398,7 @@ def load_placement(path: str | os.PathLike[str], config: PlatformConfig) -> Plac
         wait_mode=wait_mode,
         evict_batch=_number(table, "evict_batch", 500, minimum=1, integer=True),
         transfer_walk_deadline_s=_number(table, "transfer_walk_deadline_s", 600.0, minimum=1),
+        transfer_page_limit=_page_limit(table),
     )
     rows = _map_rows(table, file, config, holder)
     return Placement(settings, build_map(rows, file))
