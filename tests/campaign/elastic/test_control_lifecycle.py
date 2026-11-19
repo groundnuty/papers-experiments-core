@@ -242,3 +242,17 @@ def test_c43_idle_federations_are_kept_for_exhausted_runs_a_pending_settle_may_r
     idle = {f.label: NOW - 2000 for f in feds}
     view = ledger(federations=feds, idle_since=idle, reopenable=2)
     assert [d.label for d in of(decide(NOW, view, [(settings(), fleet)]), Drain)] == ["site-a-fed-1"]
+
+
+def test_c54_a_member_whose_down_could_not_sweep_a_node_is_never_taken_down_again_by_the_controller():
+    """C54: a down that could not sweep a node of the member (its state says `unswept`) cancelled its job all the same,
+    so a down run again would find the job gone and remove the root without that sweep, with the operator's key files
+    perhaps still on the node: the controller never retires such a member again, joined or not, and leaves it to an
+    operator's explicit down. A member whose down failed otherwise is still taken down again."""
+    unjoined = member("fed-1", status="down-failed", state=None, unswept=True)
+    drained = member("fed-2", status="down-failed", state=None, unswept=True)
+    plain = member("fed-3", status="down-failed", state=None)
+    view = ledger(federations=[joined("fed-2", drained_at=NOW - 60)])
+    decision = decide(NOW, view, [(settings(), site(members=[unjoined, drained, plain]))])
+    assert [r.member for r in of(decision, Retire)] == ["fed-3"]
+    assert of(decision, ProveEnded) == []

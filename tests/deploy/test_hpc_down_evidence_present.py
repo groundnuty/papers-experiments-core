@@ -60,7 +60,7 @@ def _gated(rig, **options):
     """The state after down's gate: down is stopped right after it (the state goes with the root at the end of a whole
     down, so it is read before)."""
 
-    def stopped():
+    def stopped(node_checked=None):
         raise RuntimeError("stopped for the test, after the gate")
 
     rig.driver.take_down = stopped

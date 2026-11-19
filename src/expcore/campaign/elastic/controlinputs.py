@@ -117,7 +117,9 @@ class Member:
     serving), `here` (beating, a process of this login node), `elsewhere` (beating, on another login node), `gone`
     (its up recorded it serving and no live heartbeat is left), with its last heartbeat; and its prepare, as the site's
     record of it shows: None (never started), `running` (started and not ended), `ok` (exit 0) or `failed` (a non-zero
-    exit, the timeout, or aborted)."""
+    exit, the timeout, or aborted). `unswept` (C54): a down of it could not sweep a node of it (its state says so), so
+    the node may still hold the operator's key files, and a down run again, its job gone, would remove the root without
+    that sweep: only an operator takes it down."""
 
     label: str
     status: str
@@ -132,6 +134,7 @@ class Member:
     relay: str = "none"
     relay_beat_at: float | None = None
     prepare: str | None = None
+    unswept: bool = False
 
     def __post_init__(self) -> None:
         if self.relay not in RELAY_STATES:

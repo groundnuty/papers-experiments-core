@@ -347,3 +347,28 @@ def test_l17_the_old_name_is_refused_even_beside_the_new_one(tmp_path):
     """L17: a file that declares both is refused too: the old key is never quietly dropped."""
     both = "max_output_tokens = 256\ntool_call_bound_s = 300\ntool_server_call_bound_s = 300"
     refused(tmp_path, VALID.replace("max_output_tokens = 256", both), "tool_call_bound_s", "tool_server_call_bound_s")
+
+
+def test_o95_egress_package_indexes_is_read_sorted_and_enters_the_caps_only_when_declared(tmp_path):
+    """O95: the declared indexes are in the caps, so in the fingerprint; a campaign without [egress] has the caps it
+    always had."""
+    campaign = load(tmp_path, VALID + '\n[egress]\npackage_indexes = ["pypi.org", "Files.PythonHosted.org"]\n')
+    assert campaign.package_indexes == ("files.pythonhosted.org", "pypi.org")
+    assert campaign.caps()["egress"] == {"package_indexes": ["files.pythonhosted.org", "pypi.org"]}
+    assert load(tmp_path).package_indexes == ()
+    assert "egress" not in load(tmp_path).caps()
+
+
+@pytest.mark.parametrize(
+    ("table", "fragments"),
+    [
+        ("package_indexes = []", ("[egress]", "'package_indexes'", "at least one host")),
+        ('package_indexes = ["https://pypi.org"]', ("'package_indexes'", "not a bare host name")),
+        ('package_indexes = ["pypi.org", "pypi.org"]', ("'package_indexes'", "more than once")),
+        ('package_index = ["pypi.org"]', ("[egress]", "'package_index'", "not a known key")),
+        ("", ("[egress]", "'package_indexes'", "is required")),
+    ],
+    ids=["empty", "a URL", "twice", "misspelt", "missing"],
+)
+def test_o95_an_egress_table_that_cannot_work_is_refused_naming_the_key(tmp_path, table, fragments):
+    refused(tmp_path, VALID + f"\n[egress]\n{table}\n", *fragments)

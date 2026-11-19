@@ -2,8 +2,9 @@
 """The egress part of an analysis: every analysed run's verdict, and the preregistered analysis again without the
 flagged runs, as a sensitivity analysis.
 
-`egress_analysis(runs, rows, absent, prereg)` takes each analysed run's record with its condition, the analysis rows
-in the same order, the absent runs and the preregistration. It returns None when no analysed record carries the
+`egress_analysis(runs, rows, absent, prereg, package_indexes=())` takes each analysed run's record with its condition,
+the analysis rows in the same order, the absent runs, the preregistration and the package indexes the campaign
+declared (O95; none by default, and then nothing here changes). It returns None when no analysed record carries the
 `egress` instrument: such a batch was not checked for egress (a Docker host, whose agent has no route out), and its
 report is the text it always was. Once one record carries it, the batch is one whose runs were checked, and every
 analysed run is judged (`expcore.egress.flags.judge`): a run whose record lacks the snapshot is flagged as unknown
@@ -24,6 +25,7 @@ from typing import Any
 
 from expcore.egress.flags import FLAGS, RunEgress, judge
 from expcore.egress.instrument import NAMESPACE
+from expcore.egress.package_index import PACKAGE_INDEX
 from expcore.stats.analysis import AnalysisResult, ContrastRefused, analyse
 from expcore.stats.rows import AbsentRun, Row
 
@@ -38,17 +40,22 @@ class EgressAnalysis:
     runs: tuple[RunEgress, ...]
     sensitivity: AnalysisResult | None
     refused: str | None = None
+    package_indexes: tuple[str, ...] = ()  # the indexes the campaign declared (O95); none: the counts are as they were
 
     @property
     def flagged(self) -> tuple[RunEgress, ...]:
         return tuple(run for run in self.runs if run.flagged)
 
     def counts(self) -> dict[str, int]:
-        """The analysed runs, the flagged ones, and the flagged ones by each flag (a run may have several)."""
+        """The analysed runs, the flagged ones, and the flagged ones by each flag (a run may have several); under
+        declared package indexes, also the runs with a `package_index` hit, flagged or not."""
         flagged = self.flagged
-        return {"analysed": len(self.runs), "flagged": len(flagged)} | {
+        counts = {"analysed": len(self.runs), "flagged": len(flagged)} | {
             flag: sum(1 for run in flagged if flag in run.flags) for flag in FLAGS
         }
+        if self.package_indexes:
+            counts[PACKAGE_INDEX] = sum(1 for run in self.runs if run.package_index)
+        return counts
 
 
 def checked(records: Sequence[Any]) -> bool:
@@ -57,7 +64,12 @@ def checked(records: Sequence[Any]) -> bool:
 
 
 def egress_analysis(
-    runs: Sequence[tuple[Any, str]], rows: Sequence[Row], absent: Sequence[AbsentRun], prereg: Any
+    runs: Sequence[tuple[Any, str]],
+    rows: Sequence[Row],
+    absent: Sequence[AbsentRun],
+    prereg: Any,
+    *,
+    package_indexes: Sequence[str] = (),
 ) -> EgressAnalysis | None:
     """The egress verdicts and the sensitivity analysis of a batch; None for a batch not checked for egress."""
     if len(runs) != len(rows):
@@ -68,13 +80,14 @@ def egress_analysis(
     for (record, _), row in zip(runs, rows, strict=True):
         if record.run_key != row.run_key:
             raise ValueError(f"the record of {record.run_key!r} is paired with the row of {row.run_key!r}")
-    verdicts = tuple(judge(record, condition) for record, condition in runs)
+    indexes = tuple(package_indexes)
+    verdicts = tuple(judge(record, condition, package_indexes=indexes) for record, condition in runs)
     flagged = {verdict.run_key for verdict in verdicts if verdict.flagged}
     if not flagged:
-        return EgressAnalysis(verdicts, None)
+        return EgressAnalysis(verdicts, None, package_indexes=indexes)
     kept = [row for row in rows if row.run_key not in flagged]
     left = [AbsentRun(row.run_key, row.condition, row.factors, LEFT_OUT_AS) for row in rows if row.run_key in flagged]
     try:
-        return EgressAnalysis(verdicts, analyse(kept, prereg, [*absent, *left]))
+        return EgressAnalysis(verdicts, analyse(kept, prereg, [*absent, *left]), package_indexes=indexes)
     except ContrastRefused as error:
-        return EgressAnalysis(verdicts, None, str(error))
+        return EgressAnalysis(verdicts, None, str(error), indexes)

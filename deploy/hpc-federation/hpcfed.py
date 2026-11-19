@@ -25,6 +25,8 @@ them in the state file in the root, so `down` and the service verbs need no envi
   whose step- or study-written evidence changed after it did, is refused first, with nothing stopped; the state and the
   link check, which the federation rewrites itself, are named in the output and the state, never refused. `down
   --discard-evidence` removes it all the same and its output says so (O63).
+  A node an earlier down could not sweep (its state's `unswept`) keeps the storage and the root until `down
+  --node-checked TEXT` says what the operator checked there (C54; README.md, "A down that could not sweep a node").
 - describe: the plan: the nodes and their shape, every step's size, and what the job bills per hour.
 - verify-data: after the study's ingest, read each ingested space (a space that is neither a baseline space nor a
   shared import, whose data is the study's own) back through its owner and compare every file's path, size and SHA-256
@@ -279,12 +281,22 @@ def main(
         "--discard-reason",
         help="with --discard-evidence: why, recorded in the state file and in down's output (at most 500 characters)",
     )
+    parser.add_argument(
+        "--node-checked",
+        help='down only: what the operator checked on a node an earlier down could not sweep (README.md, "A down that '
+        "could not sweep a node\"), recorded in the state file and in down's output; one line, at most 500 characters",
+    )
     args = parser.parse_args(words)
     if args.discard_evidence and args.command != "down":
         print(f"error: {args.command}: --discard-evidence belongs to down", file=sys.stderr)
         return 2
     if args.discard_reason is not None and (not args.discard_evidence or len(args.discard_reason) > 500):
         print("error: --discard-reason goes with --discard-evidence and is at most 500 characters", file=sys.stderr)
+        return 2
+    checked = args.node_checked
+    if checked is not None and (args.command != "down" or not checked.strip() or len(checked) > 500
+                                or any(ord(c) < 32 or ord(c) == 127 for c in checked)):  # fmt: skip
+        print("error: --node-checked belongs to down: one line of text, at most 500 characters", file=sys.stderr)
         return 2
     environ = os.environ if environ is None else environ
     try:
@@ -322,7 +334,7 @@ def main(
             self_check()
             print(driver.up(site_from_environment(environ)))
         elif args.command == "down":  # never an `else`: a command added without a branch would tear the federation down
-            print(driver.down(discard_evidence=args.discard_evidence, discard_reason=args.discard_reason))
+            print(driver.down(args.discard_evidence, args.discard_reason, node_checked=checked))
         else:
             raise AssertionError(f"{args.command}: no branch")  # pragma: no cover
     except CoreMismatch as error:

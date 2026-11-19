@@ -26,18 +26,24 @@ SHARDS = BUNDLE.parent / "shards.py"  # its `sweep`, on the agent's node at down
 # A teardown step's bound beyond its launch wait, the graceful stop (`stop_seconds`) and supervise.py's kill tail: what
 # teardown.sh spends on its own steps and the client's end. The launch wait and `stop_seconds` come from the layout.
 TEARDOWN_MARGIN_S = 90
+AGENT_NODE = "the agent's node"  # as `unswept` names it (the elastic controller reads that a node is named, C54)
+UNSWEPT_REMEDY = 'sweep it in a job on that node (README.md, "A down that could not sweep a node")'
+STEP_TERM_S = 60.0  # declared bound: a drained worker's step, sent TERM, ends in seconds (its cleanup is a removal)
 WORKDIR_LINE = re.compile(r"^hpcop: work directory (/\S+)$", re.M)  # the batch scripts' own line (zone.sbatch)
 
 
 class Down:
     """down, and what it is made of; `hpcdriver.Driver` provides the rest."""
 
-    def down(self, discard_evidence: bool = False, discard_reason: Optional[str] = None) -> str:
+    def down(
+        self, discard_evidence: bool = False, discard_reason: Optional[str] = None, node_checked: Optional[str] = None
+    ) -> str:
         """The federation taken down and its root removed. A root that holds evidence a run left (a shard step's
         record, a fault-journal line, the relay's journals, a claim, the pilot's wiring: what `up` alone writes is none)
         that was not collected, or changed after it was (`evidence_gate`: the files a step or the study writes; the
         federation's own rewritten files are named, not refused), is refused before anything is stopped, unless
-        `discard_evidence`, which the output records."""
+        `discard_evidence`, which the output records. A node an earlier down could not sweep keeps the storage and the
+        root until `node_checked` says what the operator checked there (`node_check`, C54)."""
         if not self.root.exists():
             return "down: the root is gone already"
         if not self.layout.owned:
@@ -52,7 +58,7 @@ class Down:
             return "down: the root an earlier down's removal left (cut short by files held open) is removed"
         with self.store.lifecycle("down"):  # never beside an up that may be between its state and its sbatch
             discarded = self.evidence_gate(discard_evidence, discard_reason)
-            done = self.take_down()
+            done = self.take_down(node_checked)
         return f"{discarded}\n{done}" if discarded else done
 
     def evidence_gate(self, discard: bool, reason: Optional[str] = None) -> str:
@@ -189,7 +195,7 @@ class Down:
                 f"{gone}, but the root could not be removed ({error}); run down again to finish its removal"
             ) from None
 
-    def take_down(self) -> str:
+    def take_down(self, node_checked: Optional[str] = None) -> str:
         """Whatever fails on the way, the held job is cancelled and every client ended before down returns or raises:
         a failure is reported as unverified, never a reason to leave the job billing."""
         if not self.store.exists():
@@ -210,34 +216,79 @@ class Down:
         elif any(r.get("workdir") and r.get("state") != "removed" for r in state["services"].values()):
             self.say("the held job had ended: its nodes could not be checked (the next job's sweep removes leftovers)")
         swept = ""
+        unswept: List[str] = []  # C54: the nodes a sweep failed on, recorded before anything else may fail
+        cleared: List[str] = []  # ... and the ones this down swept
         if ((agent_info if self.separate(state) else info) or {}).get("JobState") == "RUNNING":
             try:
+                if agent is not None:  # `separate`: the services' wait never looks at the agent's own job
+                    self.end_agent_steps(state, agent)
                 swept = self.sweep_agent_node(state)
+                cleared.append(AGENT_NODE)
             except (RuntimeError, OSError, TimeoutError) as error:
                 self.say(f"the agent's node could not be swept ({error}); the held job is cancelled all the same")
-                unverified.append("the agent's node")
+                unswept.append(AGENT_NODE)
         for entry in state.get("shard_nodes", []):  # W1: every other node a shard step of this federation ran on
+            label = f"the node shard {entry['label']} was resumed on"
             try:
-                swept = "\n".join(filter(None, [swept, self.sweep_shard_node(state, entry)]))
+                done = self.sweep_shard_node(state, entry)  # what its sweep printed; nothing when it was not swept
+                swept = "\n".join(filter(None, [swept, done]))
+                cleared += [label] if done else []
             except (RuntimeError, OSError, TimeoutError) as error:
-                self.say(f"the node shard {entry['label']} was resumed on could not be swept ({error})")
-                unverified.append(f"the node shard {entry['label']} was resumed on")
+                self.say(f"{label} could not be swept ({error})")
+                unswept.append(label)
+        left = self.record_unswept(state, unswept, cleared)
+        unverified += unswept
         self.cancel_all([j for j, i in ((job, info), (agent, agent_info)) if i is not None], lost)
         unverified += self.end_clients([j for j in (job, agent) if j is not None])
         if relay_unstopped and not self.relay_stopped():  # its client is ended now: checked again, never read before
             unverified.append("the fault relay")
         if unverified:
+            if swept:  # what the sweeps removed and kept reaches the down log even when down raises
+                self.say(swept)
             self.set(lambda s: s.update(phase="down"))
+            then = f"{UNSWEPT_REMEDY}, then run down again with --node-checked" if unswept else "run down again"
             raise RuntimeError(
                 f"the held job is gone, but {', '.join(unverified)} could not be verified clean; the root and its "
-                "state are kept: run down again to remove them"
+                f"state are kept: {then} to remove them"
             )
         gone = " and ".join(j for j in (job, agent) if j) or "(never submitted, or no longer ours)"
+        checked = self.node_check(left, node_checked, f"the held job {gone} is gone")
         stored = self.remove_storage(f"the held job {gone} is gone")
         self.remove_root(f"the held job {gone} is gone" + (f" ({swept})" if swept else ""))
         return f"down: the held job {gone} is gone, and so is the root" + "".join(
-            f"\n{x}" for x in (swept, stored) if x
+            f"\n{x}" for x in (checked, swept, stored) if x
         )
+
+    def record_unswept(self, state: Mapping[str, Any], unswept: List[str], cleared: List[str]) -> List[str]:
+        """C54: the nodes left unswept, kept in the state (`unswept`) before anything else may fail: those of an
+        earlier down that this one did not sweep, and those this one could not. The elastic controller reads it
+        (fleetobserve) and never takes such a member down again by itself; `node_check` holds the root for it."""
+        before = list(state.get("unswept", []))
+        left = sorted((set(before) - set(cleared)) | set(unswept))
+        if left != sorted(before):
+            self.set(lambda s: s.update(unswept=left) if left else s.pop("unswept", None))
+        return left
+
+    def node_check(self, left: List[str], checked: Optional[str], gone: str) -> str:
+        """C54: a node an earlier down could not sweep, its job gone since (so no down sweeps it now), may still hold
+        a step's or the worker's directory, the operator's key files among them: the storage and the root are removed
+        only once the operator says what was checked there (`--node-checked`, after the README's sweep in a job on
+        that node). The text is recorded in the state and in down's output, which the fleet's down log keeps. The line
+        it printed; empty when no node is left unswept."""
+        if not left:
+            return ""
+        if checked is None:
+            self.set(lambda s: s.update(phase="down"))
+            raise RuntimeError(
+                f"{gone}, but {', '.join(left)} was never swept and may still hold the operator's key files; the "
+                f'root and its state are kept: {UNSWEPT_REMEDY}, then run down again with --node-checked "<what was '
+                'checked>"'
+            )
+        entry = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "nodes": left, "checked": checked}
+        self.set(lambda s: s.setdefault("node_checked", []).append(entry))
+        line = f"down: --node-checked: {', '.join(left)} not swept by down; the operator checked: {checked}"
+        self.say(line + "; recorded in the state file")
+        return line
 
     def remove_storage(self, gone: str) -> str:
         """The provider storage `up` made on scratch (hpcstorage), removed and shown gone, only here: the held job and
@@ -283,6 +334,48 @@ class Down:
         if not record.get("node"):
             return ""
         return self.sweep_node(state, record["node"], f"{state['allocation']['name']}-sandbox-sweep")
+
+    def end_agent_steps(self, state: Mapping[str, Any], job: str) -> None:
+        """C54: a step of this federation still running in the agent's own job, the elastic worker's (`<agent job
+        name>-worker`, fleetworker.py) or a shard's (`-shard-<n>`), is sized to the whole job, so the sweep's control
+        step there can never start (live, 19 Nov: the sweep waited behind the worker's step until its bound, and a
+        second down, its job gone by then, removed the root unswept). Each one listed under the job by such a name is
+        sent TERM by its own id (`term_step`: the worker then removes its own directory, its key files first, as on
+        every way out) and given `STEP_TERM_S` to end; one still running then is cancelled by its id (on the site an
+        outright kill, K1: the sweep removes what it leaves, once its process is gone). Each must read ended by that
+        id in squeue and sacct (`step_observed`) within the cancel's bound, which covers the site's KillWait;
+        RuntimeError otherwise, and the node is not swept. No other step of the job is touched."""
+        prefixes = [n for n in ((state.get("sandbox") or {}).get("name"), state["allocation"]["name"]) if n]
+        ours = re.compile("(?:" + "|".join(re.escape(p) for p in prefixes) + r")-(?:worker|shard-[0-9]+)")
+        left = [(step, name) for step, name in self.slurm.step_listing(job) if ours.fullmatch(name)]
+        for step, name in left:
+            self.say(f"a step of this federation ({name}) still runs in the agent's job {job}: sent TERM by its id")
+            try:
+                self.slurm.term_step(step)
+            except SlurmError as error:  # its end, read by its id, decides
+                self.say(f"the TERM to step {step} reported a failure ({error})")
+        left = self.unended(left, STEP_TERM_S)
+        for step, _ in left:
+            self.say(f"step {step} outlived its TERM: it is cancelled by its id")
+            try:
+                self.slurm.cancel_step(step)
+            except SlurmError as error:
+                self.say(f"the cancel of step {step} reported a failure ({error})")
+        left = self.unended(left, self.timeouts["cancel"])
+        if left:
+            raise RuntimeError(f"step {', '.join(s for s, _ in left)} of the agent's job has not ended "
+                               f"{self.timeouts['cancel']:.0f} s after its cancel")  # fmt: skip
+
+    def unended(self, steps: List[Tuple[str, str]], bound_s: float) -> List[Tuple[str, str]]:
+        """The (id, name) steps not yet shown ended by their ids (`step_observed`) once `bound_s` has passed, read
+        again every poll until none is left; a step that cannot be told counts as not ended."""
+        deadline = self.clock() + bound_s
+        while steps:
+            steps = [(s, n) for s, n in steps if self.slurm.step_observed(s, n).get("running") is not False]
+            if not steps or self.clock() >= deadline:
+                break
+            self.sleep(self.poll_s)
+        return steps
 
     def sweep_shard_node(self, state: Mapping[str, Any], entry: Mapping[str, str]) -> str:
         """The sweep on a node a shard was resumed on (`shard_nodes`, which `shards.py resume-line` records), in the job
