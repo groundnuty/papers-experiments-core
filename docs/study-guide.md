@@ -317,7 +317,7 @@ A slot, the pair of users a run leases, is free again once its tokens can no lon
 
 A tool call's only bound in the loop is the agent's time left. A tool server that hangs mid-run therefore waits out the whole cap, and the run is scored as the agent's time cap. If your conditions differ in how many tools they call, such hangs fall on them unevenly and bias the comparison. `[agent] tool_server_call_bound_s` in `campaign.toml` declares a bound on one call to a tool server, in seconds: positive and finite, and optional.
 
-- It is for tool servers only. The bound reaches the calls of a provider that is a tool server (an MCP server, `McpToolProvider`), and no other call. A code cell, and any tool that is not a tool server's, is handed the agent's time left whatever you declare: the bound never caps what the agent's code may run for, and the model is told what it is told without the key when a cell runs long. The record's `agent_config.tool_server_tools` lists the tools the bound reached, so you can check that your code tool is not among them.
+- It is for tool servers only. The bound reaches the calls of a provider that is a tool server (an MCP server, `McpToolProvider`), and no other call. A code cell, and any tool that is not a tool server's, is handed the agent's time left whatever you declare for this key (a limit on one code cell is a key of its own, below): the bound never caps what the agent's code may run for, and the model is told what it is told without the key when a cell runs long. The record's `agent_config.tool_server_tools` lists the tools the bound reached, so you can check that your code tool is not among them.
 - Each call to a tool server runs under the shorter of the bound and the agent's time left. A call that outlasts the bound first ends as infrastructure of kind `knowledge` (the tool server did not answer, the message naming the tool and the bound): the attempt is set aside, like any other infrastructure ending, and the agent is not charged. A call that outlasts the time left first is the agent's time cap as before, unless the bound had already passed when the loop cut it: that call hung first, and is `knowledge` infrastructure too.
 - Pick the bound well above the slowest call that is not a hang, and below the time cap, or it never decides anything. A bound at or above the time cap leaves every call as it was, though it still changes the caps in the fingerprint.
 - It is a bound on wall time, and it reaches the tool server as its `timeout_s`. `McpToolProvider` honours it. A tool server of your own that is not an `McpToolProvider` must say `tool_server = True` and bound itself with the `timeout_s` it is handed, or only the time left will cut it.
@@ -354,6 +354,16 @@ else:
     raise AssertionError("the old key was read")
 shutil.rmtree(bounded)
 ```
+
+### Bounding one code cell
+
+An agent's code cell is its own time, so a cell that never returns can spend a whole run: nothing short of the agent's time cap stops it. `[agent] code_cell_bound_s` in `campaign.toml` declares a wall limit on one cell, in seconds: positive and finite, and optional. Declare the same value for every arm, so the limit is part of the setting every condition runs under and not a difference between them.
+
+- A cell that runs past the limit is killed, as every cell is at its time limit, and the agent is told so as that cell's result: an error whose text says the code ran past its limit and was killed, with the output the cell printed before it. The run goes on with the agent's next turn. It is the agent's own outcome, never infrastructure, and the cell's time is charged to the agent.
+- Pick the limit well above the slowest cell that is not a runaway: the sandbox spends a few seconds of it on setup, so a limit of only a few seconds leaves a cell no time to start. A cell is handed the shorter of the limit and the agent's time left. A cell that reaches the time left first is cut by the loop, as it is without the key: a time cap. A limit at or above the time cap leaves every cell as it was, though it still changes the caps in the fingerprint.
+- The limit is for the code tool only. It does not touch a tool server's calls, which have their own bound (`tool_server_call_bound_s`, above), and the old `tool_call_bound_s` is still refused. Docker and Apptainer sandboxes report a killed cell the same way, so the text and the record do not depend on the backend.
+- The record's `agent_config.code_cell_bound_s` holds the limit and `agent_config.code_cell_tools` the tools it reached. A cell that outlives its kill is still infrastructure (`cell_unkillable`) and ends the run.
+- Declare it before the campaign starts: the limit is one of the campaign's caps, which are in its fingerprint, and `campaign.toml`'s hash is in it too, so a store that started without the key is not resumed with it: start a new store. A study that never declares it is unchanged, byte for byte.
 
 ### Prices and the budget
 

@@ -519,3 +519,31 @@ def test_f02_the_thirteenth_fixture_pins_the_deployment_a_turn_names_and_the_twe
     assert dataclasses.replace(record, transcript=bare, totals=unswitched) == fifth
     named = [turn.get("deployment_id") for turn in replay_record(record).transcript]
     assert named == [None, record.transcript[1]["deployment_id"]]
+
+
+def test_l18_the_fourteenth_fixture_pins_a_declared_code_cell_limit_and_the_thirteen_before_it_hold_none():
+    """L18 and R03: the fourteenth merge point adds `agent_config.code_cell_bound_s`, the study's optional wall limit on
+    one code cell, which a study that declares none leaves out, with the names of the tools it reached beside it
+    (`code_cell_tools`). Its fixture, written by the code of that merge on the record tests' fake clock, declares a
+    limit of 60 s over a code tool and another tool: the code cell ran past it and was killed there, which is the code
+    tool's timeout result of 60 s, and the agent's next call, to the other tool, was answered and the run finished. It
+    validates and replays to its own bytes (the parametrized tests above); none of the thirteen before it holds either
+    key, and none is filled in with one."""
+    fourteenth = [p for p in FIXTURES if p.name.startswith("14-")]
+    assert [p.name for p in fourteenth] == ["14-code-cell-bound.json"]
+    record = load_record(fourteenth[0])
+    assert record.agent_config["code_cell_bound_s"] == 60.0
+    assert list(record.agent_config)[-3:] == ["code_cell_bound_s", "terminal_tools", "code_cell_tools"]
+    assert record.agent_config["code_cell_tools"] == ["python"]  # the limit did not reach `echo`
+    assert [(c["name"], c["status"], c["error_class"], c["elapsed_s"]) for c in record.tool_calls] == [
+        ("python", "error", "timeout", 60.0),
+        ("echo", "ok", None, 0.0),
+    ]
+    assert "ran past its 60 s limit and was killed" in record.tool_calls[0]["text"]
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("finished", None)
+    assert replay_record(record).dumps().encode("utf-8") == fourteenth[0].read_bytes()
+    for earlier in FIXTURES[:13]:
+        held = load_record(earlier)
+        assert "code_cell_bound_s" not in held.agent_config
+        assert "code_cell_tools" not in held.agent_config
+        assert replay_record(held).dumps().encode("utf-8") == earlier.read_bytes()
