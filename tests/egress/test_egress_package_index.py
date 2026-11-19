@@ -186,3 +186,28 @@ def test_the_recorded_indexes_are_read_from_the_fingerprints_caps_and_any_other_
     for fingerprint in (None, {}, {"caps": {}}, {"caps": {"egress": {"package_indexes": ["pypi.org", "a.test"]}}}):
         assert recorded_package_indexes(fingerprint) == ()  # unsorted is not the form the campaign records
     assert recorded_package_indexes({"caps": {"egress": {"package_indexes": ["pypi.org"], "x": 1}}}) == ()
+
+
+# The two cells the pilot's e2e campaign flagged, literal: each run's only hit (19 Nov 2026).
+FLAGGED_IN_THE_PILOT = [
+    "import subprocess\n"
+    "r=subprocess.run(['pip','install','xarray','h5netcdf','netcdf4'],capture_output=True,text=True)\n"
+    "print(r.stdout[-2000:])\n"
+    "print(r.stderr[-2000:])",
+    "import subprocess\n"
+    "r=subprocess.run(['pip','install','xarray','h5netcdf','netCDF4','fsspec'],capture_output=True,text=True)\n"
+    "print(r.stdout[-3000:])\n"
+    "print(r.stderr[-2000:])",
+]
+
+
+@pytest.mark.parametrize("cell", FLAGGED_IN_THE_PILOT, ids=["first", "second"])
+def test_the_pilots_two_flagged_cells_are_package_index_when_declared_and_flagged_when_not(cell):
+    """O95: the list's arguments end at its closing bracket (`capture_output=True` is not one), `import subprocess`
+    is no hit, so the cell's only hit is the install: `package_index` under the declared indexes, a flag without."""
+    assert hits(cell) == [("package_index", "pip install", False)]
+    assert hits(cell, ()) == [("download", "pip install", True)]
+    cells = ["print(1)"] * 21 + [cell]  # where the pilot's run had it, among cells without a hit
+    run = record(instruments=snapshot([]), cells=cells)
+    assert judge(run, "c", package_indexes=INDEXES).flags == ()
+    assert judge(run, "c").flags == (STATIC_SCAN,)
