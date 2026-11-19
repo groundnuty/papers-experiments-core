@@ -392,7 +392,7 @@ class AttemptRunner:
                     p.store.event(p.stamp(), ZERO_EVENT, model, f"{key}: {ZERO_REASON}; charged 0, basis measured")
                 if mix is not None:
                     p.store.record_deployments(begun.id, mix)
-                if named is not None:
+                if named is not None or switched:  # a split no header names shows in the fingerprints alone
                     p.store.record_deployment_ids(begun.id, named, switched)
                 if (
                     result.post_run_health is not None

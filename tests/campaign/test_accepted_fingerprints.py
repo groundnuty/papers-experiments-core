@@ -260,3 +260,34 @@ def test_b18_the_export_and_the_report_give_each_deployments_share_of_turns_and_
     del export["deployment_shares"]
     plain = render_report(result, export, study="a-study", code={"commit": "c" * 40}, core_version="1.2.3")
     assert "Deployments" not in plain
+
+
+def test_b20_a_run_split_across_deployments_is_flagged_on_its_fingerprints_alone_and_the_report_counts_it(tmp_path):
+    """B20: an endpoint that routes per request and sends no deployment header shows the split only in the replies'
+    fingerprints: the attempt's store column, its row of the export and the report's count agree that it switched
+    (two fingerprints, or one beside a reply with none), a run on one fingerprint is not flagged, no row names a
+    deployment, and nothing is set aside for it."""
+    first, second, third = order()
+    behaviours = {
+        first: [served(KESTREL, PLOVER, KESTREL)],
+        second: [served(KESTREL, None)],
+        third: [served(PLOVER, PLOVER)],
+    }
+    with campaign(tmp_path, behaviours) as scheduler:
+        assert scheduler.run().statuses == {"done": 3}
+        store = scheduler.store
+        assert [attempts_of(store, key) for key in (first, second, third)] == [[("done", 0, 1)]] * 3
+        rows = store.q("SELECT run_key, deployment_ids, deployment_switched FROM attempts ORDER BY id")
+        assert [(r["run_key"], r["deployment_ids"], r["deployment_switched"]) for r in rows] == [
+            (first, None, 1),
+            (second, None, 1),
+            (third, None, None),
+        ]
+        export = export_run_state(store)
+    by_key = {row["run_key"]: row for row in export["analysed_attempts"]}
+    assert [by_key[key].get("deployment_switched") for key in (first, second, third)] == [True, True, None]
+    assert all("deployment_ids" not in row for row in export["analysed_attempts"])
+    result = AnalysisResult((), (), 0.05, {"preregistration_sha256": "e" * 64})
+    text = render_report(result, export, study="a-study", code={"commit": "c" * 40}, core_version="1.2.3")
+    assert "## Deployment switches" in text
+    assert f"- {MODEL}: 0 analysed attempt(s) named a deployment, 2 switched deployment" in text

@@ -41,8 +41,9 @@ Version 3 also says, in one more optional field of a turn, which deployment serv
 what a front named in the response header the model entry's `deployment_header` names, beside `system_fingerprint`.
 It is the last field of a turn, absent for a turn whose reply named none (never a null), and a present one is plain
 printable text of 1 to 128 characters (`expcore.models.fleetheaders`). The totals say, in one more optional field,
-when the attempt's turns show more than one deployment (`deployment_switched`, written only when true: a turn without
-the id among turns with it counts as one more; visibility only, nothing is set aside for it).
+when the attempt's turns show more than one deployment (`deployment_switched`, written only when true: by their ids or
+by their system fingerprints, a turn without the id or the fingerprint among turns with it counting as one more;
+visibility only, nothing is set aside for it).
 Version 3 also says, in two optional fields of the totals, whether the attempt was held to the reservation R (C27):
 `reserved_capped`, the bound the budget gate reserved the run by, the value the campaign store keeps for the attempt
 (True: by the reply maximum, False: by the window), and `reply_cap_unheld`, whether the campaign had taken the

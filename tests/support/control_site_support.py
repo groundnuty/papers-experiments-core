@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -173,6 +174,10 @@ class FakeTransport:
                 code = self.site.deploy.fleetcontrol.main(words[4:], self.site.environ, hooks)
             return code, printed.getvalue(), err.getvalue()
         self.site.commands.append(words)
+        if script == "fleetprepare.py":  # the site's own wrapper: really run, its child too (real, short commands)
+            done = subprocess.run(words, env=dict(os.environ), cwd=str(self.site.fleet), stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=timeout, check=False)  # fmt: skip
+            return done.returncode, done.stdout, done.stderr
         verb = words[4] if script == "shards.py" else words[words.index("--fleet") + 2]
         if self.site.on_command is not None:
             self.site.on_command(words)

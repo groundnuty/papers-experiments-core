@@ -9,6 +9,10 @@ cut to 32 hex characters. It never holds the run key, which may name a study's c
 reads it on every reply and records it on the turn (`clean_deployment_id` says what is kept); a reply without it, or
 with a value that is not a plain identifier, has no deployment.
 
+`extra_headers` is a table of request headers sent, with their values, on every request of the model (the fleet's front
+routes a model's runs by a workload header). A name passes the same check as `session_header`; a value is 1 to 256
+printable ASCII characters, never one that looks like a credential.
+
 A header name is an HTTP token, and never one the client sets itself: the key rides in `Authorization`.
 """
 
@@ -16,10 +20,17 @@ import hashlib
 import json
 import re
 import secrets
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from typing import Any
+
+from expcore.models.served import fingerprint_parts
 
 SESSION_ID_LENGTH = 32  # hex characters
 DEPLOYMENT_ID_MAX = 128  # characters
+EXTRA_HEADER_VALUE_MAX = 256  # characters
+CREDENTIAL_SCHEMES = ("bearer ", "basic ")  # a value that starts so is an Authorization value in the wrong header
+# a name that has one of these in it is a credential's header (`X-API-Key`), whatever the value looks like
+CREDENTIAL_NAME_PARTS = ("key", "token", "secret", "password", "auth", "credential")
 HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}")
 # Headers the HTTP client or the SDK sets itself; a model that named one would override it.
 CLIENT_HEADERS = frozenset(
@@ -51,6 +62,54 @@ def header_name_problem(name: object, request: bool = False) -> str | None:
     return None
 
 
+def header_value_problem(value: object) -> str | None:
+    """Why `value` cannot be the value of an extra request header, or None: text of 1 to 256 printable ASCII characters
+    (so no line break can split the request) with no space at either end, and not a bearer or basic credential. It
+    never repeats the value."""
+    if not isinstance(value, str):
+        return "must be text"
+    if not value:
+        return "must not be empty"
+    if len(value) > EXTRA_HEADER_VALUE_MAX:
+        return f"must be at most {EXTRA_HEADER_VALUE_MAX} characters"
+    if not all(" " <= c <= "~" for c in value):
+        return "must be printable ASCII with no line break"
+    if value != value.strip():
+        return "must have no space at either end"
+    if value.lower().startswith(CREDENTIAL_SCHEMES):
+        return "looks like a credential, and a key is never sent in a header of the entry"
+    return None
+
+
+def extra_headers_problems(backend: str, headers: object, session_header: str | None) -> list[str]:
+    """Why a model entry's `extra_headers` cannot be used, as messages that name the header and never its value; none
+    for an empty table. Only an `openai_compat` model sends them; a name may not be the model's own `session_header`
+    (any case), and two names that differ only in case would let one silently win."""
+    if not isinstance(headers, Mapping):
+        return ["extra_headers must be a table of header name to value"]
+    if not headers:
+        return []
+    if backend != "openai_compat":
+        return ["extra_headers applies to openai_compat models only"]
+    own = session_header.lower() if isinstance(session_header, str) else None
+    problems: list[str] = []
+    seen: set[str] = set()
+    for name, value in headers.items():
+        if problem := header_name_problem(name, request=True):
+            problems.append(f"extra_headers entry {name!r} {problem}")
+            continue
+        if name.lower() in seen:
+            problems.append(f"extra_headers names {name!r} twice, ignoring case")
+        seen.add(name.lower())
+        if any(part in name.lower() for part in CREDENTIAL_NAME_PARTS):
+            problems.append(f"extra_headers entry {name!r} names a credential's header; the key is never sent in one")
+        if name.lower() == own:
+            problems.append(f"extra_headers entry {name!r} is the model's session_header, which carries the attempt id")
+        if problem := header_value_problem(value):
+            problems.append(f"extra_headers entry {name!r}: the value {problem}")
+    return problems
+
+
 def session_id(fingerprint_sha256: str | None, run_key: str, attempt: int, lease_id: int | None = None) -> str:
     """The opaque id of one attempt: the first 32 hex characters of the SHA-256 of the campaign fingerprint's hash, the
     run key, the attempt number and the lease (None for an attempt that ran on none), as a JSON list so no part can
@@ -71,6 +130,28 @@ def deployment_switched(ids: Iterable[str | None]) -> bool:
     are no switch (a model that is never served through a front). Visibility only: nothing is set aside for it."""
     seen = list(ids)
     return any(i is not None for i in seen) and len(set(seen)) > 1
+
+
+def fingerprints_switched(fingerprints: Iterable[str | None]) -> bool:
+    """Tell whether an attempt's replies show more than one system fingerprint (B20), by the rule of
+    `deployment_switched`: None, a reply that carried none, is one more value only when another reply carried one. An
+    endpoint that routes each request to one of several deployments of a model sends no deployment header, and each
+    deployment has a fingerprint of its own. A reply that carries several (joined into a mixed value) shows each."""
+    seen: list[str | None] = []
+    for fingerprint in fingerprints:
+        seen.extend(fingerprint_parts(fingerprint) if fingerprint else [None])
+    return deployment_switched(seen)
+
+
+def attempt_switched(turns: Iterable[Mapping[str, Any]]) -> bool:
+    """Tell whether an attempt's turns show more than one deployment (B20): by the ids the front named
+    (`deployment_id`) or by the system fingerprints of the replies, either one. The one definition: the record's
+    totals and the store's column (so the export) both call it, so they cannot differ. Visibility only: nothing is set
+    aside, charged differently or refused for it."""
+    turns = list(turns)
+    return deployment_switched(turn.get("deployment_id") or None for turn in turns) or fingerprints_switched(
+        turn.get("system_fingerprint") or None for turn in turns
+    )
 
 
 def deployment_id_ok(value: object) -> bool:
