@@ -1,0 +1,141 @@
+"""fleetcompose.py: a Compose site of the elastic fleet as the controller reaches it (README.md, "A Compose site of the
+elastic fleet"): a host (a group VM) whose federations the operator brought up with `deploy/compose-federation/
+federation.py --instance K up`, its static members, driven over ssh through `composesite.py` there.
+
+A `[[site]]` of the sites file with `kind = "compose"` is an ssh site (`host`, `interpreter`, `env_file`, and `deploy`,
+here the host's `deploy/compose-federation`) with `fleet` (the site's own 0700 directory on the host, one per campaign),
+`channel` (its channel root there, one per campaign) and:
+
+- `members`: a table of the static members, each its label (`[a-z0-9-]`) and its root (absolute, on the host);
+- `study`: the study's directory on the host, which each worker runs a copy of;
+- `home`: the workers' HOME on the host, a 0700 directory holding the study's key tree at its models.toml paths, which
+  the operator placed there (never copied by anything here);
+- `engine` (`docker` by default, `podman` accepted and untested) and `horizon_s` (a member's end, from its join: it
+  has no walltime; 7 days by default).
+
+Its `SiteSettings` need none of an HPC site's sizes: `max_federations` and `warm_pool` default to the number of members
+(no static member is drained for being idle: a ledger label joins once), `allowance_units` to 0 and
+`rate_units_per_hour` to 1 (no node, no add). A join reads the member's identity there (`composesite.py identity`) and
+launches its worker (`composesite.py launch`); a retirement stops the worker and proves it gone, collects, pulls, pulls
+the places, verifies the copy here, and records the member retired, with no `down`.
+"""
+
+import os
+import re
+from dataclasses import dataclass
+from typing import Any, List, Mapping, Optional, Tuple
+
+KIND = "compose"
+KEYS = ("members", "study", "home", "engine", "horizon_s")
+SCRIPT = "composesite.py"
+ENGINES = ("docker", "podman")  # `feddocker.ENGINES`
+HORIZON_S = 7 * 86400.0
+MEMBER = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
+# The seam for a member's prepare hook (the prepare-hook lane's): argv run on the host after the identity read and
+# before the worker's launch, each in order, a failure making the join wait. None is configured in this cut.
+PREPARE: Tuple[Tuple[str, ...], ...] = ()
+
+
+@dataclass(frozen=True)
+class ComposeSite:
+    """What a Compose site adds to an ssh site: its static members (label, root), the study and the workers' HOME on
+    the host, the engine, and a member's horizon."""
+
+    members: Tuple[Tuple[str, str], ...]
+    study: str
+    home: str
+    engine: str = "docker"
+    horizon_s: float = HORIZON_S
+
+    def root(self, member: str) -> str:
+        found = dict(self.members).get(member)
+        if found is None:
+            raise ValueError(f"{member} is no member of the site")
+        return found
+
+
+def _absolute(value: Any, what: str) -> str:
+    if not isinstance(value, str) or not os.path.isabs(value) or "\0" in value:
+        raise ValueError(f"{what} must be an absolute path")
+    return os.path.normpath(value)
+
+
+def compose_site(label: str, own: Mapping[str, Any]) -> ComposeSite:
+    """A Compose site's own keys, checked; ValueError naming the key."""
+    members = own.get("members")
+    if not isinstance(members, dict) or not members:
+        raise ValueError(f"site {label}: members must be a table of at least one member label and its root")
+    pairs = []
+    for name, root in members.items():
+        if not isinstance(name, str) or not MEMBER.fullmatch(name):
+            raise ValueError(f"site {label}: members: {name!r} is not a member label ([a-z0-9-])")
+        pairs.append((name, _absolute(root, f"site {label}: members.{name}")))
+    roots = [root for _, root in pairs]
+    if len(set(roots)) != len(roots):
+        raise ValueError(f"site {label}: two members name one root")
+    engine = own.get("engine", "docker")
+    if engine not in ENGINES:
+        raise ValueError(f"site {label}: engine must be one of {', '.join(ENGINES)}")
+    horizon = own.get("horizon_s", HORIZON_S)
+    if isinstance(horizon, bool) or not isinstance(horizon, (int, float)) or not 3600 <= horizon <= 90 * 86400:
+        raise ValueError(f"site {label}: horizon_s must be from 3600 to {90 * 86400} seconds")
+    return ComposeSite(tuple(pairs), _absolute(own.get("study"), f"site {label}: study"),
+                       _absolute(own.get("home"), f"site {label}: home"), engine, float(horizon))  # fmt: skip
+
+
+def settings_defaults(entry: dict, compose: ComposeSite) -> None:
+    """A Compose site's `SiteSettings` defaults, filled in `entry` where the sites file names none (module docstring).
+    Mutates `entry`: it is the sites file's table for this site, read once."""
+    count = len(compose.members)
+    for key, value in (("max_federations", count), ("warm_pool", count), ("allowance_units", 0.0),
+                       ("rate_units_per_hour", 1.0)):  # fmt: skip
+        entry.setdefault(key, value)
+
+
+def script(site: Any, command: str, *words: str) -> List[str]:
+    """`composesite.py <command> --engine <the site's> ...` on the host: the command is the fifth word, where the
+    executor looks for a retirement's `collect`."""
+    return site.script(SCRIPT, command, "--engine", site.compose.engine, *words)
+
+
+def observe_argv(site: Any) -> List[str]:
+    members = [word for name, root in site.compose.members for word in ("--member", f"{name}={root}")]
+    return script(site, "observe", "--fleet", str(site.fleet), "--site", site.label, "--channel", str(site.channel),
+                  "--horizon-s", repr(site.compose.horizon_s), *members)  # fmt: skip
+
+
+def channel_of(site: Any, label: str) -> str:
+    from expcore.campaign.elastic import channel as ch
+
+    return str(ch.federation_dir(str(site.channel), label))
+
+
+def launch_steps(action: Any, site: Any) -> Tuple[Tuple[str, ...], ...]:
+    """A joining member's steps on the host: the prepare seam's (none yet), then the worker's launch."""
+    compose = site.compose
+    launch = script(site, "launch", "--fleet", str(site.fleet), "--member", action.member, "--root",
+                    compose.root(action.member), "--federation", action.label, "--channel",
+                    channel_of(site, action.label), "--study", compose.study, "--home", compose.home)  # fmt: skip
+    return (*PREPARE, tuple(launch))
+
+
+def identity_argv(site: Any, member: str) -> List[str]:
+    return script(site, "identity", "--fleet", str(site.fleet), "--root", site.compose.root(member), "--study",
+                  site.compose.study)  # fmt: skip
+
+
+def stop_argv(site: Any, member: str) -> List[str]:
+    return script(site, "stop", "--fleet", str(site.fleet), "--member", member)
+
+
+def collect_argv(site: Any, root: str, into: str) -> List[str]:
+    return script(site, "collect", "--root", root, "--into", into)
+
+
+def retired_argv(site: Any, member: str, label: str) -> List[str]:
+    return script(site, "retired", "--fleet", str(site.fleet), "--member", member, "--channel",
+                  channel_of(site, label))  # fmt: skip
+
+
+def is_compose(site: Optional[Any]) -> bool:
+    return site is not None and getattr(site, "compose", None) is not None

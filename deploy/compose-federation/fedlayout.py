@@ -107,16 +107,20 @@ def checked_root(value: str, base: Path = Path(DEFAULT_ROOT), *, strict: bool = 
     return root
 
 
-def root_from_environment(environ: Mapping[str, str]) -> tuple[Path, Path]:
+def root_from_environment(environ: Mapping[str, str], name: str | None = None) -> tuple[Path, Path]:
     """The allowed parent and the root, from EXPCORE_FED_ROOT_PARENT and EXPCORE_FED_ROOT.
 
     Under the default parent the root may be the parent itself, and is by default, as it always was: down removes it
     and up makes it again. Any other parent must exist, and the root must be named and lie strictly below it, so a
-    parent that holds other data is never used as the root and never emptied by down."""
+    parent that holds other data is never used as the root and never emptied by down. `name` (an instance's project,
+    `fedspec.instance`) makes the default root `<parent>/<name>`, strictly below the parent, so instances of one layout
+    get roots beside each other without naming them."""
     configured = environ.get("EXPCORE_FED_ROOT_PARENT")
     parent = checked_parent(DEFAULT_ROOT if configured is None else configured)
-    default = parent == Path(DEFAULT_ROOT)
     value = environ.get("EXPCORE_FED_ROOT")
+    if value is None and name is not None:
+        value = str(parent / name)
+    default = parent == Path(DEFAULT_ROOT) and name is None
     if value is None and not default:
         raise ValueError(
             f"EXPCORE_FED_ROOT must name a directory strictly below EXPCORE_FED_ROOT_PARENT ({parent}): a parent "
@@ -128,6 +132,25 @@ def root_from_environment(environ: Mapping[str, str]) -> tuple[Path, Path]:
     return parent, root
 
 
+# One CA for every federation of a host (`federation.py ca`): its digest is in the campaign fingerprint (the TLS
+# setting's record), so federations that each made their own could never take leases of one campaign.
+CA_DIR_ENV = "EXPCORE_FED_CA_DIR"
+SHARED_CA_PEM, SHARED_CA_KEY = "federation-ca.pem", "ca.key"
+
+
+def checked_ca_dir(value: str, root: Path | None = None) -> Path:
+    """The shared CA's directory from its setting: an absolute path, never `/` or a link, outside the root and not
+    holding it (down empties the root). Whether it holds a CA, and is private, is checked where it is used."""
+    if not value or not os.path.isabs(value):
+        raise ValueError(f"{CA_DIR_ENV} must be an absolute path")
+    path = Path(os.path.normpath(value))
+    if path == Path("/") or path.is_symlink() or any(step.is_symlink() for step in path.parents):
+        raise ValueError(f"{CA_DIR_ENV} may not be / nor pass through a symbolic link")
+    if root is not None and (path == root or root in path.parents or path in root.parents):
+        raise ValueError(f"{CA_DIR_ENV} must lie outside the federation's root and not hold it: down empties the root")
+    return path
+
+
 @dataclass(frozen=True)
 class Layout:
     """The declared layout, the paths below the federation's root, and the allowed parent the root was checked
@@ -136,11 +159,19 @@ class Layout:
     root: Path
     parent: Path = Path(DEFAULT_ROOT)
     spec: Spec = field(default_factory=load_spec)
+    ca_dir: Path | None = None  # the host's shared CA (`EXPCORE_FED_CA_DIR`), or None: the root makes its own
 
     @classmethod
-    def from_environment(cls, environ: Mapping[str, str] | None = None, spec: Spec | None = None) -> "Layout":
-        parent, root = root_from_environment(os.environ if environ is None else environ)
-        return cls(root, parent, load_spec() if spec is None else spec)
+    def from_environment(
+        cls, environ: Mapping[str, str] | None = None, spec: Spec | None = None, *, instance: bool = False
+    ) -> "Layout":
+        """The layout's paths from the environment; with `instance`, the root defaults to one named after the spec's
+        project, below the parent (`root_from_environment`)."""
+        environ = os.environ if environ is None else environ
+        spec = load_spec() if spec is None else spec
+        parent, root = root_from_environment(environ, spec.project if instance else None)
+        ca_dir = environ.get(CA_DIR_ENV)
+        return cls(root, parent, spec, None if ca_dir is None else checked_ca_dir(ca_dir, root))
 
     @property
     def owned(self) -> bool:
@@ -204,7 +235,12 @@ class Layout:
 
     @property
     def ca_key(self) -> Path:
-        return self.secrets / "ca.key"
+        """The CA's key: the shared CA's, outside the root, when the host has one, else the root's own."""
+        return self.secrets / "ca.key" if self.ca_dir is None else self.ca_dir / SHARED_CA_KEY
+
+    @property
+    def shared_ca_pem(self) -> Path | None:
+        return None if self.ca_dir is None else self.ca_dir / SHARED_CA_PEM
 
     @property
     def admin_token(self) -> Path:

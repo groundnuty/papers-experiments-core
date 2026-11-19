@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import fleetcompose
 from fleetssh import SshSiteTransport, redact
 
 HERE = Path(__file__).resolve().parent
@@ -75,6 +76,7 @@ class SiteConfig:
     host: Optional[str] = field(default=None, repr=False)  # an ssh site's destination or alias: never shown or logged
     env_file: Optional[str] = None  # an ssh site's site.env, a path on its login node, sourced before each command
     shard_settings: Optional[Path] = None  # an ssh site's shard settings file, a path on its login node
+    compose: Optional[Any] = None  # a Compose site's own (`fleetcompose.ComposeSite`): its static members on a host
 
     @property
     def label(self) -> str:
@@ -119,6 +121,8 @@ def render(action: Any, site: SiteConfig, evidence: Path, ledger: Path, digest: 
         return Rendered("site", (tuple(site.script("fleet.py", "--fleet", str(site.fleet), "add", str(action.count))),))
     if kind == "Retire":
         into = evidence_dir(evidence, site.label, action.member)
+        if fleetcompose.is_compose(site):
+            return retire_compose(action, site, into, digest)
         if site.remote:
             return retire_over_ssh(action, site, into, digest)
         steps = []
@@ -172,9 +176,40 @@ def retire_over_ssh(action: Any, site: SiteConfig, into: Path, digest: str) -> R
     return Rendered("site", tuple(steps), places=(*places, SITE))
 
 
+def retire_compose(action: Any, site: SiteConfig, into: Path, digest: str) -> Rendered:
+    """A retirement at a Compose site (`fleetcompose.py`): the worker stopped and proven gone, then (for a member
+    that may hold evidence) collect into the site's `<fleet>/collected/<member>`, the pull of that copy, the pull of
+    the member's channel places and `verify-copy` here, as at an ssh site; last the member recorded retired. No down:
+    the operator's federation stays up."""
+    from expcore.campaign.elastic.control import ledger_label
+
+    label = action.label or ledger_label(site.label, action.member)
+    steps: List[Tuple[str, ...]] = [tuple(fleetcompose.stop_argv(site, action.member))]
+    places: List[str] = [SITE]
+    if action.collect:
+        there = site.fleet / COLLECTED / action.member
+        steps.append(tuple(fleetcompose.collect_argv(site, action.root, str(there))))
+        steps.append((PULL, str(there), str(into), digest))
+        places += [SITE, PULL]
+        if site.channel is not None and action.label is not None:  # a member that never joined held no lease
+            from expcore.campaign.elastic import channel as ch
+
+            steps.append((PULL_PLACES, str(ch.federation_dir(str(site.channel), action.label) / ch.PLACES),
+                          str(into / ch.PLACES)))  # fmt: skip
+            places.append(PULL_PLACES)
+        steps.append((sys.executable, "-I", "-B", str(HERE / "shards.py"), "verify-copy", str(into / ARCHIVES_MANIFEST),
+                      str(into), "--manifest-sha256", digest))  # fmt: skip
+        places.append(HERE_PLACE)
+    steps.append(tuple(fleetcompose.retired_argv(site, action.member, label)))
+    return Rendered("site", tuple(steps), places=(*places, SITE))
+
+
 def worker_launch(action: Any, site: SiteConfig, settings: Optional[Path]) -> Tuple[Tuple[str, ...], ...]:
     """A joining federation's worker, launched on its site before the join (idempotent: one already running is not
-    launched again): its ledger label, its channel under the site's channel root, and the recorded end of its job."""
+    launched again): its ledger label, its channel under the site's channel root, and the recorded end of its job. At
+    a Compose site its member's worker on the host (`fleetcompose.launch_steps`), with no shard settings."""
+    if fleetcompose.is_compose(site):
+        return fleetcompose.launch_steps(action, site)
     if site.channel is None or settings is None:
         return ()
     from expcore.campaign.elastic import channel as ch

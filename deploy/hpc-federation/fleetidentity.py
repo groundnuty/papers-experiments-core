@@ -115,13 +115,19 @@ def read_identity(
 def read_identity_remote(
     transport: Any, site: Any, member: str
 ) -> Optional[Tuple[str, Mapping[str, str]]]:  # fmt: skip
-    """One member's identity read on an ssh site's login node (`fleetidentity.py read` there, over the transport); None
-    for any failure, a call that cannot be made or that is past its bound included: the join waits."""
+    """One member's identity read on an ssh site's login node (`fleetidentity.py read` there, over the transport; at a
+    Compose site `composesite.py identity`, `fleetcompose.identity_argv`); None for any failure, a call that cannot be
+    made or that is past its bound included: the join waits."""
+    import fleetcompose
+
     settings = site.shard_settings
-    if transport is None or settings is None:
+    if transport is None or (settings is None and not fleetcompose.is_compose(site)):
         return None
-    argv = site.script("fleetidentity.py", "read", "--fleet", str(site.fleet), "--member", member, "--settings",
-                       str(settings))  # fmt: skip
+    if fleetcompose.is_compose(site):
+        argv = fleetcompose.identity_argv(site, member)
+    else:
+        argv = site.script("fleetidentity.py", "read", "--fleet", str(site.fleet), "--member", member, "--settings",
+                           str(settings))  # fmt: skip
     try:
         code, out, _ = transport.run(site, argv, TIMEOUT_S + 60)  # past the read's own bound there
         said = json.loads(out.strip().splitlines()[-1])

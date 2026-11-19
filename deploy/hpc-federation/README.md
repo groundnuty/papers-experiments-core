@@ -1755,6 +1755,21 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   that fails or times out reads nothing that tick: the lease stays charged its grant and is read again next tick, never
   taken for a place with nothing in it. Nothing of it has run live.
 
+- **A Compose site** (`kind = "compose"`, `fleetcompose.py`): a host whose federations its operator brought up with
+  `deploy/compose-federation/federation.py --instance K up` (on the host's shared CA, so all have one fingerprint), its
+  static members. It is an ssh site (`host`, `interpreter`, `env_file`, and `deploy` the host's
+  `deploy/compose-federation`) with a `channel`, `fleet` (the site's 0700 directory on the host), `members` (a table of
+  member labels and their roots), `study` and `home` (the workers' HOME, holding the study's key tree, placed by the
+  operator) on the host, and optionally `engine` and `horizon_s`. `[controller]` names `archives`, and `study` (this
+  host's copy, for a lost lease's settle) where it names no `settings`. `max_federations` and `warm_pool` default to
+  the members' count, so no member is drained for idling, and nothing is ever added. Each command runs
+  `composesite.py` there (its README section, "A Compose site of the elastic fleet"): the read; a join's identity read
+  and worker launch; a retirement's stop (the worker proven gone: no process of it left), collect, pull, places pull,
+  `verify-copy` here and the retired record, with no `down`. A member whose worker died is proven ended (`terminal`)
+  and its lost lease settles from the channel on the host as at an ssh site; it does not join again in that campaign
+  (a ledger label joins once). A prepare hook has a seam (`fleetcompose.PREPARE`) and none yet. Nothing of it has run
+  live.
+
 ## The elastic fleet's worker (`fleetworker.py`, `fleetidentity.py`)
 
 Step 6 of #462, the Helios-only path of the elastic fleet wired end to end. Nothing of it has run live.

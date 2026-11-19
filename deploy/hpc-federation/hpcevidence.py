@@ -576,12 +576,14 @@ def _manifest_of(label: str, tar: bytes, files: dict[str, bytes], root_id: str, 
     return (json.dumps(document, sort_keys=True, indent=2) + "\n").encode()
 
 
-def archive_root(root: Path, label: str, root_id: str = "") -> RootArchive:
+def archive_root(root: Path, label: str, root_id: str = "", required: tuple[str, ...] = REQUIRED) -> RootArchive:
     """The evidence of the federation's root as bytes (the module's docstring): the digest of the step records first,
     then each file of the allow-list read once with no link followed, then the check that none holds a secret.
     `root_id` (a hash of the root's path, which the manifest records and no path) tells one federation's archive from
-    another's under one shard label (a shard that moved). `RootGone` when the root is not there; EvidenceError naming
-    the file when a required one is missing, one is a link or holds a secret, or the total is too large."""
+    another's under one shard label (a shard that moved). `required` is what the root must hold: a Compose root
+    (`deploy/compose-federation/composesite.py collect`) has no HPC state file, so it requires `facts.json` alone and
+    its manifest names no up id. `RootGone` when the root is not there; EvidenceError naming the file when a required
+    one is missing, one is a link or holds a secret, or the total is too large."""
     try:
         fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     except FileNotFoundError:
@@ -595,7 +597,7 @@ def archive_root(root: Path, label: str, root_id: str = "") -> RootArchive:
             files[relative] = _read_named(fd, relative)
             if sum(map(len, files.values())) > MAX_TOTAL:
                 raise EvidenceError(f"the evidence is larger than {MAX_TOTAL >> 20} MiB")
-        for name in REQUIRED:
+        for name in required:
             if name not in files:
                 raise EvidenceError(f"{name} is missing: it is what `up` always writes, and the post-check needs it")
         secrets_found = secret_values(fd)
@@ -605,7 +607,7 @@ def archive_root(root: Path, label: str, root_id: str = "") -> RootArchive:
         if any(value in data for value in secrets_found):
             raise EvidenceError(f"{name} holds the content of a file of {SECRETS}/: not archived")
     tar = _tar_of(files)
-    up_id = _up_id(files[STATE])
+    up_id = _up_id(files[STATE]) if STATE in files else ""
     manifest = _manifest_of(label, tar, files, root_id, up_id)
     hashes = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
     return RootArchive(

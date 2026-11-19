@@ -19,6 +19,7 @@ from fedlayout import IMAGES, IMPORT_MOUNT, NODE, REGULAR_STORAGE, ROOT_MARKER
 from fedspec import LOOPBACK, ZONE, Service, Space, Spec
 
 ROOT = "${EXPCORE_FED_ROOT:?set by federation.py}"  # no default: a file run by hand binds no root by accident
+NETWORK = "fed"  # the project's one network, `<project>_fed` on the host
 ROOT_LABEL = "org.expcore.fed.root"  # every container names the root it binds: commands refuse another root's
 ZONE_IMAGE, PROVIDER_IMAGE = IMAGES
 SAFE_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
@@ -136,7 +137,7 @@ def service_model(spec: Spec, service: Service) -> dict[str, Any]:
         "environment": {"ONEPANEL_BATCH_MODE": "true", "ONEPANEL_LOG_LEVEL": "info", config[0]: config[1]},
         "volumes": volumes,
         "ports": [{"target": 443, "host_ip": LOOPBACK, "published": str(service.port), "protocol": "tcp"}],
-        "networks": {"fed": {"aliases": [service.domain]}},
+        "networks": {NETWORK: {"aliases": [service.domain]}},
     }
 
 
@@ -163,7 +164,7 @@ def model(spec: Spec) -> dict[str, Any]:
     services = {service.name: service_model(spec, service) for service in spec.services}
     services["janitor"] = janitor_model(spec)
     network = {"driver": "bridge", "labels": {ROOT_LABEL: ROOT}}  # names its root, as every container does
-    return {"name": spec.project, "services": services, "networks": {"fed": network}}
+    return {"name": spec.project, "services": services, "networks": {NETWORK: network}}
 
 
 # -- YAML ------------------------------------------------------------------------------------------------------------
