@@ -35,6 +35,7 @@ from expcore_onedata.sandbox.codetool import CodeExecutionProvider
 BOUND_S = 60.0  # the declared limit on one cell
 SLEEP_S = 180  # how long the cell would run: three times the limit
 CAP_S = 600.0  # the agent's time cap: far past the limit, so the limit is what ends the cell
+CONTROL_CAP_S = 45.0  # the control's cap: shorter than the limit, so the time left is what ends the cell
 GRACE_S = 5.0  # the sandbox's kill grace, which bounds the kill's escalation (`deadline.margin_s`)
 LOOK_FOR_S = 40.0  # how long the look waits for the cell's processes to show
 NEXT_LINE = "next cell ran"
@@ -87,6 +88,17 @@ def watch_for(look: Callable[[], list[str]], seen: dict[str, Any], *, wait_s: fl
     seen.update(marked=most, at_s=round(time.monotonic() - began, 3))
 
 
+def settled_cell(sandbox: Any, *, wait_s: float = 30.0) -> dict[str, Any]:
+    """The deadline record of the first cell once the escalation has published its outcome (a cell the loop cut leaves
+    it running in the timer's thread, for a few seconds after the loop returns)."""
+    began = time.monotonic()
+    while True:
+        cells = sandbox.metadata().get("cell_deadlines") or [{}]
+        if cells[0].get("outcome") or time.monotonic() - began >= wait_s:
+            return cells[0]
+        time.sleep(0.5)
+
+
 def run_scenario(
     sandbox: Any,
     look: Callable[[], list[str]],
@@ -99,7 +111,10 @@ def run_scenario(
     clock: Callable[[], float] | None = None,
     record_out: Path | None = None,
 ) -> dict[str, Any]:
-    """Run the scripted attempt over the sandbox and return the facts. `marker` is a string no other process carries."""
+    """Run the scripted attempt over the sandbox and return the facts. `marker` is a string no other process carries.
+
+    With a `cap_s` shorter than `bound_s` it is the control: the agent's time left is the shorter, so the bound is
+    not in force and the loop's own cut, a time cap, is what ends the run (the same cell, the same look)."""
     marker = marker or f"cellbound-{uuid.uuid4().hex[:12]}"
     limits = Limits(
         max_tool_rounds=5, time_cap_s=cap_s, token_budget=100_000, output_cap_chars=8000, max_output_tokens=4096
@@ -126,8 +141,9 @@ def run_scenario(
     if record_out is not None:
         record_out.write_text(text, encoding="utf-8")
     first, second = [*record.tool_calls, {}, {}][:2]
-    cell = (sandbox.metadata().get("cell_deadlines") or [{}])[0]
+    cell = settled_cell(sandbox)
     return {
+        "control": cap_s < bound_s,
         "bound_s": bound_s, "sleep_s": sleep_s, "cap_s": cap_s,
         "before": before, "after": {"marked": after},
         "call_1": {k: first.get(k) for k in ("status", "error_class", "elapsed_s", "text")},
@@ -145,7 +161,10 @@ def run_scenario(
 
 
 def problems(facts: dict[str, Any], *, grace_s: float = GRACE_S) -> list[str]:
-    """What is wrong with the facts: empty when the kill was shown live (the eight points of the plan)."""
+    """What is wrong with the facts: empty when the kill was shown live (the eight points of the plan), or, for the
+    control (`facts["control"]`), when the loop's cut at the time left was."""
+    if facts.get("control"):
+        return control_problems(facts, grace_s=grace_s)
     found: list[str] = []
     bound_s, call_1, call_2 = facts["bound_s"], facts["call_1"], facts["call_2"]
     if facts["before"]["marked"] < 2:
@@ -176,5 +195,32 @@ def problems(facts: dict[str, Any], *, grace_s: float = GRACE_S) -> list[str]:
         and record["tools"] == ["python"]
         and record["replay_identical"]
     ):
+        found.append(f"the record is not as expected: {record}")
+    return found
+
+
+def control_problems(facts: dict[str, Any], *, grace_s: float = GRACE_S) -> list[str]:
+    """What is wrong with the control's facts: the cap was shorter than the bound, so the cell was handed the time left,
+    the loop's cut ended the run as the agent's time cap, no limit was named, and the sandbox still killed every
+    process at that time."""
+    found: list[str] = []
+    cap_s, bound_s, call_1 = facts["cap_s"], facts["bound_s"], facts["call_1"]
+    if facts["before"]["marked"] < 2:
+        found.append(f"before the cap {facts['before']['marked']} marked process(es) were seen, not two")
+    elapsed = call_1.get("elapsed_s")
+    if elapsed is None or not cap_s - 1.0 <= elapsed <= cap_s + deadline.margin_s(grace_s):
+        found.append(f"the call took {elapsed} s, not about the {cap_s:g} s of time left")
+    if facts["outcome"] != {"name": "time_cap", "infra_kind": None}:
+        found.append(f"the run did not end as the agent's time cap: {facts['outcome']}")
+    if limit_text(bound_s) in str(call_1.get("text")):
+        found.append("the agent was told a limit that was not in force")
+    if facts["call_2"].get("status") is not None:
+        found.append(f"a second call was made after the time ran out: {facts['call_2']}")
+    if facts["deadline"]["outcome"] != deadline.KILLED:
+        found.append(f"the sandbox's deadline record is {facts['deadline']}, not a clean kill")
+    if facts["after"]["marked"] != 0:
+        found.append(f"{facts['after']['marked']} marked process(es) were still there after the call")
+    record = facts["record"]
+    if not (record["valid"] and record["bound_s"] == bound_s and record["replay_identical"]):
         found.append(f"the record is not as expected: {record}")
     return found

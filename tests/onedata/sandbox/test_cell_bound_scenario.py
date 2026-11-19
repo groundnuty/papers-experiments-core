@@ -6,7 +6,7 @@ scripted here: the live runs read it from `docker top` and `ps`."""
 import threading
 
 import pytest
-from cell_bound_live import NEXT_LINE, SLEEP_S, limit_text, problems, run_scenario
+from cell_bound_live import CONTROL_CAP_S, NEXT_LINE, SLEEP_S, limit_text, problems, run_scenario
 from deadline_support import CELL_S, cell_processes
 from loop_support import FakeClock
 
@@ -107,3 +107,36 @@ def test_l18_the_scenario_runs_over_the_docker_sandbox_on_its_fake_host(world, m
         cells._kill_at_the_cap, world.host.exec_handler = kill, handler
     assert problems(facts) == []
     assert facts["deadline"]["outcome"] == "killed"
+
+
+def test_l18_the_control_shows_the_loops_cut_when_the_time_left_is_shorter_than_the_bound():
+    """L18: with a 45 s cap under the 60 s bound, the cell is handed the 45 s left and no limit is named: the sandbox
+    kills it at the time left, the agent's time cap ends the run, and the facts of the control have no problem."""
+    clock = FakeClock()
+    sandbox = SimulatedSandbox(clock)
+    facts = run_scenario(sandbox, Look(), clock=clock, cap_s=CONTROL_CAP_S, look_for_s=5)
+    assert facts["control"] is True
+    assert sandbox.limits == [CONTROL_CAP_S]
+    assert facts["outcome"] == {"name": "time_cap", "infra_kind": None}
+    assert limit_text(60.0) not in facts["call_1"]["text"]
+    assert problems(facts) == []
+
+
+@pytest.mark.parametrize(
+    ("change", "fragment"),
+    [
+        (lambda f: f["outcome"].update(name="finished"), "time cap"),
+        (lambda f: f["call_1"].update(text=limit_text(60.0)), "not in force"),
+        (lambda f: f["call_2"].update(status="ok"), "second call"),
+        (lambda f: f["after"].update(marked=2), "still there"),
+        (lambda f: f["deadline"].update(outcome="survived_kill"), "clean kill"),
+    ],
+    ids=["no-cut", "limit-named", "second-call", "survivor", "no-kill"],
+)
+def test_l18_each_point_of_the_control_is_checked(change, fragment):
+    """L18: the control's facts have no problem, and each point it must show fails when it is not shown."""
+    clock = FakeClock()
+    facts = run_scenario(SimulatedSandbox(clock), Look(), clock=clock, cap_s=CONTROL_CAP_S, look_for_s=5)
+    assert problems(facts) == []
+    change(facts)
+    assert any(fragment in found for found in problems(facts))
