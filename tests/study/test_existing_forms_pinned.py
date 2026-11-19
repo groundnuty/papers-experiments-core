@@ -5,7 +5,8 @@ A run on a lease (`run --lease`, `expcore-shard/5`) is a new form beside the uns
 store's attempt numbers, the pin of a shard's facts, the plan check, the start), so this test runs each old form for
 real and holds what a host, a clock and an interpreter do not change to `tests/data/existing-forms-pins.json`: the store
 schema, the pinned meta rows, the fingerprint but for its environment, the runs, every attempt's number, state and
-charge, and the names of the batch's files. The file was made by the kernel before leases existed.
+charge, and the names of the batch's files. The file was made by the kernel before leases existed; its one edit since is the nullable
+attempts column `deployment_ids` that F02 adds to each store schema.
 """
 
 import json

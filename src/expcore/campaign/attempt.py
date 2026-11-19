@@ -53,6 +53,7 @@ from expcore.campaign import liveness, prerun
 from expcore.campaign.after_loop import settle_usage
 from expcore.campaign.attempts import BegunAttempt, classify, is_charged, unverified
 from expcore.campaign.defect_log import Chained, DefectLog
+from expcore.campaign.deployments import deployment_ids
 from expcore.campaign.executor import (
     BackendFactory,
     DeclaredSecrets,
@@ -382,6 +383,7 @@ class AttemptRunner:
                     defects(error, result.outcome.defect)
             result, moved = self._judge(result, record, model, key, begun)
             mix = None if record is None else p.identities.deployment_mix(model, record.transcript)  # B18
+            named = None if record is None else deployment_ids(record.transcript)  # F02
 
             def bookkeeping() -> None:  # in the transaction of the result: both stand, or neither does
                 self._bookkeeping(model, endpoint, key, result, kinds, targets, moved)
@@ -389,6 +391,8 @@ class AttemptRunner:
                     p.store.event(p.stamp(), ZERO_EVENT, model, f"{key}: {ZERO_REASON}; charged 0, basis measured")
                 if mix is not None:
                     p.store.record_deployments(begun.id, mix)
+                if named is not None:
+                    p.store.record_deployment_ids(begun.id, named)
                 if (
                     result.post_run_health is not None
                 ):  # the reading, with the result: both stand, or neither does (O90)

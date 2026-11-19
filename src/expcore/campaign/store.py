@@ -110,6 +110,8 @@ _ADDED_COLUMNS = (
     ("attempts", "spend_basis", "TEXT"),
     # JSON: the redacted snapshot of a failed instrument start or another failure that carried a diagnostic (C40); NULL: none
     ("attempts", "diagnostic", "TEXT"),
+    # JSON sorted list of the deployments the attempt's turns named (F02, `deployment_header`); NULL: no turn named one
+    ("attempts", "deployment_ids", "TEXT"),
 )
 # Statements that fill a column from what older databases kept elsewhere, run in the same transaction that adds it. Before
 # `outage_kind` existed, the kind of an outage was stored in `infra_kind`, so an outage-discarded attempt of such a
@@ -662,6 +664,11 @@ class Store:
         """Keep an attempt's deployment mix (B18): the JSON pairs of a fingerprint and the turns it served. Called from
         the `also` step of `finish_attempt`, it joins that transaction, so the mix stands or falls with the result."""
         self.transact(lambda: self.db.execute("UPDATE attempts SET deployments=? WHERE id=?", (mix, attempt_id)))
+
+    def record_deployment_ids(self, attempt_id: int, ids: str) -> None:
+        """Keep the deployments an attempt's turns named (F02): a JSON list of the distinct ids, sorted. Called from the
+        `also` step of `finish_attempt` like `record_deployments`, so it stands or falls with the result."""
+        self.transact(lambda: self.db.execute("UPDATE attempts SET deployment_ids=? WHERE id=?", (ids, attempt_id)))
 
     def finish_attempt(
         self, attempt_id: int, result: AttemptResult, max_attempts: int, *, also: Callable[[], None] | None = None

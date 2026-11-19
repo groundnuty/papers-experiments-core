@@ -37,6 +37,13 @@ def deployment_shares(declared: Mapping[str, Any], analysed: Iterable[tuple[str,
         raise DeploymentsUnreadable(f"the deployment record cannot be read ({type(error).__name__}: {error})") from None
 
 
+def deployment_ids(transcript: Iterable[Mapping[str, Any]]) -> str | None:
+    """The deployments the turns of an attempt named (`deployment_id`, F02): the distinct ids as a sorted JSON list, or
+    None when no turn named one. Unlike the fingerprint mix this is kept for any model that sets `deployment_header`."""
+    found = sorted({turn["deployment_id"] for turn in transcript if turn.get("deployment_id")})
+    return json.dumps(found) if found else None
+
+
 def fingerprint_order(accepted: Collection[str]) -> Callable[[str | None], tuple]:
     """The order of a model's fingerprints in its entry: the declared ones by name, then the others, then None (the
     turns no fingerprint served)."""

@@ -25,6 +25,11 @@ not hide it. Field names are generic: a run is named by its key, its condition, 
 file is written to a temporary file in its directory and moved into place, so a reader sees the old file or the new
 one; it is owner-only (0600), because an export can carry study data.
 
+Each analysed attempt whose turns named the deployment that served them (the model entry's `deployment_header`, F02) says
+which, in `deployment_ids`: the distinct ids, sorted, after `admission` and before `lease_id`; an attempt none of whose
+turns named one has no such key, so an export of a campaign without it is what it was. A merged batch's rows carry it
+as they carry the rest.
+
 Each analysed attempt also says when and how it began (`dispatch_seq`, `started_at`, `lease_wait_s`, `lease_outcome`), so
 an analysis can check the balance of the conditions over time: holds and unit caps can push one condition's runs late.
 It says too what it held of the platform's run admission (`admission`: `shared`, `exclusive`, or `none`), as the store
@@ -271,6 +276,7 @@ def export_run_state(store: RunState, *, excluded: Mapping[str, str] | None = No
                     "treatment": bool(done[0]["treatment"]),
                     "infra_kind": done[0]["infra_kind"],
                     **_dispatch(done[0]),
+                    **_deployment_ids(done[0]),
                 }
             )
             scored.append((who["factors"]["model"], done[0]))
@@ -479,6 +485,15 @@ def _dispatch(attempt: Any) -> dict[str, Any]:
         "lease_outcome": attempt["lease_outcome"],
         "admission": _admission(attempt),
     }
+
+
+def _deployment_ids(attempt: Any) -> dict[str, list[str]]:
+    """The deployments the analysed attempt's turns named (`deployment_ids`, a sorted list; F02), for the analysis to
+    use the deployment as a sensitivity factor. There is no key for an attempt none of whose turns named one, and for
+    a snapshot made before the column: never an empty list or a null."""
+    # a sqlite3.Row's `in` tests its values, not its column names, so the names are asked for explicitly
+    text = attempt["deployment_ids"] if "deployment_ids" in attempt.keys() else None  # noqa: SIM118
+    return {} if text is None else {"deployment_ids": json.loads(text)}
 
 
 def _admission(attempt: Any) -> str | None:
