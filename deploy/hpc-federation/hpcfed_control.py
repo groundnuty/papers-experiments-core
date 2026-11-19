@@ -417,11 +417,11 @@ def _holder_listed(launcher: Any, state: Any, name: str, deadline: float) -> Opt
     while True:
         try:
             listed = launcher.listed(name)
-        except Exception:  # an unreadable list shows no holder
-            return None
-        if listed is not None:
-            return str(listed)
-        if _MONOTONIC() >= deadline or not _CLIENT_ALIVE((state.read().get("clients") or {}).get(name)):
+            if listed is not None:
+                return str(listed)
+            if _MONOTONIC() >= deadline or not _CLIENT_ALIVE((state.read().get("clients") or {}).get(name)):
+                return None
+        except Exception:  # an unreadable list or state shows no holder; the stop's evidence is still recorded
             return None
         _SLEEP(POLL_S)
 
