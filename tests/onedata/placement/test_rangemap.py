@@ -232,6 +232,7 @@ def test_o25_a_positional_construction_from_before_the_connection_threshold_stil
         "wait_mode",
         "evict_batch",
         "transfer_walk_deadline_s",
+        "transfer_page_limit",
     ]
 
 
