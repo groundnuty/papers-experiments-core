@@ -41,6 +41,14 @@ def test_x01_a_name_the_client_sets_itself_is_refused_in_any_case(tmp_path, name
         table(tmp_path, f'extra_headers = {{ "{name}" = "x" }}\n')
 
 
+@pytest.mark.parametrize("name", ["X-API-Key", "api-key", "x-auth-token", "X-Client-Secret", "x-password"])
+def test_x01_a_name_that_is_a_credentials_header_is_refused(tmp_path, name):
+    """B20: a key never rides in a header of the entry, whatever its value looks like (the key goes in key_env or
+    key_file and is sent in Authorization by the adapter)."""
+    with pytest.raises(ConfigError, match="names a credential's header"):
+        table(tmp_path, f'extra_headers = {{ "{name}" = "not-checked" }}\n')
+
+
 def test_x01_the_session_header_is_not_a_name_in_any_case(tmp_path):
     """B20: the attempt's id rides in the session header; a second value for it would silently win or lose."""
     with pytest.raises(ConfigError, match=r"extra_headers .* the model's session_header"):

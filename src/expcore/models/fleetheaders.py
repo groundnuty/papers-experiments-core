@@ -26,6 +26,8 @@ SESSION_ID_LENGTH = 32  # hex characters
 DEPLOYMENT_ID_MAX = 128  # characters
 EXTRA_HEADER_VALUE_MAX = 256  # characters
 CREDENTIAL_SCHEMES = ("bearer ", "basic ")  # a value that starts so is an Authorization value in the wrong header
+# a name that has one of these in it is a credential's header (`X-API-Key`), whatever the value looks like
+CREDENTIAL_NAME_PARTS = ("key", "token", "secret", "password", "auth", "credential")
 HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}")
 # Headers the HTTP client or the SDK sets itself; a model that named one would override it.
 CLIENT_HEADERS = frozenset(
@@ -96,6 +98,8 @@ def extra_headers_problems(backend: str, headers: object, session_header: str | 
         if name.lower() in seen:
             problems.append(f"extra_headers names {name!r} twice, ignoring case")
         seen.add(name.lower())
+        if any(part in name.lower() for part in CREDENTIAL_NAME_PARTS):
+            problems.append(f"extra_headers entry {name!r} names a credential's header; the key is never sent in one")
         if name.lower() == own:
             problems.append(f"extra_headers entry {name!r} is the model's session_header, which carries the attempt id")
         if problem := header_value_problem(value):
