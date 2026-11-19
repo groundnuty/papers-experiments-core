@@ -164,9 +164,11 @@ def killed_pids(world) -> set[int]:
     return {int(p) for argv in world.host.sudo_commands if argv[:3] == ["kill", "-s", "KILL"] for p in argv[3:]}
 
 
-def stopped_step(record: dict, within_s: float = 10.0) -> dict:
+def stopped_step(record: dict, within_s: float = 60.0) -> dict:
     """The `stopped` step of a deadline that ordered the sandbox's stop: the stop runs in the timer's thread once the
-    outcome is recorded, so it may still be under way when the cell returns."""
+    outcome is recorded, so it may still be under way when the cell returns. The wait returns as soon as the step is
+    there; its bound is only for a loaded runner, where 10 s was not always enough (the O72 test failed so on Python
+    3.12 three times, never on a stop that did not happen)."""
     deadline_at = time.monotonic() + within_s
     while time.monotonic() < deadline_at:
         found = [s for s in record["steps"] if s["step"] == "stopped"]
