@@ -86,6 +86,16 @@ ALLOWED: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         f"a Couchbase login attempt where its port answers, on the hosts the cell is given; {CELL}",
     ),
+    # -- the agent's job, through the step's own ssh hop to the LLM fleet's front (O93), never a federation's service
+    ("deploy/hpc-federation/fleethop.py", "answers", "http.client.HTTPConnection"): (
+        1,
+        "a keyless GET /v1/models to 127.0.0.1:<the hop's local port>, the forward to the fleet's front: the liveness "
+        "test of the hop, no key sent, any HTTP status alive",
+    ),
+    ("deploy/hpc-federation/fleethop.py", "probe", "http.client.HTTPConnection"): (
+        1,
+        "the operator's one-shot keyless GET through the hop to the fleet's front, its status printed alone",
+    ),
     # -- the Compose federation
     ("deploy/compose-federation/federation.py", "up", "Rest"): (1, COMPOSE),
     ("deploy/compose-federation/federation.py", "reset_clean", "Rest"): (1, COMPOSE),
