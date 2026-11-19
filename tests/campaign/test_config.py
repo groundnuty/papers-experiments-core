@@ -301,6 +301,48 @@ def test_l17_the_old_name_of_the_bound_is_refused_naming_the_new_key_and_why(tmp
     assert "is not a known key" not in message
 
 
+def test_l18_code_cell_bound_s_is_optional_and_enters_the_caps_only_when_declared(tmp_path):
+    """L18: `[agent] code_cell_bound_s` is read as seconds (an integer may stand for a float). Undeclared, the loop's
+    caps in the fingerprint are what they were before the key existed; declared, they differ, so a store started without
+    it cannot be resumed with it. It is independent of the tool server's bound: either, both or neither."""
+    plain = load(tmp_path)
+    assert plain.agent.code_cell_bound_s is None
+    assert "code_cell_bound_s" not in plain.caps()["agent"]
+    declared = load(
+        tmp_path, VALID.replace("max_output_tokens = 256", "max_output_tokens = 256\ncode_cell_bound_s = 3600")
+    )
+    assert declared.agent.code_cell_bound_s == 3600.0
+    assert declared.agent.tool_server_call_bound_s is None
+    assert declared.caps()["agent"]["code_cell_bound_s"] == 3600.0
+    assert "tool_server_call_bound_s" not in declared.caps()["agent"]
+    assert declared.caps() != plain.caps()
+    both = "max_output_tokens = 256\ncode_cell_bound_s = 3600\ntool_server_call_bound_s = 300"
+    assert load(tmp_path, VALID.replace("max_output_tokens = 256", both)).agent.tool_server_call_bound_s == 300.0
+
+
+@pytest.mark.parametrize(
+    ("value", "fragments"),
+    [
+        ("0", ("[agent]", "code_cell_bound_s", "positive")),
+        ("-5", ("[agent]", "code_cell_bound_s", "positive")),
+        ("inf", ("[agent]", "code_cell_bound_s", "finite")),
+        ('"3600"', ("[agent]", "code_cell_bound_s", "must be a float")),
+        ("true", ("[agent]", "code_cell_bound_s", "must be a float")),
+    ],
+)
+def test_l18_a_cell_limit_that_cannot_work_is_refused_naming_the_table_and_the_key(tmp_path, value, fragments):
+    """L18: refused at load, naming the file, the table and the key."""
+    text = VALID.replace("max_output_tokens = 256", f"max_output_tokens = 256\ncode_cell_bound_s = {value}")
+    refused(tmp_path, text, *fragments)
+
+
+def test_l18_the_old_key_that_capped_every_call_stays_refused_beside_the_cell_limit(tmp_path):
+    """L18: `tool_call_bound_s` capped every tool call and is not revived by the new key: declaring both is refused with
+    the old key named, as L17 does."""
+    both = "max_output_tokens = 256\ntool_call_bound_s = 300\ncode_cell_bound_s = 3600"
+    refused(tmp_path, VALID.replace("max_output_tokens = 256", both), "tool_call_bound_s", "tool_server_call_bound_s")
+
+
 def test_l17_the_old_name_is_refused_even_beside_the_new_one(tmp_path):
     """L17: a file that declares both is refused too: the old key is never quietly dropped."""
     both = "max_output_tokens = 256\ntool_call_bound_s = 300\ntool_server_call_bound_s = 300"

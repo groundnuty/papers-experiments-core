@@ -18,6 +18,8 @@ The file is validated when it is loaded, with messages that name the file and th
     ceiling_s = 270               # optional: the whole-time ceiling in seconds, waits included, not below time_cap_s;
                                   # or `ceiling_factor = 2.25`, a multiple of time_cap_s of at least 1; never both
     tool_server_call_bound_s = 300   # optional: the longest one call to a tool server may take, in seconds (L17)
+    code_cell_bound_s = 3600      # optional: the longest one code cell may run, in seconds; past it the cell is killed,
+                                  # the agent is told, and the run goes on (L18)
 
     [scheduler]                   # optional: every key of `SchedulerConfig` that is a number, a flag or a kind
     max_attempts = 3
@@ -93,6 +95,7 @@ _TOP_KEYS = (
 )
 _AGENT_KEYS = ("max_tool_rounds", "time_cap_s", "token_budget", "output_cap_chars", "max_output_tokens")
 _CEILING_KEYS = ("ceiling_s", "ceiling_factor")  # optional, and at most one of them
+_BOUND_KEYS = ("tool_server_call_bound_s", "code_cell_bound_s")  # optional, a number of seconds each (L17, L18)
 # The key the per-call bound had before its scope was fixed (L17): it capped every tool call, the code tool's too, which
 # is not what it was for. It is refused with the new name and the reason, never read as the new key.
 RENAMED_BOUND = "tool_call_bound_s"
@@ -178,7 +181,7 @@ def _agent(root: Section) -> AgentConfig:
     section = _table(root, "agent")
     if RENAMED_BOUND in section.data:  # refused before the generic message of an unknown key: it names the new key
         raise section.fail(RENAMED_BOUND, RENAMED_BOUND_REASON)
-    section.reject_unknown([*_AGENT_KEYS, *_CEILING_KEYS, "malformed_policy", "tool_server_call_bound_s"])
+    section.reject_unknown([*_AGENT_KEYS, *_CEILING_KEYS, "malformed_policy", *_BOUND_KEYS])
     for key in _AGENT_KEYS:
         if key not in section.data:
             raise section.fail(key, "is required")
@@ -194,9 +197,9 @@ def _agent(root: Section) -> AgentConfig:
     )
     policy = section.optional_string("malformed_policy") or MALFORMED_POLICIES[0]
     ceiling = {key: _typed(section, key, float) for key in given}  # at most one; none gives the default factor
-    bound = _typed(section, "tool_server_call_bound_s", float) if "tool_server_call_bound_s" in section.data else None
+    bounds = {key: _typed(section, key, float) for key in _BOUND_KEYS if key in section.data}  # optional, each alone
     try:
-        return AgentConfig(limits, malformed_policy=policy, tool_server_call_bound_s=bound, **ceiling)
+        return AgentConfig(limits, malformed_policy=policy, **bounds, **ceiling)
     except ValueError as error:
         raise ConfigError(f"{root.file}: {section.where}: {error}") from None
 

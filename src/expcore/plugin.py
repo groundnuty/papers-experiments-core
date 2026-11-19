@@ -150,6 +150,12 @@ class ToolProvider(Protocol):
     declared per-call bound is for (`[agent] tool_server_call_bound_s`, L17): a hang of a tool server is not the
     agent's time. A provider without it (a code tool, a function provider) serves in-process tools, which are never
     handed the bound and never judged by it.
+
+    A provider whose tools run the agent's code cells (the code tool) sets a true `code_cell` attribute, likewise
+    optional. It is how the loop knows which calls the study's declared limit on one cell is for (`[agent]
+    code_cell_bound_s`, L18): such a call is handed the limit as its `timeout_s` when that is shorter than the agent's
+    time left, and `ctx.cell_bound_s` (also optional, read with a default) says the call runs under it. The provider
+    ends the cell at the limit and returns its timeout as a result: the run goes on.
     """
 
     def tools(self) -> Sequence[ToolSpec]:
@@ -158,8 +164,8 @@ class ToolProvider(Protocol):
 
     async def execute(self, name: str, arguments: dict[str, Any], *, timeout_s: float, ctx: CallContext) -> ToolOutput:
         """Run one call. `timeout_s` is the agent's time left (L05), or, for a provider that is a tool server and a
-        study that declares a per-call bound, that bound when it is shorter (L17): the call has no other limit. `ctx`
-        marks waits."""
+        study that declares a per-call bound, or one that runs code cells and a study that declares a limit on one
+        cell, that bound when it is shorter (L17, L18): the call has no other limit. `ctx` marks waits."""
         ...
 
 

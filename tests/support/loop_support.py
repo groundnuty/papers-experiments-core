@@ -24,6 +24,17 @@ class FakeClock:
         self.now += seconds
 
 
+class CellBoundContext:
+    """The call context of a code tool run outside the loop under the study's limit on one cell (L18): the loop hands
+    the limit through `cell_bound_s` when it is shorter than the agent's time left. Waits are not measured."""
+
+    def __init__(self, cell_bound_s: float) -> None:
+        self.cell_bound_s = cell_bound_s
+
+    def infrastructure_wait(self, kind: str):
+        return NO_WAITS.infrastructure_wait(kind)
+
+
 async def never(seconds: float) -> None:
     """Stands in for asyncio.sleep: the bound never passes by itself, so only a test can end a call."""
     await asyncio.Event().wait()
@@ -67,7 +78,9 @@ class FakeProvider:
     """A tool provider with scripted handlers. Records every call with the timeout it was given.
 
     With `tool_server` it stands for a tool server (an MCP server), the one kind of provider the study's per-call bound
-    reaches (L17); without it, for an in-process tool such as the code tool, which the bound never touches.
+    reaches (L17); without it, for an in-process tool such as the code tool, which the bound never touches. With
+    `code_cell` it stands for a tool that runs the agent's code cells, the one kind the declared cell limit reaches
+    (L18).
     """
 
     def __init__(
@@ -77,10 +90,12 @@ class FakeProvider:
         terminal: tuple[str, ...] = (),
         schemas=None,
         tool_server: bool = False,
+        code_cell: bool = False,
     ):
         self.handlers = handlers
         self.terminal = terminal
         self.tool_server = tool_server
+        self.code_cell = code_cell
         self.schemas = schemas or {}
         self.calls: list[tuple[str, dict, float]] = []
 
