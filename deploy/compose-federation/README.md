@@ -137,7 +137,8 @@ controller runs `composesite.py` here over ssh, from the site's directory with i
   up for the next campaign (a new site directory and channel) or the operator's own `down`.
 - **identity**: the campaign fingerprint and environment identity a start at the member pins, read here.
 
-Nothing of it has run live.
+The host's core must be a git checkout or a built wheel, never a `git archive` copy: an unknown core's commit is in
+no run's fingerprint, and `elastic create`, the identity read and every run refuse it.
 
 ## Declaring a layout
 

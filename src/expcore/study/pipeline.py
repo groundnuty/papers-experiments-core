@@ -316,7 +316,9 @@ def campaign_identity(path: str | os.PathLike[str]) -> tuple[dict[str, Any], dic
     """What a federation joins the elastic ledger with (#462 step 6), for the study at `path` as it stands beside the
     federation's `platform.toml`: the campaign fingerprint a start pins (`campaign_fingerprint`) and the environment
     identity its plugin declares, which a lease store pins as `environment_identity` (`lease_start`'s own call). Nothing
-    is started and no store is opened."""
+    is started and no store is opened. A core whose commit is unknown (or whose install is stale) is refused, as a run
+    refuses it: the fingerprint holds the core's identity, so a join on it would take leases no run serves."""
+    require_core("identity", allow_dirty=True)
     study = load_study(path)
     check_study(study)
     with study_kinds(study.kinds):
