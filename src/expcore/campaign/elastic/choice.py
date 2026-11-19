@@ -4,7 +4,8 @@ and expected times only.
 
 1. **Set.** The current set is the earliest declared set with a pending run. Progress counts leases, never results,
    and a run that goes back to pending (returned, expired, lost) makes its set current again.
-2. **Caps and budget.** A model of that set is eligible when its leases holding a cap slot (in flight, or expired with
+2. **Caps, budget and declarations.** A model of that set is eligible when it is not paused by a fingerprint seen
+   undeclared (C48, `declarations`), its leases holding a cap slot (in flight, or expired with
    their holder not yet proven ended) are below its cap (as set, `caps`), and its grant fits what is left of `max_usd`
    and of its own ceiling (as raised, `ceilings`) after every lease's charge (spent, settled, or its grant while it is
    held).
@@ -15,7 +16,7 @@ and expected times only.
 """
 
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from expcore.campaign.elastic.ceilings import pinned
@@ -53,9 +54,11 @@ def choose(
     now: float,
     ceilings: Ceilings | None = None,
     caps: Mapping[str, int] | None = None,
+    paused: Mapping[str, Sequence[str | None]] | None = None,
 ) -> Pending | Wait:
     """The run to lease from the current set's pending runs, or why the federation waits. `ceilings` and `caps` are the
-    ones in force (raised, or changed); by default the configuration's own."""
+    ones in force (raised, or changed); by default the configuration's own. `paused` gives each model paused by values
+    seen undeclared, with them."""
     ceilings = pinned(config) if ceilings is None else ceilings
     caps = config.caps if caps is None else caps
     by_model: dict[str, list[Pending]] = defaultdict(list)
@@ -70,11 +73,19 @@ def choose(
     order = sorted(by_model, key=lambda m: (-remaining[m], by_model[m][0].seq))
     held = []
     for model in order:
-        reason = _held(model, slots, committed, config, ceilings, caps)
+        reason = _paused(model, paused or {}) or _held(model, slots, committed, config, ceilings, caps)
         if reason is None:
             return by_model[model][0]
         held.append(reason)
     return Wait(f"set {set_index} waits: " + "; ".join(held))
+
+
+def _paused(model: str, paused: Mapping[str, Sequence[str | None]]) -> str | None:
+    """Why the model is paused (C48), or None."""
+    if not paused.get(model):
+        return None
+    shown = ", ".join("none" if value is None else value for value in paused[model])
+    return f"model {model} is paused: undeclared fingerprint(s) seen: {shown}"
 
 
 def _held(

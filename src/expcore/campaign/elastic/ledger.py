@@ -23,6 +23,10 @@ shown ended; the sweep expires what it must.
   whole grant the budget still holds.
 - **Caps.** A model's cap on its leases in flight or held back is the pinned one until an operator changes it, up or
   down, mid-campaign (`caps`); a lower cap revokes nothing and only stops new leases until the model is under it.
+- **Declared fingerprints.** A model's fingerprints are declared in an append-only log, never in the fingerprint
+  (`declarations`, C48): each lease carries its model's set at issue, its run judges its replies against it, and a
+  model whose lease's run saw a value its set does not declare is paused (no new lease; leases out run on) until every
+  value seen is declared.
 - **Settling and raising.** A lost lease (`settle`) is charged the spend read from its dead federation instead of its
   grant, and the difference goes back to the budget (`settling`). A ceiling is raised mid-campaign, recorded, never
   lowered or set below what is committed, and never part of the fingerprint (`ceilings`); `status` shows the money,
@@ -32,11 +36,11 @@ shown ended; the sweep expires what it must.
 import json
 import math
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.elastic import attempts, caps, ceilings, schema, settling
+from expcore.campaign.elastic import attempts, caps, ceilings, declarations, schema, settling
 from expcore.campaign.elastic.choice import InFlight, Pending, choose
 from expcore.campaign.elastic.config import LedgerConfig, LedgerRun, check_plan, micro_up
 from expcore.campaign.elastic.records import (
@@ -46,6 +50,7 @@ from expcore.campaign.elastic.records import (
     Ceiling,
     Completion,
     CompletionConflict,
+    Declaration,
     JoinRefused,
     Lease,
     LedgerError,
@@ -91,13 +96,22 @@ class Ledger(LedgerViews):
         return self._config
 
     @classmethod
-    def create(cls, path: Path, runs: list[LedgerRun], config: LedgerConfig, clock: Callable[[], float]) -> "Ledger":
-        """Create a ledger for the runs and the configuration, and open it."""
+    def create(
+        cls,
+        path: Path,
+        runs: list[LedgerRun],
+        config: LedgerConfig,
+        clock: Callable[[], float],
+        declared: Mapping[str, Iterable[str]] | None = None,
+    ) -> "Ledger":
+        """Create a ledger for the runs and the configuration, with each model's first declared fingerprints
+        (`declared`, models.toml's `accepted_fingerprints`; a model not named starts with none), and open it."""
         check_plan(runs, config)
+        first = declarations.first_rows(declared or {}, {r.model for r in runs}, clock())
         lock = DispatchLock(path.parent).acquire()
         try:
             rows = [(r.run_key, r.seq, r.model, r.condition, r.set_index) for r in runs]
-            schema.create_file(path, rows, {"config": config.to_json()})
+            schema.create_file(path, rows, {"config": config.to_json()}, first)
         except BaseException:
             lock.release()
             raise
@@ -254,6 +268,7 @@ class Ledger(LedgerViews):
             now,
             self.ceilings(),
             self.caps(),
+            declarations.paused(self.db),
         )
         if isinstance(chosen, Wait):
             return chosen
@@ -277,6 +292,7 @@ class Ledger(LedgerViews):
             ),
         )
         lease_id = cursor.lastrowid
+        declarations.record_set(self.db, lease_id, run["model"])  # the set its run is judged by (C48)
         self.db.execute("UPDATE runs SET state='leased', lease_id=? WHERE run_key=?", (lease_id, run["run_key"]))
         self._event(now, "issue", run_key=run["run_key"], lease_id=lease_id, federation=label, grant_micro=grant)
         return self._lease_view(lease_id)
@@ -369,6 +385,7 @@ class Ledger(LedgerViews):
             raise CompletionConflict(f"lease {row['id']} already has another completion: they differ")
         if row["state"] in ("returned", "cancelled"):
             raise CompletionConflict(f"lease {row['id']} was {row['state']}: a completion of it cannot be read")
+        declarations.see(self.db, now, row, completion.undeclared)  # whatever its verdict (C48)
         run = self.db.execute("SELECT * FROM runs WHERE run_key=?", (row["run_key"],)).fetchone()
         counts = run["lease_id"] == row["id"] and run["state"] != "done"
         verdict = "counts" if counts else "superseded"
@@ -388,6 +405,7 @@ class Ledger(LedgerViews):
             return
         if row["state"] not in (*LIVE, "expired"):
             raise CompletionConflict(f"lease {row['id']} is {row['state']}, so it cannot be returned")
+        declarations.see(self.db, now, row, returned.undeclared)  # its admission probe's (C48)
         self.db.execute(
             "UPDATE leases SET state='returned', slot=0, charge_micro=?, ended_at=? WHERE id=?",
             (charge, now, row["id"]),
@@ -528,6 +546,12 @@ class Ledger(LedgerViews):
         It takes effect at the next `issue`; no lease already issued is revoked (`CapRefused` for a model with no runs
         here or a cap it already has)."""
         return self._transact(lambda: caps.set_cap(self.db, self.config, self._clock(), model, new_cap, reason, actor))
+
+    def declare(self, model: str, fingerprint: str | None, reason: str, actor: str) -> Declaration:
+        """Declare a fingerprint of a model, or "none" (`fingerprint` None), recorded with the time, `reason` and
+        `actor`; the next `issue` reads it, and a model it was the last undeclared value of is no longer paused.
+        `DeclareRefused` for a model with no runs here, a value already declared, or a ledger with no log."""
+        return self._transact(lambda: declarations.declare(self.db, self._clock(), model, fingerprint, reason, actor))
 
     def raise_model_ceiling(self, model: str, new_max_micro_usd: int, reason: str, actor: str) -> Ceiling:
         """`raise_ceiling` for a model that has a ceiling of its own, never below what the model has committed."""

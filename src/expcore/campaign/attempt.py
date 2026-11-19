@@ -514,11 +514,17 @@ class AttemptRunner:
         if change is None:
             return result, False
         p.store.event(p.stamp(), "served_identity_changed", model, f"{key}: {json.dumps(change, sort_keys=True)}")
-        if result.outcome.set_aside:
+        # Under a lease's declared set nothing undeclared is ever scored (C48), so a treatment fault it would score is
+        # replaced as an instrument's refusal replaces one; a hand-run campaign keeps an outcome already set aside.
+        treated = result.outcome.set_aside and p.identities.leased(model)
+        if treated and classify(result, result.treatment_kinds, result.treatment_targets).state != "done":
+            treated = False
+        if result.outcome.set_aside and not treated:
             return result, True  # already set aside: the event and the unit's failure are what is left to do
         text = "the endpoint's served identity changed during the run"
         outcome = Outcome("infrastructure", text, infra_kind=p.settings.identity_kind)
-        return dataclasses.replace(result, outcome=outcome), True
+        changes = {"recorded_treatment": False} if treated else {}  # the record flagged a treatment it no longer is
+        return dataclasses.replace(result, outcome=outcome, **changes), True
 
     def _keep_reading(self, result: AttemptResult, note: Any, model: str, key: str) -> AttemptResult:
         """The structured reading the post-run check noted for this try (`prerun.HEALTH_READING`), kept in the result

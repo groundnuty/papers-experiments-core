@@ -29,6 +29,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from expcore.models.served import MIXED_FINGERPRINTS, DeclaredSet
+
 LIVE = ("issued", "sent")
 COMPLETION_STATES = ("done", "infra_fail", "harness_error", "interrupted", "outage_discarded")
 HELD = ("issued", "sent", "expired", "reported", "lost")  # states charged their grant until a spend settles them
@@ -61,6 +63,22 @@ class CapRefused(LedgerError):
     """A cap set on a model the ledger has no runs of, or to the value it already has."""
 
 
+class DeclareRefused(LedgerError):
+    """A declaration of a model the ledger has no runs of, of a value already declared, or in a ledger made before the
+    declaration log."""
+
+
+def undeclared_values(values: Any) -> tuple[str | None, ...]:
+    """What a completion or a return reports its run saw undeclared (C48): each a fingerprint, or None (a reply that
+    carried none), once, never several joined; ValueError for any other form."""
+    if isinstance(values, str) or not isinstance(values, Sequence):
+        raise ValueError(f"undeclared fingerprints are a list, got {values!r}")
+    for value in values:
+        if value is not None and (not isinstance(value, str) or not value or MIXED_FINGERPRINTS in value):
+            raise ValueError(f"an undeclared fingerprint is one non-empty fingerprint or None, got {value!r}")
+    return tuple(dict.fromkeys(values))
+
+
 def _lease_id(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"a lease id is a whole number of at least 1, got {value!r}")
@@ -83,9 +101,11 @@ class Completion:
     charged: int
     spend_usd: float
     archive_sha256: str
+    undeclared: tuple[str | None, ...] = ()  # what its run saw that its lease's declared set does not declare (C48)
 
     def __post_init__(self) -> None:
         _lease_id(self.lease_id)
+        object.__setattr__(self, "undeclared", undeclared_values(self.undeclared))
         if self.state not in COMPLETION_STATES:
             raise ValueError(f"completion state {self.state!r} must be one of: {', '.join(COMPLETION_STATES)}")
         if isinstance(self.charged, bool) or not isinstance(self.charged, int) or self.charged < 0:
@@ -95,12 +115,13 @@ class Completion:
             raise ValueError("archive_sha256 must be 64 lower-case hex digits")
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        found = {
             "state": self.state,
             "charged": self.charged,
             "spend_usd": self.spend_usd,
             "archive_sha256": self.archive_sha256,
         }
+        return {**found, "undeclared": list(self.undeclared)} if self.undeclared else found
 
 
 @dataclass(frozen=True)
@@ -109,10 +130,12 @@ class Return:
 
     lease_id: int
     spend_usd: float
+    undeclared: tuple[str | None, ...] = ()  # what its admission probe saw undeclared (C48)
 
     def __post_init__(self) -> None:
         _lease_id(self.lease_id)
         object.__setattr__(self, "spend_usd", _spend(self.spend_usd))
+        object.__setattr__(self, "undeclared", undeclared_values(self.undeclared))
 
 
 @dataclass(frozen=True)
@@ -154,7 +177,7 @@ class Wait:
 class Lease:
     """One lease as the ledger holds it. `slot`: it holds its model's cap slot; `charge_micro`: what the budget counts
     for it now; `verdict`: for a completion read, whether it counts or is superseded; `proven`: its federation's job is
-    proven ended."""
+    proven ended; `declared`: its model's declared fingerprints at its issue (C48), None in a ledger with no log."""
 
     lease_id: int
     run_key: str
@@ -175,6 +198,7 @@ class Lease:
     verdict: str | None
     completion_state: str | None
     proven: bool
+    declared: DeclaredSet | None = None
 
     @property
     def grant_usd(self) -> float:
@@ -274,11 +298,26 @@ class CapChange:
 
 
 @dataclass(frozen=True)
+class Declaration:
+    """One entry of the declaration log (C48): a fingerprint of a model, or None for "none" (a reply that carries no
+    fingerprint), declared when, why and by whom. Never removed or changed."""
+
+    declaration_id: int
+    at: float
+    model: str
+    fingerprint: str | None
+    reason: str
+    actor: str
+
+
+@dataclass(frozen=True)
 class Status:
     """The ledger's money in micro-dollars. `ceiling_micro` is None with no budget (then `remaining_micro` is too);
     `locked_*` is what unsettled leases hold as their grants (in flight, expired, reported, lost), by lease state and
     by model; `ceilings` is the history of raises, oldest first; `caps` is each model's cap in force and `cap_changes`
-    the history of its changes, oldest first."""
+    the history of its changes, oldest first; `declared` is each model's declared fingerprints (None: "none") and
+    `declarations` the log, oldest first, both None for a ledger made before the log; `paused` is each model paused by
+    what a lease's run saw undeclared, with those values (C48)."""
 
     ceiling_micro: int | None
     committed_micro: int
@@ -291,3 +330,6 @@ class Status:
     ceilings: tuple[Ceiling, ...]
     caps: Mapping[str, int] = field(default_factory=dict)
     cap_changes: tuple[CapChange, ...] = ()
+    declared: Mapping[str, tuple[str | None, ...]] | None = None
+    declarations: tuple[Declaration, ...] | None = None
+    paused: Mapping[str, tuple[str | None, ...]] = field(default_factory=dict)

@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.elastic.records import Lease
+from expcore.campaign.run_lease import DECLARED, declared_json
 
 LEASE_FORMAT = "expcore-elastic-lease/1"
 HEARTBEAT_FORMAT = "expcore-elastic-heartbeat/1"
@@ -179,8 +180,9 @@ def utc_text(seconds: float) -> str:
 def kernel_lease(lease: Lease) -> dict[str, Any]:
     """The kernel's lease file (`run_lease.read_lease`, `expcore-lease/1`) for a ledger lease: its run, its id, its
     attempt base (the run's charged attempts in its earlier leases, the ledger's one count), its grant in micro-dollars,
-    the campaign's fingerprint hash, and its hard term rounded down to the second."""
-    return {
+    the campaign's fingerprint hash, its hard term rounded down to the second, and its model's declared fingerprints
+    at its issue (C48) when the ledger keeps the log."""
+    found = {
         "schema": KERNEL_LEASE_SCHEMA,
         "run_key": lease.run_key,
         "lease_id": lease.lease_id,
@@ -189,6 +191,7 @@ def kernel_lease(lease: Lease) -> dict[str, Any]:
         "campaign_sha256": lease.fingerprint,
         "expires_utc": utc_text(lease.hard_term_at),
     }
+    return found if lease.declared is None else {**found, DECLARED: declared_json(lease.declared)}
 
 
 def envelope(lease: Lease) -> dict[str, Any]:

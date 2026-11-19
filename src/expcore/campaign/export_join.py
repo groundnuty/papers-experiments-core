@@ -82,13 +82,19 @@ _MAY_DIFFER = (EXPORT_KEY, DEPLOYMENTS, HOLDS, SETTINGS_KEY, LOST_KEY, INTERRUPT
 
 
 def join_exports(
-    exports: Mapping[int, Mapping[str, Any]], seq_of: Mapping[str, int], shards: Sequence[Mapping[str, Any]]
+    exports: Mapping[int, Mapping[str, Any]],
+    seq_of: Mapping[str, int],
+    shards: Sequence[Mapping[str, Any]],
+    *,
+    growing_sets: bool = False,
 ) -> dict[str, Any]:
     """Join the exports of the shards of one campaign, by shard index, into the export of the whole.
 
     `seq_of` gives every planned run's place in the whole plan, which orders the run lists; `shards` is merge.json's
     list. Refuses exports that are not of one campaign: another format, other factors, other keys, or a figure that
-    should agree and does not.
+    should agree and does not. With `growing_sets` (a merge by run, C48) a model's declared fingerprints may differ
+    between the parts, since each lease ran under its model's set at its issue and the set only grows: the joined
+    entry declares their union.
     """
     order = sorted(exports)
     if not order:
@@ -99,7 +105,7 @@ def join_exports(
     joined: dict[str, Any] = {}
     for key in _keys_of_the_join(exports, order):
         if key == DEPLOYMENTS:  # a shard whose plan has no model with a set exports none: it has no entries
-            joined[key] = _join_deployments([exports[index].get(key, ()) for index in order])
+            joined[key] = _join_deployments([exports[index].get(key, ()) for index in order], growing_sets)
             continue
         if key in _ENTRIES:  # a shard that met no hold of an operator's, or lost nothing in a kill, has none
             joined[key] = [{**entry, SHARD_KEY: index} for index in order for entry in exports[index].get(key, ())]
@@ -213,11 +219,12 @@ def _in_plan_order(
     return sorted(entries, key=lambda entry: seq_of[entry["run_key"]])
 
 
-def _join_deployments(parts: Sequence[Sequence[Mapping[str, Any]]]) -> list[dict[str, Any]]:
+def _join_deployments(parts: Sequence[Sequence[Mapping[str, Any]]], growing: bool = False) -> list[dict[str, Any]]:
     """Join the shards' `deployment_shares` (B18), given in shard order, into the whole campaign's: per model, in model
     order, the sums of the runs and turns and the fingerprints of every shard, each share computed again from the
-    sums as `deployments.deployment_shares` computes it. Every shard declares the model's set the same way. A shard
-    with no entries (it exports none) adds nothing."""
+    sums as `deployments.deployment_shares` computes it. Every shard declares the model's set the same way, save in a
+    merge by run (`growing`, C48), where the union is declared and a fingerprint (or a turn with none) is accepted when
+    any lease accepted it. A shard with no entries (it exports none) adds nothing."""
     models: dict[str, dict[str, Any]] = {}
     for part in parts:
         for entry in part:
@@ -226,10 +233,13 @@ def _join_deployments(parts: Sequence[Sequence[Mapping[str, Any]]]) -> list[dict
                 models[entry["model"]] = {**entry, "fingerprints": [dict(f) for f in entry["fingerprints"]]}
                 continue
             if held["accepted_fingerprints"] != entry["accepted_fingerprints"]:
-                raise ExportError(f"the shards' exports declare other accepted fingerprints for {entry['model']!r}")
+                if not growing:
+                    raise ExportError(f"the shards' exports declare other accepted fingerprints for {entry['model']!r}")
+                union = set(held["accepted_fingerprints"]) | set(entry["accepted_fingerprints"])
+                held["accepted_fingerprints"] = sorted(union)
             for field in _MODEL_SUMS:
                 held[field] += entry[field]
-            _join_fingerprints(held["fingerprints"], entry["fingerprints"])
+            _join_fingerprints(held["fingerprints"], entry["fingerprints"], growing)
     for held in models.values():
         with_mix = held["analysed_runs"] - held["runs_without_mix"]
         order = fingerprint_order(held["accepted_fingerprints"])
@@ -253,7 +263,7 @@ def _join_settings(parts: Mapping[int, Mapping[str, Any] | None]) -> dict[str, l
     return joined
 
 
-def _join_fingerprints(held: list[dict[str, Any]], more: Sequence[Mapping[str, Any]]) -> None:
+def _join_fingerprints(held: list[dict[str, Any]], more: Sequence[Mapping[str, Any]], growing: bool = False) -> None:
     """Add one shard's fingerprints of a model to those joined so far (`held`, the join's own copies, changed in
     place): the runs and turns summed, a fingerprint new to the join kept. A fingerprint is confirmed when any shard
     confirmed it; its witness, the step and the run that confirmed it, is the first shard's that did."""
@@ -266,6 +276,8 @@ def _join_fingerprints(held: list[dict[str, Any]], more: Sequence[Mapping[str, A
             continue
         for field in _FINGERPRINT_SUMS:
             cell[field] += row[field]
+        if growing:  # declared under a later lease's set: it was accepted where it was analysed
+            cell["accepted"] = cell["accepted"] or row["accepted"]
         if cell["confirmed_by"] is None and row["confirmed_by"] is not None:
             cell["confirmed_by"], cell["confirming_run"] = row["confirmed_by"], row["confirming_run"]
 
@@ -300,6 +312,7 @@ LEASES_KEY = "leases"  # the top-level key of such an export: merge.json's list 
 LEASE_RETRIES_KEY = "lease_retries_by_kind"  # each counted lease's own retries rows, with its lease id
 LOST_KEY_FLAG = "lost_federation"  # an exhausted run's entry: true when the ledger exhausted it for its lost leases
 LEDGER_SPEND_KEY = "ledger_spend"  # merge.json's `spend`: the ledger's money at its snapshot, locked dollars included
+DECLARATIONS_KEY = "fingerprint_declarations"  # merge.json's `declarations`: the ledger's declaration log (C48)
 
 
 def by_run_export(
@@ -308,6 +321,7 @@ def by_run_export(
     spend: Mapping[str, Any] | None = None,
     lost: Sequence[Mapping[str, Any]] = (),
     seq_of: Mapping[str, int] | None = None,
+    declarations: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """The export of a batch merged by run (C45): the counted leases' exports joined as a merge of shards joins them
     (`join_exports`, one part per lease), with each run's lease, federation and site in place of a shard.
@@ -320,8 +334,9 @@ def by_run_export(
     snapshot: what every lease is charged, the ceilings in force and what unsettled leases still lock) is carried as
     `ledger_spend`. The runs the ledger exhausted for their lost leases (`lost`, entries as a store's export lists an
     exhausted run, each with `lost_federation` true) join `exhausted_runs` in plan order (`seq_of`) and count in
-    `planned_runs`: they are exhausted runs like any other, with no analysed attempt. A batch merged otherwise never
-    reaches this."""
+    `planned_runs`: they are exhausted runs like any other, with no analysed attempt. merge.json's `declarations` (the
+    ledger's declaration log, C48) is carried as `fingerprint_declarations`, so the analysis can take the deployment
+    as a sensitivity factor and see when each was admitted. A batch merged otherwise never reaches this."""
     placed = {entry["lease_id"]: entry for entry in leases}
     out: dict[str, Any] = {}
     for key, value in joined.items():
@@ -342,6 +357,8 @@ def by_run_export(
     out[LEASES_KEY] = [dict(entry) for entry in leases]
     if spend is not None:
         out[LEDGER_SPEND_KEY] = dict(spend)
+    if declarations is not None:
+        out[DECLARATIONS_KEY] = [dict(entry) for entry in declarations]
     return out
 
 

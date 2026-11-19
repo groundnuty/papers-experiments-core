@@ -6,11 +6,12 @@ Every view is read from the file, so a reopened ledger shows exactly what it sho
 
 import json
 import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from expcore.campaign.elastic import caps as cap_table
-from expcore.campaign.elastic import schema
+from expcore.campaign.elastic import declarations, schema
 from expcore.campaign.elastic.ceilings import effective, history
 from expcore.campaign.elastic.config import PRIOR_RUNS, LedgerConfig
 from expcore.campaign.elastic.records import (
@@ -18,6 +19,7 @@ from expcore.campaign.elastic.records import (
     CapChange,
     Ceiling,
     Ceilings,
+    Declaration,
     Demand,
     Federation,
     Lease,
@@ -64,9 +66,9 @@ class LedgerViews:
         row = self.db.execute(f"{_LEASE_SQL} WHERE l.id=?", (lease_id,)).fetchone()
         if row is None:
             raise LedgerError(f"lease {lease_id} was never issued by this ledger")
-        return self._as_lease(row)
+        return self._as_lease(row, declarations.lease_sets(self.db, lease_id))
 
-    def _as_lease(self, row: Any) -> Lease:
+    def _as_lease(self, row: Any, sets: Mapping[int, Any]) -> Lease:
         completion = None if row["completion"] is None else json.loads(row["completion"])
         return Lease(
             lease_id=row["id"],
@@ -88,13 +90,15 @@ class LedgerViews:
             verdict=row["verdict"],
             completion_state=None if completion is None else completion["state"],
             proven=row["fed_ended"] is not None,
+            declared=sets.get(row["id"]),
         )
 
     def lease(self, lease_id: int) -> Lease:
         return self._lease_view(lease_id)
 
     def leases(self) -> list[Lease]:
-        return [self._as_lease(row) for row in self.db.execute(f"{_LEASE_SQL} ORDER BY l.id")]
+        sets = declarations.lease_sets(self.db)
+        return [self._as_lease(row, sets) for row in self.db.execute(f"{_LEASE_SQL} ORDER BY l.id")]
 
     def run(self, run_key: str) -> Run:
         row = self.db.execute("SELECT * FROM runs WHERE run_key=?", (run_key,)).fetchone()
@@ -132,7 +136,8 @@ class LedgerViews:
 
     def demand(self) -> Demand:
         """The current set, its pending runs per model, and the cap slots held per model: what a controller's target
-        reads (with `caps()`)."""
+        reads (with `caps()`). A paused model's runs still count (C48): its federations stay up through the pause, so
+        its leases go out the moment it is declared."""
         current = self.db.execute("SELECT MIN(set_index) FROM runs WHERE state='pending'").fetchone()[0]
         rows = self.db.execute(
             "SELECT model, COUNT(*) FROM runs WHERE state='pending' AND set_index=? GROUP BY model", (current,)
@@ -154,6 +159,14 @@ class LedgerViews:
     def cap_history(self) -> list[CapChange]:
         """Every change of a cap, oldest first, with its time, reason and actor."""
         return cap_table.history(self.db)
+
+    def declaration_log(self) -> list[Declaration] | None:
+        """Every declaration, oldest first, with its time, reason and actor; None for a ledger made before the log."""
+        return declarations.history(self.db)
+
+    def paused(self) -> dict[str, tuple[str | None, ...]]:
+        """Each model paused by values its leases' runs saw undeclared, with those values (C48)."""
+        return declarations.paused(self.db)
 
     def settlements(self) -> list[Settlement]:
         """Every lost lease whose spend was settled, by lease id, with its time and source."""
@@ -196,6 +209,9 @@ class LedgerViews:
             ceilings=tuple(self.ceiling_history()),
             caps=self.caps(),
             cap_changes=tuple(self.cap_history()),
+            declared=declarations.declared_by_model(self.db),
+            declarations=None if (logged := self.declaration_log()) is None else tuple(logged),
+            paused=self.paused(),
         )
 
 

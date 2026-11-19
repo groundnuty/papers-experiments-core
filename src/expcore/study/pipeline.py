@@ -219,9 +219,12 @@ def _digest(value: Any) -> str:
 
 
 def model_digest(spec: ModelSpec) -> str:
-    """The digest of a model entry in the campaign fingerprint: every field of it, each key location as its placeholder
-    (K13), and its declared set of accepted fingerprints and its two fleet headers only when it sets them (B18, B20).
-    An entry that names no key location, declares no set and sets no header keeps the digest it had before them."""
+    """The digest of a model entry in the campaign fingerprint: every field of it (its checkpoint, sampling and request
+    settings), each key location as its placeholder (K13), its two fleet headers only when it sets them (B20), and
+    never its declared set of accepted fingerprints (C48): deployments of one checkpoint and its flags are
+    interchangeable, so a set that grows is the same experiment, and an elastic campaign keeps the set in its ledger's
+    declaration log. An entry that names no key location and sets no header keeps the digest it had before them,
+    whatever set it declares."""
     return _digest(_fingerprinted(withheld_entry(spec)))
 
 
@@ -231,14 +234,13 @@ def _counted_digest(spec: ModelSpec) -> str:
 
 
 # the keys a model entry leaves out of its digest while it sets none: each came after the first digests were taken
-_OPTIONAL_DIGEST_KEYS = ("accepted_fingerprints", "session_header", "deployment_header")
+_OPTIONAL_DIGEST_KEYS = ("session_header", "deployment_header")
 
 
 def _fingerprinted(entry: Mapping[str, Any]) -> dict[str, Any]:
-    """A model entry as its digest takes it: without `accepted_fingerprints` when it declares none (B18), and without
-    `session_header` or `deployment_header` when it sets none (B20), so an entry from before them keeps its
-    digest."""
-    return {k: v for k, v in entry.items() if k not in _OPTIONAL_DIGEST_KEYS or v}
+    """A model entry as its digest takes it: never with `accepted_fingerprints` (C48), and without `session_header` or
+    `deployment_header` when it sets none (B20), so an entry from before them keeps its digest."""
+    return {k: v for k, v in entry.items() if k != "accepted_fingerprints" and (k not in _OPTIONAL_DIGEST_KEYS or v)}
 
 
 def study_environment(study: StudyConfig | StudyIdentity) -> dict[str, Any]:
@@ -1166,8 +1168,10 @@ def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
     if verified.merge is None or verified.merge.get("schema") != MERGE_BY_RUN_SCHEMA:
         return join_exports(parts, seq_of, verified.shards)
     lost = _lost_runs(verified.merge["exhausted"], plan)  # merged by run (C45): runs exhausted with no store
-    joined = join_exports(parts, {key: seq for key, seq in seq_of.items() if key not in lost}, verified.shards)
-    return by_run_export(joined, verified.shards, verified.merge["spend"], list(lost.values()), seq_of)
+    planned = {key: seq for key, seq in seq_of.items() if key not in lost}
+    joined = join_exports(parts, planned, verified.shards, growing_sets=True)  # each lease's declared set (C48)
+    declared = verified.merge.get("declarations")
+    return by_run_export(joined, verified.shards, verified.merge["spend"], list(lost.values()), seq_of, declared)
 
 
 def _lost_runs(exhausted: Sequence[Mapping[str, Any]], plan: Manifest) -> dict[str, dict[str, Any]]:

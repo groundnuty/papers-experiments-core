@@ -38,7 +38,7 @@ from expcore.models.fleetheaders import clean_deployment_id, random_session_id
 from expcore.models.request_bound import PromptBound
 from expcore.models.retry import Retrier, RetryPolicy, SupportsUniform
 from expcore.models.route import public_url, sdk_version, settings_sent
-from expcore.models.served import Served, requested_from_sent
+from expcore.models.served import Served, fingerprint_of_reply, requested_from_sent
 from expcore.models.usage import ANTHROPIC_COUNTED, OPENAI_COUNTED, UsageTally, extra_usage, token_count
 
 PROBE_PROMPT = "ping"
@@ -421,7 +421,7 @@ class OpenAICompatAdapter(_SdkBackend):
                     {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": sent}}
                 )
         self._messages.append(entry)
-        fingerprint = getattr(resp, "system_fingerprint", None)
+        fingerprint = fingerprint_of_reply(resp)  # several (a list) joined as the probe's collector joins them (C48)
         return ModelTurn(
             text=msg.content or "",
             tool_calls=calls,
@@ -431,7 +431,7 @@ class OpenAICompatAdapter(_SdkBackend):
             latency_s=time.monotonic() - t0,
             reasoning=reasoning,
             served_model=str(resp.model) if getattr(resp, "model", None) else None,
-            system_fingerprint=str(fingerprint) if fingerprint else None,
+            system_fingerprint=fingerprint,
             retries=retries,
             usage_extra=usage_extra,
             usage_extra_cut=usage_cut,

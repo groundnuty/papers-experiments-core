@@ -259,7 +259,9 @@ class Leased(NamedTuple):
     now: list[float]
 
 
-def leased_example(tmp_path: Path) -> Leased:
+def leased_example(tmp_path: Path, none: bool = True) -> Leased:
+    """The example's first lease, delivered; with `none` the ledger declares "none" for every model first (C48): the
+    stub's replies carry no fingerprint, so without it they are undeclared."""
     study = make_copy(tmp_path, "study")
     loaded = load_study(study)
     config = LedgerConfig(
@@ -273,6 +275,8 @@ def leased_example(tmp_path: Path) -> Leased:
     ledger = Ledger.create(
         tmp_path / "out" / "ledger.sqlite", ledger_runs(loaded.manifest, loaded.schema), config, lambda: clock_now[0]
     )
+    for model in loaded.campaign.models if none else ():
+        ledger.declare(model, None, "the stub emits no system_fingerprint", "test")
     ledger.join(
         LABEL,
         site=SITE,
@@ -318,6 +322,31 @@ def test_c44_a_real_lease_goes_from_the_ledger_through_the_channel_and_the_kerne
     assert 0 < completion["spend_micro_usd"] <= 5_000_000
     assert ledger.lease(lease.lease_id).charge_micro == completion["spend_micro_usd"]
     assert ledger.lease(lease.lease_id).charge_micro > 0
+    assert_invariants(ledger)
+
+
+def test_c48_a_reply_under_no_declared_fingerprint_sets_its_run_aside_and_pauses_its_model_through_the_worker(
+    tmp_path, clean_environment
+):
+    """C48: end to end on the example, whose stub replies carry no fingerprint, with "none" not declared: the kernel
+    judges the run by its lease's set and sets it aside, its store holds the model after that one attempt (the run
+    keeps its other attempts), the completion names the reply with none, and the dispatcher's next tick pauses the
+    model in the ledger while the run goes back to pending."""
+    study, _, ledger, site, dispatch, lease, clock_now = leased_example(tmp_path, none=False)
+    assert lease.declared is not None
+    assert not lease.declared.none
+    runner = InProcess(clean_environment)
+    worker = Worker(LABEL, channel_of(site, LABEL), study, tmp_path / "work", runner)
+    worker.open()
+    assert worker.step() == "ran", runner.codes
+    completion = json.loads((channel_of(site, LABEL) / ch.OUTBOX / ch.completion_name(lease.lease_id)).read_text())
+    assert (completion["state"], completion["attempts"], completion["charged"]) == ("infra_fail", 1, 1)
+    assert completion["undeclared_fingerprints"] == [None]
+    clock_now[0] += TICK_S
+    dispatch.tick()
+    assert ledger.lease(lease.lease_id).state == "counted"
+    assert ledger.run(lease.run_key).state == "pending"
+    assert ledger.paused() == {lease.model: (None,)}
     assert_invariants(ledger)
 
 
