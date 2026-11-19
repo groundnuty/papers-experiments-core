@@ -188,6 +188,7 @@ layout = "/srv/layout/vm.toml"
 members = { fed-1 = "/srv/feds/expcore-fed5-1", fed-2 = "/srv/feds/expcore-fed5-2" }
 prepare = ["/srv/study-tools/ingest-and-verify", "{root}", "{layout}"]  # ends with composesite.py verify-data
 prepare_timeout_s = 3600
+pass_env = ["HPC_STUDY_ARTIFACTS"]                # what the study's plugin reads: site.env names it on the host
 ```
 
 The host's core must be a git checkout or a built wheel, never a `git archive` copy: an unknown core's commit is in

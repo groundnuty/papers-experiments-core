@@ -772,3 +772,31 @@ def test_c52_a_compose_member_with_declared_data_joins_after_its_prepare_verifie
     tick(deploy, vm, ledger, clock)
     assert "site-a-fed-1" in {f.label for f in ledger.federations()}
     assert not [a for a in tick(deploy, vm, ledger, clock) if type(a).__name__ == "Prepare"]  # once
+
+
+# ------------------------------------------------------------------------------------------------ pass_env
+def test_c52_a_sites_pass_env_reaches_the_worker_and_the_identity_read_with_the_hosts_value(deploy, vm, tmp_path):
+    """C52: a study's plugin may read a variable of the site (the study's artifacts directory, say), which the identity
+    read and every lease run must see alike. A Compose site's `pass_env` names it: the host's own value (its
+    site.env's) is given to the worker, whose lease runs inherit it, and to the identity read, by the shard step's own
+    name and value rules. A name that looks like a secret is refused in the sites file; one the host has not set
+    starts no worker."""
+    vm.env_file.write_text(vm.env_file.read_text(encoding="utf-8") + "STUDY_DATA_DIR='/srv/study-data'\n", "utf-8")
+    text = (vm.tmp / "sites.toml").read_text(encoding="utf-8")
+    (vm.tmp / "sites.toml").write_text(text + 'pass_env = ["STUDY_DATA_DIR"]\n', encoding="utf-8")
+    vm.controller, (vm.config,) = deploy.control.load_config(vm.tmp / "sites.toml")
+    argv = deploy.compose.identity_argv(vm.config, "fed-1")
+    assert argv[-2:] == ["--pass-env", "STUDY_DATA_DIR"]
+    clock = FakeClock(time.time())
+    tick(deploy, vm, new_ledger(tmp_path, clock), clock)
+    pid = vm.worker("fed-1")["pid"]
+    words = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    environ = dict(word.split(b"=", 1) for word in words if b"=" in word)
+    assert environ[b"STUDY_DATA_DIR"] == b"/srv/study-data"
+    (vm.tmp / "sites.toml").write_text(text + 'pass_env = ["API_TOKEN"]\n', encoding="utf-8")
+    with pytest.raises(deploy.control.ConfigError, match="looks like a secret"):
+        deploy.control.load_config(vm.tmp / "sites.toml")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv("STUDY_DATA_DIR", raising=False)
+        with pytest.raises(deploy.site.SiteError, match="STUDY_DATA_DIR is not set"):
+            deploy.site.passed(["STUDY_DATA_DIR"])

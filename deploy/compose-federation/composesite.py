@@ -428,8 +428,26 @@ def apart(home: Path, study: Path, fleet: Path) -> None:
             raise SiteError("--home overlaps the study or the site's directory: its keys would be copied or removed")
 
 
-def worker_env(home: Path, run: Path, root: Path, tag: str) -> dict[str, str]:
-    env = {k: os.environ[k] for k in ALLOWLIST if k in os.environ}
+def passed(names: list[str] | None) -> dict[str, str]:
+    """The variables the site passes (`--pass-env`), each with this host's value (its site.env's), checked by the
+    shard step's own rules (`shards.pass_env_name_problem`, `pass_env_value_problem`): never a secret-looking name,
+    one the worker sets itself, or a value that is not a plain word or absolute path. SiteError naming the variable,
+    never its value, for one that is unset or refused."""
+    shards = _sibling("shards")
+    found = {}
+    for name in names or ():
+        if problem := shards.pass_env_name_problem(name):
+            raise SiteError(problem)
+        if name not in os.environ:
+            raise SiteError(f"pass_env variable {name} is not set in the site's environment (its site.env)")
+        if problem := shards.pass_env_value_problem(name, os.environ[name]):
+            raise SiteError(problem)
+        found[name] = os.environ[name]
+    return found
+
+
+def worker_env(home: Path, run: Path, root: Path, tag: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+    env = {**(extra or {}), **{k: os.environ[k] for k in ALLOWLIST if k in os.environ}}
     env.update(
         HOME=str(home),
         TMPDIR=str(run / "tmp"),
@@ -487,6 +505,7 @@ def launch(args: argparse.Namespace) -> int:
     here = member_dir(fleet, args.member)
     home = private_dir(args.home, "--home")
     apart(home, study, fleet)
+    extra = passed(args.pass_env)  # before anything is staged: an unset or refused variable starts nothing
     # the root's data lock too: no check can invalidate the marker between its last read here and the worker's start
     data_lock = fedverify.locked(root) if root.is_dir() and not root.is_symlink() else contextlib.nullcontext()
     with member_lock(fleet / "launch"), member_lock(here), data_lock:
@@ -516,8 +535,9 @@ def launch(args: argparse.Namespace) -> int:
         write_record(here / PIDFILE, {**fields, "pid": None, "start": None, "at": time.time()})  # the tag first
         words = worker_words(args.federation, args.channel, copy, run / "work")
         with open(log, "ab") as sink:
-            child = subprocess.Popen(words, env=worker_env(home, run, root, tag), cwd=run, stdin=subprocess.DEVNULL,
-                                     stdout=sink, stderr=subprocess.STDOUT, start_new_session=True)  # fmt: skip
+            child = subprocess.Popen(words, env=worker_env(home, run, root, tag, extra), cwd=run,
+                                     stdin=subprocess.DEVNULL, stdout=sink, stderr=subprocess.STDOUT,
+                                     start_new_session=True)  # fmt: skip
         write_record(here / PIDFILE, {**fields, "pid": child.pid, "start": start_tick(child.pid), "at": time.time()})
         deadline = time.monotonic() + SETTLE_S
         while time.monotonic() < deadline and child.poll() is None:
@@ -589,13 +609,14 @@ def identity(args: argparse.Namespace) -> int:
     """The member's (fingerprint, environment identity), read in a private copy of the study, as one JSON line."""
     root, fleet, study = Path(args.root), Path(args.fleet), Path(args.study)
     apart(private_dir(args.home, "--home"), study, fleet)
+    extra = passed(args.pass_env)
     fleet.mkdir(mode=0o700, parents=True, exist_ok=True)
     scratch = Path(tempfile.mkdtemp(prefix="identity-", dir=fleet))
     try:
         for name in ("home", "tmp"):
             (scratch / name).mkdir(mode=0o700)
         copy = stage_study(study, root, scratch)
-        env = {k: os.environ[k] for k in ALLOWLIST if k in os.environ}
+        env = {**extra, **{k: os.environ[k] for k in ALLOWLIST if k in os.environ}}
         env.update(HOME=str(scratch / "home"), TMPDIR=str(scratch / "tmp"), EXPCORE_FED_ROOT=str(root),
                    EXPCORE_FED_ROOT_PARENT=str(root.parent))  # fmt: skip
         done = subprocess.run([sys.executable, "-I", "-B", "-c", _sibling("fleetidentity").PROGRAM, str(copy)],
@@ -715,6 +736,8 @@ def parser() -> argparse.ArgumentParser:
     made["stop"].add_argument("--grace-s", dest="grace_s", type=float, default=GRACE_S)
     made["retired"].add_argument("--drained", action="store_true")
     made["identity"].add_argument("--home", required=True)  # checked apart from the study before it is copied
+    for name in ("identity", "launch"):  # what the study's plugin reads from the site, in both alike
+        made[name].add_argument("--pass-env", dest="pass_env", action="append", default=[])
     return found
 
 
