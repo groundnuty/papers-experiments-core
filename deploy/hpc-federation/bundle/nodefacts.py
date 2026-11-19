@@ -1,9 +1,10 @@
 """nodefacts.py: one node's facts for the HPC federation driver, in a control step (python3.11 -I, stdlib only).
 
 Prints one JSON object on stdout: the node's FQDN as `hostname -f` gives it (the name every service's test web
-certificate is made for, `lib.sh`'s node_fqdn), its IPv4 address on that name (the address the shim's peer lists
-hold), the step's uid and gid (the posix storage's owner, finish.sh), and its `readings` (O87): the node's OS release
-(ID and VERSION_ID of /etc/os-release), its glibc version and its kernel release. The readings are recorded and never
+certificate is made for, `lib.sh`'s node_fqdn; a one-label name is `<hostname -s>.<HPC_NODE_DOMAIN>`, see node_name),
+its IPv4 address on that name (the address the shim's peer lists hold), the step's uid and gid (the posix storage's
+owner, finish.sh), and its `readings` (O87): the node's OS release (ID and VERSION_ID of /etc/os-release), its glibc
+version and its kernel release. The readings are recorded and never
 refused: one that cannot be made is "unknown", and `unknown` maps its name to why (a missing line, a value of no plain
 shape, or the type of the exception, never its message or a path). The os-release file is read as text and never
 executed. No secret, and nothing is written.
@@ -22,6 +23,12 @@ import subprocess
 import sys
 
 FQDN = re.compile(r"[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+")
+ONE_LABEL = re.compile(r"[A-Za-z0-9-]+")
+LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+SHORT_NAME = re.compile(LABEL)  # `hostname -s` of a one-label node, which becomes the FQDN's first label
+NODE_DOMAIN = re.compile(rf"{LABEL}(?:\.{LABEL})*")  # HPC_NODE_DOMAIN: the same shape hpcsettings.py and lib.sh hold
+NODE_DOMAIN_ENV = "HPC_NODE_DOMAIN"
+FQDN_MAX = 253
 UNKNOWN = "unknown"
 OS_RELEASE = "/etc/os-release"
 READ_BYTES = 64 * 1024
@@ -143,12 +150,54 @@ def readings_or_unknown():
         return unreadable(type(error).__name__)
 
 
+class NameRefused(Exception):
+    """The node's name cannot be made into an FQDN; the message names the setting, never the node or the domain."""
+
+
+def hostname(flag):
+    return subprocess.run(["hostname", flag], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def reads_as_address(name):
+    """Whether the resolver takes `name` for an IPv4 literal (glibc reads a bare 42 as 0.0.0.42), not a host name."""
+    try:
+        socket.inet_aton(name)
+    except OSError:
+        return False
+    return True
+
+
+def node_name(environ=os.environ):
+    """The node's FQDN and the name its IPv4 address is read by (lib.sh's node_fqdn makes the same FQDN, by the same
+    rule). A dotted `hostname -f` is the FQDN, as it always was, whether or not HPC_NODE_DOMAIN is set. A one-label one
+    is `<hostname -s>.<HPC_NODE_DOMAIN>`, whose address is the short name's: the synthetic name resolves nowhere, and
+    the services' own hosts files (lib.sh, write_names) map it to that address. No domain is no name (NameRefused)."""
+    found = hostname("-f")
+    if FQDN.fullmatch(found):
+        return found, found
+    if not ONE_LABEL.fullmatch(found):
+        raise NameRefused("hostname -f gave no fully qualified name")
+    domain = environ.get(NODE_DOMAIN_ENV, "")
+    if not domain:
+        raise NameRefused(
+            f"hostname -f gave a one-label name, which is no fully qualified name: set {NODE_DOMAIN_ENV} in site.env "
+            "to the domain its FQDN is to carry"
+        )
+    short = hostname("-s")
+    if not NODE_DOMAIN.fullmatch(domain) or not SHORT_NAME.fullmatch(short) or len(short) + 1 + len(domain) > FQDN_MAX:
+        raise NameRefused(f"{NODE_DOMAIN_ENV} and hostname -s do not make a fully qualified name")
+    if reads_as_address(short):  # its address would be read as the literal, not the node's: never a wrong peer address
+        raise NameRefused("hostname -s reads as an IPv4 address, so its own address cannot be read by name")
+    return f"{short}.{domain}", short
+
+
 def main() -> int:
-    fqdn = subprocess.run(["hostname", "-f"], capture_output=True, text=True, check=True).stdout.strip()
-    if not FQDN.fullmatch(fqdn):
-        print("nodefacts: hostname -f gave no fully qualified name", file=sys.stderr)
+    try:
+        fqdn, lookup = node_name()
+    except NameRefused as refused:
+        print(f"nodefacts: {refused}", file=sys.stderr)
         return 1
-    found = sorted({info[4][0] for info in socket.getaddrinfo(fqdn, None, socket.AF_INET, socket.SOCK_STREAM)})
+    found = sorted({info[4][0] for info in socket.getaddrinfo(lookup, None, socket.AF_INET, socket.SOCK_STREAM)})
     if len(found) != 1:
         print(f"nodefacts: the node's name has {len(found)} IPv4 addresses, not one", file=sys.stderr)
         return 1

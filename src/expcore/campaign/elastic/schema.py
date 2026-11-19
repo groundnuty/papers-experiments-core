@@ -7,7 +7,7 @@ into place, so a kill during creation leaves either no ledger or a whole one.
 
 Two partial unique indexes keep the fencing rules in the file itself: a run has at most one lease in flight, and a
 federation holds at most one cap slot. A lease is settled once (`settlements`), and a ceiling only goes up
-(`ceilings`).
+(`ceilings`). A model's cap goes either way (`cap_changes`).
 """
 
 import contextlib
@@ -20,7 +20,15 @@ from typing import Any
 
 SCHEMA = "expcore-ledger/1"
 
-_SQL = """
+# The changes of a model's cap, up or down (`caps`). A ledger made before this table has none until its first change
+# creates it, so the readers of it look for the table first and the pinned configuration's caps stand without it.
+CAP_CHANGES_SQL = """CREATE TABLE IF NOT EXISTS cap_changes(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, model TEXT NOT NULL,
+  old_cap INTEGER,  -- NULL: the model had no cap
+  new_cap INTEGER NOT NULL CHECK(new_cap >= 1), reason TEXT NOT NULL, actor TEXT NOT NULL)"""
+
+_SQL = (
+    """
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE runs(
   run_key TEXT PRIMARY KEY, seq INTEGER NOT NULL UNIQUE, model TEXT NOT NULL, condition TEXT NOT NULL,
@@ -67,6 +75,9 @@ CREATE TABLE ceilings(  -- the raises of the dollar ceiling, the campaign's (mod
   old_micro INTEGER NOT NULL, new_micro INTEGER NOT NULL, reason TEXT NOT NULL, actor TEXT NOT NULL,
   CHECK(new_micro > old_micro));
 """
+    + CAP_CHANGES_SQL
+    + ";"
+)
 
 
 def create_file(path: Path, rows: list[tuple], meta: dict[str, str]) -> None:

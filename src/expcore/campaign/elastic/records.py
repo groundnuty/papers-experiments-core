@@ -57,6 +57,10 @@ class CeilingRefused(LedgerError):
     """A ceiling that is not above the current one, is below what is committed, or has nothing to raise."""
 
 
+class CapRefused(LedgerError):
+    """A cap set on a model the ledger has no runs of, or to the value it already has."""
+
+
 def _lease_id(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"a lease id is a whole number of at least 1, got {value!r}")
@@ -256,10 +260,25 @@ class Ceilings:
 
 
 @dataclass(frozen=True)
+class CapChange:
+    """One change of a model's cap on the leases it holds at once, up or down, with when, why and by whom. `old` is
+    None when the model had no cap."""
+
+    cap_id: int
+    at: float
+    model: str
+    old: int | None
+    new: int
+    reason: str
+    actor: str
+
+
+@dataclass(frozen=True)
 class Status:
     """The ledger's money in micro-dollars. `ceiling_micro` is None with no budget (then `remaining_micro` is too);
     `locked_*` is what unsettled leases hold as their grants (in flight, expired, reported, lost), by lease state and
-    by model; `ceilings` is the history of raises, oldest first."""
+    by model; `ceilings` is the history of raises, oldest first; `caps` is each model's cap in force and `cap_changes`
+    the history of its changes, oldest first."""
 
     ceiling_micro: int | None
     committed_micro: int
@@ -270,3 +289,5 @@ class Status:
     model_ceiling_micro: Mapping[str, int]
     model_remaining_micro: Mapping[str, int]
     ceilings: tuple[Ceiling, ...]
+    caps: Mapping[str, int] = field(default_factory=dict)
+    cap_changes: tuple[CapChange, ...] = ()

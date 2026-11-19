@@ -17,18 +17,29 @@ fleet's shard settings, `fleetplan.read_settings`).
   leaves while the lease runs (C46): `snapshots/` and `spend.jsonl`. For those the newest snapshot that verifies
   (`out_snapshot.restore`, each in turn, newest first) is restored into a private directory on this host with the
   journal copied beside it, as the first form is read, and the reader settles from them; the directory is removed at
-  the next read and at exit. Local transport only: those directories are read here.
+  the next read and at exit. At a site whose transport is ssh the place is on its login node: its newest snapshot is
+  streamed here as a tar (`tar -C <snapshot> -cf - .`, extracted with the `data` filter) and its journal copied, into a
+  private 0700 directory removed afterwards, and read as a local place is (each snapshot verified in turn, newest
+  first). A call that fails or times out reads nothing this tick: the lease stays charged its grant and is read again
+  next tick, never taken for a place with nothing in it.
+- `fleetidentity.py read --fleet DIR --member fed-k --settings FILE`: `read_identity` run on a site's login node, its
+  one JSON line printed (exit 1 when there is none). The controller runs it there through the transport for an ssh
+  site, whose fleet, root and manifest's Python are on the login node and not on this host.
 """
 
+import argparse
 import atexit
+import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Tuple
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
@@ -99,16 +110,41 @@ def read_identity(
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def read_identity_remote(
+    transport: Any, site: Any, member: str
+) -> Optional[Tuple[str, Mapping[str, str]]]:  # fmt: skip
+    """One member's identity read on an ssh site's login node (`fleetidentity.py read` there, over the transport); None
+    for any failure, a call that cannot be made or that is past its bound included: the join waits."""
+    settings = site.shard_settings
+    if transport is None or settings is None:
+        return None
+    argv = site.script("fleetidentity.py", "read", "--fleet", str(site.fleet), "--member", member, "--settings",
+                       str(settings))  # fmt: skip
+    try:
+        code, out, _ = transport.run(site, argv, TIMEOUT_S + 60)  # past the read's own bound there
+        said = json.loads(out.strip().splitlines()[-1])
+        digest, environment = said["fingerprint"], said["environment"]
+    except (OSError, ValueError, KeyError, IndexError, TypeError, subprocess.SubprocessError):
+        return None
+    if code != 0 or not isinstance(digest, str) or not isinstance(environment, dict):
+        return None
+    return digest, {str(k): str(v) for k, v in environment.items()}
+
+
 def identity_reader(
-    settings_path: Path, sites: Mapping[str, Any], runner: Callable[..., Any] = subprocess.run
+    settings_path: Path, sites: Mapping[str, Any], runner: Callable[..., Any] = subprocess.run, transport: Any = None
 ) -> Callable[[str, str], Optional[Tuple[str, Mapping[str, str]]]]:  # fmt: skip
-    """The controller's identity hook over the sites' fleets (`read_identity`); a member's read that worked is kept."""
+    """The controller's identity hook over the sites' fleets (`read_identity`, on the login node through `transport`
+    for an ssh site); a member's read that worked is kept."""
     kept: dict = {}
 
     def read(site: str, member: str) -> Optional[Tuple[str, Mapping[str, str]]]:
         found = kept.get((site, member))
         if found is None and site in sites:
-            found = read_identity(sites[site].fleet, member, settings_path, runner)
+            if getattr(sites[site], "remote", False):
+                found = read_identity_remote(transport, sites[site], member)
+            else:
+                found = read_identity(sites[site].fleet, member, settings_path, runner)
             if found is not None:
                 kept[(site, member)] = found
         return found
@@ -116,8 +152,18 @@ def identity_reader(
     return read
 
 
-def locator(evidence: Path) -> Callable[[Any, Any], Optional[Tuple[Path, str]]]:
-    """The spend reader's `locate` (module docstring): where a lost lease's store is, or None."""
+def remote_snapshots(transport: Any, site: Any, directory: str, scratch: Path) -> Optional[list]:
+    """The names of the snapshots in `directory` on an ssh site's login node, newest first; None when the listing fails
+    (a directory that is not there lists nothing, as `ls` fails on it: None as well, read again next tick)."""
+    listing = scratch / "snapshots.txt"
+    transport.stream(site, ["ls", "-1", "--", directory], listing)
+    names = [n for n in listing.read_text(encoding="utf-8").split("\n") if re.fullmatch(r"snap-[0-9]{6,}", n)]
+    return sorted(names, key=lambda name: int(name[5:]), reverse=True)
+
+
+def locator(evidence: Path, transport: Any = None) -> Callable[[Any, Any], Optional[Tuple[Path, str]]]:
+    """The spend reader's `locate` (module docstring): where a lost lease's store is, or None. `transport` reaches an
+    ssh site's login node (`fleetexecute.SiteTransport`)."""
     restored: list = []  # the private directory of the last read: removed at the next one and at exit
 
     def release() -> None:
@@ -149,6 +195,41 @@ def locator(evidence: Path) -> Callable[[Any, Any], Optional[Tuple[Path, str]]]:
             return private / "study" / "out"
         return None
 
+    def from_remote(site: Any, action: Any) -> Optional[Path]:
+        """A lost lease's place on an ssh site's login node, fetched into a private directory here and read as a local
+        place is; None for any failure or timeout of a call (read again next tick), and for a place with no snapshot
+        that verifies."""
+        from expcore.campaign import out_snapshot
+        from expcore.campaign.elastic import channel as ch
+        from expcore.campaign.elastic.snapshots import SNAPSHOTS
+        from expcore.campaign.elastic.transport import Missing
+        from expcore.campaign.run_lease import LEASE_JOURNAL
+
+        there = f"{ch.federation_dir(str(site.channel), action.label) / PLACES / ch.place_name(action.lease_id)}"
+        private = Path(tempfile.mkdtemp(prefix="expcore-fetch-"))  # 0700, ours
+        mirror = private / "place"
+        try:
+            names = remote_snapshots(transport, site, f"{there}/{SNAPSHOTS}", private)
+            if not names:
+                return None
+            (mirror / SNAPSHOTS).mkdir(parents=True)
+            with contextlib.suppress(Missing):  # a journal not there is read as none; a failed or timed-out call is not
+                transport.stream(site, ["cat", "--", f"{there}/{LEASE_JOURNAL}"], mirror / LEASE_JOURNAL)
+            for name in names[: out_snapshot.KEEP]:
+                tar = private / f"{name}.tar"
+                transport.stream(site, ["tar", "-C", f"{there}/{SNAPSHOTS}/{name}", "-cf", "-", "."], tar)
+                with tarfile.open(tar, "r:") as archive:
+                    archive.extractall(mirror / SNAPSHOTS / name, filter="data")
+                tar.unlink()
+                found = from_snapshot(mirror)
+                if found is not None:
+                    return found
+            return None
+        except (OSError, tarfile.TarError, ValueError, subprocess.SubprocessError):
+            return None
+        finally:
+            shutil.rmtree(private, ignore_errors=True)
+
     def locate(site: Any, action: Any) -> Optional[Tuple[Path, str]]:
         if site is None:
             return None
@@ -156,7 +237,12 @@ def locator(evidence: Path) -> Callable[[Any, Any], Optional[Tuple[Path, str]]]:
 
         name = ch.place_name(action.lease_id)
         candidates = []
-        if action.root is not None and site.channel is not None:
+        remote = getattr(site, "remote", False)
+        if action.root is not None and site.channel is not None and remote and transport is not None:
+            found = from_remote(site, action)
+            if found is not None:
+                return found, "root"
+        elif action.root is not None and site.channel is not None and not remote:
             candidates.append((ch.federation_dir(str(site.channel), action.label) / PLACES / name, "root"))
         pulled = Path(evidence) / f"{site.label}-{action.member}"
         candidates.append((pulled / PLACES / name, "pulled"))
@@ -170,3 +256,21 @@ def locator(evidence: Path) -> Callable[[Any, Any], Optional[Tuple[Path, str]]]:
         return None
 
     return locate
+
+
+def main(argv: Optional[Sequence[str]] = None, runner: Callable[..., Any] = subprocess.run) -> int:
+    """`read`: this login node's `read_identity` as one JSON line, for the controller of an ssh site."""
+    found = argparse.ArgumentParser(prog="fleetidentity.py", description=__doc__.split("\n\n")[0])
+    found.add_argument("command", choices=("read",))
+    for key in ("fleet", "member", "settings"):
+        found.add_argument(f"--{key}", required=True)
+    args = found.parse_args(argv)
+    got = read_identity(Path(args.fleet), args.member, Path(args.settings), runner)
+    if got is None:
+        return 1
+    print(json.dumps({"fingerprint": got[0], "environment": dict(got[1])}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

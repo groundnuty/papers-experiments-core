@@ -3,6 +3,7 @@ its end, and a replayed lease, another federation's or a tombstone never run."""
 
 import hashlib
 import json
+import os
 import shutil
 import sys
 import tarfile
@@ -13,6 +14,7 @@ from typing import Any, NamedTuple
 import pytest
 from channel_support import FakeHandle, FakeRunner, FakeSsh, channel_of, outcome_of, site_of, transport
 from elastic_support import SITE, assert_invariants, join, make, plan
+from fake_ssh_bin import install_fake_ssh
 from hpc_fleet_support import fleet_modules
 from merge_by_run_support import make_running
 from study_support import Campaign, clean_environment, cli, make_copy
@@ -491,3 +493,56 @@ def test_c46_locate_gives_a_lost_leases_newest_snapshot_with_its_journal_and_the
         shutil.copytree(kept, kept.with_name(ch.place_name(lease_id + 1)))
         other = Settle(SITE, LABEL, LABEL, lease_id + 1, str(tmp_path / "root"), "lost")
         assert read(config, other) is None
+
+
+@pytest.mark.parametrize("trouble", ["fail-listing", "fail-snapshot", "hang-snapshot", "fail-journal"])
+def test_c47_a_lost_lease_at_an_ssh_site_settles_at_its_journals_spend_and_a_failed_fetch_leaves_it_charged(
+    tmp_path, clean_environment, monkeypatch, trouble
+):
+    """C47: the place of a lease lost at an ssh site is on its login node: `locate` streams the newest snapshot and
+    the journal into a private directory here and settles at the journal's spend (not the grant). A call that fails or
+    hangs reads nothing this tick (the lease stays charged its grant, never taken for a place with nothing in it) and
+    the next tick settles it; the private directory is gone either way."""
+    leased, kept = _ran_for_real(tmp_path, clean_environment)
+    lease_id = leased.lease.lease_id
+    manifest = out_snapshot.restore(out_snapshot.snapshots(kept / "snapshots")[0], tmp_path / "mid" / "study" / "out")
+    make_running(Campaign(tmp_path / "mid" / "study"))
+    out_snapshot.take(
+        tmp_path / "mid" / "study" / "out", kept / "snapshots", scratch=tmp_path / "scratch",
+        facts=manifest["facts"], live=False, now="2026-11-18T12:00:00Z",
+    )  # fmt: skip
+    fake = install_fake_ssh(tmp_path / "bin", monkeypatch, "zz-login-7f3a.invalid")
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+    (tmp_path / "tmp").mkdir()
+    with fleet_modules():
+        import fleetexecute
+        import fleetidentity
+        import fleetssh
+
+        config = fleetexecute.SiteConfig(
+            SiteSettings(SITE, 7, 1e12, 47.0), tmp_path / "fleet", "ssh", sys.executable, tmp_path / "deploy",
+            Path(leased.site.root), "zz-login-7f3a.invalid", str(tmp_path / "site.env"),
+        )  # fmt: skip
+        ssh = fleetssh.SshSiteTransport(dict(os.environ), fetch_timeout_s=3.0)
+        read = fleetexecute.dead_store_reader(
+            fleetidentity.locator(tmp_path / "evidence", fleetexecute.SiteTransport(dict(os.environ), ssh=ssh)),
+            leased.loaded,
+        )
+        lost = Settle(SITE, LABEL, LABEL, lease_id, str(tmp_path / "root"), "lost")
+        match, action = {
+            "fail-listing": ("ls -1", "fail"),
+            "fail-snapshot": ("tar -C", "fail"),
+            "hang-snapshot": ("tar -C", "hang_child"),
+            "fail-journal": ("spend.jsonl", "fail"),
+        }[trouble]
+        fake.rule(match, action)
+        assert read(config, lost) is None  # charged its grant this tick
+        if action == "hang_child":
+            assert fake.child_gone()
+        assert not list((tmp_path / "tmp").iterdir())  # nothing of the fetch is left here
+        fake.clear()
+        found = read(config, lost)
+        assert found is not None
+        spend_micro, source, charged = found
+        assert (source, charged) == ("root", 0)
+        assert 0 < spend_micro < 5_000_000  # the journal's spend, not the grant of the model (5 USD)
