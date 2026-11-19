@@ -326,8 +326,8 @@ def test_o94_a_command_that_differs_inside_the_declared_artifacts_directory_is_r
 
 def test_o94_a_command_inside_the_clone_is_one_line_when_a_site_reaches_its_artifacts_through_a_link(tmp_path, cas):
     """O94 (Codex round 1): the clone's role is its resolved path, the artifacts directory's its path as written. With
-    the command inside the clone and one site's directory declared through a parent that is a link, the clone's role
-    matches the command at one site only, so the declared directory is replaced first: one line at both sites."""
+    the command inside the clone and one site's directory declared through a parent that is a link, the resolved
+    clone matches the command at one site only, so the clone is a role by its written path too: one line at both."""
     inside = [
         platform('command = "@root@/venv/bin/server"', 'command = "@artifacts@/clone/venv/bin/server"'),
         platform('clone = "@root@/clone"', 'clone = "@artifacts@/clone"\nartifacts = "@artifacts@"'),
@@ -340,6 +340,28 @@ def test_o94_a_command_inside_the_clone_is_one_line_when_a_site_reaches_its_arti
         configs.append(load(edited(DOCKER, inside), tmp_path / f"fed-{index}" / "root", cas[0], values))
     assert str(configs[1].toolserver.clone) != f"{tmp_path}/linked/studies/art/clone"  # resolved through the link
     assert configs[0].fingerprint() == configs[1].fingerprint()
+
+
+@pytest.mark.parametrize(("command", "same"), [("@clone@/bin/server", True), ("@artifacts@/tools/bin/server", False)])
+def test_o94_a_command_from_the_clone_and_one_beside_it_stay_apart_whatever_each_sites_layout(
+    tmp_path, cas, command, same
+):
+    """O94 (Codex round 2): one site keeps its clone in the artifacts directory, another elsewhere. A command run from
+    each site's pinned clone is one line; a command at the first site's clone path relative to the directory, which at
+    the second is no clone, is another, so a shard under it is refused."""
+    layout = [
+        platform('command = "@root@/venv/bin/server"', 'command = "@command@"'),
+        platform('clone = "@root@/clone"', 'clone = "@clone@"\nartifacts = "@artifacts@"'),
+    ]
+    first = {"artifacts": str(tmp_path / "a" / "study"), "clone": str(tmp_path / "a" / "study" / "tools")}
+    second = {"artifacts": str(tmp_path / "b" / "data"), "clone": str(tmp_path / "b" / "opt" / "tools")}
+    sites = [
+        {**FEDERATIONS[0], **first, "command": f"{first['clone']}/bin/server"},
+        {**FEDERATIONS[1], **second, "command": command.replace("@clone@", second["clone"]).replace(
+            "@artifacts@", second["artifacts"])},
+    ]  # fmt: skip
+    one, two = (load(edited(DOCKER, layout), tmp_path / f"fed-{i}" / "root", cas[0], v) for i, v in enumerate(sites))
+    assert (one.fingerprint() == two.fingerprint()) is same
 
 
 @pytest.mark.parametrize("value", ["relative/artifacts", "/", "//"])

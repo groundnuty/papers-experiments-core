@@ -219,6 +219,7 @@ class ToolServer:
     commit: str | None
     conditions: Mapping[str, Condition] = field(default_factory=dict)
     artifacts: str | None = None  # the study's own directory, as written: a role of the fingerprint, never in it
+    clone_written: str | None = None  # the clone's path as written (`clone` is resolved): its role beside `artifacts`
 
 
 @dataclass(frozen=True)
@@ -626,6 +627,7 @@ def _toolserver(section: Section, base: Path, *, require_manifests: bool = True)
             }
         ),
         artifacts,
+        str(base / clone) if clone else None,
     )
 
 
