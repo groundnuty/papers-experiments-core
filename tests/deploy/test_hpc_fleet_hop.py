@@ -457,3 +457,44 @@ def test_f03_the_fake_ssh_is_the_only_ssh_these_tests_can_reach(tmp_path, monkey
 
     assert Path(shutil.which("ssh")) == ssh.directory / "ssh"
     assert stat.S_IMODE((ssh.directory / "ssh").stat().st_mode) == 0o755
+
+
+def test_o93_a_stop_that_is_cut_short_leaves_the_hop_to_the_next_stop(hop_module, tmp_path, monkeypatch):
+    """O93: a stop signal that lands while the hop is being stopped ends that call, but the keeper still holds the
+    child, so the step's second stop (its cleanup after the signal) kills it: ssh never outlives the step."""
+    ssh = Ssh(tmp_path, monkeypatch)
+
+    class Child:
+        alive, terminates = True, 0
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            self.terminates += 1
+            if self.terminates == 1:
+                raise SystemExit(143)  # the signal's handler, running in the middle of the stop
+            self.alive = False
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            self.alive = False
+
+    child = Child()
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", ssh.port))
+    listener.listen()
+    try:
+        one = keeper(hop_module, ssh.hop(), popen=lambda *args, **kwargs: child)
+        one.start()
+        with pytest.raises(SystemExit):
+            one.stop()
+        assert child.alive
+        one.stop()
+        assert not child.alive
+        one.stop()  # and once it is gone a stop is a no-op
+        assert child.terminates == 2
+    finally:
+        listener.close()

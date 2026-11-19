@@ -209,10 +209,12 @@ class HopKeeper:
                 self._interval = min(self._interval * 2, self._max)
 
     def stop(self) -> None:
-        """Stop keeping the hop and kill it. The keeper cannot start it again once this has taken the lock."""
+        """Stop keeping the hop and kill it. The keeper cannot start it again once this has taken the lock. The child
+        stays on the keeper until it has been waited for, so a stop that is cut short (a signal that lands in the
+        middle) is finished by the next call, which finds it still there."""
         with self._lock:
             self._stopped.set()
-            child, self._child = self._child, None
+            child = self._child
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout=STOP_S)
         if child is None:
@@ -224,6 +226,9 @@ class HopKeeper:
             except subprocess.TimeoutExpired:
                 child.kill()
         child.wait()
+        with self._lock:
+            if self._child is child:
+                self._child = None
 
 
 def probe(args: argparse.Namespace) -> int:

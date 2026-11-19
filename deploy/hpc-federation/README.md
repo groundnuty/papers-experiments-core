@@ -891,6 +891,7 @@ import is wired into `up` (`DESIGN.md` section 8) but has not run live; it needs
 | `egresslog.c` | agent's cell | the agent's egress shim: logs each destination, never a payload |
 | `egress-collector.py` | sandbox step | receives the shim's records outside the cell and writes the run's egress log |
 | `shards.py` | login node, sandbox step | a campaign's shards, one per federation: the step lines, the step, its snapshots, the archives the merge takes |
+| `fleethop.py` | sandbox step, node | the ssh hop to the group's LLM fleet that a step or a worker keeps open while its dispatcher runs (O93); standard library only, loaded by `shards.py` and `fleetworker.py` from beside them, so it goes wherever they go |
 | `nodefacts.py` | control step | a node's FQDN, its IPv4 address, the job's uid and gid, and its OS release, glibc and kernel as `readings` (O87; recorded, never refused), as JSON (`hpcfed.py up`) |
 | `leftovers.py` | control step | how many work directories of ours of one kind the node's tmpfs holds, as JSON (`hpcfed.py down`, for a service whose step ended before naming one) |
 | `zone-export.sh` | control step on the zone's node | the zone's passphrase or the Onedata test CA on stdout, for the federation's root (`hpcfed.py up`) |
@@ -1449,14 +1450,17 @@ Before its dispatcher (or the worker) starts, `step` (and `fleetworker.py node`)
 
 with its output discarded (an ssh that fails says the host and the paths), and waits up to 60 s for 127.0.0.1:PORT to
 accept a connection and for its own ssh to be still running 1.5 s later (a listener of someone else's with the hop's ssh
-gone is no hop). If it does not, the step ends with 76 (`FLEET_HOP_FAILED`) and a message naming `fleet_hop` only, and no
-dispatcher or worker is started; the worker's launch watches its step for 20 s only, so a refusal after that is seen in
-the member's worker log and the controller's join waits. While the dispatcher runs, a thread starts the hop again when it
-exits, no faster than once per 10 s (the interval doubles to 60 s for a hop that dies again quickly). The hop is killed
-the moment the dispatcher exits and again on every way out of the step, in a `finally` with the stop signals held, and a
-stop signal ends the step through that cleanup, as with `home_files`; a step killed outright leaves its ssh to the
-scheduler's step teardown. A log says `fleet_hop: true (restarts: N)`, the step's owner record `fleet_hop: true`, and
-nothing records a host, a path or a port. A manifest without the key changes nothing.
+gone is no hop). If it does not, the step ends with 76 (`FLEET_HOP_FAILED`) and a message naming `fleet_hop` only, and
+no dispatcher or worker is started. The worker's launch (`fleetworker.py launch`) watches its step for 20 s, and for the
+hop's whole wait on top when the settings have a `fleet_hop`, so a worker whose hop never opens is no launch (it records
+none) and the controller's join, which launches first, waits instead of joining a federation with no worker. Two steps
+of one node that name the same `local_port` cannot both keep a hop: the second is refused with 76. While the dispatcher
+runs, a thread starts the hop again when it exits, no faster than once per 10 s (the interval doubles to 60 s for a hop
+that dies again quickly). The hop is killed the moment the dispatcher exits and again on every way out of the step, in a
+`finally` with the stop signals held, and a stop signal ends the step through that cleanup, as with `home_files`; a step
+killed outright leaves its ssh to the scheduler's step teardown. A log says `fleet_hop: true (restarts: N)`, the step's
+owner record `fleet_hop: true`, and nothing records a host, a path or a port. A manifest without the key changes
+nothing.
 
 `python -I -B deploy/hpc-federation/fleethop.py probe --fleet-hop JSON [--path /v1/models]` runs the same hop, makes one
 keyless GET through it and prints the HTTP status alone: a front that refuses a request without its key answers 401,

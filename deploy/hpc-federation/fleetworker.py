@@ -283,7 +283,11 @@ def launch(
                     worker={"pid": client.pid, "start": client.start, "log": str(log), "federation": args.federation}
                 )
             )
-            for _ in range(int(SETTLE_S)):  # `node` refuses a start within seconds: a client gone then is no worker
+            settle = SETTLE_S
+            if settings.get("fleet_hop"):  # `node` waits for the hop's port, then for it to stay up, before it refuses
+                fleethop = shards._sibling("fleethop")
+                settle += fleethop.WAIT_S + fleethop.SETTLE_S + 5.0
+            for _ in range(int(settle)):  # `node` refuses a start within seconds: a client gone then is no worker
                 sleep(1.0)
                 if not runner.client_alive(client):
                     record.update(lambda r: fleetrecord.member_of(r, args.member).update(worker=None))

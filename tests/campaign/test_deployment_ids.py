@@ -15,6 +15,10 @@ from scheduler_support import Factory, FakeExecutor, ReportingBackend, build
 
 from expcore.campaign.executor import record_run
 from expcore.campaign.export import export_run_state
+from expcore.campaign.export_join import join_exports
+from expcore.report import render_report
+from expcore.stats.analysis import AnalysisResult
+from expcore.stats.rows import Row
 
 PLAN = {"tasks": ("task-a",), "seeds": (1,), "models": ("m1",)}  # three runs, one per condition
 
@@ -79,3 +83,22 @@ def test_f02_a_campaign_whose_turns_name_no_deployment_exports_exactly_what_it_d
     assert export["analysed_attempts"]
     assert all("deployment_ids" not in row for row in export["analysed_attempts"])
     assert "deployment_ids" not in json.dumps(export)
+
+
+def test_b20_a_row_with_deployment_ids_passes_through_the_join_the_analysis_row_and_the_report(tmp_path):
+    """B20: the readers of an analysed attempt take the keys they need: a merged export keeps the ids on each entry, the
+    analysis's row is built as before, and the report renders (a reader that refused the key would stop the first
+    campaign's analysis)."""
+    first, second, third = order()
+    behaviours = {first: [named("dep-b", "dep-a")], second: [named("dep-a")], third: [named(None)]}
+    with build(tmp_path, executor=FakeExecutor(behaviours), factory=NamedFactory(), plan=PLAN) as scheduler:
+        scheduler.run()
+        export = export_run_state(scheduler.store)
+    seq = {key: index for index, key in enumerate(order())}
+    joined = join_exports({1: export}, seq, [{"index": 1, "label": "shard-1"}])
+    assert [row.get("deployment_ids") for row in joined["analysed_attempts"]] == [["dep-a", "dep-b"], ["dep-a"], None]
+    entry = export["analysed_attempts"][0]
+    assert Row.from_export(entry, {}).run_key == entry["run_key"]
+    result = AnalysisResult((), (), 0.05, {"preregistration_sha256": "e" * 64})
+    text = render_report(result, export, study="a-study", code={"commit": "c" * 40}, core_version="1.2.3")
+    assert "analysed" in text
