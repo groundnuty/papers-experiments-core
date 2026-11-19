@@ -333,12 +333,12 @@ def test_o94_a_command_inside_the_clone_is_one_line_when_a_site_reaches_its_arti
         platform('clone = "@root@/clone"', 'clone = "@artifacts@/clone"\nartifacts = "@artifacts@"'),
     ]
     (tmp_path / "real").mkdir()
-    (tmp_path / "home").symlink_to(tmp_path / "real")
+    (tmp_path / "linked").symlink_to(tmp_path / "real")
     configs = []
-    for index, artifacts in enumerate((tmp_path / "site-a" / "artifacts", tmp_path / "home" / "studies" / "art")):
+    for index, artifacts in enumerate((tmp_path / "site-a" / "artifacts", tmp_path / "linked" / "studies" / "art")):
         values = {**FEDERATIONS[index], "artifacts": str(artifacts)}
         configs.append(load(edited(DOCKER, inside), tmp_path / f"fed-{index}" / "root", cas[0], values))
-    assert str(configs[1].toolserver.clone) != f"{tmp_path}/home/studies/art/clone"  # resolved through the link
+    assert str(configs[1].toolserver.clone) != f"{tmp_path}/linked/studies/art/clone"  # resolved through the link
     assert configs[0].fingerprint() == configs[1].fingerprint()
 
 
