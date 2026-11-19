@@ -12,8 +12,11 @@
 snapshot and never the live platform (R13). The snapshot holds, for the files the study names:
 
 - each tracked provider's block map before and after (merged blocks, held bytes);
-- the record of every transfer the provisioner scheduled (`transfers`: counters as the provider reports them, and its
-  state as the transfer log reads it, from the half the job does, `transferrecord.state_of`);
+- the record of every transfer the provisioner scheduled that bears on the run (`transfers`: counters as the provider
+  reports them, and its state as the transfer log reads it, from the half the job does, `transferrecord.state_of`):
+  each one scheduled since the run's start, and each earlier one its change log does not show ended before that start
+  (`Provisioner.transfers_from`). The log is kept across runs, so an earlier job shown ended, such as a reset's
+  eviction, is read no more: `transfers_before_window` counts them;
 - the record of every transfer of the space that started in the run's window, whoever started it: the harness, the
   agent through the tool plane, or a QoS requirement (`space_transfers`: its type, source and target by position
   label, state, counters, and schedule, start and end times; `transferlog.py` says how it is read and where it fails
@@ -212,7 +215,10 @@ class PlatformProbes:
             positions[path] = index
         self._files, self._providers = dict(files), list(providers)
         self._before_ids: dict[str, str] = {}
+        # The provisioner's log, bounded to the run's window at `start` (`transfers_from`), unless the caller names its own.
         self._transfers = transfers if transfers is not None else provisioner.transfers
+        self._windowed = transfers is None
+        self._mark: int | None = None  # the change log's length at the run's start (`Provisioner.log_mark`)
         self._sleep, self._now = sleep, now
         self._log = TransferLog(
             client,
@@ -268,6 +274,7 @@ class PlatformProbes:
     def start(self, identity: Mapping[str, Any]) -> None:
         """Read the block maps before the run; `identity` is not used, since the snapshot is of the platform's state."""
         self._started = self._now()
+        self._mark = self._provisioner.log_mark() if self._windowed else None
         entries, self._before = self._read_maps()
         self._before_ids = {label: entry.value.file_id for label, entry in entries.items() if entry.ok}
 
@@ -276,11 +283,20 @@ class PlatformProbes:
         name = self._provisioner.provider_named(provider_id)
         return None if name is None else self._client.provider_label(name)
 
-    def _transfer_records(self, deadline: float) -> list[dict[str, Any]]:
-        """The record of every transfer the provisioner scheduled, each read once the walk is within `deadline` (the
-        provisioner's clock); one past it is not read, a failed probe with the reason `deadline`."""
+    def _scheduled(self) -> tuple[list[tuple[str, str, str]], int]:
+        """The transfers the provisioner scheduled that bear on the run, and how many earlier ones its log shows ended
+        before the run's start, which are left out (`Provisioner.transfers_from`); every one when the caller named its
+        own list, or when the run's start was not read."""
+        if self._mark is None:
+            return list(self._transfers()), 0
+        window = self._provisioner.transfers_from(self._mark)
+        return window, len(self._provisioner.transfers()) - len(window)
+
+    def _transfer_records(self, scheduled: Iterable[tuple[str, str, str]], deadline: float) -> list[dict[str, Any]]:
+        """The record of each transfer in `scheduled`, each read once the walk is within `deadline` (the provisioner's
+        clock); one past it is not read, a failed probe with the reason `deadline`."""
         records = []
-        for provider, tid, kind in self._transfers():
+        for provider, tid, kind in scheduled:
             if self._provisioner.clock() > deadline:
                 found = ProbeResult(False, None, 0, error=DEADLINE)
             else:
@@ -356,9 +372,10 @@ class PlatformProbes:
                         total["from"][source] = total["from"].get(source, 0) + n
             files[label] = {"size": size, "entry": entries[label].to_json(), "providers": readings, "pairs": pairs}
         deadline = deadline_at(self._provisioner)  # one for the records and the listing (`transferlog.py`)
-        transfers = self._transfer_records(deadline)
+        scheduled, earlier = self._scheduled()
+        transfers = self._transfer_records(scheduled, deadline)
         file_ids = {entries[label].value.file_id: label for label in self._files if entries[label].ok}
-        harness = {tid for _, tid, _ in self._transfers()}
+        harness = {tid for _, tid, _ in scheduled}
         log = self._log.read(window, file_ids, harness, deadline=deadline)
         ok = complete and all(t["probe_ok"] for t in transfers) and log.section["probe_ok"]
         gained = {p: row["gained_bytes"] for p, row in pair_totals.items()}
@@ -370,6 +387,7 @@ class PlatformProbes:
             "seconds": None if self._started is None else round(self._now() - self._started, 3),
             "files": files,
             "transfers": transfers,
+            "transfers_before_window": earlier,  # the provisioner's earlier jobs its log shows ended: not read
             "space_transfers": log.section,
             "pairs": pair_totals if complete else None,
             "on_demand": (

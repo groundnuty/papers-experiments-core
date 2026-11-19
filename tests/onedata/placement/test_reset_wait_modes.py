@@ -9,6 +9,7 @@ OOM-killed a provider (`test_probe_walk_deadline.py` has the probes' deadline)."
 import dataclasses
 import json
 
+import httpx
 import pytest
 from qos_world import FILES, federation, two_providers
 from reset_golden_scenarios import GOLDEN, SCENARIOS, one_space, several_spaces, without_new
@@ -201,3 +202,34 @@ def test_o01_a_batch_that_fails_fails_the_reset_and_no_later_batch_is_sent(
     assert failed.value.stage == "eviction"
     assert len(live) == 3
     assert fake.held(FILES[5], BETA_ID) != []
+
+
+def test_o01_a_batch_whose_answer_was_lost_waits_for_no_job_listed_before_the_next(
+    client, config, platform_file, ticker, tmp_path, fake
+):
+    """O01, O09: with `evict_batch` 1, the provider takes the first eviction and its answer is lost, so there is no id
+    to wait on; the job runs on until the listing has shown it once more. The next batch is sent only once no job is
+    listed running, never beside it, and the lost eviction is not sent again."""
+    live, lost = [], []
+    schedule, page = fake._schedule, fake._transfer_page
+
+    def posted(request, via):
+        live.append(sum(1 for job in fake.transfers.values() if job.kind == "eviction" and not job.ended))
+        answer = schedule(request, via)
+        if len(live) == 1:
+            lost.append(answer.json()["transferId"])
+            raise httpx.ReadError("simulated", request=request)
+        return answer
+
+    def listing(query, provider, include):
+        shown = page(query, provider, include)
+        if lost and lost[0] in shown.json()["transfers"] and not fake.transfers[lost[0]].ended:
+            fake.end_transfer(lost[0])  # listed running this once: it ends before the next listing
+        return shown
+
+    fake._schedule, fake._transfer_page = posted, listing
+    reset = reset_in("fixed", client, config, platform_file, ticker, tmp_path, evict_batch=1, concurrency=1)
+    eviction = reset.run({"beta": FILES}, qos_rights=False)["stages"]["eviction"]
+    assert live == [0] * len(FILES)
+    assert eviction["providers"][client.provider_label("beta")]["unanswered"] == 1
+    assert eviction["waits"]["listed_running"]["count"] >= 1

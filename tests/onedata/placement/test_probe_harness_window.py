@@ -10,6 +10,7 @@ from collections.abc import Callable
 import pytest
 
 from expcore_onedata.probes import PlatformProbes
+from expcore_onedata.provision import Provisioner
 from expcore_onedata.testing import ALPHA_ID, BETA_ID, DATA, tool_plane_replicates
 from expcore_onedata.transferorder import STOP_MARGIN_S
 
@@ -18,6 +19,14 @@ OLDER = 64  # ended jobs of the space's history from before the reset, none of t
 WINDOW_JOBS = 20  # the agent's replications into beta in the run's window
 INSIDE_S = 10  # seconds a scripted job keeps from the window's edges, past the default 5 s allowance for clock skew
 BEFORE_S = 60  # seconds from the last job before the run to its start, past the allowance and the walk's margin
+
+
+@pytest.fixture(autouse=True)
+def ends_unnoted(monkeypatch):
+    """The harness's jobs here are logged with no end noted, as by a core before `Provisioner.note_ended` or a wait
+    that proved none: the probes then keep them in the harness set and read their records, which these tests are of
+    (`test_probe_walk_deadline.py` has a noted end leaving a job unread)."""
+    monkeypatch.setattr(Provisioner, "note_ended", lambda self, provider, transfer_ids: None)
 
 
 def tracked(seeded):

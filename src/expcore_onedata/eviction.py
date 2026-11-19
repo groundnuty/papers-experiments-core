@@ -292,9 +292,10 @@ def _evict_verified(
     bound. Return the transfers, their end states, the last attempt's counters, the polls, the attempts and, when there
     were any, how many evictions' answers were lost (`unanswered`); raise `EvictionIncomplete` when files still hold
     bytes then. With `batch`, an attempt schedules at most that many files at once: each batch's jobs must end before
-    the next batch is sent, after `BATCH_PAUSE_S`, and the record says how many batches the largest attempt took
-    (`batches`, only above one). A batch that fails to send or to end fails the eviction as the whole set did, before
-    any later batch is sent, and the block maps are read once every batch has ended, as before."""
+    the next batch is sent, after `BATCH_PAUSE_S` (a batch with an eviction whose answer was lost, which has no id to
+    wait on, waits for `quiet` too: no job listed running), and the record says how many batches the largest attempt
+    took (`batches`, only above one). A batch that fails to send or to end fails the eviction as the whole set did,
+    before any later batch is sent, and the block maps are read once every batch has ended, as before."""
     pending, transfers, polls, batches = list(files), 0, 0, 0
     states: dict[str, int] = {}
     lost: set[str] = set()  # files whose eviction went unanswered: never scheduled again
@@ -302,18 +303,23 @@ def _evict_verified(
     for attempt in range(1, EVICTION_ATTEMPTS + 1):
         sending = [file_id for file_id in pending if file_id not in lost]
         records: dict[str, dict[str, Any]] = {}
+        lost_here = False  # whether the last batch had an eviction whose answer was lost
         parts = _batches(sending, batch)
         batches = max(batches, len(parts))
         for index, part in enumerate(parts):
             if index:  # the last batch's jobs have all ended: a short pause, then the next
+                if lost_here and quiet is not None:  # a job whose answer was lost has no id: wait for no job listed
+                    quiet()
                 _sleep(provisioner, watch.waits, "batch_pause")(BATCH_PAUSE_S)
             tids, unread, count = schedule(part) if part else ([], [], 0)
+            lost_here = bool(unread)
             lost.update(unread)
             unanswered += count
             if watch.scheduled is not None:
                 watch.scheduled(tids)
             transfers += len(tids)
             done = _wait_ended(provisioner, provider, tids, watch.waits, watch.reads or provisioner.retry)
+            provisioner.note_ended(provider, list(done.records))  # their end shown: no later run's probes read them
             if watch.ended is not None:
                 watch.ended(tids)
             for state, count in done.states().items():

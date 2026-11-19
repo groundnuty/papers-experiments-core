@@ -61,7 +61,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1223,6 +1223,31 @@ class Provisioner:
         """Return `(provider, transfer id, kind)` of every transfer the log says this provisioner scheduled."""
         return [(x["provider"], x["id"], x["kind"]) for x in self._lines() if x.get("action") == "transfer"]
 
+    def note_ended(self, provider: str, transfer_ids: Sequence[str]) -> None:
+        """Log that these jobs of this provisioner's own reported an ended state on `provider`, their records read so
+        (a wait that required them ended): `transfers_from` then knows they cannot run into a later window. One line
+        for the lot; none for no id."""
+        if transfer_ids:
+            self._write("transfer_ended", provider=provider, ids=sorted(transfer_ids))
+
+    def log_mark(self) -> int:
+        """The change log's length in lines now: a run's window that begins here is told by it (`transfers_from`)."""
+        return len(self._lines())
+
+    def transfers_from(self, mark: int) -> list[tuple[str, str, str]]:
+        """The transfers a run whose window began at `mark` (`log_mark`) must account for, as `transfers` gives them:
+        every one scheduled since, and every one scheduled before that the log does not show ended before the mark
+        (`note_ended`), which may still be running into the window. A job shown ended before it cannot be in the window,
+        so the probes need not read it (`probes.py`): the change log is kept across runs, and its every earlier job read
+        again at each run's end cost about 40 minutes a run once it held thousands."""
+        lines = self._lines()
+        ended = {(x["provider"], tid) for x in lines[:mark] if x.get("action") == "transfer_ended" for tid in x["ids"]}
+        return [
+            (x["provider"], x["id"], x["kind"])
+            for index, x in enumerate(lines)
+            if x.get("action") == "transfer" and (index >= mark or (x["provider"], x["id"]) not in ended)
+        ]
+
     def replicate(self, path: str, to_provider: str) -> dict[str, Any]:
         """Replicate a whole file to a provider and return a record once its block map there covers the file (O01).
 
@@ -1272,6 +1297,7 @@ class Provisioner:
                 ),
                 "replication",
             )
+            self.note_ended(to_provider, list(done.records))
             for state, count in done.states().items():
                 states[state] = states.get(state, 0) + count
             if deadline is None:
@@ -1347,6 +1373,7 @@ class Provisioner:
                 ),
                 "eviction",
             )
+            self.note_ended(from_provider, list(done.records))
             if attempt == EVICTION_ATTEMPTS:  # the last: wait the whole settle bound, then refuse (NotPlaced)
                 confirmation = self.require_empty(from_provider, [entry.file_id])
                 break

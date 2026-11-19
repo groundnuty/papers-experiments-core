@@ -58,7 +58,11 @@ setting is what bounds that.
 
 **The harness's own jobs (O08).** A job the provisioner scheduled that the accepted listing does not show proves the
 listing incomplete, and what else it misses could be into any provider: every bound is unknown, `harness_unlisted`
-counts them. The provisioner's log holds the jobs it scheduled before the run too, a reset's evictions among them, and
+counts them. The probes hand over only the jobs that bear on the run (`Provisioner.transfers_from`): those scheduled
+since its start, and earlier ones the log does not show ended before it (`Provisioner.note_ended`, written when a wait
+of the provisioner's own saw them end, as a reset's eviction batches and a replication's do), since the log is kept
+across runs and an earlier job shown ended cannot be in the window. Those it hands over may include jobs from before
+the run, and
 the ended walk never keeps a job that ended before the cutoff, so for each harness job the listing lacks, its record is
 read on every tracked provider. The job is absent by design and flags nothing (`harness_before_window` counts them)
 when a record says it ended (a final state) with a finish time after 0 and before the cutoff and no readable record
@@ -332,6 +336,12 @@ class TransferLog:
         self._seen = set(_ids(previous, self._providers))
         changed: list[Job] = []
         for polls in range(2, settings.transfer_settle_polls + 1):
+            if self._provisioner.clock() + settings.transfer_settle_s > self._deadline:
+                raise WalkDeadline(  # the next observation could only begin past the deadline: none is waited for
+                    f"the transfer walk's next observation would begin past its deadline of "
+                    f"{settings.transfer_walk_deadline_s:g} s ([placement] transfer_walk_deadline_s): the listing is "
+                    "unknown"
+                )
             self._sleep(settings.transfer_settle_s)
             current = self._timed_observe()
             self._seen |= _ids(current, self._providers)
