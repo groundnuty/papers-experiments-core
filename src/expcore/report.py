@@ -998,16 +998,18 @@ def _deployments(export: Mapping[str, Any]) -> list[str]:
 
 
 def _deployment_switches(export: Mapping[str, Any]) -> list[str]:
-    """For each model whose analysed attempts named a deployment (`deployment_ids`): how many did and how many switched
-    (B20); nothing for an export whose attempts named none. An attempt switched when its turns show more than one
-    deployment, a turn without the id among turns with it counting as one more (a front that overflows to another
-    service). Visibility only: a switched attempt is analysed like any other."""
+    """For each model whose analysed attempts named a deployment (`deployment_ids`) or switched (`deployment_switched`):
+    how many named one and how many switched (B20); nothing for an export with neither. An attempt switched when its
+    turns show more than one deployment, by the ids the front named or by the replies' system fingerprints, a turn
+    without the id or the fingerprint among turns with it counting as one more (a front that overflows to another
+    service, an endpoint that routes each request to a deployment of its own). Visibility only: a switched attempt is
+    analysed like any other."""
     named: dict[str, int] = {}
     switched: dict[str, int] = {}
     for entry in export["analysed_attempts"]:
-        if "deployment_ids" in entry:
+        if "deployment_ids" in entry or entry.get("deployment_switched"):
             model = str(entry["factors"]["model"])
-            named[model] = named.get(model, 0) + 1
+            named[model] = named.get(model, 0) + ("deployment_ids" in entry)
             switched[model] = switched.get(model, 0) + bool(entry.get("deployment_switched"))
     if not named:
         return []
@@ -1016,8 +1018,9 @@ def _deployment_switches(export: Mapping[str, Any]) -> list[str]:
         for model in sorted(named)
     ]
     note = (
-        "An attempt switched deployment when its turns show more than one, a turn without the deployment header among "
-        "turns with it counting as one more. It is analysed like any other."
+        "An attempt switched deployment when its turns show more than one, by the deployment header or by the system "
+        "fingerprint of the replies, a turn without the header or the fingerprint among turns with it counting as one "
+        "more. It is analysed like any other."
     )
     return ["## Deployment switches", "", *lines, "", note, ""]
 

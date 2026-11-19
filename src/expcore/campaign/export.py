@@ -27,9 +27,10 @@ one; it is owner-only (0600), because an export can carry study data.
 
 Each analysed attempt whose turns named the deployment that served them (the model entry's `deployment_header`, B20) says
 which, in `deployment_ids`: the distinct ids, sorted, after `admission` and before `lease_id`, with `deployment_switched:
-true` after it when its turns show more than one deployment (a turn without the id among turns with it counts as one
-more; nothing is set aside for it); an attempt none of whose
-turns named one has no such key, so an export of a campaign without it is what it was. A merged batch's rows carry it
+true` after it when its turns show more than one deployment, by their ids or by the replies' system fingerprints (a turn
+without the id, or the fingerprint, among turns with it counts as one more; nothing is set aside for it); an attempt
+none of whose turns named one has no `deployment_ids`, and one that did not switch has no `deployment_switched`, so an
+export of a campaign without either is what it was. A merged batch's rows carry it
 as they carry the rest.
 
 Each analysed attempt also says when and how it began (`dispatch_seq`, `started_at`, `lease_wait_s`, `lease_outcome`), so
@@ -491,17 +492,19 @@ def _dispatch(attempt: Any) -> dict[str, Any]:
 
 def _deployment_ids(attempt: Any) -> dict[str, Any]:
     """The deployments the analysed attempt's turns named (`deployment_ids`, a sorted list; B20), for the analysis to
-    use the deployment as a sensitivity factor, and `deployment_switched` (true) when its turns show more than one. There
-    is no key for an attempt none of whose turns named one, for one that did not switch, and for a store or a snapshot
-    that has not the columns (they are added by the first write that needs them): never an empty list, a false or a
-    null."""
+    use the deployment as a sensitivity factor, and `deployment_switched` (true) when its turns' ids or system
+    fingerprints show more than one deployment. `deployment_ids` has no key for an attempt none of whose turns named
+    one (an attempt that switched on its fingerprints alone has only the flag), `deployment_switched` none for one that
+    did not switch, and neither for a store or a snapshot that has not the columns (they are added by the first write
+    that needs them): never an empty list, a false or a null."""
     # a sqlite3.Row's `in` tests its values, not its column names, so the names are asked for explicitly
     columns = attempt.keys()
     text = attempt["deployment_ids"] if "deployment_ids" in columns else None
-    if text is None:
-        return {}
     switched = "deployment_switched" in columns and attempt["deployment_switched"]
-    return {"deployment_ids": json.loads(text), **({"deployment_switched": True} if switched else {})}
+    return {
+        **({"deployment_ids": json.loads(text)} if text is not None else {}),
+        **({"deployment_switched": True} if switched else {}),
+    }
 
 
 def _admission(attempt: Any) -> str | None:

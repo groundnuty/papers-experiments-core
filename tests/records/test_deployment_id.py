@@ -113,6 +113,51 @@ def test_b20_a_record_says_its_turns_switched_deployment_when_they_show_more_tha
     assert replay_record(record).dumps() == text
 
 
+def run_of_fingerprints(*fingerprints, ids=None) -> RunRecord:
+    """A run with one turn per fingerprint (None: its reply carried none), each naming the matching entry of `ids`."""
+    script = []
+    for index, fingerprint in enumerate(fingerprints):
+        base = turn(call(f"call-{index}", "echo")) if index < len(fingerprints) - 1 else turn(text="done")
+        name = None if ids is None else ids[index]
+        script.append(dataclasses.replace(base, system_fingerprint=fingerprint, deployment_id=name))
+    return record_run(script, {"echo": lambda args: "echoed"})
+
+
+@pytest.mark.parametrize(
+    ("fingerprints", "ids", "switched"),
+    [
+        (("fp-a", "fp-a", "fp-b"), None, True),  # an endpoint that routes per request and sends no deployment header
+        (("fp-a", None, "fp-a"), None, True),  # a reply with none among replies with one counts as one more
+        ((None, None), None, False),  # an endpoint that reports no fingerprint at all
+        (("fp-a", "fp-a"), None, False),
+        (("fp-a", "fp-a"), ("dep-x", "dep-x"), False),  # a fleet attempt: one deployment, one fingerprint
+        (("fp-a | fp-b",), None, True),  # one reply spliced from two deployments carries two fingerprints
+    ],
+)
+def test_b20_a_record_says_its_turns_switched_when_their_fingerprints_show_more_than_one(fingerprints, ids, switched):
+    """B20: the deployment id is not the only evidence: replies under more than one system fingerprint (a reply with
+    none counting as one more only when other replies carry one) set the same `deployment_switched`, which is written
+    only when true, validates, and replays to the record's own bytes."""
+    record = run_of_fingerprints(*fingerprints, ids=ids)
+    text = record.dumps()
+    if switched:
+        assert record.totals["deployment_switched"] is True
+        assert list(record.totals)[-1] == "deployment_switched"
+    else:
+        assert "deployment_switched" not in record.totals  # absent, never false
+    assert validate(decode(text)) == V3
+    assert replay_record(record).dumps() == text
+
+
+def test_b20_a_record_written_before_the_fingerprint_rule_replays_to_its_own_bytes():
+    """B20: a record whose replies show two fingerprints and whose totals have no `deployment_switched` (written before
+    the fingerprint rule) is replayed with the flag served as recorded, never filled in: no divergence at the totals."""
+    record = run_of_fingerprints("fp-a", "fp-b")
+    assert record.totals["deployment_switched"] is True
+    older = dataclasses.replace(record, totals={k: v for k, v in record.totals.items() if k != "deployment_switched"})
+    assert replay_record(older).dumps() == older.dumps()
+
+
 def test_b20_deployment_switched_is_optional_in_version_three_and_unknown_to_version_two():
     assert "deployment_switched" in optional_in("totals", V3)
     assert "deployment_switched" not in fields_of("totals", V2)

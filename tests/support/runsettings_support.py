@@ -609,6 +609,7 @@ OUT = {
     **{f"principals.{plane}.username": USER for plane in ("data_path", "toolserver", "service")},
     **{f"principals.{plane}.user_id": PER_FEDERATION for plane in ("data_path", "toolserver", "service")},
     "toolserver.clone": PATH,
+    "toolserver.artifacts": PATH + " (a role of the command line's federation-neutral form, #451)",
     "sandbox.work_root": PATH,
     "sandbox.name_prefix": HOST,
     "sandbox.label_namespace": HOST,
