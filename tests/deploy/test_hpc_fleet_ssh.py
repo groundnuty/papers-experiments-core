@@ -506,7 +506,7 @@ def retired_after_a_kill(deploy, login, tmp_path, env) -> SimpleNamespace:
 def settled(after: SimpleNamespace, tmp_path: Path) -> dict:
     """The settle's result line, once the lease is settled: the ledger holds that charge, and no lease of the run is
     left unsettled for the merge by run to refuse."""
-    (done,) = [r for r in after.log.lines if r.get("action") == "Settle"]
+    done = [r for r in after.log.lines if r.get("action") == "Settle"][-1]
     assert done["ok"] is True, done
     assert after.ledger.lease(after.lease.lease_id).charge_micro == done["spend_micro"]
     snapshot = tmp_path / "ledger-snapshot.sqlite"
@@ -549,6 +549,24 @@ def test_c47_a_spend_appended_to_the_channels_journal_after_the_retirements_pull
     done = settled(after, tmp_path)
     assert done["source"] == "root"
     assert done["spend_micro"] == pulled_spend + 250_000
+
+
+def test_c47_a_failed_read_of_the_channel_leaves_the_lease_charged_and_never_settles_it_from_the_older_pulled_copy(
+    deploy, login, tmp_path, clean_environment
+):
+    """C47: the pulled copy was taken before the job's end was proven, so a settle from it after a call at the channel
+    failed or hung could miss a spend written since, and a settled charge is final: the lease stays charged its grant
+    and the next tick, the call answering, settles it from the channel's journal."""
+    after = retired_after_a_kill(deploy, login, tmp_path, clean_environment)
+    assert after.pulled_only() is not None  # the pulled copy is whole and readable
+    login.fake.rule("echo yes", "fail")
+    grant = after.ledger.lease(after.lease.lease_id).charge_micro
+    after.executor.in_ledger(after.lost)
+    assert after.ledger.lease(after.lease.lease_id).charge_micro == grant
+    assert [r["ok"] for r in after.log.lines if r.get("action") == "Settle"] == [False]
+    login.fake.clear()
+    after.executor.in_ledger(after.lost)
+    assert settled(after, tmp_path)["source"] == "root"
 
 
 @pytest.mark.parametrize(("call", "trouble"), [("tar -C", "fail"), ("echo yes", "fail"), ("echo yes", "garbage")])

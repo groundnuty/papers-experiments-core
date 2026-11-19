@@ -175,28 +175,31 @@ class SshSiteTransport:
             if stage is not None:
                 shutil.rmtree(stage, ignore_errors=True)
 
-    def _exists(self, site: Any, flag: str, path: str) -> bool:
+    def _printed(self, site: Any, argv: List[str]) -> str:
+        """What the plain command `argv` printed at the site (as `stream` runs it: no `cd`, no site.env, which these
+        reads need none of); a command that exits non-zero raises `Missing`, a failed call `Unreachable`."""
+        scratch = Path(tempfile.mkdtemp(prefix="expcore-list-"))  # 0700, ours
+        try:
+            self.stream(site, argv, scratch / "said", LIST_TIMEOUT_S)
+            return (scratch / "said").read_text(encoding="utf-8", errors="replace")
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def exists(self, site: Any, flag: str, path: str) -> bool:
         """Whether `path` is there (`test -d` or `-f` at the site). The answer is what the command prints, `yes` or
-        `no`, never a status: the command's `cd` and the sourcing of site.env fail with 1 as `test` does, and a call
-        that failed is no answer."""
+        `no`, never a status: a failed call, and any other answer, raises, and is no answer."""
         from expcore.campaign.elastic.transport import Unreachable
 
-        script = 'if test "$1" "$2"; then echo yes; else echo no; fi'
-        code, out, _ = self.run(site, ["sh", "-c", script, "sh", flag, path], LIST_TIMEOUT_S)
-        if code != 0 or out.strip() not in ("yes", "no"):
+        said = self._printed(site, ["sh", "-c", 'if test "$1" "$2"; then echo yes; else echo no; fi', "sh", flag, path])
+        if said.strip() not in ("yes", "no"):
             raise Unreachable("the site's answer is not whole")
-        return out.strip() == "yes"
+        return said.strip() == "yes"
 
-    def _names(self, site: Any, directory: str, pattern: "re.Pattern[str]") -> List[str]:
+    def names(self, site: Any, directory: str, pattern: "re.Pattern[str]") -> List[str]:
         """The names in `directory` at the site that `pattern` matches, sorted; none when it is not there."""
-        from expcore.campaign.elastic.transport import Unreachable
-
-        if not self._exists(site, "-d", directory):
+        if not self.exists(site, "-d", directory):
             return []
-        code, out, _ = self.run(site, ["ls", "-1", "--", directory], LIST_TIMEOUT_S)
-        if code != 0:
-            raise Unreachable("the site's listing is not whole")
-        return sorted(name for name in out.split("\n") if pattern.fullmatch(name))
+        return sorted(n for n in self._printed(site, ["ls", "-1", "--", directory]).split("\n") if pattern.fullmatch(n))
 
     def _pull_place(self, site: Any, there: str, place: Path, scratch: Path) -> None:
         """One lease's place into `place` (new): its newest snapshots and its journal, as `locate` reads them."""
@@ -205,7 +208,7 @@ class SshSiteTransport:
         from expcore.campaign.run_lease import LEASE_JOURNAL
 
         place.mkdir()
-        newest = sorted(self._names(site, f"{there}/{SNAPSHOTS}", SNAPSHOT_NAME), key=lambda n: int(n[5:]),
+        newest = sorted(self.names(site, f"{there}/{SNAPSHOTS}", SNAPSHOT_NAME), key=lambda n: int(n[5:]),
                         reverse=True)[:KEEP]  # fmt: skip
         for name in newest:
             tar = scratch / f"{name}.tar"
@@ -213,7 +216,7 @@ class SshSiteTransport:
             with tarfile.open(tar, "r:") as archive:
                 archive.extractall(place / SNAPSHOTS / name, filter="data")
             tar.unlink()
-        if self._exists(site, "-f", f"{there}/{LEASE_JOURNAL}"):
+        if self.exists(site, "-f", f"{there}/{LEASE_JOURNAL}"):
             self.stream(site, ["cat", "--", f"{there}/{LEASE_JOURNAL}"], place / LEASE_JOURNAL)
 
     def pull_places(self, site: Any, remote_dir: str, local_dir: Path) -> Tuple[int, str, str]:
@@ -229,7 +232,7 @@ class SshSiteTransport:
                 return 1, "", "this host's places are a link: it is never followed"
             if local_dir.exists():
                 return 0, "its places are already here", ""
-            names = self._names(site, remote_dir, PLACE_NAME)
+            names = self.names(site, remote_dir, PLACE_NAME)
             if not names:
                 return 0, "it has no places", ""
             stage = Path(tempfile.mkdtemp(prefix=f".{local_dir.name}.pull-", dir=str(local_dir.parent)))

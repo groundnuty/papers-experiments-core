@@ -25,7 +25,7 @@ process.
   ssh (`fleetssh.py`): its retirement is collect (into `<fleet>/collected/<member>` at the site), the pull of that copy
   to `<evidence>/<site>-<member>` here, the pull of the member's channel places (`<channel>/<label>/places/`, when the
   site has a channel: the newest snapshots and journal of each lease's place, into
-  `<evidence>/<site>-<member>/places/`, which the settle reads when its channel's place cannot be), `verify-copy` on
+  `<evidence>/<site>-<member>/places/`, which the settle reads when its channel's place is gone), `verify-copy` on
   this host over the pulled copy against collect's hash, and only then `down`; a place that cannot be pulled stops it
   before `down`, as an evidence pull does. One at a site is refused while the ledger holds a lease of its federation
   that is `reported` (its archive not yet pulled here).
@@ -261,6 +261,14 @@ class SiteTransport:
 
     def pull(self, site: SiteConfig, remote: str, local: Path, digest: str) -> Tuple[int, str, str]:
         return self.ssh.pull(site, remote, local, digest)
+
+    def exists(self, site: SiteConfig, flag: str, path: str) -> bool:
+        """Whether a path is there at an ssh site (`fleetssh.SshSiteTransport.exists`); a call that fails raises."""
+        return self.ssh.exists(site, flag, path)
+
+    def names(self, site: SiteConfig, directory: str, pattern: Any) -> List[str]:
+        """The names in a directory at an ssh site that `pattern` matches (`fleetssh.SshSiteTransport.names`)."""
+        return self.ssh.names(site, directory, pattern)
 
     def pull_places(self, site: SiteConfig, remote: str, local: Path) -> Tuple[int, str, str]:
         """An ssh site's member's channel places into a new directory here (`fleetssh.SshSiteTransport.pull_places`)."""
