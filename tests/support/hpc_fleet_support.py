@@ -182,13 +182,13 @@ class Bench:
         assert runner is None or runner is self.fake(label), f"{root} driven over another federation's cluster"
         return self.driver(label, layout, Path(root), agent, environ)
 
-    def federation(self, label: str, command: str, layout: Path, root: Path, log: Path) -> tuple[int, str]:
+    def federation(self, label: str, command: str, layout: Path, root: Path, log: Path, words=()) -> tuple[int, str]:
         """`hpcfed.py --layout L --root R <command>` through its own `main`, in this process, on the federation's own
         fake cluster: what the fleet's process of its own would run, with the environment it gives it
         (`fleet.member_environ`: an up's has the lock the fleet's ups share)."""
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(printed):
-            code = self.deploy.hpc.cli.main(["--layout", str(layout), "--root", str(root), command],
+            code = self.deploy.hpc.cli.main(["--layout", str(layout), "--root", str(root), command, *words],
                                             self.deploy.fleet.member_environ(self.environ, root, command),
                                             runner=self.fake(label))  # fmt: skip
         log.write_text(printed.getvalue(), encoding="utf-8")

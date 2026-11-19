@@ -7,7 +7,7 @@
     uv run python deploy/hpc-federation/fleet.py --fleet DIR step [--shard L] [--resume]
     uv run python deploy/hpc-federation/fleet.py --fleet DIR step-stop --shard L
     uv run python deploy/hpc-federation/fleet.py --fleet DIR status
-    uv run python deploy/hpc-federation/fleet.py --fleet DIR down [--member L]
+    uv run python deploy/hpc-federation/fleet.py --fleet DIR down [--member L [--node-checked TEXT]]
 
 Run on the login node with the site's values exported (`set -a; . site.env; set +a`), as `hpcfed.py up` is.
 
@@ -39,7 +39,9 @@ Run on the login node with the site's values exported (`set -a; . site.env; set 
 - status: what the record and each root's state file say, each federation's state in plain words (up and ready, up
   with no relay, failed and still HOLDING jobs by count, down); nothing is run. `plan` says the same states first.
 - down: every federation this fleet made, or one, taken down by `hpcfed.py down` and verified gone; a root or state
-  that is not the one this fleet's up made is refused and left untouched, and nothing else is ever looked for.
+  that is not the one this fleet's up made is refused and left untouched, and nothing else is ever looked for. With
+  `--member L`, `--node-checked TEXT` goes to its `hpcfed.py down`: what the operator checked on a node an earlier
+  down could not sweep (C54), without which that down keeps the root.
 """
 
 import argparse
@@ -98,9 +100,10 @@ def _say(line: str) -> None:
 
 
 # One federation's `hpcfed.py --layout L --root R <up|down>`: (label, command, layout, root, log) -> (its exit status,
-# what it printed). By default a process of its own (`hpcfed_process`): a federation's driver changes process-wide
-# state (the umask its secrets are written under), so two never share a process.
-Operate = Callable[[str, str, Path, Path, Path], Tuple[int, str]]
+# what it printed); a down's `--node-checked TEXT` comes as the keyword `words`. By default a process of its own
+# (`hpcfed_process`): a federation's driver changes process-wide state (the umask its secrets are written under), so
+# two never share a process.
+Operate = Callable[..., Tuple[int, str]]
 
 
 @dataclass
@@ -144,9 +147,11 @@ def hpcfed_process(environ: Mapping[str, str], run: Callable[..., Any] = subproc
     module of the launch directory is ever imported), from the fleet's own 0700 directory (never a shared one), in a
     process of its own with this environment (site.env's values), its output appended to the federation's log (0600)."""
 
-    def operate(label: str, command: str, layout: Path, root: Path, log: Path) -> Tuple[int, str]:
+    def operate(
+        label: str, command: str, layout: Path, root: Path, log: Path, words: Sequence[str] = ()
+    ) -> Tuple[int, str]:
         argv = [sys.executable, "-I", "-B", str(HERE / "hpcfed.py"), "--layout", str(layout), "--root", str(root),
-                command]  # fmt: skip
+                command, *words]  # fmt: skip
         descriptor = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
         try:
             done = run(argv, env=member_environ(environ, root, command), cwd=str(Path(root).parents[1]),
@@ -255,13 +260,14 @@ class Fleet:
     def say(self, line: str) -> None:
         self.hooks.say(line)
 
-    def operate(self, label: str, command: str, layout: Path) -> Tuple[int, str]:
+    def operate(self, label: str, command: str, layout: Path, words: Sequence[str] = ()) -> Tuple[int, str]:
         """One federation's `hpcfed.py up` or `down`, its output in `<fleet>/logs/<label>.<command>.log`."""
         logs = self.directory / "logs"
         logs.mkdir(mode=0o700, exist_ok=True)
         log = logs / f"{label}.{command}.log"
+        extra = {"words": tuple(words)} if words else {}  # a hook that takes none is never handed any
         try:
-            return self.hooks.federation(label, command, layout, root_of(self.directory, label), log)
+            return self.hooks.federation(label, command, layout, root_of(self.directory, label), log, **extra)
         except (OSError, subprocess.SubprocessError) as error:
             return 1, f"error: {command}: it could not be run ({type(error).__name__})"
 
@@ -519,7 +525,10 @@ class Fleet:
             print(f"{shard['label']}: {state}" + (" (moved: its first reset there is full)" if shard["moved"] else ""))
         return 0
 
-    def down(self, only: Optional[str]) -> int:
+    def down(self, only: Optional[str], node_checked: Optional[str] = None) -> int:
+        if node_checked is not None and only is None:
+            raise FleetError("--node-checked names what was checked on one member's node: give --member")
+        words = ("--node-checked", node_checked) if node_checked is not None else ()
         with self.record.lifecycle("down"):
             record = self.record.read()
             if only is not None:
@@ -528,7 +537,7 @@ class Fleet:
                        and m["status"] != "down"]  # fmt: skip
             parallel = setting(self.environ, PARALLEL_VAR, record.get("parallel") or 1)
             layout = Path(record["layout"]["path"])
-            results = pooled(targets, parallel, lambda label: self.down_one(label, layout))
+            results = pooled(targets, parallel, lambda label: self.down_one(label, layout, words))
         self.say(f"{sum(results.values())} of {len(targets)} federation(s) down")
         return 0 if all(results.values()) else 1
 
@@ -550,7 +559,7 @@ class Fleet:
             return 1, f"error: down: its root holds files no up of this fleet's marked ({type(error).__name__}): kept"
         return 0, "down: its up never marked the root; the empty root removed"
 
-    def down_one(self, label: str, layout: Path) -> bool:
+    def down_one(self, label: str, layout: Path, words: Sequence[str] = ()) -> bool:
         member = member_of(self.record.read(), label)
         if member["made"] is None:
             self.say(f"{label}: never made by this fleet ({member['status']}): nothing touched")
@@ -566,7 +575,7 @@ class Fleet:
         if self.never_marked(root):  # its up stopped before it marked the root: hpcfed's down would refuse it
             code, printed = self.remove_empty(root)
         else:
-            code, printed = self.operate(label, "down", layout)
+            code, printed = self.operate(label, "down", layout, words)
         ok = code == 0 and not root.exists()
         said = None if ok else last_error(printed) if code != 0 else "its root is still there"
 
@@ -593,6 +602,7 @@ def main(argv: Optional[Sequence[str]] = None, environ: Optional[Mapping[str, st
     parser.add_argument("--shard", help="one shard (step; step-stop needs it)")
     parser.add_argument("--resume", action="store_true", help="launch an ended shard's step again, resuming (step)")
     parser.add_argument("--member", help="one federation (down)")
+    parser.add_argument("--node-checked", help="with down --member: what was checked on a node a down left unswept")
     args = parser.parse_args(argv)
     environ = os.environ if environ is None else environ
     hooks = hooks or default_hooks(environ)
@@ -614,7 +624,9 @@ def main(argv: Optional[Sequence[str]] = None, environ: Optional[Mapping[str, st
             return fleet.step_stop(args.shard)
         if args.command == "status":
             return fleet.status()
-        return fleet.down(args.member)
+        if args.node_checked is not None and args.command != "down":
+            raise FleetError("--node-checked belongs to down")
+        return fleet.down(args.member, args.node_checked)
     except CoreMismatch as error:
         print(f"error: {args.command}: {error}", file=sys.stderr)
         return CORE_MISMATCH

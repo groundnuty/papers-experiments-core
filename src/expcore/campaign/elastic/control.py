@@ -272,7 +272,7 @@ def _unjoined(
     """A member the ledger does not hold: join it once ready, take it down when it cannot serve; 1 while it is on its
     way (an up in flight, or its data not yet verified) or joins now."""
     site = settings.label
-    if m.status == "down":
+    if m.status == "down" or m.unswept:  # C54: a down that could not sweep a node of it is the operator's to repeat
         return 0
     flying = prepare_key(site, m.label) in busy
     live = flying or m.prepare == "running"  # a prepare that may still be running: a retirement ends it first
@@ -342,7 +342,7 @@ def _joined(now: float, ledger: LedgerView, settings: SiteSettings, m: Member, f
             acts.append(ProveEnded(site, m.label, label, "cancelled", "its down was verified by the fleet"))
         return "gone"
     if fed.ended_at is not None or fed.drained_at is not None:
-        if held not in LIVE:
+        if held not in LIVE and not m.unswept:  # C54: a down that could not sweep a node of it is the operator's
             why = "drained" if fed.ended_at is None else f"its job is proven ended ({fed.end_proof})"
             acts.append(
                 Retire(

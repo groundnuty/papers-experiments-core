@@ -807,7 +807,10 @@ section 3).
 - **`down`** stops the fault relay first, then tears every service down (the providers, then the zone), waits for every step to leave, removes the
   recorded work directory of a service whose step it had to cancel (a cancel was an outright kill on the site, which
   left 2 to 2.6 GB per service), checks each node
-  for the recorded work directory, sweeps the agent's node and every node a shard was resumed on (`shards.py sweep`, a
+  for the recorded work directory, sweeps the agent's node (once any step of this federation still running in the
+  agent's own job, the worker's or a shard's, is sent TERM by its id, cancelled if it outlives it, and shown ended;
+  a node a down could not sweep holds the root until `down --node-checked`: C54, "A down that could not sweep a
+  node" below) and every node a shard was resumed on (`shards.py sweep`, a
   control step there by `HPC_CORE_PYTHON`: every shard step's
   directory of this federation on its tmpfs whose step is gone is removed, and one holding an `out/` that could not be
   archived is kept and named in what `down` prints; the sandbox's killed runs are reaped, a dead FUSE mount unmounted
@@ -1140,7 +1143,8 @@ processes with it, and leaves the run's directory and its `_runs` record under t
 its work root, and `down`'s sweep run the Apptainer run reaper over the work root: a run whose driver is shown gone has
 its token files removed, its processes ended, each mount in its directory unmounted (`fusermount3 -u`, then `-uz`)
 and shown gone by the mount table, then its directory and record removed. A dead run whose leftovers cannot all go
-refuses the step and fails the sweep (so `down` keeps the root for a second pass). The sweep then removes the work
+refuses the step and fails the sweep (so `down` keeps the root, and a later `down`, the node's job gone, needs `--node-checked`:
+"A down that could not sweep a node"). The sweep then removes the work
 root, by `rmdir` alone, once it is empty and no step directory is on the node.
 
 **A resume on another node (`resume-line`).** When the agent's node is lost, or a shard is better continued elsewhere,
@@ -1854,6 +1858,46 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   hand-off is one way: a member its campaign retired after a drain (an idle retirement is one) stays out of that
   campaign until its operator's `composesite.py undrain`, while another campaign may take it at once.
   None of these keys: the controller decides and logs exactly as before.
+
+### A down that could not sweep a node
+
+`down` sweeps the agent's node (and each node a shard was resumed on) while its job still runs. First it sends TERM,
+by its own id, to any step of this federation still running in the agent's own job (`<agent job name>-worker`, the
+elastic worker's, or `-shard-<n>`): the worker removes its own directory, its key files first. A step still running
+60 s later is cancelled by its id (on the site an outright kill, K1; the sweep removes what it leaves). Down waits until
+squeue and sacct show that id ended: such a step holds the whole job, and the sweep's step could not start behind it
+(live, 19 Nov). A sweep that still fails, or a step that does not end within the cancel's bound (300 s, beyond the
+site's KillWait), leaves the node unswept: the held jobs are cancelled all the
+same, the root and its state are kept, and the state records the node (`unswept`). The node's tmpfs may then still
+hold a step's or the worker's directory, the operator's key files (`home_files`) among them, and a `down` run again
+finds the job gone and has nothing to sweep in. So every later `down` keeps the storage and the root until the
+operator says what was checked on that node (`--node-checked "<what was checked>"`, recorded in the state and in
+down's output, which `<fleet>/logs/<member>.down.log` keeps), a sweep that later succeeds there clears the record,
+and the elastic controller never takes such a member down again by itself (it reads `unswept` and leaves the member
+`down-failed`, its root kept; the failed down's error is in its log). Until the operator's down it still counts
+against the site's `max_federations` (and `HPC_FLEET_MAX` in `fleet.py add`): it takes a slot, which is fail-closed
+and accepted. The operator, in this order:
+
+1. Find the node: `sandbox.node` in the root's state file (`<fleet>/fed-k/root/hpc-federation.json`).
+2. Sweep it in a short job of the study's own account on that node, from a private 0700 directory, with the core's
+   Python and the environment `down`'s own sweep step has: `srun --account=<account> --partition=<partition>
+   --nodelist=<node> -N1 -n1 -c1 --mem=1g --time=5 --export=PATH --chdir=/ /usr/bin/env -i PATH=<HPC_STEP_PATH>
+   LC_ALL=C TMPDIR=<HPC_NODE_TMP> <HPC_CORE_PYTHON> -I -B <deploy>/shards.py sweep --tmpfs <HPC_NODE_TMP> --root
+   <the member's root> --live-fails` (with `--network=<HPC_STEP_NETWORK>` and `HPC_NODE_DOMAIN=<domain>` where site.env sets
+   them). Exit 0 is the proof (`--live-fails`: a step of ours still alive there is exit 3, never clean). It removes
+   every directory of this federation's steps and its worker whose process is gone, the key files with them, and
+   names what it keeps. If it cannot run there (the node down, or held by another job for long), tell the coordinator
+   before going on: the keys may still be on that node.
+3. Then `fleet.py --fleet F down --member fed-k --node-checked "<what was checked: the sweep's job, its exit, what
+   it printed>"`, which removes the root and the storage; the controller proves the end on its next tick.
+
+This procedure has not run live.
+
+A member whose held job ended by itself (its walltime, a node failure) gets no sweep at all: `down` says "the held
+job had ended: its nodes could not be checked". At a time limit Slurm sends every step TERM first, so the worker's
+own cleanup normally removes its directory; after a node failure, or whenever in doubt, the operator runs a leftover
+check on that node, a short job there that lists what of ours is left on its tmpfs (`expcore-shard-*` directories, a
+worker's among them), as the end-to-end test's key check does, and sweeps it as in step 2 if anything is.
 
 ## The elastic fleet's worker (`fleetworker.py`, `fleetidentity.py`)
 
