@@ -826,7 +826,7 @@ def _egress_summary(egress: EgressAnalysis) -> list[str]:
     lines = [
         f"egress: {counts['flagged']} of {counts['analysed']} analysed run(s) flagged ({counts['outside']} outside, "
         f"{counts['log_unknown']} unknown log, {counts['static_scan']} static scan)"
-        + (f"; {counts['package_index']} package-index run(s), not flagged" if egress.package_indexes else "")
+        + (f"; {counts['package_index']} with a package-index hit (not a flag)" if egress.package_indexes else "")
     ]
     if egress.refused is not None:
         return [*lines, f"sensitivity: not computed ({egress.refused})"]

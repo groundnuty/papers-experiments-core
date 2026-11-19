@@ -26,12 +26,13 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from expcore.egress.declare import Declaration
-from expcore.egress.package_index import PACKAGE_INDEX, PIP_INSTALL, plain_installs
+from expcore.egress.package_index import PACKAGE_INDEX, PIP_INSTALL, names_setting, plain_installs
 
 SCAN_VERSION = 1
 MAX_HITS = 200  # per run; `hits_cut` says when more were found
 URL, DOWNLOAD, NETWORK_CALL = "url", "download", "network_call"
 _WEB = ("http://", "https://")  # the schemes a URL on a declared package index may have
+_TAIL = re.compile(r"[^\s'\"]*")  # what may follow a URL's match up to the next space or quote
 
 _SCHEMES = "https?|ftps?|wss?|git|ssh|sftp|rsync|s3|gs"
 _URL = re.compile(rf"\b(?:{_SCHEMES})://[^\s'\"<>`\\)\]}}]+", re.IGNORECASE)
@@ -75,12 +76,23 @@ def _host(url: str) -> str | None:
         return None
 
 
-def _hits_of(index: int, code: str, declared: Declaration, indexes: tuple[str, ...]) -> list[dict[str, Any]]:
+def _on_index(match: re.Match[str], code: str, host: str) -> bool:
+    """Whether a URL may be a declared index's: http(s), and its host, read again with what follows the match up to the
+    next space or quote, still the same (`https://pypi.org)@elsewhere/` is elsewhere's)."""
+    whole = match.group() + _TAIL.match(code, match.end()).group()
+    return match.group().lower().startswith(_WEB) and _host(whole) == host
+
+
+def _hits_of(
+    index: int, code: str, declared: Declaration, indexes: tuple[str, ...], installs: bool
+) -> list[dict[str, Any]]:
     """Every hit in one cell, in a fixed order: URLs by host, then downloads, then network modules. Under declared
-    package indexes, a URL on one of their hosts and a cell's plain `pip install` are `package_index` hits that do
-    not flag (`expcore.egress.package_index`)."""
+    package indexes, a URL on one of their hosts and, when `installs`, a cell's plain `pip install` are
+    `package_index` hits that do not flag (`expcore.egress.package_index`)."""
     hits = []
-    urls = [(_host(m.group()) or "?", m.group().lower().startswith(_WEB)) for m in _URL.finditer(code)]
+    matches = list(_URL.finditer(code))
+    hosts = [_host(m.group()) or "?" for m in matches]
+    urls = [(h, bool(indexes) and _on_index(m, code, h)) for m, h in zip(matches, hosts, strict=True)]
     for host in dict.fromkeys(host for host, _ in urls):
         if host in indexes and all(web for other, web in urls if other == host):  # http(s) only
             hits.append({"cell": index, "kind": PACKAGE_INDEX, "what": host, "flag": False})
@@ -89,7 +101,7 @@ def _hits_of(index: int, code: str, declared: Declaration, indexes: tuple[str, .
     for name, pattern in _DOWNLOADS.items():
         if not pattern.search(code):
             continue
-        if indexes and name == "pip install" and plain_installs(code):
+        if installs and name == "pip install" and plain_installs(code):
             hits.append({"cell": index, "kind": PACKAGE_INDEX, "what": name, "flag": False})
         else:
             hits.append({"cell": index, "kind": DOWNLOAD, "what": name, "flag": True})
@@ -102,7 +114,8 @@ def scan_cells(cells: Sequence[str], declared: Declaration, *, package_indexes: 
     """The scan of a run's code cells under its declaration: its hits, and whether any flags the run. Under declared
     package indexes it also says which, and how many `package_index` hits it found (the cut list may show fewer)."""
     indexes = tuple(package_indexes)
-    found = [hit for index, code in enumerate(cells) for hit in _hits_of(index, code, declared, indexes)]
+    installs = bool(indexes) and not any(names_setting(code) for code in cells)  # a setting holds across cells
+    found = [hit for index, code in enumerate(cells) for hit in _hits_of(index, code, declared, indexes, installs)]
     scanned = {
         "version": SCAN_VERSION,
         "cells": len(cells),

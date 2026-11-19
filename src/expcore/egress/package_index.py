@@ -20,9 +20,12 @@ Under a declared list the static scan (`expcore.egress.scan`) reclassifies two o
   few options that change no source (`-q`, `-U`, `--user`, `--no-cache-dir`, ...). Anything else keeps the flag: an
   index or find-links option of any spelling, a requirements or constraints file, `-e`, a path, a URL, a VCS
   requirement, a shell or format substitution, an argument list that is not all literals, a command string or list
-  added to or formatted at run time, an install that names no requirement where it is written. A cell that names an
-  index setting anywhere (an index or find-links option's name, any `PIP_` or `UV_` environment setting, `pip config`,
-  a `pip.conf`) also keeps the flag. The rule reads text, as the scan does: what it cannot see, it does not clear.
+  added to, formatted or joined to another literal at run time, a command substitution, an archive file named as a
+  requirement, an install that names no requirement where it is written. A run with a cell that names an index
+  setting anywhere (an index or find-links option's name, any `PIP_` or `UV_` environment setting, `pip config`, a
+  `pip.conf`) has no install cleared, in any cell. A URL is a `package_index` hit only when its host, read again up to
+  the next space or quote, is still the declared one. The rule reads text, as the scan does: what it cannot see, it
+  does not clear.
 
 `curl`, `wget`, `git clone`, `conda`, every other URL, every network call and every outside connection in the egress
 log flag exactly as before: the log holds addresses, never names, so it cannot be allow-listed by host.
@@ -58,6 +61,7 @@ _OPTION_VALUE = re.compile(r"(--progress-bar|--upgrade-strategy|--root-user-acti
 _V = r"(?:===|==|!=|<=|>=|~=|<|>)[A-Za-z0-9.*+!_-]+"
 _REQUIREMENT = re.compile(rf"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?(?:\[[A-Za-z0-9._,-]*\])?(?:{_V}(?:,{_V})*)?")
 _SPECIFIER = re.compile(rf"(?:===|==|!=|<=|>=|~=|<|>)|{_V}(?:,{_V})*")
+_ARCHIVE = re.compile(r"\.(?:whl|zip|egg|tgz|tbz2?|txz|tar(?:\.(?:gz|bz2|xz|lz|lzma|zst))?)$", re.IGNORECASE)  # a file
 _LITERALS = re.compile(r"(?:\s*,\s*(?:'[^'\\\n]*'|\"[^\"\\\n]*\"))*\s*,?\s*")
 _OPENERS, _CLOSERS = "([{", ")]}"
 
@@ -155,8 +159,10 @@ def _plain_install(text: str, match: re.Match[str]) -> bool:
         start += 1  # past the quote that closes "install"
     quote = None if listed else _quote_open(line)
     span, end = _arguments(text, start, _depth(text[: match.start()]) > 0, quote)
-    if (listed or quote) and text[end + 1 :].lstrip()[:1] in ("+", "%", "."):
-        return False  # the list or the string is added to, or formatted, at run time
+    if text[end : end + 1] == "`":
+        return False  # a command substitution among the arguments
+    if (listed or quote) and text[end + 1 :].lstrip()[:1] in ("+", "%", ".", "'", '"'):
+        return False  # the list or the string is added to, formatted or joined to the next literal
     if listed:
         if not _LITERALS.fullmatch(span):
             return False  # an element that is not a literal
@@ -165,14 +171,21 @@ def _plain_install(text: str, match: re.Match[str]) -> bool:
         tokens = [t.strip("'\"") for t in span.replace("\\\n", " ").split()]
     # an install that names no requirement here is one whose arguments come from elsewhere
     return any(_REQUIREMENT.fullmatch(token) for token in tokens) and all(
-        token and _plain_token(token) for token in tokens
+        token and _plain_token(token) and not _ARCHIVE.search(token) for token in tokens
     )
+
+
+def names_setting(code: str) -> bool:
+    """Whether a cell names an index setting anywhere (an index or find-links option's name, a `PIP_` or `UV_`
+    environment setting, `pip config`, a `pip.conf`): then no install of the run is cleared, since a setting made in
+    one cell holds in the next."""
+    return bool(_CELL_SOURCE.search(code) or _SETTING.search(code))
 
 
 def plain_installs(code: str) -> bool:
     """Whether every `pip install` in a cell is one from the default index (the module's text); False for a cell
-    without one, and for a cell that names an index setting anywhere."""
-    if _CELL_SOURCE.search(code) or _SETTING.search(code):
+    without one, and for a cell that names an index setting anywhere (`names_setting`)."""
+    if names_setting(code):
         return False
     text = _REDIRECT.sub(" ", code)
     found = list(PIP_INSTALL.finditer(text))

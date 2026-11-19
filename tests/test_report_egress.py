@@ -353,7 +353,7 @@ def test_o95_under_declared_package_indexes_the_report_summary_and_analysis_json
     report = render(result, egress=egress)
     assert "3 of 4 analysed run(s) flagged" in report
     assert "1 analysed run(s) installed from or named the declared package indexes (pypi.org)" in report
-    assert "egress: 3 of 4 analysed run(s) flagged (1 outside, 1 unknown log, 1 static scan); 1 package-index run(s)" \
+    assert "egress: 3 of 4 analysed run(s) flagged (1 outside, 1 unknown log, 1 static scan); 1 with a package-index" \
         in "\n".join(summary_lines(result, egress))  # fmt: skip
     summary = _egress_summary(egress)
     assert (summary["counts"]["package_index"], summary["package_indexes"]) == (1, ["pypi.org"])

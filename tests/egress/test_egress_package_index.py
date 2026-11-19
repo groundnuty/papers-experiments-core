@@ -64,6 +64,10 @@ def test_a_plain_install_from_the_default_index_is_a_package_index_hit_that_does
         "os.system('pip install ' + name)",
         "os.system('pip install %s' % name)",
         "cmd = 'pip install'\nos.system(cmd + ' ' + name)",
+        "!pip install demo-1.0-py3-none-any.whl",
+        "os.system('pip install demo' ' -r requirements.txt')",
+        "os.system('pip install demo'\n          ' -r requirements.txt')",
+        "!pip install demo `printf %s ./wheels/demo`",
         "subprocess.run(\n    ['pip', 'install',\n     'pandas', '-i', 'https://pypi.org/simple'])",  # over lines
         "!PIP_INDEX_URL=https://mirror.example.net/simple pip install pandas",
         "os.environ['PIP_EXTRA_INDEX_URL'] = u\n!pip install pandas",
@@ -93,6 +97,15 @@ def test_a_url_on_a_declared_index_host_is_a_package_index_hit_and_one_elsewhere
         ("url", "example.org", True),
     ]
     assert hits("u = 'ssh://pypi.org/x'") == [("url", "pypi.org", True)]
+    assert hits("u = 'https://pypi.org)@mirror.example.net/pkg'") == [("url", "pypi.org", True)]  # elsewhere's
+
+
+def test_an_index_setting_in_one_cell_keeps_every_install_of_the_run_flagged():
+    """O95: a setting made in one cell holds in the next."""
+    cells = ["os.environ['PIP_FIND_LINKS'] = '/mnt/wheels'", "%pip install demo"]
+    found = scan_cells(cells, DECLARED, package_indexes=INDEXES)
+    assert ("download", "pip install", True) in [(h["kind"], h["what"], h["flag"]) for h in found["hits"]]
+    assert found["flagged"]
 
 
 @pytest.mark.parametrize(
