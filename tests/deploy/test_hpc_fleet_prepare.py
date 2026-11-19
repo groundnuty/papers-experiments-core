@@ -379,6 +379,52 @@ def test_c49_a_call_that_never_reaches_the_sites_record_is_asked_three_times_the
     assert retire.reason == "never joined: its prepare could not be started"
 
 
+def test_c49_a_member_whose_jobs_break_while_its_prepare_runs_has_the_commands_group_killed_and_is_retired(
+    deploy, tmp_path, site
+):
+    """C49: a real executor with a prepare in flight (about 15 min for a real ingest): the member's jobs end meanwhile,
+    the next decision (taken with the executor's busy keys, as a tick takes them) retires the member at once, the
+    retirement begins by ending the prepare, the command's whole process group is gone, the prepare's end is the
+    abort's, and the member is taken down and never joined."""
+    member(site)
+    grandchild = tmp_path / "grandchild.pid"
+    command = (sys.executable, "-c", HANG, str(grandchild), "hang")
+    settings = SiteSettings("site-a", 1, 1e12, 47.0, prepare_timeout_s=60.0)
+    found = deploy.fleetexecute.SiteConfig(settings, site.fleet, prepare=command)
+    bench = Bench(tmp_path, deploy, site)
+    ledger = Ledger.open(bench.ledger, clock=bench.clock)
+    log = deploy.fleetexecute.Log(None)
+    executor = deploy.fleetexecute.Executor(ledger, bench.ledger, {"site-a": found}, site.transport(),
+                                            tmp_path / "evidence", log)  # fmt: skip
+    try:
+        executor.start(Prepare("site-a", "fed-1", "test"))
+        deadline = time.monotonic() + 15
+        while not grandchild.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        worker = int(grandchild.read_text())
+        assert alive(worker)
+        assert prepare_key("site-a", "fed-1") in executor.busy()
+        site.jobs["41"].state = site.jobs["42"].state = "NODE_FAIL"  # both held jobs end: the member is over
+        view = deploy.fleetcontrol.observe_site(site.transport(), found, None)
+        views = read_only(bench.ledger)
+        try:
+            decision = decide(site.now, ledger_view(views), [(settings, view)], executor.busy())
+        finally:
+            views.close()
+        (retire,) = [a for a in decision.actions if a.__class__ is Retire]
+        assert retire.abort_prepare is True
+        executor.run(decision)
+        executor.wait()
+    finally:
+        executor.pool.shutdown(wait=True)
+        ledger.close()
+    assert [v for v in verbs(site) if v != "add"] == ["prepare", "abort", "down"]
+    assert not alive(worker)
+    end = json.loads(prepare_files(site)[0].read_text(encoding="utf-8"))
+    assert end["outcome"] == "aborted"
+    assert bench.joined() == set()
+
+
 # ------------------------------------------------------------------------------------------------ the decision
 def test_c49_a_prepare_in_flight_counts_as_on_its_way_and_takes_a_verify_runs_share_of_the_login_memory(
     deploy, tmp_path, site
