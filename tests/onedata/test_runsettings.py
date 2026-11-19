@@ -286,6 +286,92 @@ def test_c06_a_command_line_is_held_with_its_federations_values_by_role_and_its_
     assert apart[0].fingerprint()["toolserver"] != apart[1].fingerprint()["toolserver"]
 
 
+# The tool server's interpreter and config in the study's own directory, which the platform declares (#451): a path
+# each site has its own of, outside the federation's root.
+ARTIFACTS_EDITS = [
+    platform('command = "@root@/venv/bin/server"', 'command = "@artifacts@/toolserver/venv/bin/server"'),
+    platform('"--config", "@root@/server.toml"', '"--config", "@artifacts@/toolserver/server.toml"'),
+    platform('clone = "@root@/clone"', 'clone = "@root@/clone"\nartifacts = "@artifacts@"'),
+]
+SITES = ("site-a/artifacts", "cluster-b/studies/s/artifacts-v1")  # two lengths: a size can never match by chance
+
+
+def _at_site(tmp_path, cas, index: int, edits=ARTIFACTS_EDITS):
+    values = {**FEDERATIONS[index], "artifacts": str(tmp_path / SITES[index])}
+    return load(edited(DOCKER, edits), tmp_path / f"fed-{index}" / "root", cas[0], values)
+
+
+def test_o94_one_template_with_its_artifacts_at_two_sites_paths_gives_one_fingerprint(tmp_path, cas):
+    """O94 (#451): the tool server's command and its files lie in the study's own directory, whose path is each
+    site's own (`@study_artifacts@`). Declared as `[toolserver] artifacts`, it is a role of the command line, so two
+    sites' renders give one fingerprint; undeclared, its path is in the command's hash and the two sites' shards never
+    join one campaign."""
+    one, two = (_at_site(tmp_path, cas, index) for index in range(2))
+    assert one.fingerprint() == two.fingerprint()
+    words = runsettings.neutral_words([one.toolserver.command], runsettings.federation_roles(one))
+    assert words == ["<artifacts>/toolserver/venv/bin/server"]
+    undeclared = [edit for edit in ARTIFACTS_EDITS if "artifacts =" not in edit[2]]
+    apart = [_at_site(tmp_path, cas, index, undeclared).fingerprint()["toolserver"] for index in range(2)]
+    assert apart[0] != apart[1]
+
+
+def test_o94_a_command_that_differs_inside_the_declared_artifacts_directory_is_refused(tmp_path, cas):
+    """O94: only the directory's path is a role: another interpreter inside it is another command line, so a shard
+    under it is refused (the fingerprints differ)."""
+    one = _at_site(tmp_path, cas, 0).fingerprint()
+    other = [platform('"@artifacts@/toolserver/venv/bin/server"', '"@artifacts@/toolserver/venv2/bin/server"')]
+    two = _at_site(tmp_path, cas, 1, [*ARTIFACTS_EDITS, *other]).fingerprint()
+    assert not compare_fingerprints({"platform": one}, {"platform": two}).same
+
+
+def test_o94_a_command_inside_the_clone_is_one_line_when_a_site_reaches_its_artifacts_through_a_link(tmp_path, cas):
+    """O94 (Codex round 1): the clone's role is its resolved path, the artifacts directory's its path as written. With
+    the command inside the clone and one site's directory declared through a parent that is a link, the resolved
+    clone matches the command at one site only, so the clone is a role by its written path too: one line at both."""
+    inside = [
+        platform('command = "@root@/venv/bin/server"', 'command = "@artifacts@/clone/venv/bin/server"'),
+        platform('clone = "@root@/clone"', 'clone = "@artifacts@/clone"\nartifacts = "@artifacts@"'),
+    ]
+    (tmp_path / "real").mkdir()
+    (tmp_path / "linked").symlink_to(tmp_path / "real")
+    configs = []
+    for index, artifacts in enumerate((tmp_path / "site-a" / "artifacts", tmp_path / "linked" / "studies" / "art")):
+        values = {**FEDERATIONS[index], "artifacts": str(artifacts)}
+        configs.append(load(edited(DOCKER, inside), tmp_path / f"fed-{index}" / "root", cas[0], values))
+    assert str(configs[1].toolserver.clone) != f"{tmp_path}/linked/studies/art/clone"  # resolved through the link
+    assert configs[0].fingerprint() == configs[1].fingerprint()
+
+
+@pytest.mark.parametrize(("command", "same"), [("@clone@/bin/server", True), ("@artifacts@/tools/bin/server", False)])
+def test_o94_a_command_from_the_clone_and_one_beside_it_stay_apart_whatever_each_sites_layout(
+    tmp_path, cas, command, same
+):
+    """O94 (Codex round 2): one site keeps its clone in the artifacts directory, another elsewhere. A command run from
+    each site's pinned clone is one line; a command at the first site's clone path relative to the directory, which at
+    the second is no clone, is another, so a shard under it is refused."""
+    layout = [
+        platform('command = "@root@/venv/bin/server"', 'command = "@command@"'),
+        platform('clone = "@root@/clone"', 'clone = "@clone@"\nartifacts = "@artifacts@"'),
+    ]
+    first = {"artifacts": str(tmp_path / "a" / "study"), "clone": str(tmp_path / "a" / "study" / "tools")}
+    second = {"artifacts": str(tmp_path / "b" / "data"), "clone": str(tmp_path / "b" / "opt" / "tools")}
+    sites = [
+        {**FEDERATIONS[0], **first, "command": f"{first['clone']}/bin/server"},
+        {**FEDERATIONS[1], **second, "command": command.replace("@clone@", second["clone"]).replace(
+            "@artifacts@", second["artifacts"])},
+    ]  # fmt: skip
+    one, two = (load(edited(DOCKER, layout), tmp_path / f"fed-{i}" / "root", cas[0], v) for i, v in enumerate(sites))
+    assert (one.fingerprint() == two.fingerprint()) is same
+
+
+@pytest.mark.parametrize("value", ["relative/artifacts", "/", "//"])
+def test_o94_an_artifacts_directory_that_is_not_absolute_or_is_the_root_is_refused(tmp_path, cas, value):
+    """O94: the declared directory is an absolute path other than the root, as the command that lies in it is."""
+    declared = [platform('clone = "@root@/clone"', f'clone = "@root@/clone"\nartifacts = "{value}"')]
+    with pytest.raises(ConfigError, match="'artifacts' must be an absolute path other than the root"):
+        load(edited(DOCKER, declared), tmp_path / "root", cas[0])
+
+
 @pytest.mark.parametrize(
     ("ours", "theirs"),
     [

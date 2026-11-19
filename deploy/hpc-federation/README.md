@@ -744,7 +744,7 @@ section 3).
   platform template writes none. `shards.py step` compares it with the record a plan expects (below).
 - **The study's artifacts tree** (O74, `hpcidentity.tree_sha256`): with `HPC_STUDY_ARTIFACTS` set, `up` reads the
   directory's tree once, in its preflight on the login node before anything is made or submitted, and the record holds
-  its SHA-256 as `study_artifacts_tree_sha256`. The digest is of one canonical listing: `expcore-artifacts-tree/1` and a
+  its SHA-256 as `study_artifacts_tree_sha256`. The digest is of one canonical listing: `expcore-artifacts-tree/2` and a
   NUL, then one record per entry, sorted by the entry's relative path as bytes (the whole path, so `a-b` comes before
   `a/b`) and none for the directory itself: `F NUL path NUL size NUL sha256 NUL` for a regular file, `D NUL path NUL`
   for a directory, `L NUL path NUL target NUL` for a symbolic link (paths are raw bytes, `/`-separated). The venv is in
@@ -766,8 +766,13 @@ section 3).
   is a file or is itself a link. Every refusal fails `up` before the root is made, naming `HPC_STUDY_ARTIFACTS` and a
   path relative to the directory (escaped), never an absolute one. The tree is opened below one held descriptor with
   no link followed and is never written, so a read-only tree reads as any other, and a file that changes while it is
-  read is refused. A file is hashed as it is: a venv whose scripts name the venv's own absolute path (a shebang, a
-  `pyvenv.cfg`) digests differently at another path, so build the tree where it will stay. The digest goes through the
+  read is refused. **One recipe built at two sites' paths is one digest (O94):** a file's bytes and a link's target are
+  hashed with the directory's real path and its `HPC_STUDY_ARTIFACTS` spelling replaced by `@study_artifacts@` (the
+  size is that of what is hashed), so a venv's scripts, its `pyvenv.cfg`, an editable install's `.pth` and the
+  interpreter's `_sysconfigdata` are the same at every path; and the install's bookkeeping is left out of the listing
+  (`RECORD`, `direct_url.json` and `uv_cache.json` in a `*.dist-info`, and all below a `.git` directory but its `HEAD`,
+  which names the clone's commit). Every other byte is hashed as it is, so the code, the dependencies and the
+  interpreter stay pinned byte for byte, and a link left out is still checked. The digest goes through the
   state file (`study_artifacts_tree_sha256`, beside the site's `study_artifacts`) to the core's phase, so `[hpc] core =
   "step"` has it though a node's environment is an allowlist, and the core never reads the tree again. A layout with no
   platform template writes no record and reads no tree; each federation of a fleet reads the tree itself.

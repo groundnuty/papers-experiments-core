@@ -64,6 +64,8 @@ args = []                       # a path among them is absolute too: the server 
 start_timeout_s = 120
 clone = "path"                  # optional, with commit: the checkout the server runs from, verified clean
 commit = "..."
+artifacts = "/absolute/path"    # optional: the study's own directory the command and its files lie in, a path that is
+                                #   each site's own (`@study_artifacts@`): the fingerprint holds it by its role
 
 [toolserver.conditions.<name>]
 allow = ["tool", ...]           # the server-side allow-list of this condition
@@ -216,6 +218,8 @@ class ToolServer:
     clone: Path | None
     commit: str | None
     conditions: Mapping[str, Condition] = field(default_factory=dict)
+    artifacts: str | None = None  # the study's own directory, as written: a role of the fingerprint, never in it
+    clone_written: str | None = None  # the clone's path as written (`clone` is resolved): its role beside `artifacts`
 
 
 @dataclass(frozen=True)
@@ -327,7 +331,8 @@ class PlatformConfig:
         the agent's user and interpreter, the kill's grace and the placeholder token by its SHA-256, the gate's upstream
         read timeout only when it is not the default (`gate`: O85), and, when it is a provider other than the local one,
         the provider the content check reads through, by its `providers[i]` position: O87). With a
-        `[toolserver]`, its pinned commit, its command line (federation-neutral, hashed), its start's bound and each
+        `[toolserver]`, its pinned commit, its command line (federation- and site-neutral, hashed: the directory its
+        `artifacts` declares is a role, #451), its start's bound and each
         condition's allow-list, rights and manifest's SHA-256 (`toolserver`); with a `[placement]`, its data provider by
         label, its range map by digest and the bounds a run's instruments read (`placement`); with `[faults]`, the
         fault injector's sanction, targets and every bound of its waits and its heal (`faults`,
@@ -584,10 +589,15 @@ def _toolserver(section: Section, base: Path, *, require_manifests: bool = True)
     """Read [toolserver] and its conditions, each with a manifest that is a file unless `require_manifests` is off."""
     if "insecure_tls" in section.data:
         raise moved(section, "insecure_tls")
-    section.reject_unknown(("command", "args", "start_timeout_s", "clone", "commit", "conditions"))
+    section.reject_unknown(("command", "args", "start_timeout_s", "clone", "commit", "conditions", "artifacts"))
     clone, commit = section.optional_string("clone"), section.optional_string("commit")
     if (clone is None) != (commit is None):
         raise section.fail("commit" if commit is None else "clone", "is needed beside the other: both or neither")
+    artifacts = section.optional_string("artifacts")
+    if artifacts is not None:
+        artifacts = artifacts.rstrip("/")  # as the command writes the directory: `<artifacts>/venv/...`
+        if not artifacts.startswith("/"):
+            raise section.fail("artifacts", "must be an absolute path other than the root")
     conditions = section.section("conditions")
     if not conditions.data:
         raise conditions.fail(None, "must declare at least one condition")
@@ -616,6 +626,8 @@ def _toolserver(section: Section, base: Path, *, require_manifests: bool = True)
                 for index, n in enumerate(conditions.data)
             }
         ),
+        artifacts,
+        str(base / clone) if clone else None,
     )
 
 
