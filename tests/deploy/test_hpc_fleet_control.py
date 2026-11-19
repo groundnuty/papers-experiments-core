@@ -405,7 +405,8 @@ def test_c43_with_every_model_at_its_cap_idle_federations_are_drained_then_taken
 def test_c43_todays_fleet_commands_are_unchanged_and_the_controllers_calls_are_theirs(deploy, tmp_path, monkeypatch):
     """C43: fleet.py keeps exactly today's commands; the controller's add and down are those commands' own argv
     (`--fleet F add K`, `--fleet F down --member fed-k`), parsed by fleet.py's own parser, and its collect and
-    verify-copy are shards.py's."""
+    verify-copy are shards.py's. C54: the controller's down never carries `--node-checked`, which is the operator's
+    word alone."""
     assert deploy.fleet.COMMANDS == ("up", "add", "plan", "step", "step-stop", "status", "down")
     settings = SiteSettings("site-a", 7, 1e12, 47.0)
     config_ = deploy.fleetexecute.SiteConfig(settings, tmp_path / "fleet")
@@ -415,14 +416,17 @@ def test_c43_todays_fleet_commands_are_unchanged_and_the_controllers_calls_are_t
     assert add[3].endswith("fleet.py")
     assert list(add[4:]) == ["--fleet", str(tmp_path / "fleet"), "add", "2"]
     assert list(retire[-1][4:]) == ["--fleet", str(tmp_path / "fleet"), "down", "--member", "fed-3"]
+    assert not any("--node-checked" in step for step in retire)
     assert [step[4] for step in retire[:2]] == ["collect", "verify-copy"]
     seen = []
     monkeypatch.setattr(deploy.fleet.Fleet, "add", lambda self, count: seen.append(("add", count)) or 0)
-    monkeypatch.setattr(deploy.fleet.Fleet, "down", lambda self, only: seen.append(("down", only)) or 0)
+    monkeypatch.setattr(
+        deploy.fleet.Fleet, "down", lambda self, only, checked=None: seen.append(("down", only, checked)) or 0
+    )
     hooks = SimpleNamespace()
     for argv in (add[4:], retire[-1][4:]):
         assert deploy.fleet.main(list(argv), {}, hooks) == 0
-    assert seen == [("add", 2), ("down", "fed-3")]
+    assert seen == [("add", 2), ("down", "fed-3", None)]
 
 
 # ------------------------------------------------------------------------------------------------ the additions
