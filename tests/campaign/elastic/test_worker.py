@@ -9,31 +9,25 @@ import sys
 import tarfile
 import time
 from pathlib import Path
-from typing import Any, NamedTuple
 
 import pytest
 from channel_support import FakeHandle, FakeRunner, FakeSsh, channel_of, outcome_of, site_of, transport
 from elastic_support import SITE, assert_invariants, join, make, plan
 from fake_ssh_bin import install_fake_ssh
 from hpc_fleet_support import fleet_modules
+from leased_support import LABEL, InProcess, leased_example, ran_for_real
 from merge_by_run_support import make_running
-from study_support import Campaign, clean_environment, cli, make_copy
+from study_support import Campaign, clean_environment
 
 from expcore.campaign import out_snapshot
-from expcore.campaign.elastic import Ledger, LedgerConfig, ledger_runs
 from expcore.campaign.elastic import channel as ch
 from expcore.campaign.elastic.control import Settle, SiteSettings
 from expcore.campaign.elastic.dispatch import TICK_S, Dispatcher
 from expcore.campaign.elastic.records import Lease
 from expcore.campaign.elastic.worker import Occupied, ProcessRunner, Worker, WorkerError, main
-from expcore.campaign.manifest import fingerprint_sha256
 from expcore.campaign.run_lease import LEASE_JOURNAL, read_lease
-from expcore.study.config import load_study
-from expcore.study.pipeline import campaign_fingerprint
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
-
-LABEL = "fed-1"
 
 
 def a_lease(lease_id: int, run_key: str = "task=task-0|model=m1|condition=api-none") -> Lease:
@@ -226,74 +220,6 @@ def test_c44_the_lease_file_the_channel_writes_is_the_one_the_kernel_reads(tmp_p
     assert read.expiry.timestamp() == int(lease.hard_term_at)
 
 
-class InProcess:
-    """`expcore run <study> --lease <file>` in this process (the suite's pinned core identity), as the worker's run."""
-
-    def __init__(self, env):
-        self.env = env
-        self.codes: list[tuple[int, str]] = []
-
-    def start(self, study: Path, lease_file: Path, log: Path, journal: Path):
-        outer = self
-
-        class Done:
-            def wait(self, timeout: float) -> int:
-                code, errors = cli(
-                    outer.env, "run", str(study), "--lease", str(lease_file), "--spend-journal", str(journal)
-                )
-                outer.codes.append((code, errors))
-                return code
-
-        return Done()
-
-
-class Leased(NamedTuple):
-    """A real lease of the example study, issued to `LABEL` and delivered over the fake ssh."""
-
-    study: Path
-    loaded: Any
-    ledger: Ledger
-    site: Any
-    dispatch: Dispatcher
-    lease: Lease
-    now: list[float]
-
-
-def leased_example(tmp_path: Path, none: bool = True) -> Leased:
-    """The example's first lease, delivered; with `none` the ledger declares "none" for every model first (C48): the
-    stub's replies carry no fingerprint, so without it they are undeclared."""
-    study = make_copy(tmp_path, "study")
-    loaded = load_study(study)
-    config = LedgerConfig(
-        fingerprint=fingerprint_sha256(campaign_fingerprint(study)),
-        hard_term_s=3600.0,
-        prior_run_s=600.0,
-        max_usd=100.0,
-        grants_usd=dict.fromkeys(loaded.campaign.models, 5.0),
-    )
-    clock_now = [time.time()]
-    ledger = Ledger.create(
-        tmp_path / "out" / "ledger.sqlite", ledger_runs(loaded.manifest, loaded.schema), config, lambda: clock_now[0]
-    )
-    for model in loaded.campaign.models if none else ():
-        ledger.declare(model, None, "the stub emits no system_fingerprint", "test")
-    ledger.join(
-        LABEL,
-        site=SITE,
-        job_ids=("job-1",),
-        job_end_at=clock_now[0] + 86_400,
-        fingerprint=config.fingerprint,
-        environment="b" * 64,
-        kill_wait_s=180.0,
-    )
-    ssh, site = FakeSsh(), site_of(tmp_path)
-    dispatch = Dispatcher(ledger, [site], transport(ssh), tmp_path / "out" / "leases")
-    dispatch.tick()
-    dispatch.tick()
-    (lease,) = ledger.leases()
-    return Leased(study, loaded, ledger, site, dispatch, lease, clock_now)
-
-
 def test_c44_a_real_lease_goes_from_the_ledger_through_the_channel_and_the_kernel_to_a_counted_run(
     tmp_path, clean_environment
 ):
@@ -460,22 +386,12 @@ def test_a_lease_run_has_its_spend_journal_where_the_worker_puts_it(tmp_path):
     assert argv == [str(place / "study"), "--lease", str(place / "lease.json"), "--spend-journal", str(journal)]
 
 
-def _ran_for_real(tmp_path: Path, env: dict[str, str]) -> tuple[Leased, Path]:
-    """A worker that ran the example study's lease for real; the lease's place on the channel."""
-    leased = leased_example(tmp_path)
-    channel = channel_of(leased.site, LABEL)
-    worker = Worker(LABEL, channel, leased.study, tmp_path / "work", InProcess(env))
-    worker.open()
-    assert worker.step() == "ran"
-    return leased, channel / ch.PLACES / ch.place_name(leased.lease.lease_id)
-
-
 def test_c46_a_worker_running_a_lease_leaves_a_verifying_snapshot_and_its_spend_journal_in_the_leases_place(
     tmp_path, clean_environment
 ):
     """C46: while a lease runs the worker snapshots its `out/` (`out_snapshot`), and the run journals its spend, in
     `<channel>/places/lease-<id>/` on the shared file system, which the dispatcher's later archive fetch leaves."""
-    leased, kept = _ran_for_real(tmp_path, clean_environment)
+    leased, kept = ran_for_real(tmp_path, clean_environment)
     (newest, *_) = out_snapshot.snapshots(kept / "snapshots")
     manifest = out_snapshot.restore(newest, tmp_path / "restored" / "out")  # every file read against its manifest
     assert manifest["facts"]["lease"] == {"lease_id": leased.lease.lease_id, "run_key": leased.lease.run_key}
@@ -496,7 +412,7 @@ def test_c46_locate_gives_a_lost_leases_newest_snapshot_with_its_journal_and_the
     """C46: a federation lost mid-run leaves its place: the newest snapshot (the store as of its last attempt's
     start) and the journal. `locate` restores that snapshot beside the journal, `dead_store_reader` settles the lease
     from them, and the same place under another lease's id gives nothing."""
-    leased, kept = _ran_for_real(tmp_path, clean_environment)
+    leased, kept = ran_for_real(tmp_path, clean_environment)
     lease_id = leased.lease.lease_id
     ended = out_snapshot.snapshots(kept / "snapshots")[0]
     manifest = out_snapshot.restore(ended, tmp_path / "mid" / "study" / "out")
@@ -532,7 +448,7 @@ def test_c47_a_lost_lease_at_an_ssh_site_settles_at_its_journals_spend_and_a_fai
     the journal into a private directory here and settles at the journal's spend (not the grant). A call that fails or
     hangs reads nothing this tick (the lease stays charged its grant, never taken for a place with nothing in it) and
     the next tick settles it; the private directory is gone either way."""
-    leased, kept = _ran_for_real(tmp_path, clean_environment)
+    leased, kept = ran_for_real(tmp_path, clean_environment)
     lease_id = leased.lease.lease_id
     manifest = out_snapshot.restore(out_snapshot.snapshots(kept / "snapshots")[0], tmp_path / "mid" / "study" / "out")
     make_running(Campaign(tmp_path / "mid" / "study"))

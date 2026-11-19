@@ -13,6 +13,12 @@ host's local disk, and each command the controller runs at the site is one ssh c
   it names is asked for), then each file it names, each checked against its size and SHA-256, into a directory beside
   `local_dir`, moved into place by one rename only when whole. `verify-copy` then runs on this host over that copy, and
   only then does `down` go on.
+- `SshSiteTransport.pull_places(site, remote_dir, local_dir)` is the copy back of a member's channel places
+  (`<channel>/<label>/places/`, the stores the worker leaves for a lease that is lost): for each `lease-<id>/` there,
+  the newest `KEEP` snapshots (each a tar of the snapshot, extracted with the `data` filter) and `spend.jsonl`, into a
+  directory beside `local_dir`, moved into place by one rename only when whole. A directory that is not there, and a
+  place without snapshots or a journal, are nothing to pull; a call that fails or times out is a failed pull (a place
+  is never taken for one with nothing in it), so the retirement stops before `down`, as an evidence pull that fails.
 - The host or alias is the operator's; it appears in no result, log or error (the label names the site), and is
   removed from what a remote command printed.
 """
@@ -23,6 +29,7 @@ import os
 import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
 from pathlib import Path
 from typing import Any, Callable, List, Mapping, Optional, Tuple
@@ -35,6 +42,9 @@ MAX_MANIFEST = 1 << 20
 MAX_FILES = 8  # a root-only copy is a pair; this is the most a manifest may name before nothing is fetched
 PLAIN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
+PLACE_NAME = re.compile(r"lease-[0-9]{12}")  # `elastic.channel.place_name`: a place's directory under `places/`
+SNAPSHOT_NAME = re.compile(r"snap-[0-9]{6,}")  # `out_snapshot`: one snapshot's directory
+LIST_TIMEOUT_S = 120.0  # one listing or test of a directory at the site
 
 
 def _sha256(path: Path) -> str:
@@ -161,6 +171,81 @@ class SshSiteTransport:
             return 1, "", "a file of the copy could not be read there"
         except (OSError, ValueError) as error:
             return 1, "", f"the copy could not be fetched ({type(error).__name__})"
+        finally:
+            if stage is not None:
+                shutil.rmtree(stage, ignore_errors=True)
+
+    def _exists(self, site: Any, flag: str, path: str) -> bool:
+        """Whether `path` is there (`test -d` or `-f` at the site): 0 is yes and 1 is no; any other status, ssh's own
+        included, is a call that failed, never an answer."""
+        from expcore.campaign.elastic.transport import Unreachable
+
+        code, _, _ = self.run(site, ["test", flag, path], LIST_TIMEOUT_S)
+        if code not in (0, 1):
+            raise Unreachable("the site's answer is not whole")
+        return code == 0
+
+    def _names(self, site: Any, directory: str, pattern: "re.Pattern[str]") -> List[str]:
+        """The names in `directory` at the site that `pattern` matches, sorted; none when it is not there."""
+        from expcore.campaign.elastic.transport import Unreachable
+
+        if not self._exists(site, "-d", directory):
+            return []
+        code, out, _ = self.run(site, ["ls", "-1", "--", directory], LIST_TIMEOUT_S)
+        if code != 0:
+            raise Unreachable("the site's listing is not whole")
+        return sorted(name for name in out.split("\n") if pattern.fullmatch(name))
+
+    def _pull_place(self, site: Any, there: str, place: Path, scratch: Path) -> None:
+        """One lease's place into `place` (new): its newest snapshots and its journal, as `locate` reads them."""
+        from expcore.campaign.elastic.snapshots import SNAPSHOTS
+        from expcore.campaign.out_snapshot import KEEP
+        from expcore.campaign.run_lease import LEASE_JOURNAL
+
+        place.mkdir()
+        newest = sorted(self._names(site, f"{there}/{SNAPSHOTS}", SNAPSHOT_NAME), key=lambda n: int(n[5:]),
+                        reverse=True)[:KEEP]  # fmt: skip
+        for name in newest:
+            tar = scratch / f"{name}.tar"
+            self.stream(site, ["tar", "-C", f"{there}/{SNAPSHOTS}/{name}", "-cf", "-", "."], tar)
+            with tarfile.open(tar, "r:") as archive:
+                archive.extractall(place / SNAPSHOTS / name, filter="data")
+            tar.unlink()
+        if self._exists(site, "-f", f"{there}/{LEASE_JOURNAL}"):
+            self.stream(site, ["cat", "--", f"{there}/{LEASE_JOURNAL}"], place / LEASE_JOURNAL)
+
+    def pull_places(self, site: Any, remote_dir: str, local_dir: Path) -> Tuple[int, str, str]:
+        """The places under `remote_dir` of the site into `local_dir` (the module's docstring); (0, said, "") when they
+        are here whole or there are none, else (1, "", why). A `local_dir` that is already here is a retry's earlier
+        pull, whole by its rename: it is not fetched again."""
+        from expcore.campaign.elastic.transport import Missing, Unreachable
+
+        local_dir = Path(local_dir)
+        stage: Optional[Path] = None
+        try:
+            if local_dir.is_symlink():
+                return 1, "", "this host's places are a link: it is never followed"
+            if local_dir.exists():
+                return 0, "its places are already here", ""
+            names = self._names(site, remote_dir, PLACE_NAME)
+            if not names:
+                return 0, "it has no places", ""
+            stage = Path(tempfile.mkdtemp(prefix=f".{local_dir.name}.pull-", dir=str(local_dir.parent)))
+            (stage / "tmp").mkdir()
+            (stage / "places").mkdir()
+            for name in names:
+                self._pull_place(site, f"{remote_dir}/{name}", stage / "places" / name, stage / "tmp")
+            shutil.rmtree(stage / "tmp")
+            _fsync_dir(stage / "places")  # the places are in their directory before any down
+            os.rename(stage / "places", local_dir)
+            _fsync_dir(local_dir.parent)
+            return 0, f"its {len(names)} place(s) are fetched", ""
+        except (Unreachable, subprocess.SubprocessError):
+            return 1, "", "its ssh call failed or timed out"
+        except Missing:
+            return 1, "", "a file of a place could not be read there"
+        except (OSError, tarfile.TarError, ValueError) as error:
+            return 1, "", f"the places could not be fetched ({type(error).__name__})"
         finally:
             if stage is not None:
                 shutil.rmtree(stage, ignore_errors=True)

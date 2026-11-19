@@ -23,9 +23,12 @@ process.
 - **The copy back.** A local site's commands run on this host (`transport = "local"`, the login node itself), so the
   collected copy is already here and `verify-copy` checks it. A site whose `transport` is `ssh` runs every command over
   ssh (`fleetssh.py`): its retirement is collect (into `<fleet>/collected/<member>` at the site), the pull of that copy
-  to `<evidence>/<site>-<member>` here, `verify-copy` on this host over the pulled copy against collect's hash, and
-  only then `down`; one at a site is refused while the ledger holds a lease of its federation that is `reported`
-  (its archive not yet pulled here).
+  to `<evidence>/<site>-<member>` here, the pull of the member's channel places (`<channel>/<label>/places/`, when the
+  site has a channel: the newest snapshots and journal of each lease's place, into `<evidence>/<site>-<member>/places/`,
+  where a lost lease's spend is read once the member's root is gone), `verify-copy` on this host over the pulled copy
+  against collect's hash, and only then `down`; a place that cannot be pulled stops it before `down`, as an evidence
+  pull does. One at a site is refused while the ledger holds a lease of its federation that is `reported` (its archive
+  not yet pulled here).
 """
 
 import json
@@ -52,6 +55,7 @@ COLLECTED = (
     "collected"  # at an ssh site, in its fleet's directory: <COLLECTED>/<member> holds a member's collected copy
 )
 SITE, HERE_PLACE, PULL = "site", "here", "pull"  # where a rendered step runs: over the site's transport, here, a pull
+PULL_PLACES = "pull-places"  # ... or the pull of the member's channel places (`SshSiteTransport.pull_places`)
 HEX64 = re.compile(r"[0-9a-f]{64}")
 COMMAND_TIMEOUT_S = 6 * 3600.0  # the fleet's commands bound their own waits (an up's queue wait, a down's steps)
 LAUNCH_TIMEOUT_S = 300.0  # a worker's launch only spawns a detached srun client: it never holds the tick for long
@@ -93,7 +97,7 @@ class Rendered:
     site_steps: Tuple[Tuple[str, ...], ...] = ()  # a join's: the worker's launch on the site, before the ledger's join
     places: Tuple[
         str, ...
-    ] = ()  # each step's place (`SITE`, `HERE_PLACE`, `PULL`); none given: every step is the site's
+    ] = ()  # each step's place (`SITE`, `HERE_PLACE`, `PULL`, `PULL_PLACES`); none given: every step is the site's
 
 
 def evidence_dir(evidence: Path, site: str, member: str) -> Path:
@@ -145,7 +149,8 @@ def render(action: Any, site: SiteConfig, evidence: Path, ledger: Path, digest: 
 
 def retire_over_ssh(action: Any, site: SiteConfig, into: Path, digest: str) -> Rendered:
     """A retirement at an ssh site: collect into the site's `<fleet>/collected/<member>`, the pull of that copy to
-    `into` here, `verify-copy` on this host over the pulled copy, then `down`; each only after the one before."""
+    `into` here, the pull of the member's channel places beside it (a member that joined the ledger, at a site with a
+    channel), `verify-copy` on this host over the pulled copy, then `down`; each only after the one before."""
     steps: List[Tuple[str, ...]] = []
     places: List[str] = []
     if action.collect:
@@ -153,9 +158,16 @@ def retire_over_ssh(action: Any, site: SiteConfig, into: Path, digest: str) -> R
         steps.append(tuple(site.script("shards.py", "collect", "--roots-only", "--root", action.root, "--into",
                                        str(there))))  # fmt: skip
         steps.append((PULL, str(there), str(into), digest))
+        places += [SITE, PULL]
+        if site.channel is not None and action.label is not None:  # a member that never joined held no lease
+            from expcore.campaign.elastic import channel as ch
+
+            steps.append((PULL_PLACES, str(ch.federation_dir(str(site.channel), action.label) / ch.PLACES),
+                          str(into / ch.PLACES)))  # fmt: skip
+            places.append(PULL_PLACES)
         steps.append((sys.executable, "-I", "-B", str(HERE / "shards.py"), "verify-copy", str(into / ARCHIVES_MANIFEST),
                       str(into), "--manifest-sha256", digest))  # fmt: skip
-        places += [SITE, PULL, HERE_PLACE]
+        places.append(HERE_PLACE)
     steps.append(tuple(site.script("fleet.py", "--fleet", str(site.fleet), "down", "--member", action.member)))
     return Rendered("site", tuple(steps), places=(*places, SITE))
 
@@ -206,6 +218,7 @@ def printed(entry: Mapping[str, Any]) -> str:
         lines.append("# then, in the ledger:")
     places = entry.get("places") or [SITE] * len(entry["steps"])
     notes = {PULL: "# pulled to this host over ssh (checked against collect's hash):",
+             PULL_PLACES: "# its channel's places, pulled to this host over ssh (one that cannot be pulled stops it):",
              HERE_PLACE: "# on this host, over the pulled copy:"}  # fmt: skip
     for step, place in zip(entry["steps"], places):
         lines += ([notes[place]] if place in notes else []) + [shlex.join(step)]
@@ -248,6 +261,10 @@ class SiteTransport:
 
     def pull(self, site: SiteConfig, remote: str, local: Path, digest: str) -> Tuple[int, str, str]:
         return self.ssh.pull(site, remote, local, digest)
+
+    def pull_places(self, site: SiteConfig, remote: str, local: Path) -> Tuple[int, str, str]:
+        """An ssh site's member's channel places into a new directory here (`fleetssh.SshSiteTransport.pull_places`)."""
+        return self.ssh.pull_places(site, remote, local)
 
     def stream(self, site: SiteConfig, argv: Sequence[str], local: Path, timeout_s: Optional[float] = None) -> None:
         """An ssh site's command's standard output into a new file here (`fleetssh.SshSiteTransport.stream`)."""
@@ -470,6 +487,8 @@ class Executor:
             try:
                 if place == PULL:
                     code, out, err = self.transport.pull(site, argv[1], Path(argv[2]), argv[3])
+                elif place == PULL_PLACES:
+                    code, out, err = self.transport.pull_places(site, argv[1], Path(argv[2]))
                 elif place == HERE_PLACE:
                     code, out, err = self.transport.run_here(argv, self.evidence, COMMAND_TIMEOUT_S)
                 else:

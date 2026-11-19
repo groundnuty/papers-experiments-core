@@ -1743,8 +1743,11 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   fleet's directory with `env_file` sourced; a pull is a plain `cat`, never prefixed.) A retirement is collect (at the
   site, into `<fleet>/collected/<member>`), the pull of that copy to `<evidence>/<site>-<member>` here (the manifest
   first, its SHA-256 checked against collect's, then each file it names against its size and SHA-256, moved in by one
-  rename), `verify-copy` on this host over the pulled copy, and only then `down`; it waits while the ledger holds a
-  lease of its federation that is `reported`, whose archive the dispatcher has not pulled here yet. A lost lease's
+  rename), the pull of the member's channel places (`<channel>/<label>/places/lease-<id>/` of every lease, at a site
+  with a channel: the newest two snapshots and `spend.jsonl` of each, into `<evidence>/<site>-<member>/places/` by one
+  rename; none where there are no places; a call that fails stops it before `down`, and a retry over the evidence
+  already here pulls them), `verify-copy` on this host over the pulled copy, and only then `down`; it waits while the
+  ledger holds a lease of its federation that is `reported`, whose archive the dispatcher has not pulled here yet. A lost lease's
   place at a remote site (`<channel>/<label>/places/lease-<id>/`, on the login node) is fetched over ssh to a private
   0700 directory here, removed afterwards: `ls` of its snapshots, then each of the newest two as a `tar` stream
   (extracted with the `data` filter, so a member that is absolute, a link out or a device is refused) and the journal
@@ -1788,7 +1791,8 @@ Step 6 of #462, the Helios-only path of the elastic fleet wired end to end. Noth
   allowlist and a home of its own) asks the core for the campaign fingerprint a start there pins and the environment
   identity its plugin declares, the one a lease store pins; the ledger keeps the digest of the identity. A read that fails
   is None and the join waits. **Where a lost lease's store is** (`locator`): a place `<channel>/<label>/places/lease-<id>/`
-  while the decision shows the member's root, or the same under the collected evidence (`pulled`). A place holds
+  while the decision shows the member's root, or the same under the collected evidence (`pulled`: at an ssh site the
+  retirement pulled the member's places there, before its root was gone). A place holds
   `study/out/` with `spend.jsonl` beside `study/` (put there by an operator: read as it is), or what the worker leaves:
   `snapshots/` and `spend.jsonl`. For those the newest snapshot that verifies (each tried in turn, newest first) is
   restored into a private directory on this host with the journal copied beside it, and read as the first form is; the

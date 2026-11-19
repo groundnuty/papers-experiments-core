@@ -12,7 +12,8 @@ fleet's shard settings, `fleetplan.read_settings`).
 - `locator(evidence)`: `(site, Settle) -> (out/, source)` or None, for `fleetexecute.dead_store_reader`: the lost
   lease's store as a place `lease-<id>/` holds it (`PLACES`): in the federation's channel on the site's shared file
   system (`root`, offered only while the decision shows the member's root, that is while it still holds the jobs the
-  federation joined with) or in the evidence the controller collected from the member (`pulled`). A place holds
+  federation joined with) or in the evidence the controller collected from the member (`pulled`; at an ssh site
+  its retirement pulled the member's places there, `fleetssh.SshSiteTransport.pull_places`). A place holds
   either `study/out/` with the lease's `spend.jsonl` beside `study/` (put there by an operator), or what the worker
   leaves while the lease runs (C46): `snapshots/` and `spend.jsonl`. For those the newest snapshot that verifies
   (`out_snapshot.restore`, each in turn, newest first) is restored into a private directory on this host with the
