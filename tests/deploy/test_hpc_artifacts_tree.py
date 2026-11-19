@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 from hpc_fed_support import hpc_on_path
 
-PREFIX = b"expcore-artifacts-tree/1\0"
+PREFIX = b"expcore-artifacts-tree/2\0"
 HEX = re.compile(r"[0-9a-f]{64}")
 
 
@@ -102,7 +102,7 @@ def test_o74_the_digest_is_the_sha256_of_the_canonical_listing_sorted_by_the_pat
         b"F\0z\0" + b"0\0" + sha(b"").encode() + b"\0",
     ]
     assert identity.tree_sha256(root) == sha(PREFIX + b"".join(records))
-    assert identity.TREE_VERSION == "expcore-artifacts-tree/1"
+    assert identity.TREE_VERSION == "expcore-artifacts-tree/2"
 
 
 def test_o74_an_empty_directory_has_the_digest_of_the_prefix_alone(identity, tmp_path):
@@ -226,17 +226,119 @@ def test_o74_any_change_of_the_tree_gives_another_digest(identity, tmp_path, cha
     assert identity.tree_sha256(root) != before
 
 
+# -- version 2: one recipe built at two sites' paths is one tree ----------------------------------------------------
+
+
+def site_build(root: Path, site: bytes, spelled: str | None = None) -> Path:
+    """`study_tree` as a site's install of it writes it at `root`, spelled `spelled` (the path its venv was built by,
+    the real path by default) in its scripts, its `.pth` and its interpreter's `_sysconfigdata`, and by its real path in
+    `pyvenv.cfg`: the place-bearing files of a real build, and the bookkeeping that differs by `site` (the `RECORD` of
+    those scripts' hashes, `direct_url.json`, uv's cache key, the clone's index, logs, refs and config)."""
+    study_tree(root)
+    at = (spelled or os.path.realpath(root)).encode()
+    real = os.path.realpath(root).encode()
+    info = "venv/lib/python3.12/site-packages/pkg-1.0.dist-info/"
+    put(root, {
+        "venv/bin/activate": b"VIRTUAL_ENV='" + at + b"/venv'\nexport VIRTUAL_ENV\n",
+        "venv/bin/server": b"#!" + at + b"/venv/bin/python\nfrom pkg import main\nmain()\n",
+        "venv/pyvenv.cfg": b"home = " + real + b"/python/bin\nversion_info = 3.12.8\n",
+        "venv/lib/python3.12/site-packages/_editable_impl_pkg.pth": at + b"/clone/src\n",
+        "python/lib/python3.12/_sysconfigdata__linux_x86_64-linux-gnu.py":
+            b"build_time_vars = {" + b"".join(b"'k%d': '%s/python/lib'," % (i, at) for i in range(27)) + b"}\n",
+        info + "METADATA": b"Name: pkg\nVersion: 1.0\n",
+        info + "RECORD": b"../../../bin/server,sha256=" + site * 8 + b",64\n",
+        info + "direct_url.json": b'{"url": "file://' + at + b'/clone", "dir_info": {"editable": true}}',
+        info + "uv_cache.json": b'{"timestamp": ' + site + b"}",
+        "clone/.git/config": b"[remote]\n\turl = " + at + b"/../mirror-" + site + b"\n",
+        "clone/.git/index": b"an index of " + site,
+        "clone/.git/logs/HEAD": b"0000 1111 cloned at " + site,
+        "clone/.git/packed-refs": b"1111 refs/remotes/" + site,
+    })  # fmt: skip
+    return root
+
+
+def test_o94_one_recipe_built_at_two_sites_paths_of_other_lengths_gives_one_digest(identity, tmp_path):
+    """O94 (`expcore-artifacts-tree/2`): two sites build one study's directory from one recipe, at paths of other
+    lengths, one of them declared through a parent that is a link (its venv names the declared path, its `pyvenv.cfg`
+    the real one). Only the directory's own path in the place-bearing files and the bookkeeping differ, so the two are
+    one digest: one render identity for both sites' federations."""
+    one = site_build(tmp_path / "a" / "artifacts", b"1")
+    (tmp_path / "real").mkdir()
+    (tmp_path / "home").symlink_to(tmp_path / "real")
+    declared = tmp_path / "home" / "studies" / "s" / "artifacts-v1"
+    two = site_build(declared, b"22", spelled=str(declared))
+    assert os.path.realpath(declared) != str(declared)
+    assert (one / "venv" / "bin" / "server").read_bytes() != (two / "venv" / "bin" / "server").read_bytes()
+    assert identity.tree_sha256(one) == identity.tree_sha256(two)
+
+
+def _a_code_file_changed(root: Path) -> None:
+    (root / "clone" / "server.py").write_bytes(b"print('serve!')\n")
+
+
+def _a_script_names_another_interpreter(root: Path) -> None:
+    script = root / "venv" / "bin" / "server"
+    script.write_bytes(script.read_bytes().replace(b"/venv/bin/python", b"/venv/bin/python3.11"))
+
+
+def _the_clones_head_moved(root: Path) -> None:
+    (root / "clone" / ".git" / "HEAD").write_bytes(b"ref: refs/heads/other\n")
+
+
+def _a_record_outside_a_dist_info_changed(root: Path) -> None:
+    put(root, {"clone/RECORD": b"kept: it is no install's bookkeeping\n"})
+
+
+@pytest.mark.parametrize(
+    "change",
+    [_a_code_file_changed, _a_script_names_another_interpreter, _the_clones_head_moved,
+     _a_record_outside_a_dist_info_changed],
+    ids=lambda change: change.__name__.strip("_"),
+)  # fmt: skip
+def test_o94_a_changed_file_at_one_site_is_another_digest_whatever_the_paths(identity, tmp_path, change):
+    """O94: only the directory's own path and the bookkeeping are neutral. A changed byte of the code, a
+    script that names another interpreter, the clone's `HEAD` (its commit) and a file named like the bookkeeping
+    outside a `*.dist-info` are each another digest, so a shard against that federation is refused."""
+    one = site_build(tmp_path / "a" / "artifacts", b"1")
+    two = site_build(tmp_path / "bb" / "artifacts", b"2")
+    change(two)
+    assert identity.tree_sha256(one) != identity.tree_sha256(two)
+
+
+def test_o94_the_directorys_path_is_replaced_across_the_read_chunks(identity, tmp_path, monkeypatch):
+    """O94: a spelling of the directory's path split between two reads is replaced as in one, and the
+    file's size in the listing is that of what is hashed."""
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    at = str(root).encode()
+    data = b"x" * 5 + at + b"/a " + at + at + b"/tail"
+    (root / "f").write_bytes(data)
+    neutral = data.replace(at, b"@study_artifacts@")
+    expected = sha(PREFIX + b"F\0f\0" + str(len(neutral)).encode() + b"\0" + sha(neutral).encode() + b"\0")
+    for chunk in (1, 3, 7, len(at) - 1, len(at), 1 << 20):
+        monkeypatch.setattr(identity, "CHUNK", chunk)
+        assert identity.tree_sha256(root) == expected, chunk
+
+
+def test_o94_a_link_the_listing_leaves_out_is_still_refused_when_it_leaves(identity, tmp_path):
+    """O94: the clone's `.git` internals are out of the listing, never out of the link check."""
+    root = study_tree(tmp_path / "artifacts")
+    (root / "clone" / ".git" / "hooks").mkdir()
+    (root / "clone" / ".git" / "hooks" / "post-checkout").symlink_to(outside_place(tmp_path) / "python3.12")
+    leaves(identity, root, tmp_path, "clone/.git/hooks/post-checkout", None)
+
+
 # -- links: recorded by their target string, never followed; one that leaves the tree is refused --------------------
 
-# The digest of `study_tree`, as the code before links were checked (3531d3cc) took it: the canonical form of a tree
-# whose links all stay inside did not change when the check was added.
-STUDY_TREE_DIGEST = "ce01443fadbd22e880de62b992578ef503509a1194e777bb1102377b4683809a"
+# The digest of `study_tree` in the listing's version 2 (its clone's `.git/index` left out): the canonical form of a
+# tree whose links all stay inside, which the link check (3531d3cc) did not change in version 1 either.
+STUDY_TREE_DIGEST = "a062614ffca0544673ff9d8927cf844f4723c7dcfaf60e2df9cd91aad3ebdb6c"
 
 
 def test_o74_a_tree_with_only_inside_links_has_the_digest_the_code_before_the_check_gave(identity, tmp_path):
     """O74: pinned. `study_tree` holds `lib64 -> lib`, the venv's `bin/python3` into the interpreter installed in the
-    tree and the interpreter's own links: all inside, all recorded by their target strings, so its digest is the one
-    3531d3cc computed. A change here is a change of the identity every pinned plan holds."""
+    tree and the interpreter's own links: all inside, all recorded by their target strings, so its digest is the
+    pinned one. A change here is a change of the identity every pinned plan holds."""
     assert identity.tree_sha256(study_tree(tmp_path / "artifacts")) == STUDY_TREE_DIGEST
 
 
@@ -264,7 +366,7 @@ def test_o74_an_absolute_link_into_the_tree_is_allowed_by_the_roots_real_path_or
 ):
     """O74: a venv built on the directory holds absolute targets. They are inside when they start, component by
     component, with the directory's real path or with the path it is declared by (`HPC_STUDY_ARTIFACTS`, when a parent
-    of it is a link); each is recorded as written."""
+    of it is a link); each is recorded with that path as the placeholder (version 2), so both are one target."""
     real = tmp_path / "real"
     put(real / "artifacts", {"venv/lib/x": b"x"})
     (tmp_path / "alias").symlink_to(real)
@@ -278,8 +380,8 @@ def test_o74_an_absolute_link_into_the_tree_is_allowed_by_the_roots_real_path_or
         b"venv": b"D\0venv\0",
         b"venv/lib": b"D\0venv/lib\0",
         b"venv/lib/x": b"F\0venv/lib/x\0" + b"1\0" + sha(b"x").encode() + b"\0",
-        b"venv/lib64-declared": b"L\0venv/lib64-declared\0" + by_declared.encode() + b"\0",
-        b"venv/lib64-real": b"L\0venv/lib64-real\0" + by_real.encode() + b"\0",
+        b"venv/lib64-declared": b"L\0venv/lib64-declared\0@study_artifacts@/venv/lib\0",
+        b"venv/lib64-real": b"L\0venv/lib64-real\0@study_artifacts@/venv/lib\0",
     }
     expected = sha(PREFIX + b"".join(records[name] for name in sorted(records)))
     assert identity.tree_sha256(declared) == expected

@@ -20,6 +20,12 @@ an ordered list of actions, each the call an operator would make by hand: a prov
 - **Retire** only what is drained or proven ended and holds no lease in flight: collect its root evidence, then down.
   Idle federations no cap lets work are drained once idle past their re-up cost, the least walltime left first,
   keeping a declared warm pool (none by default). A failed up is taken down with no collect.
+- **Prepare.** A site that declares a prepare command (`prepare_timeout_s`) has each member that is up, linked and
+  running, and not yet verified, run it once (`Prepare`): the study's ingest and verify-data, which the core never
+  reads. It joins only when the member then reads verified. A prepare that exited non-zero or timed out, one that
+  exited 0 and left the data unverified, and one found started and never ended with no run of this controller's (it
+  died: the controller is not the one that started it) retire the member unjoined, through the retirement path (a
+  member already verified when it finds one in flight is joined). The replacement is the usual add.
 - **Proof.** A job the site shows ended is proven `terminal`; a member the fleet's record shows down (its down verified
   the job gone) is proven `cancelled`. A site that cannot be read proves nothing and gets no action.
 """
@@ -50,6 +56,7 @@ __all__ = [
     "Join",
     "LedgerView",
     "Member",
+    "Prepare",
     "ProveEnded",
     "Retire",
     "Settle",
@@ -59,6 +66,8 @@ __all__ = [
     "environment_digest",
     "ledger_label",
     "ledger_view",
+    "prepare_key",
+    "prepare_lost_key",
     "read_only",
 ]
 
@@ -83,6 +92,16 @@ class Join:
 
 
 @dataclass(frozen=True)
+class Prepare:
+    """Run the site's prepare command for a member that is up, linked and running with its data not verified: once,
+    and one at a time for a member (`prepare_key` is its busy key)."""
+
+    site: str
+    member: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class Drain:
     site: str
     member: str
@@ -93,7 +112,7 @@ class Drain:
 @dataclass(frozen=True)
 class Retire:
     """Collect the member's root evidence (when `collect`), copy it back, then `down --member`; `label` is its ledger
-    label, None for a member that never joined."""
+    label, None for a member that never joined. `abort_prepare` first ends a prepare found started and never ended."""
 
     site: str
     member: str
@@ -101,6 +120,7 @@ class Retire:
     root: str
     collect: bool
     reason: str
+    abort_prepare: bool = False
 
 
 @dataclass(frozen=True)
@@ -126,8 +146,8 @@ class Settle:
     reason: str
 
 
-Action = ProveEnded | Settle | Drain | Join | Retire | Add
-ORDER = (ProveEnded, Settle, Drain, Join, Retire, Add)
+Action = ProveEnded | Settle | Drain | Join | Prepare | Retire | Add
+ORDER = (ProveEnded, Settle, Drain, Join, Prepare, Retire, Add)
 
 
 @dataclass
@@ -145,6 +165,18 @@ class Decision:
 def ledger_label(site: str, member: str) -> str:
     """A member's label in the ledger: every fleet has a `fed-1`, so the site's label goes in front."""
     return f"{site}-{member}"
+
+
+def prepare_key(site: str, member: str) -> str:
+    """The busy key of a member's prepare in flight: not the member's own (`site/member`, a retirement's), which would
+    stop the member counting as on its way."""
+    return f"prepare:{site}/{member}"
+
+
+def prepare_lost_key(site: str, member: str) -> str:
+    """The key under which the executor reports a member whose prepare could not be started at its site (the call that
+    runs it failed, with no record, as many times as it tries): the member is retired, not asked again for ever."""
+    return f"prepare-lost:{site}/{member}"
 
 
 def cutoff_s(settings: SiteSettings, ledger: LedgerView) -> float:
@@ -172,13 +204,14 @@ def decide(
     sites: Sequence[tuple[SiteSettings, SiteView]],
     busy: frozenset[str] = frozenset(),
 ) -> Decision:
-    """The targets and the actions of one tick. `busy` holds the sites with an add running (`site`) and the members
-    with a retirement running (`site/member`)."""
+    """The targets and the actions of one tick. `busy` holds the sites with an add running (`site`), the members with
+    a retirement running (`site/member`), the members with a prepare running (`prepare_key`) and the members whose
+    prepare could not be started (`prepare_lost_key`)."""
     labels = [s.label for s, _ in sites]
     if len(set(labels)) != len(labels) or any(s.label != v.label for s, v in sites):
         raise ValueError("each site is given once, its settings and its read under one label")
     decision = Decision(at=now, wanted=ledger.leases_wanted())
-    memory = login_budgets(sites)
+    memory = login_budgets(sites, busy)
     free = 0
     rooms: dict[str, int] = {}
     for settings, view in sites:
@@ -218,7 +251,7 @@ def _site(
             continue
         fed = ledger.federations.get(ledger_label(site, m.label))
         if fed is None:
-            free += _unjoined(now, ledger, settings, m, decision.actions)
+            free += _unjoined(now, ledger, settings, m, decision.actions, busy)
         else:
             state = _joined(now, ledger, settings, m, fed, decision.actions)
             free += state == "free"
@@ -230,26 +263,69 @@ def _site(
     return free, room
 
 
-def _unjoined(now: float, ledger: LedgerView, settings: SiteSettings, m: Member, acts: list) -> int:
+def _unjoined(
+    now: float, ledger: LedgerView, settings: SiteSettings, m: Member, acts: list, busy: frozenset[str] = frozenset()
+) -> int:
     """A member the ledger does not hold: join it once ready, take it down when it cannot serve; 1 while it is on its
     way (an up in flight, or its data not yet verified) or joins now."""
     site = settings.label
     if m.status == "down":
         return 0
+    flying = prepare_key(site, m.label) in busy
+    live = flying or m.prepare == "running"  # a prepare that may still be running: a retirement ends it first
     if m.status in ("failed", "down-failed") or m.ended or m.broken:
-        acts.append(Retire(site, m.label, None, m.root, False, f"never joined: {m.status}, its job {m.state}"))
+        why = f"never joined: {m.status}, its job {m.state}"
+        acts.append(Retire(site, m.label, None, m.root, False, why, live))  # a member that breaks mid-prepare too
         return 0
     if m.status == "up" and m.linked and m.relay == "gone":
-        acts.append(Retire(site, m.label, None, m.root, True, relay_gone(m)))
+        acts.append(Retire(site, m.label, None, m.root, True, relay_gone(m), live))
         return 0
-    if m.status != "up" or not m.linked or not m.verified or m.waiting:
+    if flying:
+        return 1  # a prepare in flight here: its end is decided on a later tick, never under a live run
+    if m.status != "up" or not m.linked or m.waiting:
         return 1
+    if settings.prepare_timeout_s is None:
+        if not m.verified:
+            return 1
+    else:
+        held = _prepared(settings, m, acts, busy)
+        if held is not None:
+            return held
     if m.ends_at is None or m.ends_at - cutoff_s(settings, ledger) <= now:
         acts.append(Retire(site, m.label, None, m.root, True, "too close to its job end to take a lease"))
         return 0
     wait = None if m.started_at is None or m.submitted_at is None else m.started_at - m.submitted_at
     label = ledger_label(site, m.label)
     acts.append(Join(site, m.label, label, m.jobs, m.ends_at, settings.kill_wait_s, wait, "up, linked and verified"))
+    return 1
+
+
+def _prepared(settings: SiteSettings, m: Member, acts: list, busy: frozenset[str]) -> int | None:
+    """A member up, linked and running at a site that declares a prepare command: 1 while its data is on its way (a
+    prepare is to start), 0 when it is retired unjoined, None when it may join (verified, with no prepare against it).
+    A prepare in flight here was handled before this (`_unjoined`). Such a member is never idle-retired: only
+    federations the ledger holds are (`_retire_idle`), and this one is not joined until its prepare has ended."""
+    site = settings.label
+    if prepare_lost_key(site, m.label) in busy:  # its call never reached the site's record, as many times as it tries
+        why = "never joined: its prepare could not be started"
+        acts.append(Retire(site, m.label, None, m.root, True, why, m.prepare == "running"))
+        return 0
+    if m.prepare == "failed":  # the marker does not redeem a prepare that failed
+        acts.append(Retire(site, m.label, None, m.root, True, "never joined: its prepare failed or timed out"))
+        return 0
+    if m.prepare == "running":  # started and never ended, and no run of ours: the controller that started it is gone
+        if m.verified:
+            return None
+        why = "never joined: its prepare was in flight when its controller died, and its data is not verified"
+        acts.append(Retire(site, m.label, None, m.root, True, why, True))
+        return 0
+    if m.verified:
+        return None
+    if m.prepare == "ok":
+        why = "never joined: its prepare exited 0 and its data is not verified"
+        acts.append(Retire(site, m.label, None, m.root, True, why))
+        return 0
+    acts.append(Prepare(site, m.label, "up and linked, its data not verified"))
     return 1
 
 
@@ -295,18 +371,22 @@ def relay_gone(m: Member) -> str:
     return f"relay gone, no exit status (its last heartbeat at {beat}): outage injection cannot run without it"
 
 
-def login_load(settings: SiteSettings, view: SiteView) -> dict:
+def login_load(settings: SiteSettings, view: SiteView, busy: frozenset[str] = frozenset()) -> dict:
     """What one fleet takes of its login node's memory, in MB: the relays beating there, each up and each verify-data
-    in flight."""
+    in flight (every member up, linked and not yet verified, and every member whose prepare is in flight here, which
+    goes on running after it has left its marker)."""
     live = [m for m in view.members if m.status not in HOLDS_NOTHING]
     relays = sum(1 for m in live if m.relay == "here")
     ups = sum(1 for m in live if m.status in ("claimed", "made"))
-    verifying = sum(1 for m in live if m.status == "up" and m.linked and not m.verified)
+    verifying = sum(1 for m in live if m.status == "up" and m.linked
+                    and (not m.verified or prepare_key(settings.label, m.label) in busy))  # fmt: skip
     load = relays * settings.relay_mb + ups * settings.up_mb + verifying * settings.verify_mb
     return {"load_mb": load, "relays": relays, "ups": ups, "verifying": verifying}
 
 
-def login_budgets(sites: Sequence[tuple[SiteSettings, SiteView]]) -> dict[str, tuple[str, int | None, dict]]:
+def login_budgets(
+    sites: Sequence[tuple[SiteSettings, SiteView]], busy: frozenset[str] = frozenset()
+) -> dict[str, tuple[str, int | None, dict]]:
     """Per site: its login node's key, how many more federations (an up now, a relay after) that login node's memory
     takes, shared by every site on it (one cgroup), and the figures; None where no site on it declares a cap. A site
     on it that could not be read leaves no room: its use is unknown."""
@@ -321,7 +401,7 @@ def login_budgets(sites: Sequence[tuple[SiteSettings, SiteView]]) -> dict[str, t
         else:
             reserve = max(s.login_reserve_mb for s, _ in members)
             each = max(s.relay_mb + s.up_mb for s, _ in members)
-            loads = [login_load(s, v) for s, v in members if v.error is None]
+            loads = [login_load(s, v, busy) for s, v in members if v.error is None]
             used = reserve + sum(load["load_mb"] for load in loads)
             free = min(caps) - used
             dark = len(loads) < len(members)
@@ -445,7 +525,7 @@ def _retire_idle(
             label = ledger_label(settings.label, m.label)
             fed = ledger.federations.get(label)
             if fed is None or label in drained or fed.drained_at is not None or fed.ended_at is not None:
-                continue
+                continue  # a member not in the ledger (one whose prepare runs included) is on its way, never idle
             if now >= fed.job_end_at:
                 continue  # past its recorded end: never drained
             if m.status != "up" or m.state != "RUNNING" or ledger.holding.get(label) is not None:

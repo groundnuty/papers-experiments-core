@@ -19,7 +19,13 @@ process.
 - **Never `--discard-evidence`, never `scancel`.** A down goes through `fleet.py`, whose `hpcfed.py down` refuses a
   root with evidence not collected (its gate), and cancels only the jobs that member's up recorded, by id.
 - **One operation per site and per member at a time.** An add (one per site) and a retirement (one per member) run in
-  the background; until each ends its key is busy, and the decision gives that site no add and that member nothing.
+  the background; until each ends its key is busy, and the decision gives that site no add and that member nothing. A
+  member's prepare has a key of its own (it still counts as on its way); a member that ends or breaks while its prepare
+  runs is retired at once, and the retirement begins by ending the prepare.
+- **A member's prepare** (`fleetprepare.py`, when the site names `prepare`): one call at the site per member, the
+  study's own command bounded and logged there; the controller's log keeps its outcome, exit status, times and
+  duration, never its output, argv or a path. A retirement of a member found with a prepare started and never ended
+  begins with `fleetprepare.py abort`.
 - **The copy back.** A local site's commands run on this host (`transport = "local"`, the login node itself), so the
   collected copy is already here and `verify-copy` checks it. A site whose `transport` is `ssh` runs every command over
   ssh (`fleetssh.py`): its retirement is collect (into `<fleet>/collected/<member>` at the site), the pull of that copy
@@ -59,6 +65,9 @@ PULL_PLACES = "pull-places"  # ... or the pull of the member's channel places (`
 HEX64 = re.compile(r"[0-9a-f]{64}")
 COMMAND_TIMEOUT_S = 6 * 3600.0  # the fleet's commands bound their own waits (an up's queue wait, a down's steps)
 LAUNCH_TIMEOUT_S = 300.0  # a worker's launch only spawns a detached srun client: it never holds the tick for long
+PREPARE_GRACE_S = 120.0  # the call's own bound beyond the prepare's timeout, which `fleetprepare.py` enforces itself
+PREPARE_TRIES = 3  # calls that fail with no outcome (the wrapper never ran, or never claimed) before the member is lost
+PREPARE_OUTCOMES = ("ok", "failed", "timeout", "aborted")
 
 
 @dataclass(frozen=True)
@@ -75,6 +84,7 @@ class SiteConfig:
     host: Optional[str] = field(default=None, repr=False)  # an ssh site's destination or alias: never shown or logged
     env_file: Optional[str] = None  # an ssh site's site.env, a path on its login node, sourced before each command
     shard_settings: Optional[Path] = None  # an ssh site's shard settings file, a path on its login node
+    prepare: Optional[Tuple[str, ...]] = None  # the study's prepare command (an argv, `{root}` and `{layout}` in it)
 
     @property
     def label(self) -> str:
@@ -117,11 +127,19 @@ def render(action: Any, site: SiteConfig, evidence: Path, ledger: Path, digest: 
     )
     if kind == "Add":
         return Rendered("site", (tuple(site.script("fleet.py", "--fleet", str(site.fleet), "add", str(action.count))),))
+    if kind == "Prepare":
+        if site.prepare is None or site.settings.prepare_timeout_s is None:
+            raise ValueError(f"site {site.label} declares no prepare command")
+        words = ("run", "--fleet", str(site.fleet), "--member", action.member, "--timeout",
+                 repr(float(site.settings.prepare_timeout_s)), "--", *site.prepare)  # fmt: skip
+        return Rendered("site", (tuple(site.script("fleetprepare.py", *words)),))
     if kind == "Retire":
         into = evidence_dir(evidence, site.label, action.member)
         if site.remote:
             return retire_over_ssh(action, site, into, digest)
         steps = []
+        if action.abort_prepare:
+            steps.append(abort_step(action, site))
         if action.collect:
             steps.append(
                 site.script("shards.py", "collect", "--roots-only", "--root", action.root, "--into", str(into))
@@ -153,6 +171,9 @@ def retire_over_ssh(action: Any, site: SiteConfig, into: Path, digest: str) -> R
     channel), `verify-copy` on this host over the pulled copy, then `down`; each only after the one before."""
     steps: List[Tuple[str, ...]] = []
     places: List[str] = []
+    if action.abort_prepare:
+        steps.append(abort_step(action, site))
+        places.append(SITE)
     if action.collect:
         there = site.fleet / COLLECTED / action.member
         steps.append(tuple(site.script("shards.py", "collect", "--roots-only", "--root", action.root, "--into",
@@ -170,6 +191,11 @@ def retire_over_ssh(action: Any, site: SiteConfig, into: Path, digest: str) -> R
         places.append(HERE_PLACE)
     steps.append(tuple(site.script("fleet.py", "--fleet", str(site.fleet), "down", "--member", action.member)))
     return Rendered("site", tuple(steps), places=(*places, SITE))
+
+
+def abort_step(action: Any, site: SiteConfig) -> Tuple[str, ...]:
+    """The end of a prepare found started and never ended, before its member is collected and taken down."""
+    return tuple(site.script("fleetprepare.py", "abort", "--fleet", str(site.fleet), "--member", action.member))
 
 
 def worker_launch(action: Any, site: SiteConfig, settings: Optional[Path]) -> Tuple[Tuple[str, ...], ...]:
@@ -199,10 +225,12 @@ def said_of(site: Optional[SiteConfig], err: str, out: str) -> str:
 
 def described(action: Any, rendered: Rendered, site: Optional[SiteConfig] = None) -> Dict[str, Any]:
     """An action for the log and the dry run: its kind, site, member, reason and commands (no ssh site's host)."""
+    steps = [shown(site, step) for step in rendered.steps]
+    if site is not None and type(action).__name__ == "Prepare":  # printed in a dry run, never logged
+        steps = [["<the site's prepare command: not logged>"]]
     entry = {"action": type(action).__name__, "site": action.site, "member": getattr(action, "member", None),
              "label": getattr(action, "label", None), "reason": action.reason, "where": rendered.where,
-             "site_steps": [shown(site, step) for step in rendered.site_steps],
-             "steps": [shown(site, step) for step in rendered.steps]}  # fmt: skip
+             "site_steps": [shown(site, step) for step in rendered.site_steps], "steps": steps}  # fmt: skip
     if rendered.places:
         entry["places"] = list(rendered.places)
     return entry
@@ -277,6 +305,24 @@ class SiteTransport:
     def stream(self, site: SiteConfig, argv: Sequence[str], local: Path, timeout_s: Optional[float] = None) -> None:
         """An ssh site's command's standard output into a new file here (`fleetssh.SshSiteTransport.stream`)."""
         self.ssh.stream(site, argv, local, timeout_s)
+
+
+def prepare_outcome(out: str) -> Dict[str, Any]:
+    """The line `fleetprepare.py run` printed (its outcome, exit status, times and duration), each field checked and
+    nothing else kept; empty when there is none or it is not that."""
+    lines = [line for line in out.splitlines() if line.strip()]
+    try:
+        found = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        return {}
+    if not isinstance(found, dict) or found.get("outcome") not in PREPARE_OUTCOMES:
+        return {}
+    code = found.get("exit")
+    keep: Dict[str, Any] = {"outcome": found["outcome"], "exit": code if isinstance(code, int) else None}
+    for key in ("started_at", "ended_at", "duration_s"):
+        value = found.get(key)
+        keep[key] = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    return keep
 
 
 def last_line(text: str) -> str:
@@ -360,10 +406,16 @@ class Executor:
     clock: Callable[[], float] = time.time
     pool: ThreadPoolExecutor = field(default_factory=lambda: ThreadPoolExecutor(max_workers=8))
     running: Dict[str, Future] = field(default_factory=dict)
+    unclaimed: Dict[str, int] = field(default_factory=dict)  # a prepare's calls that failed with no outcome, by member
+    counting: threading.Lock = field(
+        default_factory=threading.Lock
+    )  # `unclaimed`: the workers change it, the loop reads
 
     def busy(self) -> frozenset:
         self.reap()
-        return frozenset(self.running)
+        with self.counting:
+            lost = frozenset(key for key, n in self.unclaimed.items() if n >= PREPARE_TRIES)
+        return frozenset(self.running) | lost
 
     def reap(self) -> None:
         for key in [key for key, future in self.running.items() if future.done()]:
@@ -382,7 +434,7 @@ class Executor:
         for action in decision.actions:
             kind = type(action).__name__
             try:
-                if kind in ("Add", "Retire"):
+                if kind in ("Add", "Retire", "Prepare"):
                     self.start(action)
                 else:
                     self.in_ledger(action)
@@ -472,9 +524,16 @@ class Executor:
         return f"{label} holds lease(s) {live} in flight" if live else None
 
     def start(self, action: Any) -> None:
+        from expcore.campaign.elastic.control import prepare_key
+
         kind = type(action).__name__
         site = self.sites[action.site]
-        key = action.site if kind == "Add" else f"{action.site}/{action.member}"
+        if kind == "Add":
+            key = action.site
+        elif kind == "Prepare":
+            key = prepare_key(action.site, action.member)
+        else:
+            key = f"{action.site}/{action.member}"
         if key in self.running:
             return
         if kind == "Retire":
@@ -482,7 +541,31 @@ class Executor:
             if refused is not None:
                 self.log.write("result", action=kind, member=action.member, ok=False, said=f"not retired: {refused}")
                 return
-        self.running[key] = self.pool.submit(self.site_steps, action, site)
+        self.running[key] = self.pool.submit(self.prepare_steps if kind == "Prepare" else self.site_steps, action, site)
+
+    def prepare_steps(self, action: Any, site: SiteConfig) -> bool:
+        """A member's prepare: one call at the site (`fleetprepare.py run`), which bounds the command, keeps its output
+        in the site's own log and records its start and end there. What this logs is the call's status and the outcome,
+        exit status, times and duration it printed, never the command, its output, what the call said on stderr (a
+        path may be in it) or a path; True when it exited 0. A call that fails with no outcome is asked again on the
+        next tick, up to `PREPARE_TRIES` calls: then the member is reported lost, and retired."""
+        from expcore.campaign.elastic.control import prepare_lost_key
+
+        (argv,) = render(action, site, self.evidence, self.ledger_path).steps
+        try:
+            code, out, _ = self.transport.run(site, list(argv), site.settings.prepare_timeout_s + PREPARE_GRACE_S)
+        except (OSError, subprocess.SubprocessError):
+            code, out = 1, ""
+        found = prepare_outcome(out)
+        lost = prepare_lost_key(action.site, action.member)
+        with self.counting:
+            if code == 0 or found:
+                self.unclaimed.pop(lost, None)
+            else:  # no outcome: the wrapper did not run, or could not claim; asked again, up to PREPARE_TRIES calls
+                self.unclaimed[lost] = self.unclaimed.get(lost, 0) + 1
+        self.log.write("result", action="Prepare", site=action.site, member=action.member, code=code, ok=code == 0,
+                       **found)  # fmt: skip
+        return code == 0
 
     def site_steps(self, action: Any, site: SiteConfig) -> bool:
         """An add's or a retirement's commands on the site, in order, each only after the one before succeeded."""

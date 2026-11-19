@@ -145,6 +145,7 @@ args = ["-m", "onedata_mcp"]
 start_timeout_s = 120
 clone = "@study_artifacts@/onedata-mcp"
 commit = "8c9b10c34efdad29498362fc4be4e785ff2a102b"
+artifacts = "@study_artifacts@"  # the command's directory by its role: one fingerprint at every site's path (#451)
 
 [toolserver.conditions.knowledge]
 allow = ["get_file_distribution", "list_space_providers", "get_transfer"]

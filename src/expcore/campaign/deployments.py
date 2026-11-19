@@ -13,7 +13,7 @@ import json
 from collections.abc import Callable, Collection, Iterable, Mapping
 from typing import Any
 
-from expcore.models.fleetheaders import deployment_switched
+from expcore.models.fleetheaders import attempt_switched
 from expcore.models.served import MIXED_FINGERPRINTS, is_mixed
 
 ACCEPTED_META = "accepted_fingerprints"  # the store's meta key of the declared sets and their confirmations
@@ -42,9 +42,10 @@ def deployment_shares(declared: Mapping[str, Any], analysed: Iterable[tuple[str,
 
 
 def deployments_switched(transcript: Iterable[Mapping[str, Any]]) -> bool:
-    """Tell whether the turns of an attempt show more than one deployment (B20): a turn without the id among turns with
-    it counts as one more, all turns without it are no switch. Visibility only."""
-    return deployment_switched(turn.get("deployment_id") or None for turn in transcript)
+    """Tell whether the turns of an attempt show more than one deployment (B20), by the ids the front named or by the
+    replies' system fingerprints (`attempt_switched`, the record's own rule): a turn without the id or the fingerprint
+    among turns with it counts as one more, all turns without it are no switch. Visibility only."""
+    return attempt_switched(transcript)
 
 
 def deployment_ids(transcript: Iterable[Mapping[str, Any]]) -> str | None:

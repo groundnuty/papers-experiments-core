@@ -44,6 +44,12 @@ that the operator's own ssh config resolves: never logged), `interpreter` and `d
 core is importable by that interpreter), `env_file` (its site.env on the login node, required: sourced before each
 command, which fails without it, never a run on the login shell's defaults) and `settings` (the shard settings file on
 the login node; required when `[controller]` names `settings`).
+A site may also name `prepare`, the study's own command for each member that has come up (an argv list: its ingest and
+`hpcfed.py verify-data`; `{root}` in a word is the member's federation root and `{layout}` the fleet's layout file), and
+then `prepare_timeout_s` (required with it, refused without): the controller runs it once per member on the site's login
+node, through the site's transport, from its deploy directory (`fleetprepare.py`), and joins the member only when it
+exits 0 and the member then reads verified; any other end retires the member unjoined. Its output stays in a log file
+at the site; the controller's log keeps the outcome, the exit status and the duration.
 One campaign drives one site: the ledger and `archives` are this host's; each archive is pulled over ssh, hashed here.
 """
 
@@ -79,7 +85,7 @@ from fleetexecute import (  # noqa: E402
 
 COMMANDS = ("observe", "control", "drain", "ended", "join", "settle")
 CONTROLLER_KEYS = ("evidence", "interval_s", "log", "archives", "settings")
-SITE_KEYS = ("fleet", "transport", "interpreter", "deploy", "channel", "host", "env_file", "settings")
+SITE_KEYS = ("fleet", "transport", "interpreter", "deploy", "channel", "host", "env_file", "settings", "prepare")
 SSH_ONLY_KEYS = ("host", "env_file", "settings")
 DISPATCH_S = 30.0  # `elastic.dispatch.TICK_S`: with a dispatcher the loop goes round this often
 TRANSPORTS = ("local", "ssh")
@@ -159,6 +165,7 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
     sites = []
     for entry in data.get("site") or []:
         own = {key: entry.pop(key) for key in SITE_KEYS if key in entry}
+        prepare = prepare_of(entry.get("label"), own.get("prepare"), "prepare_timeout_s" in entry)
         if own.get("transport", "local") not in TRANSPORTS:
             raise ConfigError(f"site {entry.get('label')}: transport must be one of {', '.join(TRANSPORTS)}")
         remote = own.get("transport", "local") == "ssh"
@@ -179,7 +186,7 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
         elif any(key in own for key in SSH_ONLY_KEYS):
             raise ConfigError(f"site {settings.label}: {', '.join(SSH_ONLY_KEYS)} belong to an ssh site")
         sites.append(SiteConfig(settings, fleet, own.get("transport", "local"), python, deploy, channel, host,
-                                env_file, shard_settings))  # fmt: skip
+                                env_file, shard_settings, prepare))  # fmt: skip
     if not sites or len({s.label for s in sites}) != len(sites):
         raise ConfigError("the sites file needs at least one [[site]], each label once")
     channels = [s.channel is not None for s in sites]
@@ -189,6 +196,20 @@ def load_config(path: Path) -> Tuple[Controller, List[SiteConfig]]:
     if len({fleet_identity(s.fleet, s.host) for s in sites}) != len(sites):
         raise ConfigError("two sites name one fleet directory: each fleet is one site's, read and acted on once")
     return controller, sites
+
+
+def prepare_of(label: Any, argv: Any, timed: bool) -> Optional[Tuple[str, ...]]:
+    """A site's `prepare` command, checked: an argv of non-empty words, with `prepare_timeout_s` beside it and never
+    without it (a command with no bound, or a bound for no command, is a mistake in the file)."""
+    if argv is None:
+        if timed:
+            raise ConfigError(f"site {label}: prepare_timeout_s belongs with prepare")
+        return None
+    if not isinstance(argv, list) or not argv or not all(isinstance(word, str) and word for word in argv):
+        raise ConfigError(f"site {label}: prepare must be a list of words, the command's argv, none empty")
+    if not timed:
+        raise ConfigError(f"site {label}: prepare needs prepare_timeout_s, the bound of the command")
+    return tuple(argv)
 
 
 def ssh_site(label: str, own: Mapping[str, Any], needs_settings: bool) -> Tuple[str, Optional[str], Optional[Path]]:

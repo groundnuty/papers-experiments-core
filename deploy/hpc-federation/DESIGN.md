@@ -1244,7 +1244,7 @@ template does not name is left out, and so is the artifacts digest of a site wit
 template writes no record. **The artifacts digest** is taken by `up` once, in its preflight on the login node, before
 the root is made or a job submitted (a tree that cannot be digested fails `up` there), kept in the state file and
 handed to the core's phase among its values, so a core step on a node, whose environment is an allowlist, has it and
-never reads the tree. It is the SHA-256 of one canonical listing: `expcore-artifacts-tree/1` and a NUL, then one record
+never reads the tree. It is the SHA-256 of one canonical listing: `expcore-artifacts-tree/2` and a NUL, then one record
 per entry sorted by its relative path as bytes, none for the directory itself: `F NUL path NUL size NUL sha256 NUL` (a
 regular file), `D NUL path NUL` (a directory), `L NUL path NUL target NUL` (a symbolic link, by its target string, never
 followed, so what it points at must be in the tree to be pinned: the directory is self-contained, its interpreter
@@ -1254,7 +1254,10 @@ goes up one and one at the root is an escape, an absolute target must begin, by 
 path or the path it was declared by, and a path may pass through 40 links at most, so a loop is refused; a link that
 dangles inside is allowed and recorded, and a tree whose links stay inside has its earlier digest). A special file, or a
 root that is not a directory of its own, is refused, naming `HPC_STUDY_ARTIFACTS` and a path relative to the directory, never an absolute one. No mode, owner, time
-or path of the directory is in it, so a copy elsewhere has the same digest. The tree is read below one held descriptor
+or path of the directory is in it, so a copy elsewhere has the same digest; and since version 2 (O94) a file's bytes and
+a link's target are hashed with the directory's own path (its real path and `HPC_STUDY_ARTIFACTS`) replaced by
+`@study_artifacts@`, and the install's bookkeeping (`RECORD`, `direct_url.json`, `uv_cache.json` in a `*.dist-info`;
+all below a `.git` but `HEAD`) is left out, so one recipe built at two sites' paths is one digest. The tree is read below one held descriptor
 with no link followed and never written (the pilot makes it read-only first). A manifest's `expect_render_identity`
 (a path of the study; the lines carry it with its hash as `--expect-render-identity*`) makes `step` compare the
 federation's record with the expected one before it makes anything, beside the pre-step guard and before it, refusing
