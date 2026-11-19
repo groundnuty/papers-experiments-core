@@ -236,3 +236,19 @@ def test_c53_a_lone_controller_logs_no_sharing(deploy, tmp_path):
     assert deploy.fleetcontrol.load_config(one.file())[0].sharing is None
     assert set(one.ticks()[-1]) == {"kind", "at", "dry_run", "wanted", "targets", "waits", "relays", "money",
                                     "actions"}  # fmt: skip
+
+
+def test_c53_priority_holds_back_every_add_and_a_compose_join_and_nothing_else(deploy):
+    """C53: a deferring controller holds back every add and a join of a Compose site's static member; the join of its
+    own HPC member that came up, and a drain, go on."""
+    from expcore.campaign.elastic.control import Add, Drain, Join
+
+    sites = {"vm": SimpleNamespace(compose=object()), "hpc": SimpleNamespace(compose=None)}
+
+    def join(site: str) -> Join:
+        return Join(site, "fed-1", f"{site}-fed-1", ("job-1",), 0.0, 0.0, None, "up, linked and verified")
+
+    assert deploy.fleetshare.deferrable(Add("hpc", 1, "short"), sites)
+    assert deploy.fleetshare.deferrable(join("vm"), sites)
+    assert not deploy.fleetshare.deferrable(join("hpc"), sites)
+    assert not deploy.fleetshare.deferrable(Drain("vm", "fed-1", "vm-fed-1", "idle"), sites)
