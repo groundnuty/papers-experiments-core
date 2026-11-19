@@ -23,9 +23,9 @@ Under a declared list the static scan (`expcore.egress.scan`) reclassifies two o
   added to, formatted or joined to another literal at run time, a command substitution, an archive file named as a
   requirement, an install that names no requirement where it is written. A run with a cell that names an index
   setting anywhere (an index or find-links option's name, any `PIP_` or `UV_` environment setting, `pip config`, a
-  `pip.conf`) has no install cleared, in any cell. A URL is a `package_index` hit only when its host, read again up to
-  the next space or quote, is still the declared one. The rule reads text, as the scan does: what it cannot see, it
-  does not clear.
+  `pip.conf`) has no install cleared, in any cell. A URL is a `package_index` hit only when its authority, read on
+  past the match to the next space, has no user part (`https://pypi.org)@elsewhere/` is elsewhere's). The rule reads
+  text, as the scan does: what it cannot see, it does not clear.
 
 `curl`, `wget`, `git clone`, `conda`, every other URL, every network call and every outside connection in the egress
 log flag exactly as before: the log holds addresses, never names, so it cannot be allow-listed by host.
@@ -62,6 +62,7 @@ _V = r"(?:===|==|!=|<=|>=|~=|<|>)[A-Za-z0-9.*+!_-]+"
 _REQUIREMENT = re.compile(rf"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?(?:\[[A-Za-z0-9._,-]*\])?(?:{_V}(?:,{_V})*)?")
 _SPECIFIER = re.compile(rf"(?:===|==|!=|<=|>=|~=|<|>)|{_V}(?:,{_V})*")
 _ARCHIVE = re.compile(r"\.(?:whl|zip|egg|tgz|tbz2?|txz|tar(?:\.(?:gz|bz2|xz|lz|lzma|zst))?)$", re.IGNORECASE)  # a file
+_JOINED = re.compile(r"\s*(?:[+%.]|[rRbBuUfF]{0,2}['\"])")  # what may join a literal at run time, prefixes included
 _LITERALS = re.compile(r"(?:\s*,\s*(?:'[^'\\\n]*'|\"[^\"\\\n]*\"))*\s*,?\s*")
 _OPENERS, _CLOSERS = "([{", ")]}"
 
@@ -161,7 +162,7 @@ def _plain_install(text: str, match: re.Match[str]) -> bool:
     span, end = _arguments(text, start, _depth(text[: match.start()]) > 0, quote)
     if text[end : end + 1] == "`":
         return False  # a command substitution among the arguments
-    if (listed or quote) and text[end + 1 :].lstrip()[:1] in ("+", "%", ".", "'", '"'):
+    if (listed or quote) and _JOINED.match(text, end + 1):
         return False  # the list or the string is added to, formatted or joined to the next literal
     if listed:
         if not _LITERALS.fullmatch(span):
@@ -171,7 +172,7 @@ def _plain_install(text: str, match: re.Match[str]) -> bool:
         tokens = [t.strip("'\"") for t in span.replace("\\\n", " ").split()]
     # an install that names no requirement here is one whose arguments come from elsewhere
     return any(_REQUIREMENT.fullmatch(token) for token in tokens) and all(
-        token and _plain_token(token) and not _ARCHIVE.search(token) for token in tokens
+        token and _plain_token(token) and not _ARCHIVE.search(re.split(r"[\[<>=!~,;]", token)[0]) for token in tokens
     )
 
 

@@ -65,6 +65,8 @@ def test_a_plain_install_from_the_default_index_is_a_package_index_hit_that_does
         "os.system('pip install %s' % name)",
         "cmd = 'pip install'\nos.system(cmd + ' ' + name)",
         "!pip install demo-1.0-py3-none-any.whl",
+        "!pip install 'demo-1.0.tar.gz[extra]'",
+        'os.system("pip install demo" r" -r requirements.txt")',
         "os.system('pip install demo' ' -r requirements.txt')",
         "os.system('pip install demo'\n          ' -r requirements.txt')",
         "!pip install demo `printf %s ./wheels/demo`",
@@ -98,6 +100,8 @@ def test_a_url_on_a_declared_index_host_is_a_package_index_hit_and_one_elsewhere
     ]
     assert hits("u = 'ssh://pypi.org/x'") == [("url", "pypi.org", True)]
     assert hits("u = 'https://pypi.org)@mirror.example.net/pkg'") == [("url", "pypi.org", True)]  # elsewhere's
+    assert hits('u = "https://pypi.org\'@mirror.example.net/pkg"') == [("url", "pypi.org", True)]
+    assert hits("get('https://pypi.org')\nget(\"https://pypi.org/simple/\")") == [("package_index", "pypi.org", False)]
 
 
 def test_an_index_setting_in_one_cell_keeps_every_install_of_the_run_flagged():

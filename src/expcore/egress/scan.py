@@ -32,7 +32,8 @@ SCAN_VERSION = 1
 MAX_HITS = 200  # per run; `hits_cut` says when more were found
 URL, DOWNLOAD, NETWORK_CALL = "url", "download", "network_call"
 _WEB = ("http://", "https://")  # the schemes a URL on a declared package index may have
-_TAIL = re.compile(r"[^\s'\"]*")  # what may follow a URL's match up to the next space or quote
+_TAIL = re.compile(r"\S*")  # what may follow a URL's match up to the next space
+_AUTHORITY = re.compile(r"[^/?#]*")  # a URL's authority, after its scheme
 
 _SCHEMES = "https?|ftps?|wss?|git|ssh|sftp|rsync|s3|gs"
 _URL = re.compile(rf"\b(?:{_SCHEMES})://[^\s'\"<>`\\)\]}}]+", re.IGNORECASE)
@@ -76,11 +77,12 @@ def _host(url: str) -> str | None:
         return None
 
 
-def _on_index(match: re.Match[str], code: str, host: str) -> bool:
-    """Whether a URL may be a declared index's: http(s), and its host, read again with what follows the match up to the
-    next space or quote, still the same (`https://pypi.org)@elsewhere/` is elsewhere's)."""
+def _on_index(match: re.Match[str], code: str) -> bool:
+    """Whether a URL may be a declared index's: http(s), and no user part in its authority, read on past the match
+    to the next space (`https://pypi.org)@elsewhere/` and `https://pypi.org'@elsewhere/` are elsewhere's)."""
     whole = match.group() + _TAIL.match(code, match.end()).group()
-    return match.group().lower().startswith(_WEB) and _host(whole) == host
+    authority = _AUTHORITY.match(whole.split("://", 1)[1]).group()
+    return match.group().lower().startswith(_WEB) and "@" not in authority
 
 
 def _hits_of(
@@ -92,7 +94,7 @@ def _hits_of(
     hits = []
     matches = list(_URL.finditer(code))
     hosts = [_host(m.group()) or "?" for m in matches]
-    urls = [(h, bool(indexes) and _on_index(m, code, h)) for m, h in zip(matches, hosts, strict=True)]
+    urls = [(h, bool(indexes) and _on_index(m, code)) for m, h in zip(matches, hosts, strict=True)]
     for host in dict.fromkeys(host for host, _ in urls):
         if host in indexes and all(web for other, web in urls if other == host):  # http(s) only
             hits.append({"cell": index, "kind": PACKAGE_INDEX, "what": host, "flag": False})
