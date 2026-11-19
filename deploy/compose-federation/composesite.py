@@ -16,18 +16,19 @@ Each takes `--engine` after its name (the site's setting, `EXPCORE_FED_ENGINE`; 
 federations the operator brought up with `federation.py up` (static members: none is ever brought up or taken down
 here).
 
-- **observe** reads each member, and writes nothing: live when every service its `facts.json` names has a running
-  container of the root's project (the root's mark names it) bound to that root; linked when its `link-check.json` says
-  ok; verified when linked and every space its `platform.toml` declares data for (`data_manifest`) has a marker in
-  `data-verified.json` naming its id and its manifest's SHA-256 (`data_verified`: fail closed; no Compose command writes
-  one yet, so a member with declared data never joins); its worker, by the pidfile `launch` wrote for this campaign's
-  channel. A member is `up` and `RUNNING` while live and not yet launched, or launched with its worker running and its
-  project there (a service merely stopped, as an injected outage stops one, keeps it so); `GONE` (proven ended) once
-  launched and no process of its worker is left (`worker_gone`), whether the project is up or not; `BROKEN` when its
-  project is down (a service with no container) and the worker still runs (drained, then retired, which stops it);
-  `down` when it is not live and was never launched, or was retired for this channel. Its job id is `compose-<project>`,
-  the same at every read, and its end `--horizon-s` from now: a member has no walltime. The site reports no node, so the
-  controller never adds to it.
+- **observe** reads each member, and writes nothing of the site's (a declared manifest is parsed from a private
+  temporary copy of its bytes): live when every service its `facts.json` names has a running container of the root's
+  project (the root's mark names it) bound to that root; linked when its `link-check.json` says ok; verified when linked
+  and every space its `platform.toml` declares data for (`data_manifest`) has a marker in `data-verified.json` naming
+  its id and its manifest's SHA-256 (`data_verified`: fail closed; no Compose command writes one yet, so a member with
+  declared data never joins); its worker, by the pidfile `launch` wrote for this campaign's channel. A member is `up`
+  and `RUNNING` while live and not yet launched, or launched with its worker running and its project there (a service
+  merely stopped, as an injected outage stops one, keeps it so); `GONE` (proven ended) once launched and no process of
+  its worker is left (`worker_gone`), whether the project is up or not; `BROKEN` when its project is down (a service
+  with no container) and the worker still runs (drained, then retired, which stops it); `down` when it is not live and
+  was never launched, or was retired for this channel. Its job id is `compose-<project>`, the same at every read, and
+  its end `--horizon-s` from now: a member has no walltime. The site reports no node, so the controller never adds to
+  it.
 - **launch** starts the elastic worker once, detached in a session of its own, with an environment of the allowlist
   alone and HOME the site's `--home` (a 0700 directory of this user holding the study's key tree at its models.toml
   paths, placed by the operator: never copied, never read here), in `<fleet>/members/<name>/run/` (the study copied
@@ -294,7 +295,7 @@ def data_verified(root: Path) -> bool:
             found = (entry.get("manifest_sha256"), entry.get("manifest_file_sha256"), entry.get("space_id"))
             if found != (digest, file_digest, space_id):
                 return False
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, ImportError):  # unread: unverified
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError):  # a bad manifest too: unverified
         return False
     return True
 

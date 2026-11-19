@@ -564,7 +564,7 @@ Each row names the files whose tests back the ID; `tests/test_changelog.py` chec
 | C49 | A federation the controller adds gets its study data ingested and verified before it joins, and one whose prepare fails never joins | `tests/deploy/test_hpc_fleet_prepare.py` |
 | C50 | A campaign's members run on any platform it declares, and on no other, and each run records the one it ran under | `tests/study/test_declared_platforms.py`, `tests/campaign/elastic/test_ledger_platforms.py`, `tests/campaign/test_merge_by_run_checks.py`, `tests/deploy/test_hpc_fleet_control.py`, `tests/deploy/test_hpc_fleet_join_worker.py`, `tests/deploy/test_hpc_render_identity.py` |
 | C51 | A host's Compose federations are one site's members: one fingerprint, no collision, an end proven over the worker's whole tree, and no down | `tests/campaign/elastic/test_ledger_cli.py`, `tests/deploy/test_compose_instances.py`, `tests/deploy/test_compose_site.py` |
-| C52 | A Compose federation's declared data joins the campaign only once read back as its manifest | `tests/deploy/test_compose_site.py` |
+| C52 | A Compose federation's declared data joins the campaign only once read back as its manifest | `tests/deploy/test_compose_instances.py`, `tests/deploy/test_compose_site.py` |
 | P01 | Unknown code is dirty code, and dirty code does not start a study run | `tests/provenance/test_codestamp.py`, `tests/provenance/test_core_identity.py`, `tests/study/test_core_identity_pipeline.py` |
 | P02 | Code identity includes the data files the code reads, and is re-verified | `tests/provenance/test_codestamp.py`, `tests/study/test_plugin_import.py`, `tests/study/test_plugin_modules.py` |
 | P03 | Tree hashes ignore modification times and caches | `tests/provenance/test_codestamp.py` |
