@@ -60,6 +60,14 @@ and the injector journals them with the stop's outcome (`injected`, or `stop_unk
 unconfirmed) and records them in its snapshot, so a live slot's journal holds every stop's real duration, which a
 measured `[hpc] stop_seconds` comes from. A stop with no answer has none.
 
+**The holder of a kept stop (O96).** A stopped provider's kept work directory on its node's tmpfs vanished during an
+outage wherever no process of ours was left on that node (live, 19 Nov 2026), so the stop verb launches a holder step
+there and says `"holder": "failed"` in its evidence when it could not show one. The driver keeps that word in
+`last_stop` (`holder`, present only then) and raises DriverError for the stop: the injector then journals the stop
+(`stop_unknown`, with the evidence), brings the provider back at once, while its directory is still there, and fails
+`start` as `injector_failure`, so the attempt, which has not begun its agent's loop, is set aside and run again rather
+than run through an outage that would most likely lose the provider.
+
 **The heal (O35).** `ping` runs op-worker's runner (`/usr/sbin/op_worker ping`) inside the provider's service, and
 `restart_link` runs the Compose driver's very command, `compose.RESTART_LINK_SCRIPT` (rtransfer_config's restart_link
 through nodetool's rpcterms), inside it, so env.sh finds the service's own epmd port and cookie and none is on a
@@ -137,6 +145,7 @@ HPC_STOP_EXTRA_S = (
     90.0  # `stop_bound_s` beyond `stop_seconds`: supervise.py's kill tail (30 s) and the step's end (60 s)
 )
 HPC_VERB_MARGIN_S = 30.0  # what a verb's relay bound keeps beyond its inner worst case
+HOLDER_FAILED = "failed"  # `HOLDER_FAILED`: a stop's evidence when it showed no holder step beside the kept directory
 
 
 def verb_inner_worst_s(step_launch_wait_s: float, stop_bound_s: float) -> dict[str, float]:
@@ -304,6 +313,8 @@ class HpcDriver:
         self.last_stop = stop_evidence(done.stdout)
         if done.returncode != 0:
             raise DriverError(f"the command to {step} failed with exit code {done.returncode}")
+        if (self.last_stop or {}).get("holder") == HOLDER_FAILED:
+            raise DriverError(f"the command to {step} kept the service with no holder step beside its work directory")
 
     def start(self, service: str) -> None:
         """Start the provider's stopped service again. The figure of an earlier launch is gone: this one has not
@@ -501,7 +512,8 @@ def stop_evidence(stdout: str) -> dict[str, Any] | None:
     """A stop's evidence, from the stop verb's answer: `stopped` (a bool, or None), `ended` (a word of `STOP_ENDS`, or
     None), `seconds` (from the request to the verb's verdict) and `service_seconds` (the service's own end after its
     SIGTERM, as the node measured it), each a finite number of at least 0 or None; None when the answer holds none of
-    them. Nothing else the answer holds is kept (it can name a node)."""
+    them; and `holder`, `failed`, only when the answer says so (O96). Nothing else the answer holds is kept (it can
+    name a node)."""
     record = _record(stdout)
     if record is None:
         return None
@@ -512,4 +524,6 @@ def stop_evidence(stdout: str) -> dict[str, Any] | None:
         "seconds": _duration(record.get("seconds")),
         "service_seconds": _duration(record.get("service_seconds")),
     }
-    return None if all(value is None for value in evidence.values()) else evidence
+    if all(value is None for value in evidence.values()):
+        return None
+    return {**evidence, "holder": HOLDER_FAILED} if record.get("holder") == HOLDER_FAILED else evidence

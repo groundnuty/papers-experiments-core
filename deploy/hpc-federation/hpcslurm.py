@@ -8,7 +8,8 @@
 - **Every step** is `srun --jobid --exact` with a name, its cores and memory, `--chdir=/`, and `/usr/bin/env -i` with
   an explicit allowlist in front of its command, so neither the login environment nor a site prolog decides what it
   sees, and it never starts in the login node's working directory (or, where that does not exist on the node, in the
-  node's shared /tmp, where slurmstepd falls back). No step uses `--overlap`.
+  node's shared /tmp, where slurmstepd falls back). No step uses `--overlap` but a kept stop's holder (`Step.overlap`),
+  a sleep that shares the node's resources with every other step, so it never holds back a control or service step.
 - **A control step's srun client** that outlives its bound is ended only once its step has been gone from `squeue -s`
   for three polls in a row (a finished step's client can hang on the login node); a step still listed at the bound is
   cancelled by its own id.
@@ -424,7 +425,8 @@ class Step:
     of one with no `--het-group` is refused. A step of a further component also carries that component's own job id
     (`component`), by which squeue -s and sacct list its steps. A job of one component takes no `het_group`. A step
     names `--network=<value>` (`network`, the site's `HPC_STEP_NETWORK`) only when it has a value: with none, its argv
-    is what it was before the setting existed."""
+    is what it was before the setting existed. `overlap` (a kept stop's holder alone, O96) names `--overlap` in place
+    of `--exact`: the step shares the node's cores and memory with every other step, as the holder proven live did."""
 
     job: str
     node: str
@@ -437,6 +439,7 @@ class Step:
     het_group: Optional[int] = None
     component: Optional[str] = None
     network: str = ""
+    overlap: bool = False
 
     @property
     def listed_as(self) -> str:
@@ -453,7 +456,7 @@ class Step:
             "srun",
             f"--jobid={self.job}",
             *group,
-            "--exact",
+            "--overlap" if self.overlap else "--exact",
             "-N1",
             "-n1",
             "-w",
