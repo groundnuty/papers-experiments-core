@@ -35,6 +35,7 @@ an ordered list of actions, each the call an operator would make by hand: a prov
   the job gone) is proven `cancelled`. A site that cannot be read proves nothing and gets no action.
 """
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -434,20 +435,23 @@ def login_budgets(
 def made_units(settings: SiteSettings, view: SiteView, federations: Mapping[str, Federation]) -> float:
     """The billing units the site's members count against its allowance (C60): one whole `--time` each (its rate times
     the `--time`), as reserved, except a member whose down is verified (`down`) and whose end the ledger proves: it
-    counts what its jobs billed, from their start (the job end recorded at its join less one whole `--time`: the
-    start, never the submit) to the proven end (at or after the true one), never below 0 nor above one whole `--time`.
-    A downed member with no ledger row (it never joined) or no proven end yet keeps its whole `--time`: what is not
-    known is never counted as less."""
+    counts what its jobs billed, from their start to the proven end (at or after the true one), never below 0 nor above
+    one whole `--time`. The start is the job end recorded at its join less the `--time` rounded up to whole minutes, as
+    Slurm rounds a limit (so never later than the true start, and never the submit). A downed member with no ledger
+    row (it never joined), no proven end yet, or a start so found after its join (its job end and this `--time`
+    disagree: the layout's `--time` changed) keeps its whole `--time`: what is not known is never counted as less."""
     whole = settings.rate_units_per_hour * view.time_s / 3600.0
+    limit = math.ceil(view.time_s / 60.0) * 60.0
     total = 0.0
     for m in view.members:
         if m.status == "taken":
             continue
         fed = federations.get(ledger_label(settings.label, m.label)) if m.status == "down" else None
-        if fed is None or fed.ended_at is None:
+        start = None if fed is None else fed.job_end_at - limit
+        if fed is None or fed.ended_at is None or start > fed.joined_at:
             total += whole
             continue
-        billed = min(fed.ended_at, fed.job_end_at) - (fed.job_end_at - view.time_s)
+        billed = min(fed.ended_at, fed.job_end_at) - start
         total += min(whole, settings.rate_units_per_hour * max(billed, 0.0) / 3600.0)
     return total
 
