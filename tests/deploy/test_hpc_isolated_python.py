@@ -250,9 +250,10 @@ def python_findings(source: str) -> list[str]:
 
 SRC = DEPLOY.parent / "src"  # the core's own code, which the driver and the sandbox launch on the nodes
 # The Python launches of the core's own code that run on a node, each by the file it is in (the sandbox's gate, the
-# mount watcher, the egress collector, the read-log collector, the completion check, the copy-out, the work disk's copy
-# helper, the signal helper's root half and the resolve launcher's flags): each must exist, so the scan below cannot go
-# silent because a launch moved. They are the only `-I` displays in `src/`.
+# mount watcher, the egress collector, the read-log collector on Apptainer and the Docker read-log collector's
+# container, the completion check, the copy-out, the work disk's copy helper, the signal helper's root half and the
+# resolve launcher's flags): each must exist, so the scan below cannot go silent because a launch moved. They are the
+# only `-I` displays in `src/`.
 SRC_LAUNCHES = {
     "expcore/campaign/elastic/transport.py": 1,  # the elastic channel's exchange verb on a login node (C44)
     "expcore/campaign/elastic/worker.py": 1,  # the node worker's `expcore run --lease` (C44)
@@ -263,6 +264,7 @@ SRC_LAUNCHES = {
     "expcore_onedata/sandbox/apptainer/sandbox.py": 1,
     "expcore_onedata/sandbox/apptainer/workdisk.py": 1,  # the copy out of the work disk's image (O71)
     "expcore_onedata/sandbox/completion.py": 1,
+    "expcore_onedata/sandbox/containers.py": 1,  # the Docker read-log collector's container (O91)
     "expcore_onedata/sandbox/copyout.py": 1,
     "expcore_onedata/sandbox/procsignal.py": 1,  # the root half of a signal, run under sudo (O72)
 }
@@ -392,11 +394,12 @@ def test_o58_every_python_argv_the_driver_builds_runs_isolated_and_every_slurm_l
 
 
 def test_o58_every_python_the_core_launches_on_a_node_runs_isolated_and_writes_no_bytecode():
-    """O58: the gate, the mount watcher, the egress collector, the read-log collector, the completion check, the
-    copy-out, the work disk's copy helper and the signal helper's root half of `src/` run an interpreter on a batch node
-    with `-I` and `-B` together, as the driver's own launches do: `-I` alone still writes `__pycache__` into a checkout
-    or a tree the node shares (a root interpreter included). Every `-I` display of `src/` is scanned, and the launches
-    are all found (a scan that finds none of them would pass for the wrong reason)."""
+    """O58: the gate, the mount watcher, the egress collector, the read-log collector (Apptainer's, and the Docker
+    read-log collector's container), the completion check, the copy-out, the work disk's copy helper and the signal
+    helper's root half of `src/` run an interpreter on a batch node with `-I` and `-B` together, as the driver's own
+    launches do: `-I` alone still writes `__pycache__` into a checkout or a tree the node shares (a root interpreter
+    included). Every `-I` display of `src/` is scanned, and the launches are all found (a scan that finds none of them
+    would pass for the wrong reason)."""
     counts, findings = {}, {}
     for path in sorted(SRC.rglob("*.py")):
         count, bad = isolated_launches(path.read_text(encoding="utf-8"))

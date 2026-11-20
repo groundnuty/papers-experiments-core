@@ -104,7 +104,9 @@ class SandboxSpec:
     no data path has no token and no endpoint. `lease_key` names the leased resource the sandbox's containers, network
     and directories are labelled with, so a probe can prove them gone (C19). `listing` is a REST data path's listing
     mode, `paged` or `complete` (`gatepolicy`, O21); a start refuses another, and any but `paged` on another data path.
-    `inputs` are the run's read-only inputs, in the order they are mounted and recorded (O20).
+    `inputs` are the run's read-only inputs, in the order they are mounted and recorded (O20). The read-log channel
+    (`expcore_onedata.readlog`) is not asked for here: a platform that declares `readlog_collector_sha256` has it for
+    every run.
     """
 
     run_key: str

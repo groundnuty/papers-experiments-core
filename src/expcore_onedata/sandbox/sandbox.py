@@ -25,6 +25,11 @@ Per run, named `<prefix>-<id>` where the id starts with the lease key when there
     started and again at every teardown (`_write_token_file`, `_remove_token_files`); a run killed outright before that
     leaves it until the next start on the root removes it (`reap.reap_token_files`). Each secret is bound with
     `--mount`, which refuses a missing source where `-v` makes a directory of it (`containers.bind`);
+  * the read-log channel, when the platform pins its collector (`readlog_collector_sha256`; `readlog_channel`, Linux
+    only): a collector container with no
+    network that the agent's scripts log their reads to through a socket directory bound read-only into the agent. Its
+    log is bound into the collector alone, read once at the collection after the collector was stopped with SIGTERM
+    (so that it writes its end line), scanned for the token and exposed as `read_log()`;
   * no data path: neither;
   * the agent container: read-only root, all capabilities dropped, no-new-privileges, fixed cpus, memory and pids;
   * each read-only input of the spec: copied into the run's directory, hashed into the metadata, and mounted read-only
@@ -47,7 +52,9 @@ import json
 import logging
 import os
 import re
+import secrets
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -60,6 +67,8 @@ from typing import Any
 from expcore.config.loading import ConfigError
 from expcore_onedata import tls
 from expcore_onedata.fault_drain import GATE, MOUNT
+from expcore_onedata.readlog import facts as readlog_facts
+from expcore_onedata.readlog import reader as readlog_reader
 from expcore_onedata.sandbox import (
     cellhost,
     cellresolv,
@@ -79,6 +88,7 @@ from expcore_onedata.sandbox import (
 )
 from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import infradeath as ID
+from expcore_onedata.sandbox import readlog_channel as RL
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import (
@@ -96,11 +106,13 @@ from expcore_onedata.sandbox.completion import ExecIncomplete
 from expcore_onedata.sandbox.containers import (
     GATE_CA_PATH,
     GATE_TOKEN_PATH,
+    READLOG_READY,
     SIDECAR_LOG_DIR,
     Names,
     agent_run_args,
     certifi_bundle,
     certifi_probe_args,
+    collector_run_args,
     extra_args_record,
     gate_run_args,
     gate_upstreams,
@@ -133,6 +145,9 @@ TEARDOWN_TROUBLE = ("GATE TEARDOWN INCOMPLETE", "GATE TEARDOWN FAILED", "GATE TE
 MOUNT_NOT_THROUGH_GATE = "mount_not_through_gate"  # a mount's reads go through oneclient: no gate counts them (O22)
 NOT_COLLECTED = "gate_not_collected"  # the gate has not been stopped by a collection: its log may still grow (O22)
 MOUNT_WAIT_S = 60.0
+READLOG_POLLS = (
+    100  # reads of the collector's state, 0.1 s apart, for its ready line, and again for its exit after a signal
+)
 READ_ONLY_PROBE = (
     "try:\n"
     "    open({path!r}, 'w').close()\n"
@@ -212,6 +227,16 @@ class DockerSandbox:
         self._inputs: tuple[ReadOnlyInput, ...] = ()  # the spec's read-only inputs, their sources resolved
         self._input_copies: list[tuple[Path, str]] = []  # each input's copy in the run's directory, and its path
         self._token_files: list[Path] = []  # the run's files of the token, on the host only while their holder starts
+        # the read-log channel (`readlog_channel`): the nonce the collector is told, the one sender uid it accepts (the
+        # declared agent uid: a cell runs as it), what the start made, and the log as the collection read it
+        self._readlog_pin = settings.readlog_collector_sha256  # None: this run has no channel
+        self.readlog_nonce = secrets.token_hex(16)
+        self.readlog_expected_peer_uid = settings.agent_uid
+        self._readlog: RL.Prepared | None = None
+        self._readlog_bytes: bytes | None = None
+        self._readlog_stopped = False  # the harness stopped the collector, once: its stop and its note stand
+        self._readlog_collected = False  # the stopped collector's log was read AND scanned for the token, once
+        self._readlog_token_hit = False  # that log held the token: every later collection fails the same way
         self.keep_evidence = False
         self._init_sleep: dict[str, Any] | None = None  # the agent's init's `sleep`, by pid and start time (O34)
         self._uptime0: float | None = None
@@ -293,6 +318,15 @@ class DockerSandbox:
             raise StartRefused("the listing mode must be paged or complete, and complete is for a REST data path only")
         if cellhost.is_node_name(sp.node_names):  # O73: the neutral host name is never a node's
             raise StartRefused(cellhost.REFUSAL)
+        if self._readlog_pin is not None:
+            if not _linux():
+                raise StartRefused(
+                    "the read-log channel passes a Unix socket through a bind, which only a Linux host does"
+                )
+            if not RL.pin_matches(self._readlog_pin):  # before anything exists: no run on another collector than pinned
+                raise StartRefused(
+                    "[sandbox] readlog_collector_sha256 is not the read-log collector of this core: its SHA-256 differs"
+                )
         if sp.mode is not DataPathMode.NONE and s.tls.ca_file is not None:
             try:  # the bytes the record names by their hash, read once: the containers get these and never the path
                 self._ca_bytes = s.tls.bundle()
@@ -313,8 +347,8 @@ class DockerSandbox:
     def _images(self) -> dict[str, Any]:
         s, mode = self.s, self.spec.mode
         images = {"agent": s.agent}
-        if mode is DataPathMode.REST:
-            images["gate"] = s.gate
+        if mode is DataPathMode.REST or self._readlog_pin is not None:
+            images["gate"] = s.gate  # the read-log collector runs on the gate's image, pinned like the gate's own
         if mode is DataPathMode.MOUNT:
             images["oneclient"] = s.oneclient
         return images
@@ -380,6 +414,9 @@ class DockerSandbox:
             "attempts": tries,
         }
         self._checkpoint()
+        if self._readlog_pin is not None:
+            self._start_readlog()  # before the agent: its socket directory is bound into it, and its canary follows
+            self._checkpoint()
         gate_ip = self._start_gate() if mode is DataPathMode.REST else None
         self._checkpoint()
         share = self._start_mount() if mode is DataPathMode.MOUNT else None
@@ -388,6 +425,8 @@ class DockerSandbox:
         self._init_sleep = self._identify_init_sleep()  # before any cell: a probe's process would be one more
         self._checkpoint()
         roles = {"agent": self.names.agent} | ({"gate": self.names.gate} if gate_ip else {})
+        if self._readlog is not None:
+            roles["readlog"] = self.names.readlog
         if share:
             roles["sidecar"] = self.names.sidecar
         escalation = DL.Escalation(s.kill_grace_s, self._abort_mount, sleep=self._sleep, clock=self._clock)
@@ -401,6 +440,8 @@ class DockerSandbox:
         if share and s.mount.io_mode == DIRECT:
             self._verify_direct_io()
         self._verify_inputs()
+        if self._readlog is not None:
+            self._send_readlog_canary()  # the log's first record, from a cell of the agent's own uid, before any of its own
         self._cells.sample_pids()
         self._start_sampler()
 
@@ -690,6 +731,186 @@ class DockerSandbox:
             self._meta["mount"]["oneclient_build"] = build
         return share
 
+    # ------------------------------------------------------------------------------------------------ the read log
+    def _start_readlog(self) -> None:
+        """Start the read-log collector container (`collector_run_args`) and wait for its ready line, then write the
+        run's fact of it through the one writer (owner `readlog`): both hashes, the placement and the one sender uid
+        it accepts. Registered before it is created, so that no interrupt leaves one that `stop` misses. A collector
+        that exits, or does not say it is ready, refuses the start."""
+        names, s = self.names, self.s
+        self._register_container(names.readlog)
+        made = RL.prepare(self.dir, agent_uid=s.agent_uid, pin=self._readlog_pin)
+        self._readlog = made
+        args = collector_run_args(
+            s, names, self._label_args(), made.dirs, s.gate.id, uid=made.uid, gid=made.gid, nonce=self.readlog_nonce
+        )
+        self.host.docker(*args)
+        self._wait_readlog()
+        self.watch_container("readlog", names.readlog)
+        fact = readlog_facts.fact(
+            collector_sha256=made.collector_sha256,
+            client_sha256=made.client_sha256,
+            placement="docker_container",
+            expected_peer_uid=self.readlog_expected_peer_uid,
+        )
+        self._facts.write(readlog_facts.OWNER, {readlog_facts.KEY: fact})
+        self._meta["read_log"] = {"nonce": self.readlog_nonce, "expected_peer_uid": self.readlog_expected_peer_uid}
+
+    def _wait_readlog(self) -> None:
+        for _ in range(READLOG_POLLS):
+            logs = self.host.docker("logs", self.names.readlog, check=False)
+            if READLOG_READY in logs.stdout:
+                return
+            if (hostops.inspect(self.host, self.names.readlog) or {}).get("State", {}).get("Running") is not True:
+                log.error("the read-log collector exited: %s", describe_stderr(logs.stderr))
+                raise SandboxError("the read-log collector exited before it was ready")
+            self._sleep(0.1)
+        raise SandboxError("the read-log collector did not become ready")
+
+    def _send_readlog_canary(self) -> None:
+        """The harness's canary: a cell of the agent's own uid sends the log's first record through the real client at
+        the fixed target, so that a socket the agent cannot reach, or a collector that does not take it, refuses the start
+        and never shows as a run that read nothing."""
+        done = self._cells.run(RL.CANARY_SOURCE, 60, record=False)
+        if not RL.canary_sent(done.stdout, done.exit_code):
+            log.error("the read-log canary said %r (%s)", done.stdout.strip()[:200], describe_stderr(done.stderr))
+            raise SandboxError("the read-log canary could not be sent from inside a cell")
+        self._meta["read_log"]["canary"] = True
+
+    def read_log(self) -> bytes | None:
+        """The collector's log as the collection read it, once, after the collector had stopped; None before that, for a
+        run without the channel, when the log could not be read or held the token, and when it would read intact though
+        its collector did not end cleanly under the harness's stop (`_collect_readlog`;
+        `readlog.instrument.ReadLogSource`). A log that is None is UNKNOWN reads, never a run that read nothing."""
+        return self._readlog_bytes
+
+    def _stop_readlog(self) -> None:
+        """SIGTERM the collector and wait for it to exit, so that it drains what is queued and writes its end line; one
+        still running after `READLOG_POLLS` reads is killed, so that its log is stable when it is read, and shows no end
+        line. The stop is the harness's own, marked as such before the signal (no death in the run's record).
+        `readlog_stop` in the metadata says what happened, as the Apptainer backend's does: `ran_until_stop` (the
+        collector was shown running when the harness came to stop it), `term` (the signal was delivered),
+        `ended_on_term`, `killed`, and `stopped` (the container was shown not running, the condition of reading its
+        log). Only a collector that ran until this stop and ended on SIGTERM ended cleanly (`_collect_readlog`)."""
+        note = self._meta["readlog_stop"] = {
+            "ran_until_stop": False, "term": False, "ended_on_term": False, "killed": False, "stopped": False,
+        }  # fmt: skip
+        try:
+            self._stop_on_purpose("readlog")
+            running = self._readlog_running()
+            note["ran_until_stop"] = running is True  # True only while it ran until this stop; unknown is not running
+            if running is not False:  # one that is already gone has nothing to signal
+                sent = self.host.docker("kill", "-s", "TERM", self.names.readlog, check=False, timeout=30)
+                note["term"] = sent.returncode == 0
+                exited = self._readlog_exited()
+                note["ended_on_term"] = note["term"] and exited  # a TERM that was not delivered ended nothing
+                if not exited:
+                    self.host.docker("kill", "-s", "KILL", self.names.readlog, check=False, timeout=30)
+                    note["killed"] = True
+                    self._readlog_exited()
+            state = (hostops.inspect(self.host, self.names.readlog) or {}).get("State", {})
+            note["stopped"] = state.get("Running") is False
+            note["exit_code"] = state.get("ExitCode")
+        except Exception as e:
+            note["error"] = describe_error(e)
+
+    def _readlog_exited(self) -> bool:
+        """Wait, at most `READLOG_POLLS` reads of 0.1 s, for the collector's container to be shown not running."""
+        for _ in range(READLOG_POLLS):
+            if self._readlog_running() is False:
+                return True
+            self._sleep(0.1)
+        return False
+
+    def _readlog_running(self) -> bool | None:
+        """Whether the collector's container is running now; None when docker cannot say."""
+        info = hostops.inspect(self.host, self.names.readlog)
+        return None if info is None else info.get("State", {}).get("Running") is True
+
+    def _collect_readlog(self, dest: Path, result: dict[str, Any]) -> None:
+        """Stop the collector, read its log ONCE from the run's own directory (never from the running container),
+        scan it for the token, and copy it into the evidence: `read_log` in the result names the copy, or is None when
+        the log is not read (unknown reads, never none).
+
+        One rule for both backends: when the collector did not end cleanly under the harness's OWN stop (it was not
+        running when the collection came to stop it, because something else killed it, stopped it or it crashed, or
+        it needed the kill, or could not be shown gone), a log that would read INTACT is withheld (None, no copy: it
+        reads `log_missing`, unknown), since a lost collector is never a clean log however complete its bytes look;
+        a log that already reads unknown (a killed collector's has no end line) is kept as evidence, with its own
+        reasons. A collector's death is the run's infrastructure failure (`infra_check`). A log that holds the data-path token is removed with its source (a
+        secret is never evidence, `_remove_token_files`) and the collection fails (O05). A second collection finds the
+        collector gone and writes the bytes it already read. The bytes are exposed only once the scan has passed: a
+        collection that fails between the read and the scan has exposed none, and the next one reads and scans the
+        stopped collector's log again (the collector is stopped once)."""
+        if self._readlog_token_hit:
+            raise kinds.collection_error("the run's evidence", "the read log held the data-path token")
+        if not self._readlog_collected:
+            if not self._readlog_stopped:  # a retry after a failure below reads the stopped collector's log again
+                self._stop_readlog()
+                self._readlog_stopped = True
+            data = self._read_stopped_log()
+            token = self.spec.token.reveal().encode() if self.spec.token is not None else b""
+            if data is not None and token and token in data:
+                self._readlog_token_hit = True
+                self._remove_log_with_token()
+                raise kinds.collection_error("the run's evidence", "the read log held the data-path token")
+            # the bytes are exposed (`read_log()`, the copy) only once they have passed the scan: a failure or an
+            # interrupt before this line leaves the next collection to read and scan them again
+            self._readlog_bytes = data
+            self._readlog_collected = True
+        if self._readlog_bytes is None:
+            result["read_log"] = None
+            return
+        (dest / RL.COPY_NAME).write_bytes(self._readlog_bytes)
+        result["read_log"] = RL.COPY_NAME
+
+    def _remove_log_with_token(self) -> None:
+        """Remove the collector's log, verified, as a copy of the token: registered first, so that every teardown
+        removes it again and a kept run is never moved with it (`_remove_token_files`, `_token_files_left`)."""
+        path = RL.log_path(self._readlog.dirs)
+        if path not in self._token_files:
+            self._token_files.append(path)
+        self._remove_token_files(path)
+
+    def _scrub_readlog(self, errors: list[str]) -> None:
+        """A run kept as evidence holds no secret (O05), whatever stopped its collection: the collector's log, read and
+        scanned by `_collect_readlog` or not (a collection that failed first never got to it), is scanned for the token
+        here, once the collector's container is gone and the file cannot grow, and removed when it holds it or cannot be
+        scanned."""
+        token = self.spec.token.reveal().encode() if self.spec.token is not None else b""
+        if RL.holds_token(self._readlog.dirs, token) is False:
+            return
+        try:
+            self._remove_log_with_token()
+        except SandboxError as e:
+            errors.append(str(e))
+        except Exception as e:
+            log.error("the read log could not be removed from the kept run: %s", describe_error(e))
+            errors.append(f"a teardown step failed ({type(e).__name__})")
+
+    def _read_stopped_log(self) -> bytes | None:
+        """The log of the stopped collector, read once, or None: not read when the container was not shown stopped (its
+        file could still grow), and withheld when the stop was not clean and the log would read intact."""
+        stop = self._meta["readlog_stop"]
+        if not stop.get("stopped"):
+            return None
+        data = self._read_log_once()
+        clean = stop.get("ran_until_stop") is True and stop.get("ended_on_term") is True
+        if data is None or clean:
+            return data
+        found = readlog_reader.read_log(data, self.readlog_nonce, expected_peer_uid=self.readlog_expected_peer_uid)
+        if found.intact:
+            log.error("the read-log collector did not end cleanly under the harness's stop: its log is withheld")
+            return None
+        return data
+
+    def _read_log_once(self) -> bytes | None:
+        try:
+            return RL.read_log_bytes(self._readlog.dirs)
+        except OSError as e:
+            log.error("the read log could not be read: %s", describe_error(e))
+            return None
+
     def _one_shot_name(self) -> str:
         """The name of a one-shot container of the agent image, registered before it is created, so a `stop` that runs
         meanwhile looks for it."""
@@ -752,7 +973,7 @@ class DockerSandbox:
             resolv=self._write_resolv(), gate_ip=gate_ip, gate_hosts=gate_hosts,
             ca=self.dir / "tls" / "ca.pem" if rest else None,
             trust_bundles=self._trust_bundles() if rest else {}, zone_host=self._agent_zone_host() if rest else None,
-            inputs=self._input_copies,
+            inputs=self._input_copies, readlog=self._readlog.dirs if self._readlog else None,
         )  # fmt: skip
         self._register_container(self.names.agent)
         self.host.docker(*args, env=env)
@@ -1355,6 +1576,8 @@ class DockerSandbox:
             except SandboxError as failed:
                 raise kinds.collection_error("the gate log", str(failed)) from None
             result["gate_log"] = "gate-requests.jsonl"
+        if self._readlog is not None:
+            self._collect_readlog(dest, result)
         (dest / "metadata.json").write_text(json.dumps(self.metadata(), indent=1, default=str), encoding="utf-8")
         return result
 
@@ -1614,6 +1837,9 @@ class DockerSandbox:
                         self._note_end(GATE)  # a gate not stopped before (no collection) is gone with its container
             if held:  # the network and the mounts cannot go while those two live: all of it is left for a retry
                 errors.append("the sidecar and the agent are left running with a FUSE mount that could not be released")
+                if self._readlog is not None:  # the run directory stays: a log that holds the token must not stay in it
+                    self._teardown_step = "read log"
+                    self._scrub_readlog(errors)
             else:
                 self._remove_the_rest(errors)
             complete = not errors
@@ -1662,6 +1888,8 @@ class DockerSandbox:
                     "relocated": False,
                 }
         self._teardown_step = "run directory"
+        if self.keep_evidence and self._readlog is not None:
+            self._scrub_readlog(errors)  # the collector is gone: its log cannot grow, and a secret is never evidence
         if self._mounts_may_be_live(unmount_errors):
             # a directory is never moved, renamed or removed while a mount under it may be live: the mount would go with
             # it, to a path no probe looks at, and the lease would be freed over a live mount (O15, C19)
@@ -1699,6 +1927,11 @@ class DockerSandbox:
 
     def __exit__(self, *exc: object) -> None:
         self.stop()
+
+
+def _linux() -> bool:
+    """Whether this host passes a Unix socket through a bind (the read-log channel): Linux only."""
+    return sys.platform.startswith("linux")
 
 
 __all__ = ["DockerSandbox"]

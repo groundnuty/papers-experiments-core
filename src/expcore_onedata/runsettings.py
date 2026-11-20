@@ -195,6 +195,8 @@ def sandbox_record(sandbox: SandboxSettings, roles: list[tuple[str, str]]) -> di
         "python": sandbox.python,
         "kill_grace_s": float(sandbox.kill_grace_s),
         "placeholder_token_sha256": hashlib.sha256(sandbox.placeholder_token.encode("utf-8")).hexdigest(),
+        # another collector is another experiment; a platform without the channel keeps the record it had (O91)
+        **({"readlog_collector_sha256": sandbox.readlog_collector_sha256} if sandbox.readlog_collector_sha256 else {}),
     }
     if float(sandbox.gate_upstream_read_timeout_s) != float(UPSTREAM_READ_TIMEOUT_S):  # O85: as before when not set
         out["gate"] = {"upstream_read_timeout_s": float(sandbox.gate_upstream_read_timeout_s)}

@@ -455,6 +455,8 @@ IN = {
     "sandbox.placeholder_token": edit("docker", platform('placeholder_token = "placeholder"',
                                                          'placeholder_token = "nothing"')),
     "sandbox.kill_grace_s": edit("docker", platform("kill_grace_s = 5", "kill_grace_s = 6")),
+    "sandbox.readlog_collector_sha256": edit("docker", platform(
+        "kill_grace_s = 5", 'kill_grace_s = 5\nreadlog_collector_sha256 = "' + "ab" * 32 + '"')),
     "sandbox.content_check_provider": edit("docker", platform(CHECK_FILE_LINE, CHECK_FILE_LINE + CHECK_PROVIDER_LINE)),
     "sandbox.images.agent.id": edit("docker", platform(SHA["agent"], SHA["sif"])),
     "sandbox.images.gate.id": edit("docker", platform(SHA["gate"], SHA["sif"])),

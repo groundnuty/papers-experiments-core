@@ -636,6 +636,16 @@ Run it outside any sandbox, after up: it needs Docker, `sudo` for the sandbox's 
 `python:3.12-slim` on the host (never pulled), the agent's image and the gate's unless `EXPCORE_LIVE_AGENT_IMAGE` and
 `EXPCORE_LIVE_GATE_IMAGE` name others.
 
+## The sandbox's read-log channel against it
+
+The read-log channel (on for a platform that declares `[sandbox] readlog_collector_sha256`, [interfaces](../../docs/interfaces.md#the-read-log-the-read_log-instrument-and-its-channel)) needs nothing of this federation. Its collector is a container of the gate's image with `--network none`: it joins neither `expcore-fed_fed` nor the sandbox's internal network, so it dials nothing and nothing dials it. The agent reaches it through a Unix socket in a directory the sandbox binds read-only, which is why the channel is Linux only: Docker Desktop's file sharing cannot pass a socket through a bind. The collector's log is in a directory of the run that only the collector's container binds. The sandbox removes the collector with the rest of the run's containers, and never touches the federation's network.
+
+A live check needs Docker on a Linux host and the agent's and the gate's images (`tests/live/test_readlog_docker.py`; it starts no federation and writes nothing to one):
+
+```sh
+EXPCORE_LIVE_DOCKER=1 EXPCORE_LIVE_PLATFORM=/path/to/platform.toml uv run pytest tests/live/test_readlog_docker.py
+```
+
 `day0/` holds the dated reports: the day-0 checks' own (`day0-<UTC>.md` and `.json`) and the facts they do not
 measure (`<date>-federation-facts.md`): releases, live test results, the fault test, what listens on the host, the
 commands' timings and what is unknown. A new facts file starts from `day0/federation-facts.template.md`: its

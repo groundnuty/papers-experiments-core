@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from expcore_onedata.readlog.paths import TARGETS as READLOG_TARGETS
 from expcore_onedata.sandbox.api import ReadOnlyInput, StartRefused
 from expcore_onedata.sandbox.apptainer.settings import OWN_TARGETS
 from expcore_onedata.sandbox.cellpath import normal
@@ -58,9 +59,23 @@ MAX_TARGET = 1024
 # what the agent's other mounts, and docker itself, already take: no input may be, hold or lie under one of them. On
 # either backend that includes every path the sandbox binds into a cell itself (`OWN_TARGETS`, the Apptainer settings':
 # the name-service files, the egress shim, the preloads and `/etc/ld.so.preload`, the collector's socket directory, the
-# gate's information file), so a study's input never shadows a bind of the sandbox's own (O20, O56)
+# gate's information file) and the read-log channel's two targets (`readlog.paths.TARGETS`, bound into the agent of a
+# run that has the channel), so a study's input never shadows a bind of the sandbox's own (O20, O56, O91)
 TAKEN = tuple(
-    dict.fromkeys(("/work", "/tmp", "/dev", "/proc", "/sys", "/etc/hosts", "/etc/hostname", RESOLV_CONF, *OWN_TARGETS))
+    dict.fromkeys(
+        (
+            "/work",
+            "/tmp",
+            "/dev",
+            "/proc",
+            "/sys",
+            "/etc/hosts",
+            "/etc/hostname",
+            RESOLV_CONF,
+            *OWN_TARGETS,
+            *READLOG_TARGETS,
+        )
+    )
 )
 FILE_MODE, RUNNABLE_MODE, DIR_MODE = 0o644, 0o755, 0o755
 PROBE_MARK = "# read-only input probe (O20)"
