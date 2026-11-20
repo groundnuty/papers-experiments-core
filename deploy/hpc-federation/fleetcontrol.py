@@ -39,11 +39,12 @@ its `label` (an operator's label, `[a-z0-9-]`, never a site's name), `fleet` (it
 login node of a remote site over ssh, the ledger staying on this host's local disk), optionally `interpreter` and
 `deploy` (the Python and this directory on its login node), and the settings of `SiteSettings`: `max_federations`,
 `allowance_units` and `rate_units_per_hour` (required), `kill_wait_s`, `parallel_ups`, `warm_pool`, `retire_idle_s`,
-`queue_stall_s`, `lease_bound_s`, `collect_s`, `margin_s`. An `ssh` site also names `host` (an ssh destination or alias
-that the operator's own ssh config resolves: never logged), `interpreter` and `deploy` (absolute, on the login node; the
-core is importable by that interpreter), `env_file` (its site.env on the login node, required: sourced before each
-command, which fails without it, never a run on the login shell's defaults) and `settings` (the shard settings file on
-the login node; required when `[controller]` names `settings`).
+`queue_stall_s`, `lease_bound_s`, `collect_s`, `margin_s`, `node_room` (`idle`, the default, or `queue`: no node limit,
+one waiting up at a time, for a site whose jobs share nodes). An `ssh` site also names `host` (an ssh destination or
+alias that the operator's own ssh config resolves: never logged), `interpreter` and `deploy` (absolute, on the login
+node; the core is importable by that interpreter), `env_file` (its site.env on the login node, required: sourced
+before each command, which fails without it, never a run on the login shell's defaults) and `settings` (the shard
+settings file on the login node; required when `[controller]` names `settings`).
 A site may also name `prepare`, the study's own command for each member that has come up (an argv list: its ingest and
 `hpcfed.py verify-data`; `{root}` in a word is the member's federation root and `{layout}` the fleet's layout file), and
 then `prepare_timeout_s` (required with it, refused without): the controller runs it once per member on the site's login

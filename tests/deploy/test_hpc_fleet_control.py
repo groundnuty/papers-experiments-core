@@ -362,6 +362,24 @@ def test_c43_a_stalled_queue_stops_adds_there_and_its_wait_is_logged(deploy, tmp
     assert tick["waits"]["site-a"] == [{"member": "fed-1", "queue_wait_s": 1000.0, "waiting": True}]
 
 
+def test_c56_a_site_that_trusts_the_queue_adds_with_no_idle_node_and_the_log_names_the_mode(
+    deploy, tmp_path, site, capsys
+):
+    """C56: `node_room = "queue"` in the sites file: 0 idle nodes beside 36 mixed, and the site still adds one up (and
+    the log shows the mode and the node figures); a value that is not `idle` or `queue` is refused naming the key."""
+    site.nodes = {"idle": 0, "mixed": 36}
+    bench = Bench(tmp_path, deploy, [site])
+    bench.settings = {"site-a": {"node_room": "queue"}}
+    assert bench.tick() == 0
+    assert verbs(site) == ["add"]
+    limits = bench.lines("tick")[-1]["targets"]["site-a"]["limits"]
+    assert (limits["node_room"], limits["nodes"], limits["idle_nodes"], limits["mixed_nodes"]) == ("queue", None, 0, 36)
+    bench.settings = {"site-a": {"node_room": "free"}}
+    assert bench.tick() == 2
+    assert "node_room must be one of idle, queue" in capsys.readouterr().err
+    assert len(verbs(site)) == 1
+
+
 @pytest.mark.parametrize("limit", ["quota", "nodes", "allowance"])
 def test_c43_quota_exhaustion_no_free_whole_nodes_or_a_spent_allowance_add_nothing(deploy, tmp_path, site, limit):
     """C43: inodes past the 95% line, 6 idle nodes beside 300 mixed ones, or an allowance short of one more whole
