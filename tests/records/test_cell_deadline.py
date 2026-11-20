@@ -195,3 +195,91 @@ def test_o97_the_whole_deadline_is_bounded_in_size():
     /proc can never make a record that cannot be written or read back."""
     fat = invalid(steps=[{"step": "a", "text": ["x" * 200] * 4}] * STEPS_CAP)
     assert problem(fat) == f"cell_deadline: more than {SIZE_CAP} bytes as JSON"
+
+
+# ------------------------------------------------------------------------- what a survivor, a task and a wait may hold
+def with_survivor(**survivor) -> dict:
+    return invalid(survivors=[survivor])
+
+
+def with_task(**task) -> dict:
+    return with_survivor(comm="python3", state="D", tasks=[task])
+
+
+def with_wait(**wait) -> dict:
+    return with_task(state="D", waits_on=[wait])
+
+
+@pytest.mark.parametrize(
+    "held",
+    [
+        pytest.param(with_task(), id="a task that says nothing"),
+        pytest.param(with_task(state="D", wchan=None, syscall="running"), id="no call, no wait symbol"),
+        pytest.param(with_task(syscall="unreadable"), id="a syscall that could not be read"),
+        pytest.param(with_task(syscall={"nr": -1}), id="a task outside any syscall"),
+        pytest.param(with_task(syscall={"nr": 21}), id="a call with no fd"),
+        pytest.param(with_task(syscall={"nr": 0, "fd": 3}), id="a read of an fd"),
+        pytest.param(
+            with_wait(fd=3, mount="data", fstype="fuse", space="space-a", path="a/b", pos=0, flags="0100000"),
+            id="a descriptor entry",
+        ),
+        pytest.param(with_wait(mount="data", fstype="fuse", space="space-a", path="a/b"), id="a path-call entry"),
+        pytest.param(with_wait(mount="work", fstype=None), id="an entry off the data mount"),
+        pytest.param(with_wait(), id="an entry that says nothing"),
+        pytest.param(with_survivor(comm="x", waits_on=[{"mount": "data"}]), id="the design's survivor-level waits_on"),
+        pytest.param(with_survivor(comm="x", cwd_mount="work", tasks_cut=2), id="a cwd mount and a cut count"),
+    ],
+)
+def test_o97_a_survivor_a_task_and_a_wait_each_hold_the_keys_of_a_closed_list_and_these_pass(held):
+    """O97: every key of the closed lists is optional, and the shapes the readers build, a descriptor entry and a
+    path-call entry among them, are valid; the same check the readers' own tests make of their output."""
+    assert problem(held) is None
+    assert validate(decode(recorded(held).dumps())) == V3
+
+
+@pytest.mark.parametrize(
+    ("held", "where"),
+    [
+        pytest.param(
+            with_task(cmdline="python3 -c x"), r"tasks\[0\]: unknown field\(s\) \['cmdline'\]", id="a command line"
+        ),
+        pytest.param(with_task(environ="A=1"), r"unknown field\(s\) \['environ'\]", id="an environment"),
+        pytest.param(
+            with_task(blocking={"via": "fd"}), r"unknown field\(s\) \['blocking'\]", id="what the verdict read"
+        ),
+        pytest.param(with_task(wchan=5), r"tasks\[0\]\.wchan: text", id="a wait symbol that is no text"),
+        pytest.param(with_task(state="D" * 65), r"tasks\[0\]\.state: text of at most 64", id="a state too long"),
+        pytest.param(with_task(syscall="blocked"), r"syscall: one of", id="a syscall word that is none"),
+        pytest.param(with_task(syscall={"nr": 0, "fd": 3, "args": [1]}), r"syscall: .* alone", id="a syscall argument"),
+        pytest.param(with_task(syscall={"fd": 3}), r"syscall: .* alone", id="a syscall with no number"),
+        pytest.param(with_task(syscall={"nr": True}), r"syscall\.nr: a whole number", id="a bool number"),
+        pytest.param(with_task(syscall={"nr": 0, "fd": -1}), r"syscall\.fd: a whole number from 0", id="a negative fd"),
+        pytest.param(with_task(waits_on=[{}] * (TASKS_CAP + 1)), r"waits_on: a list of at most 4", id="too many waits"),
+        pytest.param(with_task(waits_on={"fd": 3}), r"waits_on: a list of at most 4", id="a wait that is no list"),
+        pytest.param(
+            with_wait(cmdline="x"), r"waits_on\[0\]: unknown field\(s\) \['cmdline'\]", id="a wait command line"
+        ),
+        pytest.param(with_wait(target="/home/someone/x"), r"unknown field\(s\) \['target'\]", id="a link's target"),
+        pytest.param(with_wait(host="a-node"), r"unknown field\(s\) \['host'\]", id="a node name"),
+        pytest.param(with_wait(mount="/mnt/data"), r"mount: one of", id="a mount that is a configured path"),
+        pytest.param(with_wait(mount=None), r"mount: one of", id="a mount that is null"),
+        pytest.param(with_wait(path="x" * 257), r"path: text of at most 256", id="a path past its cap"),
+        pytest.param(with_wait(space="s" * 65), r"space: text of at most 64", id="a space name past its cap"),
+        pytest.param(with_wait(fd=True), r"fd: a whole number from 0", id="a bool fd"),
+        pytest.param(with_wait(pos=-1), r"pos: a whole number from 0", id="a negative position"),
+        pytest.param(with_wait(pos="0"), r"pos: a whole number from 0", id="a position that is text"),
+        pytest.param(with_wait(flags=0o100000), r"flags: text of at most 16", id="flags that are a number"),
+        pytest.param(
+            with_survivor(waits_on=[{"x": 1}]), r"survivors\[0\]\.waits_on\[0\]: unknown field", id="survivor-level"
+        ),
+        pytest.param(with_survivor(tasks_cut=-1), r"tasks_cut: a whole number from 0", id="a negative cut count"),
+        pytest.param(with_survivor(cwd_mount=3), r"cwd_mount: text", id="a cwd mount that is no text"),
+    ],
+)
+def test_o97_a_key_outside_the_closed_lists_or_of_the_wrong_type_is_refused_at_each_level(held, where):
+    """O97: the record can hold no command line, environment, configured path, link target or node name whatever a
+    reader reads: an unknown key at any of the three levels, and a value of the wrong type, are refused."""
+    data = decode(recorded().dumps())
+    data["tool_calls"][0]["cell_deadline"] = held
+    with pytest.raises(RecordError, match=where):
+        validate(data)

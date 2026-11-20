@@ -9,7 +9,9 @@ what each task was blocked on), `survivors_cut` (how many the reading left out),
 connection could be aborted without the kernel's own help), `attribution` (whose block the verdict made it, with the
 reason) and `restore` (what became of the mount's restore). Nothing in it is file content, a command line, an
 environment, a configured path, a node name or an address: the survivors name the process, never its arguments, and a
-file only by its space and its path below the space, which the agent's own code already names in the transcript.
+file only by its space and its path below the space, which the agent's own code already names in the transcript. That
+is structural: a survivor, a task and a thing it waits on each hold a closed list of keys (`SURVIVOR_KEYS`,
+`TASK_KEYS`, `WAIT_KEYS`), each optional, of the types the section names, so no reader can put anything else in.
 
 This module checks the nested shape (`problem`), which the flat sections of the schema cannot; the schema calls it for
 every call that holds the field. Every list is capped, every text is bounded, every value is plain JSON, and the whole
@@ -37,7 +39,17 @@ REQUIRED = ("outcome", "utc", "grace_s", "margin_s", "steps")
 OPTIONAL = ("restore", "survivors", "survivors_cut", "connection", "attribution")
 VERDICTS = ("agent", "infrastructure")
 ATTRIBUTION_KEYS = ("verdict", "why", "target", "space_holder")
+# what a survivor, one of its tasks and one thing it waits on may hold: a closed list at each level, so the record can
+# hold no command line, no environment, no configured path and no node name whatever a reader reads. A reader that adds
+# a key is refused here, and the call then carries its steps alone (`calldeadline.cell_deadline_of`): each reader tests
+# that its own output passes `problem`
 SURVIVOR_KEYS = ("comm", "state", "tasks", "tasks_cut", "waits_on", "cwd_mount")
+TASK_KEYS = ("state", "wchan", "syscall", "waits_on")
+SYSCALL_KEYS = ("nr", "fd")
+SYSCALL_WORDS = ("running", "unreadable")  # a task whose `syscall` reads as no call, or could not be read
+WAIT_KEYS = ("mount", "fstype", "space", "path", "fd", "pos", "flags")
+MOUNTS = ("data", "work", "tmp", "shm", "input", "other")  # the role of the mount a thing waited on is on
+PATH_CAP = 256  # characters of a path below its space
 _NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,39}")
 
 
@@ -73,6 +85,69 @@ def _number(value: Any, where: str) -> str | None:
     return None if ok else f"{where}: a number of seconds, not {value!r}"
 
 
+def _text(value: Any, where: str, cap: int = TEXT_CAP) -> str | None:
+    """A text of at most `cap` characters, or null."""
+    if value is None or (isinstance(value, str) and len(value) <= cap):
+        return None
+    return f"{where}: text of at most {cap} characters, or null"
+
+
+def _count(value: Any, where: str) -> str | None:
+    ok = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    return None if ok else f"{where}: a whole number from 0, not {value!r}"
+
+
+def _syscall(value: Any, where: str) -> str | None:
+    if isinstance(value, str):
+        return None if value in SYSCALL_WORDS else f"{where}: one of {SYSCALL_WORDS}, or an object, not {value!r}"
+    if not isinstance(value, dict) or set(value) - set(SYSCALL_KEYS) or "nr" not in value:
+        return f"{where}: {SYSCALL_WORDS} or an object of `nr` (and `fd`) alone"
+    if isinstance(value["nr"], bool) or not isinstance(value["nr"], int):  # -1 is a task outside any syscall
+        return f"{where}.nr: a whole number, not {value['nr']!r}"
+    return _count(value["fd"], f"{where}.fd") if "fd" in value else None
+
+
+def _wait(entry: Any, where: str) -> str | None:
+    if not isinstance(entry, dict):
+        return f"{where}: an object"
+    stray = sorted(set(entry) - set(WAIT_KEYS))
+    if stray:
+        return f"{where}: unknown field(s) {stray}"
+    if "mount" in entry and entry["mount"] not in MOUNTS:
+        return f"{where}.mount: one of {MOUNTS}, not {entry['mount']!r}"
+    for key in ("fstype", "space"):
+        if key in entry and (bad := _text(entry[key], f"{where}.{key}", 64)):
+            return bad
+    if "path" in entry and (bad := _text(entry["path"], f"{where}.path", PATH_CAP)):
+        return bad
+    for key in ("fd", "pos"):
+        if key in entry and (bad := _count(entry[key], f"{where}.{key}")):
+            return bad
+    if "flags" in entry and (bad := _text(entry["flags"], f"{where}.flags", 16)):
+        return bad
+    return None
+
+
+def _waits(items: Any, where: str) -> str | None:
+    if not isinstance(items, list) or len(items) > TASKS_CAP:
+        return f"{where}: a list of at most {TASKS_CAP} objects"
+    return next((p for i, e in enumerate(items) if (p := _wait(e, f"{where}[{i}]"))), None)
+
+
+def _task(task: Any, where: str) -> str | None:
+    if not isinstance(task, dict):
+        return f"{where}: an object"
+    stray = sorted(set(task) - set(TASK_KEYS))
+    if stray:
+        return f"{where}: unknown field(s) {stray}"
+    for key in ("state", "wchan"):
+        if key in task and (bad := _text(task[key], f"{where}.{key}", 64)):
+            return bad
+    if "syscall" in task and (bad := _syscall(task["syscall"], f"{where}.syscall")):
+        return bad
+    return _waits(task["waits_on"], f"{where}.waits_on") if "waits_on" in task else None
+
+
 def _survivor(survivor: Any, where: str) -> str | None:
     if not isinstance(survivor, dict):
         return f"{where}: an object"
@@ -80,16 +155,19 @@ def _survivor(survivor: Any, where: str) -> str | None:
     if stray:
         return f"{where}: unknown field(s) {stray}"
     for key in ("comm", "state", "cwd_mount"):
-        if key in survivor and survivor[key] is not None and not isinstance(survivor[key], str):
-            return f"{where}.{key}: text or null"
-    if "tasks_cut" in survivor and not (isinstance(survivor["tasks_cut"], int) and survivor["tasks_cut"] >= 0):
-        return f"{where}.tasks_cut: a count"
-    for key in ("tasks", "waits_on"):
-        if key in survivor:
-            items = survivor[key]
-            if not isinstance(items, list) or len(items) > TASKS_CAP or not all(isinstance(i, dict) for i in items):
-                return f"{where}.{key}: a list of at most {TASKS_CAP} objects"
-    return _plain(survivor, where)
+        if key in survivor and (bad := _text(survivor[key], f"{where}.{key}", 64)):
+            return bad
+    if "tasks_cut" in survivor and (bad := _count(survivor["tasks_cut"], f"{where}.tasks_cut")):
+        return bad
+    if "tasks" in survivor:
+        tasks = survivor["tasks"]
+        if not isinstance(tasks, list) or len(tasks) > TASKS_CAP:
+            return f"{where}.tasks: a list of at most {TASKS_CAP} objects"
+        if bad := next((p for i, t in enumerate(tasks) if (p := _task(t, f"{where}.tasks[{i}]"))), None):
+            return bad
+    if "waits_on" in survivor and (bad := _waits(survivor["waits_on"], f"{where}.waits_on")):
+        return bad
+    return None
 
 
 def _attribution(attribution: Any, where: str) -> str | None:
