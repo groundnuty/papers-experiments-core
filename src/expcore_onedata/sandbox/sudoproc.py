@@ -4,16 +4,16 @@
 The agent runs as another user, so on the Docker backend what its survivors wait on is read by the root half
 (`procsnap.py`, run as `sudo PYTHON -I -B -c SOURCE`). The diagnosis has a few seconds, and a survivor holds up to
 dozens of files, so a sudo call for each would not fit: `SudoProcReader.snapshot` makes one call that reads every listed
-process whole, and the reader answers the diagnosis's four reads from it, `listdir`, `read`, `readlink` and `read_at`
-(`stuckread.ProcReader`: the same reader an Apptainer node offers, over `os`). Only what the snapshot did not hold costs
-another call: the memory at a path argument, `maps` (which can wait on a survivor's memory lock, so the snapshot does
-not wait on it), and a file past a cut listing. Those are at most `MISSES` calls.
+process whole, and the reader answers the diagnosis's four reads from it, `listdir`, `read`, `readlink` and `read_at`:
+it is a `stuckread.ProcReader`, the same reader an Apptainer node offers over `os`, with names relative to `/proc`
+(`1234/task/1234/stat`; `/proc/1234/...` is taken too). Only what the snapshot did not hold costs another call: the
+memory at a path argument, `maps` (which can wait on a survivor's memory lock, so the snapshot does not wait on it), and
+a file past a cut listing. Those are at most `MISSES` calls.
 
-Everything it cannot show raises `OSError`, and a diagnosis reads that as unknown, which never becomes the agent's: a
-process that was not listed (`PermissionError`: the reader is a window on the survivors, never on the host), one that is
-gone or was replaced by another process of the same pid (`FileNotFoundError`, and nothing of it was read: the root half
-checked its start tick as it opened it), a name off the root half's list (`PermissionError`), a call that failed or
-answered wrongly (`EIO`), and a budget that is spent (`TimeoutError`). A path is `/proc/<pid>/...` or relative to it.
+Everything it cannot show is None, and raises nothing, and a diagnosis reads that as unknown, which never becomes the
+agent's: a process that was not listed (the reader is a window on the survivors, never on the host), one that is gone
+or was replaced by another process of the same pid (nothing of it was read: the root half checked its start tick as it
+opened it), a name off the root half's list, a call that failed or answered wrongly, and a budget that is spent.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from expcore_onedata.sandbox import procsnap
 from expcore_onedata.sandbox.hostops import HostOps
 
 PROGRAM = Path(procsnap.__file__).read_text(encoding="utf-8")  # runs as root under this interpreter, `-I -B -c`
-MISSES = 6  # calls past the snapshot a diagnosis may make; the next read raises `TimeoutError`
+MISSES = 6  # calls past the snapshot a diagnosis may make; the next read answers None
 COMMAND_S = 10.0  # the most one call may take, whatever the diagnosis has left
 NO_TIME = "the diagnosis has no time left"
 
@@ -111,10 +111,10 @@ class SudoProcReader:
             return None, "the call's answer was not JSON"
         return (answer, None) if isinstance(answer, dict) else (None, "the call's answer was not an object")
 
-    # --- the four reads -----------------------------------------------------------------------------------------------
-    def _where(self, path: str | Path) -> tuple[int, str]:
-        """The pid and the name below its directory that `path` names; `PermissionError` for anything else."""
-        text = str(path)
+    # --- what a read needs: who it is for and what the snapshot holds ------------------------------------------
+    def _where(self, name: str | Path) -> tuple[int, str]:
+        """The pid and the name below its directory that `name` names; `PermissionError` for anything else."""
+        text = str(name)
         if text.startswith("/proc/"):
             text = text[len("/proc/") :]
         pid, _, rel = text.partition("/")
@@ -168,32 +168,46 @@ class SudoProcReader:
             raise _error("the snapshot could not read it", errors[rel] if isinstance(errors[rel], str) else None)
         return shot.get(section, {}).get(rel)
 
-    def listdir(self, path: str | Path) -> list[str]:
-        pid, rel = self._where(path)
-        found = self._from(self._process(pid), "listings", rel)
-        if isinstance(found, list):
-            return [str(item) for item in found]
-        return list(self._cached(pid, "listdir", rel, "list"))
-
-    def read(self, path: str | Path) -> str:
-        pid, rel = self._where(path)
-        found = self._from(self._process(pid), "text", rel)
-        return found if isinstance(found, str) else str(self._cached(pid, "read", rel, "text"))
-
-    def readlink(self, path: str | Path) -> str:
-        pid, rel = self._where(path)
-        found = self._from(self._process(pid), "links", rel)
-        return found if isinstance(found, str) else str(self._cached(pid, "readlink", rel, "link"))
-
-    def read_at(self, path: str | Path, offset: int, n: int) -> bytes:
-        """`n` bytes of `path` (`mem`) from `offset`: a call of its own, not kept (a blocked call's pointer)."""
-        pid, rel = self._where(path)
-        self._process(pid)
-        entry = self._past(pid, "read_at", rel, offset=offset, n=n)
+    # --- the four reads of `stuckread.ProcReader`: None where the file cannot be shown, never a raise -----------
+    def listdir(self, name: str | Path) -> list[str] | None:
         try:
+            pid, rel = self._where(name)
+            found = self._from(self._process(pid), "listings", rel)
+            return (
+                [str(item) for item in found]
+                if isinstance(found, list)
+                else list(self._cached(pid, "listdir", rel, "list"))
+            )
+        except OSError:
+            return None
+
+    def read(self, name: str | Path, limit: int) -> bytes | None:
+        """The file's text as bytes, at most `limit` of them."""
+        try:
+            pid, rel = self._where(name)
+            found = self._from(self._process(pid), "text", rel)
+            text = found if isinstance(found, str) else str(self._cached(pid, "read", rel, "text"))
+            return text.encode("utf-8")[: max(limit, 0)]
+        except OSError:
+            return None
+
+    def readlink(self, name: str | Path) -> str | None:
+        try:
+            pid, rel = self._where(name)
+            found = self._from(self._process(pid), "links", rel)
+            return found if isinstance(found, str) else str(self._cached(pid, "readlink", rel, "link"))
+        except OSError:
+            return None
+
+    def read_at(self, name: str | Path, offset: int, size: int) -> bytes | None:
+        """`size` bytes of a thread's memory from `offset`: a call of its own, not kept (a blocked call's pointer)."""
+        try:
+            pid, rel = self._where(name)
+            self._process(pid)
+            entry = self._past(pid, "read_at", rel, offset=offset, n=size)
             return base64.b64decode(str(entry["b64"]), validate=True)
-        except (KeyError, binascii.Error) as error:
-            raise _error(f"the bytes were not returned ({type(error).__name__})") from None
+        except (OSError, KeyError, binascii.Error):
+            return None
 
     def _cached(self, pid: int, kind: str, rel: str, key: str) -> Any:
         """A read past the snapshot, made once and kept."""

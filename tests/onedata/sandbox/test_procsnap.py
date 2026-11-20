@@ -42,19 +42,25 @@ def target(pid: int = 31, start: str = START) -> dict:
 
 
 def test_o97_a_snapshot_holds_what_the_diagnosis_reads_of_each_thread_and_fd(tree):
-    """O97: one call answers for a process: its stat and mountinfo, its cwd, its threads' stat, wchan and syscall, and
-    each fd's link and fdinfo, each file once, as the root user."""
+    """O97: one call answers for a process: its stat, its threads' stat, wchan and syscall, and, through the first
+    thread that is not a zombie (here 32: the leader's own entries are empty), the mount table, root, working
+    directory and each descriptor's link and fdinfo, each file once, as the root user."""
     [one] = run({"targets": [target()], "snapshot": True})["results"]
     shot = one["snapshot"]
     assert one["status"] == "ok"
-    assert shot["listings"] == {"task": ["31", "32"], "fd": ["3", "4"]}
+    assert shot["listings"] == {"task": ["31", "32"], "task/32/fd": ["3", "4"]}
     assert shot["text"]["task/32/syscall"].startswith("0 0x3 ")
     assert shot["text"]["task/32/wchan"] == "request_wait_answer"
-    assert shot["text"]["fdinfo/3"].count("mnt_id:\t60") == 1
-    assert shot["links"] == {"cwd": "/work", "fd/3": "/data/space-a/file", "fd/4": "/work/out"}
+    assert shot["text"]["task/32/fdinfo/3"].count("mnt_id:\t60") == 1
+    assert shot["links"] == {
+        "task/32/root": "/",
+        "task/32/cwd": "/work",
+        "task/32/fd/3": "/data/space-a/file",
+        "task/32/fd/4": "/work/out",
+    }
+    assert "fuse.oneclient" in shot["text"]["task/32/mountinfo"]
     assert "stat" in shot["text"]
-    assert "mountinfo" in shot["text"]
-    assert not any(name in shot["text"] for name in ("cmdline", "environ", "maps", "mem"))
+    assert not any(name.endswith(("cmdline", "environ", "maps", "mem")) for name in shot["text"])
 
 
 def test_o97_a_pid_that_now_holds_another_process_is_not_read(tree):
@@ -65,7 +71,7 @@ def test_o97_a_pid_that_now_holds_another_process_is_not_read(tree):
         {
             "targets": [target()],
             "snapshot": True,
-            "reads": [{"pid": 31, "start": START, "kind": "read_at", "rel": "mem", "offset": 16, "n": 64}],
+            "reads": [{"pid": 31, "start": START, "kind": "read_at", "rel": "task/32/mem", "offset": 16, "n": 64}],
         }
     )
     assert answer["results"][0] == {"pid": 31, "status": "replaced"}
@@ -84,9 +90,9 @@ def test_o97_a_read_past_the_snapshot_is_answered_alone_and_the_memory_at_an_off
     """O97: the path argument a blocked call named is read from the process's memory at the pointer it gave: `read_at`
     answers the bytes (base64), at most `READ_CAP`, and `maps` is a plain read made last."""
     reads = [
-        {"pid": 31, "start": START, "kind": "read_at", "rel": "mem", "offset": 16, "n": 20},
-        {"pid": 31, "start": START, "kind": "read", "rel": "maps"},
-        {"pid": 31, "start": START, "kind": "readlink", "rel": "fd/3"},
+        {"pid": 31, "start": START, "kind": "read_at", "rel": "task/32/mem", "offset": 16, "n": 20},
+        {"pid": 31, "start": START, "kind": "read", "rel": "task/32/maps"},
+        {"pid": 31, "start": START, "kind": "readlink", "rel": "task/32/fd/3"},
         {"pid": 31, "start": START, "kind": "listdir", "rel": "task"},
     ]
     answer = run({"targets": [], "snapshot": False, "reads": reads})["reads"]
@@ -97,7 +103,24 @@ def test_o97_a_read_past_the_snapshot_is_answered_alone_and_the_memory_at_an_off
 
 
 @pytest.mark.parametrize(
-    "rel", ["cmdline", "environ", "../1/stat", "/etc/passwd", "task/../../1/stat", "fd/../cwd/x", "stat/", "root", ""]
+    "rel",
+    [
+        "cmdline",
+        "environ",
+        "../1/stat",
+        "/etc/passwd",
+        "task/../../1/stat",
+        "task/32/../../1/stat",
+        "task/32/cmdline",
+        "task/32/environ",
+        "task/32/fd/../cwd",
+        "stat/",
+        "root",
+        "mountinfo",
+        "maps",
+        "mem",
+        "",
+    ],
 )
 def test_o97_only_the_files_the_diagnosis_names_are_read(tree, rel):
     """O97: the helper runs as root and is given a relative name by the harness: it reads only a short list of `/proc`
@@ -109,12 +132,12 @@ def test_o97_only_the_files_the_diagnosis_names_are_read(tree, rel):
 def test_o97_an_oversize_read_and_a_cut_listing_are_said_not_made_up(tree):
     """O97: a `read_at` of more than `READ_CAP` bytes is refused; a process with more fds than the snapshot reads says
     its listing was cut, and the fds past the cut are not in the snapshot."""
-    (tree / "31" / "fd" / "5").symlink_to("/work/more")
-    (tree / "31" / "fdinfo" / "5").write_text("pos:\t0\nmnt_id:\t61\n")
+    (tree / "31" / "task" / "32" / "fd" / "5").symlink_to("/work/more")
+    (tree / "31" / "task" / "32" / "fdinfo" / "5").write_text("pos:\t0\nmnt_id:\t61\n")
     answer = run(
         {
             "targets": [],
-            "reads": [{"pid": 31, "start": START, "kind": "read_at", "rel": "mem", "offset": 0, "n": 10**6}],
+            "reads": [{"pid": 31, "start": START, "kind": "read_at", "rel": "task/32/mem", "offset": 0, "n": 10**6}],
         }
     )
     assert answer["reads"] == [{"ok": False, "err": "refused"}]
@@ -124,9 +147,9 @@ def test_o97_an_oversize_read_and_a_cut_listing_are_said_not_made_up(tree):
         shot = run({"targets": [target()], "snapshot": True})["results"][0]["snapshot"]
     finally:
         procsnap.FD_CAP = old
-    assert shot["cut"] == ["fd"]
-    assert "fd/5" not in shot["links"]
-    assert "fd/3" in shot["links"]
+    assert shot["cut"] == ["task/32/fd"]
+    assert "task/32/fd/5" not in shot["links"]
+    assert "task/32/fd/3" in shot["links"]
 
 
 def test_o97_a_request_that_is_not_one_is_refused_with_exit_2_and_nothing_read(tree):
@@ -158,7 +181,7 @@ def test_o97_the_program_reads_a_real_process_of_this_user_as_a_subprocess_would
         [one] = json.loads(done.stdout)["results"]
         assert one["status"] == "ok"
         assert str(child.pid) in one["snapshot"]["listings"]["task"]
-        assert one["snapshot"]["links"]["cwd"] == os.getcwd()
+        assert one["snapshot"]["links"][f"task/{child.pid}/cwd"] == os.getcwd()
     finally:
         child.kill()
         child.wait()

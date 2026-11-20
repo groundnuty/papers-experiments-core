@@ -15,12 +15,16 @@ gone), and every later read of it goes through that directory, so a pid that end
 meanwhile (on the agent's node that could be the data gate) is never read. With `snapshot` the answer holds, for each
 target that is `ok`, `snapshot`:
 
-    {"text": {"stat": ..., "mountinfo": ..., "task/<tid>/stat": ..., "task/<tid>/wchan": ..., "task/<tid>/syscall": ...,
-              "fdinfo/<n>": ...},
-     "links": {"cwd": ..., "fd/<n>": ...},
-     "listings": {"task": [tids], "fd": [fds]},
+    {"text": {"stat": ..., "task/<tid>/stat": ..., "task/<tid>/wchan": ..., "task/<tid>/syscall": ...,
+              "task/<live>/mountinfo": ..., "task/<live>/fdinfo/<n>": ...},
+     "links": {"task/<live>/root": ..., "task/<live>/cwd": ..., "task/<live>/fd/<n>": ...},
+     "listings": {"task": [tids], "task/<live>/fd": [fds]},
      "errors": {name: "ENOENT" | "EACCES" | ...},   # a file the snapshot tried and could not read
-     "cut": ["task", "fd"]}                          # a listing longer than `TASK_CAP` or `FD_CAP`: the rest is unread
+     "cut": ["task", "task/<live>/fd"]}              # a listing longer than `TASK_CAP` or `FD_CAP`: the rest is unread
+
+`<live>` is the first thread, by its number, that is not a zombie: the process's mount table, root, working directory
+and descriptors are read through that thread's directory, as the diagnosis (`stuckread`) reads them, since a zombie
+leader's own entries are empty.
 
 `reads` are single reads past the snapshot, each `{"pid", "start", "kind": "read" | "readlink" | "listdir" |
 "read_at", "rel": <name below the process's directory>, "offset", "n"}`, made after the snapshots, with the same
@@ -28,9 +32,10 @@ identity check; the answer is one entry each, in order: `{"ok": true, "text" | "
 `{"ok": false, "err": ...}` (`refused` for a name not on the list, a size past `READ_CAP` or a request that is not well
 formed; `replaced`, `gone` or `unreadable` for the process; an errno name for a read).
 
-Only these names are read (`ALLOWED`): `stat`, `mountinfo`, `cwd`, `maps`, `mem`, `syscall`, `wchan`, `task/<tid>/stat`,
-`task/<tid>/wchan`, `task/<tid>/syscall`, `fd/<n>`, `fdinfo/<n>`, and the listings of `task` and `fd`. Never a command
-line, an environment or a file below a link. The exit code is 0 whenever the request was read, 2 when it was not.
+Only these names are read (`ALLOWED`): `stat`, the listing of `task`, and below `task/<tid>/` its `stat`, `wchan`,
+`syscall`, `mountinfo`, `maps`, `mem` (at an offset), `root` and `cwd` (links), the listing of `fd`, `fd/<n>` (a link)
+and `fdinfo/<n>`. Never a command line, an environment or a file below a link. The exit code is 0 whenever the request
+was read, 2 when it was not.
 """
 
 import base64
@@ -46,10 +51,12 @@ FD_CAP = 256  # fds of one process whose link and info are read
 TEXT_CAP = 262144  # bytes of any one file of the snapshot
 READ_CAP = 4096  # bytes of one `read_at` (a path argument is at most 4 KiB)
 MAPS_CAP = 1048576  # bytes of `maps`
-ALLOWED = re.compile(
-    r"stat|mountinfo|cwd|maps|mem|syscall|wchan|task|fd|"
-    r"task/[0-9]+/(?:stat|wchan|syscall)|fd/[0-9]+|fdinfo/[0-9]+"
-)
+_TASK = r"task/[0-9]+"
+READ = re.compile(rf"stat|{_TASK}/(?:stat|wchan|syscall|mountinfo|maps)|{_TASK}/fdinfo/[0-9]+")
+LINK = re.compile(rf"{_TASK}/(?:root|cwd)|{_TASK}/fd/[0-9]+")
+LIST = re.compile(rf"task|{_TASK}/fd")
+MEMORY = re.compile(rf"{_TASK}/mem")
+ALLOWED = re.compile("|".join(p.pattern for p in (READ, LINK, LIST, MEMORY)))
 DEAD_END = ("replaced", "gone", "unreadable")
 
 
@@ -128,6 +135,12 @@ def _file(handle, rel, cap):
         os.close(stream)
 
 
+def _state(stat):
+    """The state field of a `stat` text; None when it cannot be read."""
+    fields = stat[stat.rfind(")") + 2 :].split()
+    return fields[0] if stat.rfind(")") >= 0 and fields else None
+
+
 def _snapshot(handle):
     text, links, listings, errors, cut = {}, {}, {}, {}, []
 
@@ -137,51 +150,57 @@ def _snapshot(handle):
         except OSError as error:
             errors[rel] = _name(error)
 
-    for rel in ("stat", "mountinfo"):
-        take(rel)
-    try:
-        links["cwd"] = os.readlink("cwd", dir_fd=handle)
-    except OSError as error:
-        errors["cwd"] = _name(error)
-    for name, cap in (("task", TASK_CAP), ("fd", FD_CAP)):
+    def link(rel):
         try:
-            found = sorted(_list(handle, name), key=int)
+            links[rel] = os.readlink(rel, dir_fd=handle)
+        except OSError as error:
+            errors[rel] = _name(error)
+
+    def listing(rel, cap):
+        try:
+            found = sorted(_list(handle, rel), key=int)
         except (OSError, ValueError) as error:
-            errors[name] = _name(error)
-            continue
-        listings[name] = found
+            errors[rel] = _name(error)
+            return []
+        listings[rel] = found
         if len(found) > cap:
-            cut.append(name)
-        for item in found[:cap]:
-            if name == "task":
-                for leaf in ("stat", "wchan", "syscall"):
-                    take(f"task/{item}/{leaf}")
-            else:
-                try:
-                    links[f"fd/{item}"] = os.readlink(f"fd/{item}", dir_fd=handle)
-                except OSError as error:
-                    errors[f"fd/{item}"] = _name(error)
-                take(f"fdinfo/{item}")
+            cut.append(rel)
+        return found[:cap]
+
+    take("stat")
+    live = None
+    for tid in listing("task", TASK_CAP):
+        for leaf in ("stat", "wchan", "syscall"):
+            take(f"task/{tid}/{leaf}")
+        if live is None and _state(text.get(f"task/{tid}/stat", "")) not in (None, "Z", "X", "x"):
+            live = f"task/{tid}"
+    if live is not None:  # read as the diagnosis reads it: through the first thread that is not a zombie
+        take(f"{live}/mountinfo")
+        link(f"{live}/root")
+        link(f"{live}/cwd")
+        for number in listing(f"{live}/fd", FD_CAP):
+            link(f"{live}/fd/{number}")
+            take(f"{live}/fdinfo/{number}")
     return {"text": text, "links": links, "listings": listings, "errors": errors, "cut": cut}
 
 
 def _read_one(handle, request):
     kind, rel = request.get("kind"), request.get("rel")
-    if not isinstance(rel, str) or not ALLOWED.fullmatch(rel):
+    if not isinstance(rel, str):
         return {"ok": False, "err": "refused"}
     try:
-        if kind == "read" and rel not in ("task", "fd", "cwd") and not rel.startswith("fd/"):
-            return {"ok": True, "text": _file(handle, rel, MAPS_CAP if rel == "maps" else TEXT_CAP)}
-        if kind == "readlink" and (rel == "cwd" or rel.startswith("fd/")):
+        if kind == "read" and READ.fullmatch(rel):
+            return {"ok": True, "text": _file(handle, rel, MAPS_CAP if rel.endswith("/maps") else TEXT_CAP)}
+        if kind == "readlink" and LINK.fullmatch(rel):
             return {"ok": True, "link": os.readlink(rel, dir_fd=handle)}
-        if kind == "listdir" and rel in ("task", "fd"):
+        if kind == "listdir" and LIST.fullmatch(rel):
             return {"ok": True, "list": _list(handle, rel)}
-        if kind == "read_at" and rel == "mem":
+        if kind == "read_at" and MEMORY.fullmatch(rel):
             offset, size = request.get("offset"), request.get("n")
             ints = all(isinstance(v, int) and not isinstance(v, bool) for v in (offset, size))
             if not ints or offset < 0 or not 0 < size <= READ_CAP:
                 return {"ok": False, "err": "refused"}
-            stream = os.open("mem", os.O_RDONLY, dir_fd=handle)
+            stream = os.open(rel, os.O_RDONLY, dir_fd=handle)
             try:
                 return {"ok": True, "b64": base64.b64encode(os.pread(stream, size, offset)).decode("ascii")}
             finally:
