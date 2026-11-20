@@ -75,6 +75,7 @@ from expcore_onedata.sandbox import mountwatch as MW
 from expcore_onedata.sandbox.api import SandboxError, StartRefused
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.apptainer import helpers
+from expcore_onedata.sandbox.apptainer import mountabort as MA
 from expcore_onedata.sandbox.apptainer import oneclient_bundle as OB
 from expcore_onedata.sandbox.apptainer.infra import process_state
 from expcore_onedata.sandbox.apptainer.mountgen import Generation, suffix
@@ -495,6 +496,49 @@ class HostMount:
         mount is up). Read from what the generation recorded when its mount came up, never from the mount."""
         live = self._live
         return {"device": live.device, "fusectl": live.fusectl}
+
+    def abort(self, timeout_s: float) -> dict[str, Any]:
+        """Free what waits on the live connection, within `timeout_s` (`mountabort`): the deadline's abort. oneclient's
+        state is noted first as the harness's, so its end after the abort is never read as a death; only the freeing
+        action runs here, and the unmount and oneclient's stop are the restore's. The record is kept in the
+        generation's metadata. Never raises."""
+        gen = self._live
+        if gen.oneclient is None:
+            record = MA.not_attempted()
+        else:
+            try:
+                self._note_mount(gen)
+                record = MA.abort(
+                    self.node,
+                    gen.oneclient.process,
+                    connection=None if gen.device is None else FC.conn(gen.device),
+                    state=gen.fusectl,
+                    root=self._fusectl_root,
+                    identity_ok=lambda: self._identity_ok(gen),
+                    timeout_s=timeout_s,
+                    sleep=self._sleep,
+                    clock=self._clock,
+                )
+            except Exception as error:  # `mountabort.abort` does not raise; the note before it may
+                log.error("the abort of the mount could not be made: %s", describe_error(error))
+                record = {"ok": False, "method": None, "waiting_before": None, "waiting_after": None,
+                          "abort_s": 0.0, "why": MA.RAISED}  # fmt: skip
+        with self._lock:
+            gen.abort = dict(record)
+        return record
+
+    def _identity_ok(self, gen: Generation) -> bool:
+        """Whether the mount table, read now, shows this uid's read-only FUSE mount at the mount point on the device
+        the generation's mount came up with: the connection's identity, since its number is reused after an unmount.
+        Read from the table alone: nothing is statted on a mount that may be wedged."""
+        try:
+            table = self._mountinfo()
+            mountpoint = str(self.where.mountpoint)
+            return (
+                fuse_state(table, mountpoint, os.getuid()) is None and FC.fuse_device(table, mountpoint) == gen.device
+            )
+        except (OSError, MountTableError):
+            return False
 
     def refuse_restores(self) -> None:
         """A stop is under way or about to be: from now on no restore writes the token file or starts a process, and one
