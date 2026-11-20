@@ -382,3 +382,74 @@ def test_o97_the_default_restore_of_a_backend_that_has_none_fails_and_ends_the_r
     with pytest.raises(InfraError) as ended:
         mounted.exec("print(1)", 5)
     assert ended.value.kind == "sandbox"
+
+
+# ---------------------------------------------------------------- a restore that reaches its lock after the settle
+def test_o97_a_restore_that_starts_after_the_settle_finds_nothing_pending_and_never_runs(cells):
+    """O97: the loop cut the call as the code tool handed `restore_mount` to its thread, and `launch` settled before
+    that thread entered `restore()`: the settle retired the pending restore (`not_needed`), so the late call is a no-op
+    that never calls the backend's restore: no token written, no oneclient started beside the teardown."""
+    record, called = pending(), []
+    cells._publish(1, record)
+    assert cells.settle() is None
+    assert record["restore"] == deadline.RESTORE_NOT_NEEDED
+    answer = cells.restore(lambda: called.append(1) or {"ok": True, "generation": 2})
+    assert answer["ok"] is None
+    assert called == []
+    assert (record["outcome"], record["restore"]) == (deadline.MOUNT_ABORTED, deadline.RESTORE_NOT_NEEDED)
+    assert cells.pending_restore is None
+    assert cells.wait_restored(1.0) is True
+
+
+def test_o97_a_restore_that_starts_after_the_stops_wait_finds_nothing_pending_and_never_runs(cells):
+    """O97: the same for the sandbox's stop, which calls `wait_decided` first and never settles: it retires a
+    restore not begun too, so the teardown it then runs is never beside one."""
+    record, called = pending(), []
+    cells._publish(1, record)
+    cells.wait_decided()
+    assert record["restore"] == deadline.RESTORE_NOT_NEEDED
+    assert cells.restore(lambda: called.append(1) or {"ok": True})["ok"] is None
+    assert called == []
+
+
+def test_o97_a_restore_already_running_is_waited_for_by_the_settle_and_never_retired(cells):
+    """O97: the retirement takes only a restore not begun: one that `restore()` already set `running`, with the idle
+    flag clear, is waited for, and its outcome stands."""
+    record, entered, release = pending(), threading.Event(), threading.Event()
+    cells._publish(1, record)
+
+    def restore() -> dict:
+        entered.set()
+        release.wait(10)
+        return {"ok": True, "generation": 2}
+
+    thread = running_in_a_thread(cells, restore)
+    assert entered.wait(10)
+    assert cells.pending_restore is record
+    threading.Timer(0.2, release.set).start()
+    cells.wait_decided()
+    thread.join(10)
+    assert (record["outcome"], record["restore"]) == (deadline.MOUNT_RESTORED, deadline.RESTORE_DONE)
+
+
+def test_o97_the_retirement_and_the_start_of_a_restore_are_one_or_the_other_under_the_lock(cells):
+    """O97: `restore()` sets `running` and clears the idle flag in one hold of `meta_lock`, as the retirement takes or
+    leaves `pending` in one: with the two racing, over many rounds, every restore either ran whole, with the settle
+    waiting for it, or never began, and none is ever running when the settle returns."""
+    for _ in range(200):
+        cells.ended = cells.pending_restore = None
+        record, ran, start = pending(), [], threading.Barrier(2)
+        cells._publish(1, record)
+
+        def late(ran=ran, start=start) -> None:
+            start.wait(5)
+            cells.restore(lambda: ran.append(1) or {"ok": True, "generation": 2})
+
+        thread = threading.Thread(target=late, daemon=True)
+        thread.start()
+        start.wait(5)
+        cells.settle()
+        assert cells.wait_restored(0) is True  # nothing runs once the settle has returned
+        thread.join(10)
+        assert (ran == [1]) is (record["restore"] == deadline.RESTORE_DONE)
+        assert record["restore"] in (deadline.RESTORE_DONE, deadline.RESTORE_NOT_NEEDED)

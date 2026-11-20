@@ -482,13 +482,8 @@ class CellRunner:
             log.error("a cell's deadline was not decided within its margin: the run is ended as %s", DL.SURVIVED)
             with self.meta_lock:
                 self.ended = self.ended or self._unknown("not decided within its margin")
-        self._settle_restore()  # a restore under way is waited for: nothing may run beside it
+        self._settle_restore()  # a restore not begun is retired, one under way is waited for: nothing runs beside it
         with self.meta_lock:
-            pending = self.pending_restore
-            if pending is not None and pending.get("restore") == DL.RESTORE_PENDING:
-                # the body is over, and nothing reads the mount again: the collection takes the outputs as they are
-                self._amend(pending, restore=DL.RESTORE_NOT_NEEDED)
-                self.pending_restore = None
             return self.ended
 
     # ------------------------------------------------------------------------------------------------ the restore
@@ -585,7 +580,20 @@ class CellRunner:
         return self._restore_idle.wait(timeout_s)
 
     def _settle_restore(self) -> None:
-        """Wait for a restore under way, at most `RESTORE_WAIT_S`, and give up on one that outlasts it."""
+        """Before a settle, a collection or a stop goes on, once the cell's deadline is decided: retire a restore not
+        begun, then wait for one under way, at most `RESTORE_WAIT_S`, and give up on one that outlasts it.
+
+        The retirement comes first, under `meta_lock`: the body is over and nothing reads the mount again, so a pending
+        restore is `not_needed`, and a `restore()` that reaches its lock after this finds nothing pending and does
+        nothing (the loop cut the call as the code tool handed the restore to its thread: that thread enters
+        `restore()` after the settle began, and would otherwise run beside the teardown). `restore()` takes its lock
+        to set `running` and clear the idle flag in one hold, so what is not retired here is already running, the flag
+        already clear, and the wait below sees it."""
+        with self.meta_lock:
+            pending = self.pending_restore
+            if pending is not None and pending.get("restore") == DL.RESTORE_PENDING:
+                self._amend(pending, restore=DL.RESTORE_NOT_NEEDED)
+                self.pending_restore = None
         if not self.wait_restored(RESTORE_WAIT_S):
             self._abandon_restore()
 
