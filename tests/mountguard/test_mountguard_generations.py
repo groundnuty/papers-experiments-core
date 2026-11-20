@@ -197,3 +197,48 @@ def test_o97_the_instrument_reads_a_source_that_gives_no_log_as_missing():
     data = MountGuard(Source(), NONCE).finish()
     assert data["log"] == "unknown"
     assert "log_missing" in data["unknown"]
+
+
+def test_o97_a_generation_whose_polls_failed_unproves_the_run_whatever_another_proved():
+    """O97: only the window's need for a proof is the union: a generation whose poll of the node's processes failed may
+    have hidden a cell, and another generation's good proofs never hide it."""
+    run, data = verdict_of([log(), log(polls_failed=1)])
+    assert data["isolation"] == "unproven"
+    assert "cell_poll_failed" in data["unproven"]
+    assert run.verdict == "unknown"
+
+
+def test_o97_a_generation_that_never_saw_the_mount_unproves_the_run_whatever_another_proved():
+    """O97: `mount_seen` false in generation 2 is a failed isolation of the run; generation 1's proofs do not cover
+    it."""
+    run, data = verdict_of([log(), log(mount_seen=False)])
+    assert data["isolation"] == "unproven"
+    assert "mount_unseen" in data["unproven"]
+    assert run.verdict == "unknown"
+
+
+def test_o97_a_generation_with_no_cell_that_also_never_saw_the_mount_is_unproven():
+    """O97: `no_proof` is forgiven only for an otherwise clean generation: beside a failure it stays."""
+    _, data = verdict_of([log(), log(mount_seen=False, **NO_CELL)])
+    assert data["isolation"] == "unproven"
+    assert "mount_unseen" in data["unproven"]
+
+
+def test_o97_every_clause_but_the_need_for_a_proof_is_per_generation():
+    """O97: each of (b) polls_failed, (c) a failing proof, (d) mount_seen false and (e) an access in the window of a
+    later generation is not hidden by the first generation's good proofs; (a) a later generation with no proof but
+    otherwise clean is not held against the run, and (f) with no proof anywhere there is none."""
+    failing = log(proofs=[proof(ok=False, problems=["same_pid_namespace"])])
+    cases = {
+        "a": ([log(), log(**NO_CELL)], "clean", "proven"),
+        "b": ([log(), log(polls_failed=1)], "unknown", "unproven"),
+        "c": ([log(), failing], "unknown", "unproven"),
+        "d": ([log(), log(mount_seen=False)], "unknown", "unproven"),
+        "e": ([log(), log([inotify("dir", "IN_OPEN")])], "flagged", "proven"),
+        "f": ([log(**NO_CELL), log(**NO_CELL)], "unknown", "unproven"),
+    }
+    got = {}
+    for name, (logs, _, _) in cases.items():
+        run, data = verdict_of(logs)
+        got[name] = (run.verdict, data["isolation"])
+    assert got == {name: (verdict, isolation) for name, (_, verdict, isolation) in cases.items()}
