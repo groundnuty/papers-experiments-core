@@ -14,6 +14,7 @@ from expcore.egress import EgressLog
 from expcore.errors import InfraError
 from expcore_onedata.sandbox import copyout
 from expcore_onedata.sandbox.apptainer import argv as AV
+from expcore_onedata.sandbox.apptainer.collect import Collection
 from expcore_onedata.sandbox.hostops import CmdResult
 
 
@@ -228,3 +229,51 @@ def test_a_kept_run_never_keeps_a_file_that_holds_the_token(node, settings, tmp_
         if path.is_file():
             assert TOKEN.encode() not in path.read_bytes(), path
     assert box.metadata()["evidence_kept"]["files_holding_the_token_removed"] == 1
+
+
+def _no_scan(*_args, **_kwargs):
+    raise OSError("injected scan error")
+
+
+def _holds_no_token(root: Path) -> None:
+    for path in root.rglob("*"):
+        if path.is_file():
+            assert TOKEN.encode() not in path.read_bytes(), path
+
+
+@pytest.mark.parametrize("how", ["token", "scan_error"])
+def test_c63_the_egress_log_is_copied_and_exposed_only_after_its_scan(node, settings, tmp_path, monkeypatch, how):
+    """C63, O56, O05: a collection that fails in its scan, by the token found in the egress log or by a scan that
+    could not run, has written no copy of the log and handed on none of its bytes: the copy was once written, and the
+    bytes set, before the scan, so a failure between left an unscanned log in the evidence directory."""
+    box = start(node, settings)
+    try:
+        with open(box.dir / "egress" / "egress.jsonl", "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"event": "leak", "value": TOKEN}) + "\n")
+        if how == "scan_error":
+            monkeypatch.setattr(Collection, "_scan", _no_scan)
+        with pytest.raises(InfraError if how == "token" else OSError):
+            box.collect(tmp_path / "out")
+        assert not (tmp_path / "out" / "egress.jsonl").exists()
+        assert box.egress_log() is None
+        _holds_no_token(tmp_path / "out")
+    finally:
+        box.stop()
+
+
+def test_c63_a_token_in_the_egress_log_does_not_leave_the_gate_log_unscanned(node, settings, tmp_path):
+    """C63, O05: the failure for a token in the egress log is raised after every file of evidence is scanned, so the
+    gate log's copy that holds it too is removed as well, and the error counts both."""
+    box = start(node, settings)
+    try:
+        for log in (box.dir / "egress" / "egress.jsonl", box.dir / "gate" / "requests.jsonl"):
+            with open(log, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"event": "leak", "value": TOKEN}) + "\n")
+        with pytest.raises(InfraError, match=r"2 file\(s\) held the data-path token"):
+            box.collect(tmp_path / "out")
+        assert not (tmp_path / "out" / "egress.jsonl").exists()
+        assert not (tmp_path / "out" / "gate-requests.jsonl").exists()
+        assert box.egress_log() is None
+        _holds_no_token(tmp_path / "out")
+    finally:
+        box.stop()

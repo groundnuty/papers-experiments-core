@@ -13,8 +13,10 @@ is stopped (SIGTERM, so it writes its close lines) and the bytes it served count
 collector is stopped (it writes its end line) and its log read once, kept for the egress instrument and copied, and the
 read-log collector's the same when the platform has the channel (O91, `readlogrun`). Every
 file of evidence the collection writes is scanned for the data-path token: one that holds it is removed and the
-collection fails, since a secret is never evidence (O05). A mount run's guard closes its window here and its log is
-copied too (O60, `hostmount`).
+collection fails, since a secret is never evidence (O05). The two collectors' logs are scanned in memory, and their
+copies are written and their bytes handed on (`Collection.egress_bytes`, `readlog_bytes`) only once the scan has passed:
+a collection that fails before then has written and exposed neither (C63). A mount run's guard closes its window here
+and its log is copied too (O60, `hostmount`).
 """
 
 from __future__ import annotations
@@ -48,8 +50,8 @@ class Collection:
 
     def __init__(self, box: ApptainerSandbox) -> None:
         self.box = box
-        self.egress_bytes: bytes | None = None
-        self.readlog_bytes: bytes | None = None  # O91: the read-log collector's log once read; None until then
+        self.egress_bytes: bytes | None = None  # the collector's log once read AND scanned; None until then (C63)
+        self.readlog_bytes: bytes | None = None  # O91: the read-log collector's, the same; None until then
 
     def run(self, dest: Path, outputs: Sequence[str]) -> dict[str, Any]:
         box = self.box
@@ -72,17 +74,26 @@ class Collection:
             self._stop_gate()
             written.append(self._copy_gate_log(dest))
             result["gate_log"] = GATE_COPY
-        written.append(self._egress(dest))
-        result["egress_log"] = EGRESS_COPY if self.egress_bytes is not None else None
+        self.egress_bytes = self.readlog_bytes = None  # read again below: exposed only once scanned (C63)
+        logs: dict[Path, bytes] = {}  # the collectors' logs as read: written and handed on after the scan
+        egress, readlog = self._egress(), None
+        result["egress_log"] = EGRESS_COPY if egress is not None else None
+        if egress is not None:
+            logs[dest / EGRESS_COPY] = egress
         if box._readlog.enabled:  # a platform without the channel has no key of it (O91)
-            written.append(self._readlog(dest))
-            result["read_log"] = readlogrun.COPY if self.readlog_bytes is not None else None
+            readlog = self._readlog()
+            result["read_log"] = readlogrun.COPY if readlog is not None else None
+            if readlog is not None:
+                logs[dest / readlogrun.COPY] = readlog
         if box.spec.mode is DataPathMode.MOUNT:
             written.append(self._mount_watch(dest))
             result["mount_watch_log"] = MOUNT_WATCH_COPY if written[-1] is not None else None
         (dest / "metadata.json").write_text(json.dumps(box.metadata(), indent=1, default=str), encoding="utf-8")
         written.append(dest / "metadata.json")
-        self._scan([path for path in written if path is not None])
+        self._scan([path for path in written if path is not None], logs)
+        for target, data in logs.items():  # the scan passed: now the copies, and the bytes for the instruments (C63)
+            target.write_bytes(data)
+        self.egress_bytes, self.readlog_bytes = egress, readlog
         return result
 
     def deaths(self) -> list[dict[str, Any]]:
@@ -203,9 +214,9 @@ class Collection:
             raise kinds.collection_error("the gate log", str(failed)) from None
         return target
 
-    def _egress(self, dest: Path) -> Path | None:
-        """Stop the collector so it writes its end line, read its log once and copy it. A log that cannot be read is
-        None, which the instrument reads as unknown, never as a run that connected nowhere."""
+    def _egress(self) -> bytes | None:
+        """Stop the collector so it writes its end line and read its log once; `run` scans it and then copies it. A log
+        that cannot be read is None, which the instrument reads as unknown, never as a run that connected nowhere."""
         box = self.box
         collector = box._helpers.get("collector")
         if "collector_stop" not in box._meta and collector is not None:
@@ -215,25 +226,17 @@ class Collection:
             except SandboxError as error:
                 box._meta["collector_stop"] = {"error": str(error)}
         try:
-            self.egress_bytes = (box.dir / "egress" / "egress.jsonl").read_bytes()
+            return (box.dir / "egress" / "egress.jsonl").read_bytes()
         except OSError:
-            self.egress_bytes = None
             return None
-        target = dest / EGRESS_COPY
-        target.write_bytes(self.egress_bytes)
-        return target
 
-    def _readlog(self, dest: Path) -> Path | None:
-        """Stop the read-log collector so it drains and writes its end line, read its log once and copy it (O91). A log
-        that cannot be read is None, which the instrument reads as unknown, never as a run that read nothing."""
+    def _readlog(self) -> bytes | None:
+        """Stop the read-log collector so it drains and writes its end line and read its log once; `run` scans it and
+        then copies it (O91). A log that cannot be read is None, which the instrument reads as unknown, never as a run
+        that read nothing."""
         channel = self.box._readlog
         channel.stop()
-        self.readlog_bytes = channel.read()
-        if self.readlog_bytes is None:
-            return None
-        target = dest / readlogrun.COPY
-        target.write_bytes(self.readlog_bytes)
-        return target
+        return channel.read()
 
     def _mount_watch(self, dest: Path) -> Path | None:
         """Close the mount guard's window, now that every process of the run is shown gone, and copy its log (O60): the
@@ -245,20 +248,19 @@ class Collection:
         target.write_bytes(found)
         return target
 
-    def _scan(self, paths: Sequence[Path]) -> None:
-        """A file of evidence that holds the token is removed, and the collection fails (O05)."""
+    def _scan(self, paths: Sequence[Path], logs: dict[Path, bytes]) -> None:
+        """A file of evidence that holds the token is removed, and the collection fails (O05). So does a log of the two
+        collectors that holds it, which has no copy yet and is never given one, nor handed on as the instrument's
+        source (C63); every file is scanned before the failure, a log's hit counted with the files'."""
         token = self.box.spec.token.reveal().encode() if self.box.spec.token is not None else b""
         if not token:
             return
         held = [path for path in paths if path.exists() and token in path.read_bytes()]
         for path in held:
             path.unlink()
-            if path.name == EGRESS_COPY:
-                self.egress_bytes = None
-            elif path.name == readlogrun.COPY:  # the log is never handed on as the instrument's source (O05)
-                self.readlog_bytes = None
-        if held:
-            raise kinds.collection_error("the run's evidence", f"{len(held)} file(s) held the data-path token")
+        hits = len(held) + sum(1 for data in logs.values() if token in data)
+        if hits:
+            raise kinds.collection_error("the run's evidence", f"{hits} file(s) held the data-path token")
 
 
 def _remove(path: Path) -> None:
