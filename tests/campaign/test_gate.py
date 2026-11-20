@@ -7,6 +7,7 @@ import re
 
 import pytest
 from campaign_support import LATER, NOW, finished, planned_store, run_one
+from scheduler_support import event_kinds
 
 from expcore.campaign.gate import ALL, HOLDS_KEY, RELEASED_KEY, Budget, BudgetGate
 from expcore.campaign.recovery import recover
@@ -297,3 +298,49 @@ def test_c12_a_budget_that_cannot_work_is_refused(changes, message):
     """C12: a ceiling that is zero, negative or infinite, or a release that adds nothing, is refused at once."""
     with pytest.raises(ValueError, match=message):
         Budget(**{"max_usd": 10.0, **changes})
+
+
+def single_run_gate(store, **budget):
+    """The gate of a lease's store (C41), which holds one run: built with `single_run`."""
+    return BudgetGate(store, {"m1": PRICED}, Budget(**{"max_usd": 100.0, **budget}), LIMITS, single_run=True)
+
+
+def stops_of(store):
+    return json.loads(store.get_meta(HOLDS_KEY) or "{}")
+
+
+def test_c64_a_single_run_gate_counts_its_run_in_flight_once_and_asks_about_no_second_run(tmp_path):
+    """C64: a ceiling of 40 and a bound of 30. A lease's gate with its run in flight holds nothing and records no stop,
+    where a store of many runs holds the next run (30 + 30 over 40) and records its stop. A top-up of the run in flight
+    is weighed as always: 30 + 10 fits, 30 + 15 does not."""
+    lease, _, _ = planned_store(tmp_path / "lease")
+    gate = single_run_gate(lease, max_usd=40.0)
+    assert gate.assess(["m1"], NOW).reason("m1") is None
+    assert (stops_of(lease), [k for k in event_kinds(lease) if k.startswith("budget_hold")]) == ({}, [])
+    assert gate.refusal("m1", ["m1"], 10.0) is None
+    assert "over the ceiling of 40.00 USD" in gate.refusal("m1", ["m1"], 15.0)
+    many, _, _ = planned_store(tmp_path / "many")
+    assert "in flight 30.00" in gate_for(many, max_usd=40.0).assess(["m1"], NOW).reason("m1")
+    assert set(stops_of(many)) == {ALL}
+
+
+def test_c64_a_single_run_gate_still_weighs_a_run_that_is_pending_and_not_in_flight(tmp_path):
+    """C64: before its run starts, or when it is set aside and pending again, the run is weighed in full: a grant below
+    one reservation (20 against 30) holds it, exactly one reservation admits it, and what an attempt already spent
+    counts (4.5 + 30 over 30)."""
+    store, _, manifest = planned_store(tmp_path)
+    assert "over the ceiling of 20.00 USD" in single_run_gate(store, max_usd=20.0).assess([], NOW).reason("m1")
+    assert single_run_gate(store, max_usd=30.0).assess([], NOW).reason("m1") is None
+    run_one(store, keys_of(manifest)[0], finished(**TOKENS))
+    assert "4.50 + in flight 0.00 + this run 30.00" in single_run_gate(store, max_usd=30.0).assess([], NOW).reason("m1")
+
+
+def test_c64_a_single_run_gate_holds_nothing_once_its_run_is_done(tmp_path):
+    """C64: with every run done there is none left to start, so no stop is recorded for the next one, which the same
+    figures in a store of many runs would hold (what was spent, 4.5 a run, and 30 more over 30)."""
+    store, _, manifest = planned_store(tmp_path)
+    for key in keys_of(manifest):
+        run_one(store, key, finished(**TOKENS))
+    assert single_run_gate(store, max_usd=30.0).assess([], NOW).reason("m1") is None
+    assert (stops_of(store), [k for k in event_kinds(store) if k.startswith("budget_hold")]) == ({}, [])
+    assert "over the ceiling of 30.00 USD" in gate_for(store, max_usd=30.0).assess([], NOW).reason("m1")
