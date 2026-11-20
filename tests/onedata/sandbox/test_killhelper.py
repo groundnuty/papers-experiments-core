@@ -29,14 +29,14 @@ def start_of(pid: int) -> str:
     return text[text.rfind(")") + 2 :].split()[19]
 
 
-def exec_done(pid: int, within_s: float = 10.0) -> None:
+def exec_done(pid: int, within_s: float = 10.0, marker: bytes = b"a-listed-process") -> None:
     """Wait until the child has exec'd its own command line. Between fork and exec /proc/<pid>/cmdline is still the
     parent's, so a listing taken then records the parent's digest and the kill later finds the process `changed`
     (seen once on a loaded runner). The start tick does not change at exec; the command line does."""
     deadline = time.monotonic() + within_s
     while time.monotonic() < deadline:
         try:
-            if b"a-listed-process" in Path(f"/proc/{pid}/cmdline").read_bytes():
+            if marker in Path(f"/proc/{pid}/cmdline").read_bytes():
                 return
         except OSError:
             pass
@@ -276,6 +276,7 @@ def test_o72_the_digest_the_harness_lists_is_the_one_the_helper_reads(sleeper, a
     must never make its own leftover look like another process."""
     process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)", argument])
     try:
+        exec_done(process.pid, marker=b"time.sleep(120)")  # the -c code: in every case's own command line
         pid, start, digest = identity_of(process)
         assert killhelper.signal_target(pid, start, digest, signal.SIGKILL) == killhelper.SIGNALLED
         assert process.wait(timeout=10) == -signal.SIGKILL
