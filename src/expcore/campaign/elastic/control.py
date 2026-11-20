@@ -436,10 +436,10 @@ def made_units(settings: SiteSettings, view: SiteView, federations: Mapping[str,
     """The billing units the site's members count against its allowance (C60): one whole `--time` each (its rate times
     the `--time`), as reserved, except a member whose down is verified (`down`) and whose end the ledger proves: it
     counts what its jobs billed, from their start to the proven end (at or after the true one), never below 0 nor above
-    one whole `--time`. The start is the job end recorded at its join less the `--time` rounded up to whole minutes, as
+    its whole limit. The start is the job end recorded at its join less the `--time` rounded up to whole minutes, as
     Slurm rounds a limit (so never later than the true start, and never the submit). A downed member with no ledger
     row (it never joined), no proven end yet, or a start so found after its join (its job end and this `--time`
-    disagree: the layout's `--time` changed) keeps its whole `--time`: what is not known is never counted as less."""
+    disagree: the layout's `--time` changed) keeps its whole `--time`, as every member counted before C60."""
     whole = settings.rate_units_per_hour * view.time_s / 3600.0
     limit = math.ceil(view.time_s / 60.0) * 60.0
     total = 0.0
@@ -452,7 +452,7 @@ def made_units(settings: SiteSettings, view: SiteView, federations: Mapping[str,
             total += whole
             continue
         billed = min(fed.ended_at, fed.job_end_at) - start
-        total += min(whole, settings.rate_units_per_hour * max(billed, 0.0) / 3600.0)
+        total += settings.rate_units_per_hour * min(max(billed, 0.0), limit) / 3600.0
     return total
 
 

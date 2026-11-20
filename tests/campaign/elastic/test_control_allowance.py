@@ -65,15 +65,17 @@ def test_c60_a_downed_member_counts_nothing_for_a_job_that_never_ran_and_never_m
     assert made_units(settings(), site(members=members), overran) == WHOLE
 
 
-def test_c60_the_start_is_never_found_later_than_it_was():
+def test_c60_the_start_is_found_from_the_limit_slurm_rounds_and_a_start_after_the_join_counts_as_before():
     """C60: a --time of 12 h and 1 s is a 12 h 1 min limit to Slurm, so the start is found from the limit rounded up to
-    whole minutes and the member counts no less than it billed; and a start found after the member's join (its
-    recorded job end and the layout's --time disagree, as after a change of the layout's --time) counts the whole
-    --time."""
+    whole minutes and the member counts no less than it billed; a start found after the member's join (its recorded
+    job end and the layout's --time disagree, as after a change of the layout's --time) is not trusted, and the member
+    counts the layout's whole --time, as every member did before C60."""
     members = [member("fed-2", status="down", state=None)]
     rounded = site(members=members, time_s=TIME_H * HOUR + 1.0)
     end_at = NOW + (TIME_H - 3.0) * HOUR + 60.0  # started 3 h ago under a 12 h 1 min limit
     row = joined("fed-2", job_end_at=end_at, ended_at=NOW - HOUR, end_proof="cancelled")
     assert made_units(settings(), rounded, {"site-a-fed-2": row}) == 2 * RATE
+    full = joined("fed-2", job_end_at=end_at, ended_at=end_at + HOUR, end_proof="terminal")  # ran its whole limit
+    assert made_units(settings(), rounded, {"site-a-fed-2": full}) == RATE * (TIME_H * HOUR + 60.0) / HOUR
     shrunk = site(members=members, time_s=8 * HOUR)  # the layout now says 8 h: the row's start would be after its join
     assert made_units(settings(), shrunk, {"site-a-fed-2": downed_row(3.0, 1.0)}) == RATE * 8
