@@ -234,7 +234,8 @@ class DockerSandbox:
         self.readlog_expected_peer_uid = settings.agent_uid
         self._readlog: RL.Prepared | None = None
         self._readlog_bytes: bytes | None = None
-        self._readlog_collected = False  # the collector was stopped and its log read, once
+        self._readlog_stopped = False  # the harness stopped the collector, once: its stop and its note stand
+        self._readlog_collected = False  # the stopped collector's log was read AND scanned for the token, once
         self._readlog_token_hit = False  # that log held the token: every later collection fails the same way
         self.keep_evidence = False
         self._init_sleep: dict[str, Any] | None = None  # the agent's init's `sleep`, by pid and start time (O34)
@@ -838,18 +839,25 @@ class DockerSandbox:
         a log that already reads unknown (a killed collector's has no end line) is kept as evidence, with its own
         reasons. A collector's death is the run's infrastructure failure (`infra_check`). A log that holds the data-path token is removed with its source (a
         secret is never evidence, `_remove_token_files`) and the collection fails (O05). A second collection finds the
-        collector gone and writes the bytes it already read."""
+        collector gone and writes the bytes it already read. The bytes are exposed only once the scan has passed: a
+        collection that fails between the read and the scan has exposed none, and the next one reads and scans the
+        stopped collector's log again (the collector is stopped once)."""
         if self._readlog_token_hit:
             raise kinds.collection_error("the run's evidence", "the read log held the data-path token")
         if not self._readlog_collected:
-            self._stop_readlog()
-            self._readlog_collected = True
-            self._readlog_bytes = self._read_stopped_log()
+            if not self._readlog_stopped:  # a retry after a failure below reads the stopped collector's log again
+                self._stop_readlog()
+                self._readlog_stopped = True
+            data = self._read_stopped_log()
             token = self.spec.token.reveal().encode() if self.spec.token is not None else b""
-            if self._readlog_bytes is not None and token and token in self._readlog_bytes:
-                self._readlog_bytes, self._readlog_token_hit = None, True
+            if data is not None and token and token in data:
+                self._readlog_token_hit = True
                 self._remove_log_with_token()
                 raise kinds.collection_error("the run's evidence", "the read log held the data-path token")
+            # the bytes are exposed (`read_log()`, the copy) only once they have passed the scan: a failure or an
+            # interrupt before this line leaves the next collection to read and scan them again
+            self._readlog_bytes = data
+            self._readlog_collected = True
         if self._readlog_bytes is None:
             result["read_log"] = None
             return
@@ -1829,6 +1837,9 @@ class DockerSandbox:
                         self._note_end(GATE)  # a gate not stopped before (no collection) is gone with its container
             if held:  # the network and the mounts cannot go while those two live: all of it is left for a retry
                 errors.append("the sidecar and the agent are left running with a FUSE mount that could not be released")
+                if self._readlog is not None:  # the run directory stays: a log that holds the token must not stay in it
+                    self._teardown_step = "read log"
+                    self._scrub_readlog(errors)
             else:
                 self._remove_the_rest(errors)
             complete = not errors

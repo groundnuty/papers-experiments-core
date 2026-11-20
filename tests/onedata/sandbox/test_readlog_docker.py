@@ -27,9 +27,11 @@ from expcore_onedata.readlog.instrument import ReadLog
 from expcore_onedata.sandbox import containers as C
 from expcore_onedata.sandbox import readlog_channel as RL
 from expcore_onedata.sandbox import sandbox as sandbox_module
+from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox.api import ReadOnlyInput, SandboxError, StartRefused
 from expcore_onedata.sandbox.hostops import CmdResult
 from expcore_onedata.sandbox.sandbox import DockerSandbox
+from expcore_onedata.tokens import Secret
 
 
 @pytest.fixture
@@ -595,3 +597,67 @@ def test_o91_a_collector_that_ends_by_itself_just_before_the_harness_s_term_is_n
     assert done["read_log"] is None
     assert sbx.read_log() is None
     sbx.stop()
+
+
+class FailsOnce(Secret):
+    """A token whose `reveal` raises once when armed: a failure, or an interrupt, between the collection's read of the
+    log and its scan for the token."""
+
+    armed = False
+
+    def reveal(self) -> str:
+        if self.armed:
+            self.armed = False
+            raise RuntimeError("interrupted before the scan")
+        return super().reveal()
+
+
+def test_o05_o91_a_collection_that_fails_after_reading_the_log_and_before_its_scan_exposes_nothing_and_scans_again(
+    world, collector, tmp_path, monkeypatch
+):
+    """O91: the log's bytes are exposed (`read_log()`, the copy) only once they have passed the token scan, so a
+    collection that fails between the read and the scan leaves the next one to read and scan again: a log that holds the
+    token is never copied or handed on, and the collector is stopped once."""
+    token = FailsOnce(TOKEN)
+    sbx = start(world, "via-gate", token=token)
+    collector.records = [read(f"file-{TOKEN}")]
+    real_read, reads = sbx._read_stopped_log, []
+
+    def read_then_arm():
+        data = real_read()
+        if not reads:  # the first collection only: its scan then fails
+            token.armed = True
+        reads.append(data)
+        return data
+
+    monkeypatch.setattr(sbx, "_read_stopped_log", read_then_arm)
+    with pytest.raises(RuntimeError, match="before the scan"):
+        sbx.collect(tmp_path / "one")
+    assert sbx.read_log() is None  # nothing was exposed before the scan
+    with pytest.raises(InfraError) as failed:  # the next collection reads again and scans
+        sbx.collect(tmp_path / "two")
+    assert failed.value.kind == "output_collection"
+    assert len(reads) == 2
+    assert not (tmp_path / "two" / RL.COPY_NAME).exists()
+    assert not collector.log_path.exists()  # removed with its source
+    assert sbx.read_log() is None
+    assert terms(world).count(("signalled", sbx.names.readlog, "TERM")) == 1  # the collector was stopped once
+    sbx.stop()
+
+
+def test_o05_o91_a_teardown_that_holds_the_agent_and_sidecar_still_scrubs_the_read_log(
+    world, collector, tmp_path, monkeypatch
+):
+    """O91: a teardown that leaves the agent and the sidecar running (a FUSE mount that will not release) leaves the run
+    directory where it is; a read log in it that was never scanned, because the collection failed first, is scanned
+    and removed when it holds the token, as at a teardown that goes on."""
+    sbx = start(world, "mounted")
+    collector.log_path.write_bytes(b'{"event": "record", "rec": {"item": "' + TOKEN.encode() + b'"}}\n')
+    failed_collection(world, sbx, tmp_path)
+    held = TD.TeardownResult(fuse_safe=False, removed=[], errors=["a mount that will not release"], log=[])
+    monkeypatch.setattr(TD, "ordered_fuse_teardown", lambda *args, **kwargs: held)
+    with pytest.raises(SandboxError, match="FUSE mount that could not be released"):
+        sbx.stop()
+    assert sbx.dir.is_dir()  # held: nothing of the run directory moved or removed
+    assert not collector.log_path.exists()
+    assert [p for p in sbx.dir.rglob("*") if p.is_file() and TOKEN.encode() in p.read_bytes()] == []
