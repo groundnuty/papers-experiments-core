@@ -376,3 +376,58 @@ def test_o97_a_stop_that_comes_while_a_restore_runs_waits_for_it_and_the_restore
     assert not sandbox.token_files_left()
     assert node.mounted_at is None
     assert sandbox.stopped
+
+
+# -------------------------------------------------------------------------------- the run ends with a restore pending
+def stuck_cell_with_restore_pending(node, box):
+    node.cell_handler = node.stuck
+    result = box.exec("read_a_stopped_providers_file()", 1.2)
+    assert result.restore_pending is True
+    node.cell_handler = node.default_cell
+    return result
+
+
+def test_o97_a_run_whose_last_cell_was_aborted_collects_with_no_restore_and_stops_with_the_mount_unmounted(
+    node, box, free_by_fusectl, tmp_path
+):
+    """O97: the blocked read was the agent's last cell: the body ends with the restore pending, which is then
+    `not_needed`; the collection reads the one generation's log as it always did, and the stop unmounts the dead
+    mount."""
+    stuck_cell_with_restore_pending(node, box)
+    node.cell()  # a proof in the window
+    box.collect(tmp_path / "out")
+    record = deadline_of(box)
+    assert record["restore"] == DL.RESTORE_NOT_NEEDED
+    assert record["outcome"] == DL.MOUNT_ABORTED
+    assert box._cells.ended is None
+    logs = box.mount_watch_logs()
+    assert len(logs) == 1
+    assert box.mount_watch_log() == logs[0]
+    meta = box.metadata()["mount"]
+    assert meta["guard"]["verdict"] == "clean"
+    assert meta["remounts"] == 0
+    assert box.infra_check()["deaths"] == []
+    box.stop()
+    assert node.mounted_at is None
+    assert node.mount_count == 1
+
+
+def test_o97_the_same_when_oneclient_ended_with_the_kill_it_is_the_harness_s_end_not_a_death(
+    node, tmp_path, fusectl_root, monkeypatch
+):
+    sandbox = make_box(node, tmp_path, fusectl_root)  # no fusectl directory: the abort kills oneclient
+    try:
+        stuck_cell_with_restore_pending(node, sandbox)
+        node.cell()
+        sandbox.collect(tmp_path / "out")
+        assert deadline_of(sandbox)["restore"] == DL.RESTORE_NOT_NEEDED
+        assert node.freed_by == ["daemon_death"]
+        check = sandbox.infra_check()
+        assert check["deaths"] == []
+        assert check["containers"]["mount"]["stopped_by_harness"] is True
+        assert sandbox.metadata()["mount"]["guard"]["verdict"] == "clean"
+        sandbox.stop()
+        assert node.mounted_at is None
+    finally:
+        node.free("teardown")
+        sandbox.stop(force=True)

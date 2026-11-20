@@ -153,3 +153,18 @@ def test_o97_a_sandbox_with_no_mount_has_no_mount_watch_logs(node, settings):
         assert box.mount_watch_logs() == []
     finally:
         box.stop()
+
+
+def test_o97_the_live_oneclient_log_is_read_at_each_call_not_kept_from_the_windows_close(node, settings, fusectl_root):
+    """O97: a run that is never restored reads oneclient's log as it always did: a later write shows."""
+    mount = mount_of(node, settings, fusectl_root)
+    try:
+        mount.start()
+        log = mount.where.log_dir / directio.LOG_FILE
+        log.write_text("before the close\n")
+        mount.close_watch()
+        log.write_text("after the close\n")
+        assert mount.oneclient_log() == b"after the close\n"
+        assert mount.generation_oneclient_logs() == [b"after the close\n"]
+    finally:
+        mount.stop()

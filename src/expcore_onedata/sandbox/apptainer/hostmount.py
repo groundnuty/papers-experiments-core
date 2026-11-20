@@ -458,16 +458,14 @@ class HostMount:
                 self._judge()
 
     def _judge(self) -> None:
-        """The snapshot of the generations' logs and the I/O-mode reading of their oneclient logs, taken once."""
-        live = self._live
-        if live.oneclient is not None and live.oneclient_log is None:
-            live.oneclient_log = _read_log_link(self.where, directio.LOG_FILE)
+        """The snapshot of the generations' logs and the I/O-mode reading of their oneclient logs, taken once. An
+        earlier generation's log is the one kept when it ended; the live one's is read now and not kept: it stays
+        readable as it always was, at each call (`oneclient_log`)."""
+        texts = [gen.oneclient_log for gen in self._gens[:-1]]
+        texts.append(None if self._live.oneclient is None else _read_log_link(self.where, directio.LOG_FILE))
         self._snapshot = _guard_snapshot([gen.log for gen in self._gens], self.nonce)
         declared = getattr(self.s.mount, "io_mode", None)
-        readings = [
-            iomode.judge(declared, None if gen.oneclient_log is None else gen.oneclient_log.decode("utf-8", "replace"))
-            for gen in self._gens
-        ]
+        readings = [iomode.judge(declared, None if text is None else text.decode("utf-8", "replace")) for text in texts]
         self._io_mode = _worst_io(readings, declared)
 
     def mount_watch_logs(self) -> list[bytes | None]:
