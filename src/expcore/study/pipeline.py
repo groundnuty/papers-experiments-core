@@ -1278,6 +1278,7 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
             "contrasts": analysis.result.contrasts,
             **_holm_entries(analysis.result),
         }
+        | _descriptives_entry(analysis.result)
         | ({} if analysis.egress is None else {"egress": _egress_summary(analysis.egress)})
         | ({} if analysis.mount_guard is None else {"mount_guard": _mount_guard_summary(analysis.mount_guard)})
         | ({} if analysis.guards is None else {"guards": _guards_summary(analysis.guards)})
@@ -1289,6 +1290,12 @@ def _summary(analysis: StudyAnalysis) -> dict[str, Any]:
         | _declared_reruns_entry(analysis.study.prereg.sensitivity_reruns)
         | ({} if analysis.rescore is None else {"rescore": dict(analysis.rescore)})
     )
+
+
+def _descriptives_entry(result: AnalysisResult) -> dict[str, Any]:
+    """`descriptives` (S21): the one-arm estimates of an analysis that has no contrast, whose analysis.json would
+    otherwise hold none of its numbers. An analysis with a contrast has no such key: its analysis.json is as it was."""
+    return {} if result.contrasts or not result.descriptives else {"descriptives": result.descriptives}
 
 
 def _declared_reruns_entry(declared: tuple[str, ...] | None) -> dict[str, Any]:

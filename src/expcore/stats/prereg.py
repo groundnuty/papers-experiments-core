@@ -88,6 +88,10 @@ mapping is a read-only view and every list a tuple, so no edit in place can chan
     conditions = ["cond-a"]    # one condition or a set of them, pooled
     outcome = "waited"         # a rate or share; or `numerator` and `denominator` for a ratio of totals
     cluster = "group"
+
+A preregistration declares at least one contrast, except in one form (S21): `exploratory_only = true` with at least
+one `[descriptives.<name>]` and no contrast, for a campaign that runs one condition alone. There is then no Holm
+family and the analysis is the one-arm estimates. Any other file with no contrast is refused.
 """
 
 from __future__ import annotations
@@ -381,8 +385,12 @@ def parse(raw: Mapping[str, Any], source: str, sha256: str, schema: FactorSchema
     contrasts = {
         name: _contrast(source, name, table, schema, alpha) for name, table in _tables(root, "contrasts").items()
     }
-    if not contrasts:
-        raise root.fail("contrasts", "must declare at least one contrast")
+    if not contrasts and not _descriptives_only(root):
+        raise root.fail(
+            "contrasts",
+            "must declare at least one contrast, or, for a preregistration that makes no confirmatory claim and "
+            "compares nothing, say exploratory_only = true and declare at least one [descriptives.<name>]",
+        )
     exploratory_only = _flag(root, "exploratory_only")
     families = _named_families(root, contrasts, exploratory_only)
     if families:
@@ -611,6 +619,20 @@ def _descriptive(
     if numerator == denominator:
         raise section.fail("denominator", "must differ from the numerator: a ratio needs two different outcomes")
     return DescriptiveSpec(name, conditions, cluster, numerator=numerator, denominator=denominator)
+
+
+def _descriptives_only(root: Section) -> bool:
+    """Whether the file is of the form that declares no contrast (S21): `exploratory_only = true` and at least one
+    [descriptives.<name>]. It only looks: a flag of another type, or entries that are not tables or have a blank name,
+    are read, and refused, where they always were, so a file with no contrast that this does not accept fails as it
+    did."""
+    declared = root.data.get("descriptives")
+    return (
+        root.data.get("exploratory_only") is True
+        and isinstance(declared, Mapping)
+        and bool(declared)
+        and all(isinstance(entry, Mapping) and name.strip() for name, entry in declared.items())
+    )
 
 
 def _flag(section: Section, key: str) -> bool:
