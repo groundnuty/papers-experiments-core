@@ -267,6 +267,7 @@ SRC_LAUNCHES = {
     "expcore_onedata/sandbox/containers.py": 1,  # the Docker read-log collector's container (O91)
     "expcore_onedata/sandbox/copyout.py": 1,
     "expcore_onedata/sandbox/procsignal.py": 1,  # the root half of a signal, run under sudo (O72)
+    "expcore_onedata/sandbox/sudoproc.py": 1,  # the root half of the Docker diagnosis's /proc reads (O97)
 }
 
 
