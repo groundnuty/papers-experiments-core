@@ -8,7 +8,7 @@ from replay_scenarios import SCENARIOS
 
 from expcore.records.digest import digest
 from expcore.records.record import RunRecord, decode
-from expcore.records.schema import RecordError, SchemaVersion
+from expcore.records.schema import CELL_DEADLINE_FIELDS, RecordError, SchemaVersion
 from expcore.replay.replay import ReplayDivergence, replay_record
 
 
@@ -295,11 +295,12 @@ V2 = SchemaVersion(
     added={
         "record": ("instruments", "treatment_targets", "instrument_refusal", "lease_id"),
         "turn": ("request_sha256", "deployment_id"),
-        "tool_call": ("detail", "elapsed_s", "exec_check"),
+        "tool_call": ("detail", "elapsed_s", "exec_check", "cell_deadline"),
         "usage": ("extra", "extra_cut"),  # the real table's version 3 fields, here added with this version
         "outcome": ("infra_target",),
         "totals": ("reserved_capped", "reply_cap_unheld", "deployment_switched"),
         "exec_check": ("source_whole", "exit_status", "nonce_matched"),
+        "cell_deadline": CELL_DEADLINE_FIELDS,
     },
     config_before={"cleanup_deadline_s": 7.0},
     optional={
@@ -308,8 +309,9 @@ V2 = SchemaVersion(
         "record": ("treatment_targets", "instrument_refusal", "lease_id"),
         "outcome": ("infra_target",),
         "totals": ("reserved_capped", "reply_cap_unheld", "deployment_switched"),
-        "tool_call": ("elapsed_s", "exec_check"),
+        "tool_call": ("elapsed_s", "exec_check", "cell_deadline"),
         "exec_check": ("source_whole", "exit_status", "nonce_matched"),
+        "cell_deadline": CELL_DEADLINE_FIELDS,
     },
 )
 TABLE = (V1, V2)
@@ -326,6 +328,7 @@ def older(data: dict) -> dict:
         del entry["detail"]
         entry.pop("elapsed_s", None)  # a field the current writer adds, and this table's version 2 lists
         entry.pop("exec_check", None)  # likewise, for a call whose tool verified its exec
+        entry.pop("cell_deadline", None)  # likewise, for a call whose cell's deadline fired with a survivor
     del data["agent_config"]["cleanup_deadline_s"]
     data["agent_config_sha256"] = digest(data["agent_config"])
     return data

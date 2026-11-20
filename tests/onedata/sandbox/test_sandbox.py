@@ -912,7 +912,10 @@ def test_o12_the_record_names_the_pool_by_position_and_the_configuration_by_its_
     assert meta["network"]["pool"] == 0  # the first of [sandbox.network] pools
     assert set(meta["mount"]) == {
         "io_mode", "options", "extra_args", "image_config", "log_dir_from", "network", "wait_s", "oneclient_build",
+        "remounts", "generations",
     }  # fmt: skip
+    assert meta["mount"]["remounts"] == 0  # every run says how many times its mount was restored (O97)
+    assert meta["mount"]["generations"] == [{"wait_s": meta["mount"]["wait_s"], "fusectl": None, "abort": None}]
     assert meta["mount"]["log_dir_from"] == "sandbox"
     assert meta["mount"]["network"] in ("default bridge", "federation")  # the kind of network, never its name
     text = json.dumps(meta, default=str)

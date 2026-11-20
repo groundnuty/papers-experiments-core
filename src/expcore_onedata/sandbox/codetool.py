@@ -25,6 +25,13 @@ skipped when it ran (O72). The refusal of every later call, and `launch` or the 
 raise `InfraError` of kind `cell_unkillable`, which no condition can treat (O34); nothing read from the run after an
 abort or a stop is the cell's evidence, so no refusal of the gate is read into that cell's call.
 
+A cell whose process was blocked on what the study's own manipulation holds down, and was freed by the abort of its
+mount, is the agent's own time limit (O97): the result says a restore is pending, and this tool restores the mount
+(`restore_mount`) before it returns, inside `ctx.infrastructure_wait("sandbox_lifecycle")`, so the agent's clock is
+paused for the restore and the next cell finds the mount as the start made it. A restore that fails leaves this call
+its timeout and ends the run: the next call raises `sandbox`. Every call whose cell's deadline fired with a survivor
+carries the deadline on its record (`ToolOutput.cell_deadline`), the escalated ones included.
+
 What is kept of a cell's output is capped per stream by the sandbox (`cells.OUTPUT_CAP_BYTES`, O43). When it cut
 one, the text this tool returns ends with a notice that says how much of each cut stream was written and how much kept,
 and the call's `source_truncated` is True, as for any source's own limit (L07, apart from the loop's own cap); the
@@ -42,8 +49,9 @@ import asyncio
 from collections.abc import Sequence
 from typing import Any
 
+from expcore.errors import InfraError
 from expcore.plugin import CallContext, ToolOutput, ToolSpec
-from expcore_onedata.sandbox import kinds
+from expcore_onedata.sandbox import calldeadline, kinds
 from expcore_onedata.sandbox.api import NOT_STARTED, ExecResult, Sandbox
 
 DEFAULT_NAME = "python"
@@ -90,6 +98,8 @@ class CodeExecutionProvider:
             )
         limit_s = max(float(timeout_s), MIN_TIMEOUT_S)
         result = await asyncio.to_thread(self._sandbox.exec, code, limit_s)
+        if result.restore_pending:
+            await self._restore(ctx)
         # a cell that outlived its kill at its deadline ended the run (O34), and the run's ending is said by the next
         # call, `launch` and the collection (`run_ended_error`): this call keeps its own result, a timeout (O72). Its
         # mount or its sandbox is gone, and nothing read after that, the gate's log included, is the cell's evidence.
@@ -105,6 +115,18 @@ class CodeExecutionProvider:
         under_limit = getattr(ctx, "cell_bound_s", None) is not None and kinds.deadline_error(result.kill) is None
         return self._output(result, limit_s if under_limit else None)
 
+    async def _restore(self, ctx: CallContext) -> None:
+        """Bring the mount back after a deadline that freed the agent's survivor (O97), in the agent's paused clock. The
+        sandbox's `restore_mount` never raises, and how it went is on the deadline's record and, for a failure, the
+        run's end, which the next call raises: nothing here keeps this call from returning its own result. A sandbox
+        that says a restore is pending and has none is inconsistent, and the call fails as `sandbox` rather than leave
+        a dead mount for the next cell."""
+        restore = getattr(self._sandbox, "restore_mount", None)
+        if restore is None:
+            raise InfraError("sandbox", "the sandbox aborted the mount at a cell's deadline and cannot restore it")
+        async with ctx.infrastructure_wait("sandbox_lifecycle"):
+            await asyncio.to_thread(restore)
+
     @classmethod
     def _output(cls, result: ExecResult, cell_limit_s: float | None = None) -> ToolOutput:
         """The text the model sees for a finished cell, or for one too little time was left to start; a notice ends it
@@ -114,7 +136,14 @@ class CodeExecutionProvider:
         text, cut = shown.text, None
         if result.output_cut:
             text, cut = f"{shown.text}\n{_cut_notice(result.output_cut)}", True
-        return ToolOutput(text, shown.is_error, shown.error_class, source_truncated=cut, exec_check=result.exec_check)
+        return ToolOutput(
+            text,
+            shown.is_error,
+            shown.error_class,
+            source_truncated=cut,
+            exec_check=result.exec_check,
+            cell_deadline=calldeadline.cell_deadline_of(result.deadline),
+        )
 
     @staticmethod
     def _shown(result: ExecResult, cell_limit_s: float | None = None) -> ToolOutput:

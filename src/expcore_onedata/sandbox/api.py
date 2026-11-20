@@ -10,7 +10,7 @@ The data path of a run is one of three kinds. The study's `data_path` factor nam
 """
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Callable, Collection, Mapping
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -120,6 +120,14 @@ class SandboxSpec:
     # the real names and addresses of the federation's nodes (O73), which the gate scans the answers it relays for:
     # empty where the names are already the declared ones (Compose). Never shown, never in anything a cell can read.
     node_names: tuple[str, ...] = dataclasses.field(default=(), repr=False)
+    # for a mount run: each space's name as the mount shows it, mapped to its data provider's label (`providers[i]`;
+    # `PlatformConfig.space_holders`), which the attribution of a cell's blocked read compares with what the run's own
+    # injection holds down (O97). Empty where no space declares a holder: no block is then the agent's.
+    space_holders: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    # for a mount run: the labels of the providers the run's own injection holds down at the moment it is called, read
+    # when the deadline asks for a verdict (`attribution.attributer(spec.held_down, spec.space_holders)`). Made at the
+    # launch, inside the attempt, so the timer's thread reads that attempt's holds and no other's (`fault_owner`, O97).
+    held_down: Callable[[], Collection[str]] = dataclasses.field(default=lambda: frozenset(), repr=False, compare=False)
 
 
 RAN = "ran"  # the cell was started: its exit code, timeout and kill say how it ended
@@ -162,6 +170,9 @@ class ExecResult:
     # the cell's deadline aborted the run's mount and the survivors were the agent's: the mount is to be restored
     # (`MountRestoring.restore_mount`) before anything else runs, and the kill stays the agent's time limit (O34)
     restore_pending: bool = False
+    # the record of the cell's deadline when it fired with a process that outlived the kill, however it ended (the
+    # live dict of `cells.CellRunner`: a restore updates it, so read it after the restore); None for any other cell
+    deadline: dict[str, Any] | None = None
 
 
 @runtime_checkable
