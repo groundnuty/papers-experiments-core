@@ -76,7 +76,7 @@ class PauseRefused(LedgerError):
 
 class DrainRefused(LedgerError):
     """An operator's drain of a federation the ledger does not hold, one already drained or proven ended, one past its
-    recorded job end, or one beside a controller that does not say it honours operator writes (C58)."""
+    recorded job end, or one beside a controller that does not say it honours operator writes (C59)."""
 
 
 def undeclared_values(values: Any) -> tuple[str | None, ...]:

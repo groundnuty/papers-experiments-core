@@ -1,5 +1,5 @@
 # Provenance: new
-"""An operator's drain of one federation while a controller holds the ledger (C58).
+"""An operator's drain of one federation while a controller holds the ledger (C59).
 
 The standing rule retires a member after repeated health-gate failures, and the operator must be able to do it while
 the controller runs. `fleetcontrol.py drain` takes the ledger's dispatcher lock, which the running controller holds,

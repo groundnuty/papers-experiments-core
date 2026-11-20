@@ -36,7 +36,7 @@
   that an undeclared fingerprint also pauses (C48) stays paused until `declare`, and `resume` says so. Refused for a
   model no operator paused. `status` shows each operator pause with its time, actor and reason, and the log of both.
 - `drain LEDGER --label L --reason TEXT --actor NAME`: drain federation L (its label in the ledger, `<site>-<member>`)
-  while the controller runs (C58): it takes no new lease from the dispatcher's next issue, a lease it holds runs to its
+  while the controller runs (C59): it takes no new lease from the dispatcher's next issue, a lease it holds runs to its
   end and counts, and the controller's next tick retires it once none is in flight. It is the ledger's own drain, with
   the reason and actor in its `drain` event. Refused for a federation the ledger does not hold, one already drained or
   proven ended, one past its recorded job end, and, writing nothing, while a live controller does not say it honours

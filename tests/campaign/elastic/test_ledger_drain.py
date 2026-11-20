@@ -1,4 +1,4 @@
-"""C58: an operator drains one federation while a controller holds the ledger, on C55's live path (the file's own
+"""C59: an operator drains one federation while a controller holds the ledger, on C55's live path (the file's own
 write lock, never the dispatcher's): the controller gives it no lease from its next issue, a lease it holds runs to its
 end and counts, and the controller's next tick retires it once none is in flight. Refused, writing nothing, beside a
 controller that does not say it honours operator writes, and for a federation that cannot be drained."""
@@ -37,6 +37,15 @@ def _drain_events(path: Path) -> list[dict]:
         reader.close()
 
 
+def _state(path: Path) -> tuple[list, list]:
+    """Everything a drain could change: every federation row and the whole event log."""
+    reader = LedgerReader(path)
+    try:
+        return reader.federations(), reader.events()
+    finally:
+        reader.close()
+
+
 def _closed_with(tmp_path, *labels) -> tuple[Path, FakeClock]:
     """A ledger no controller holds, its federations joined with job ends a day after the real clock's now (the
     command reads the real clock)."""
@@ -48,8 +57,8 @@ def _closed_with(tmp_path, *labels) -> tuple[Path, FakeClock]:
     return ledger_path(tmp_path), clock
 
 
-def test_c58_a_drain_beside_a_live_controller_is_honoured_at_its_next_issue_and_tick(tmp_path):
-    """C58: the controller holds the ledger (its dispatcher lock and its declaration); the drain is written beside it
+def test_c59_a_drain_beside_a_live_controller_is_honoured_at_its_next_issue_and_tick(tmp_path):
+    """C59: the controller holds the ledger (its dispatcher lock and its declaration); the drain is written beside it
     from another connection, recorded as a `drain` with the operator's reason and actor; the controller's next issue
     to the federation waits and its next tick retires it, and the other federation is untouched."""
     ledger, clock = make(tmp_path, runs=plan(tasks=2, conditions=("api-none",)))
@@ -69,8 +78,8 @@ def test_c58_a_drain_beside_a_live_controller_is_honoured_at_its_next_issue_and_
     ledger.close()
 
 
-def test_c58_a_lease_in_flight_runs_to_its_end_and_counts_and_only_then_is_its_federation_retired(tmp_path):
-    """C58: drained while it holds a sent lease, the federation is not retired; the lease reports and is counted as any
+def test_c59_a_lease_in_flight_runs_to_its_end_and_counts_and_only_then_is_its_federation_retired(tmp_path):
+    """C59: drained while it holds a sent lease, the federation is not retired; the lease reports and is counted as any
     other, and the next tick retires the federation."""
     ledger, clock = make(tmp_path, runs=plan(tasks=2, conditions=("api-none",)))
     join(ledger, clock, FED)
@@ -85,25 +94,22 @@ def test_c58_a_lease_in_flight_runs_to_its_end_and_counts_and_only_then_is_its_f
     ledger.close()
 
 
-def test_c58_drain_is_refused_and_writes_nothing_beside_an_older_controller(tmp_path, capsys):
-    """C58: a controller holds the dispatcher lock and never declares itself (an older core): the command exits 1
+def test_c59_drain_is_refused_and_writes_nothing_beside_an_older_controller(tmp_path, capsys):
+    """C59: a controller holds the dispatcher lock and never declares itself (an older core): the command exits 1
     naming the restart, and the federation and the events are as they were."""
     path, _ = _closed_with(tmp_path, FED)
+    before = _state(path)
     with DispatchLock(path.parent):
         assert main(["drain", str(path), "--label", FED, "--reason", WHY, "--actor", "op-1"]) == 1
     assert "Restart it on this commit or later" in capsys.readouterr().err
-    assert _drain_events(path) == []
-    reader = LedgerReader(path)
-    try:
-        assert reader.federations()[0].drained_at is None
-    finally:
-        reader.close()
+    assert _state(path) == before
 
 
 @pytest.mark.parametrize("case", ["unknown", "ended", "drained", "past its end"])
-def test_c58_a_federation_that_cannot_be_drained_is_refused_with_nothing_written(tmp_path, case):
-    """C58: a label the ledger does not hold, a federation proven ended, one already drained, and one past its
-    recorded job end (that is proven, never drained) are each refused, and no drain is recorded."""
+def test_c59_a_federation_that_cannot_be_drained_is_refused_with_nothing_written(tmp_path, case):
+    """C59: a label the ledger does not hold, a federation proven ended, one already drained, and one past its
+    recorded job end (that is proven, never drained) are each refused, and the federations and the whole event log
+    are as they were."""
     ledger, clock = make(tmp_path, runs=plan(tasks=2, conditions=("api-none",)))
     join(ledger, clock, FED, job_end_in_s=600.0)
     if case == "ended":
@@ -112,15 +118,15 @@ def test_c58_a_federation_that_cannot_be_drained_is_refused_with_nothing_written
         ledger.drain(FED)
     elif case == "past its end":
         clock.advance(601.0)
-    before = _drain_events(ledger_path(tmp_path))
+    before = _state(ledger_path(tmp_path))
     with pytest.raises(DrainRefused):
         drain_in_file(ledger_path(tmp_path), "site-a-fed-9" if case == "unknown" else FED, WHY, "op-1", clock=clock)
-    assert _drain_events(ledger_path(tmp_path)) == before
+    assert _state(ledger_path(tmp_path)) == before
     ledger.close()
 
 
-def test_c58_the_command_drains_a_ledger_no_controller_holds_and_says_the_next_one_reads_it(tmp_path, capsys):
-    """C58: `drain LEDGER --label L --reason R --actor A` exits 0, prints the event and that no controller holds the
+def test_c59_the_command_drains_a_ledger_no_controller_holds_and_says_the_next_one_reads_it(tmp_path, capsys):
+    """C59: `drain LEDGER --label L --reason R --actor A` exits 0, prints the event and that no controller holds the
     ledger; a controller that opens it then finds the federation drained."""
     path, clock = _closed_with(tmp_path, FED)
     assert main(["drain", str(path), "--label", FED, "--reason", WHY, "--actor", "op-1"]) == 0
