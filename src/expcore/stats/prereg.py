@@ -623,10 +623,16 @@ def _descriptive(
 
 def _descriptives_only(root: Section) -> bool:
     """Whether the file is of the form that declares no contrast (S21): `exploratory_only = true` and at least one
-    [descriptives.<name>]. It only looks: a flag of another type or a malformed table is read, and refused, where it
-    always was, so a file with no contrast that this does not accept fails as it did."""
+    [descriptives.<name>]. It only looks: a flag of another type, or entries that are not tables or have a blank name,
+    are read, and refused, where they always were, so a file with no contrast that this does not accept fails as it
+    did."""
     declared = root.data.get("descriptives")
-    return root.data.get("exploratory_only") is True and isinstance(declared, Mapping) and bool(declared)
+    return (
+        root.data.get("exploratory_only") is True
+        and isinstance(declared, Mapping)
+        and bool(declared)
+        and all(isinstance(entry, Mapping) and name.strip() for name, entry in declared.items())
+    )
 
 
 def _flag(section: Section, key: str) -> bool:

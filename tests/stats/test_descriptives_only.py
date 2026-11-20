@@ -18,7 +18,7 @@ from expcore.stats.analysis import analyse, pilot_power, power_study
 from expcore.stats.federation_effect import federation_analysis
 from expcore.stats.prereg import parse
 from expcore.stats.rows import Row
-from expcore.study.pipeline import _json_text
+from expcore.study.pipeline import _descriptives_entry, _json_text
 
 SCHEMA = FactorSchema(
     {"arm": ["a", "b"]}, ["task", "arm", "model", "seed"], {f"cond-{arm}": {"arm": arm} for arm in "ab"}
@@ -91,35 +91,30 @@ def test_s21_a_descriptives_only_preregistration_loads():
     assert list(prereg.descriptives) == ["waited-in-a", "queries-per-placement"]
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        TEXT.replace("exploratory_only = true\n", ""),
-        TEXT.replace("exploratory_only = true", "exploratory_only = false"),
-        TEXT.replace("exploratory_only = true", 'holm_family = ["a-vs-b"]'),
-    ],
-    ids=["no exploratory_only", "exploratory_only false", "a family instead"],
-)
-def test_s21_no_contrast_without_exploratory_only_is_still_refused_and_the_refusal_names_the_allowed_form(text):
-    """S21: the descriptives alone do not make a preregistration: it must also say it makes no confirmatory claim."""
+NOTHING = TEXT[: TEXT.index("[descriptives.waited-in-a]")]  # exploratory_only, and no one-arm estimate
+BLANK = '[descriptives." "]\nconditions = ["cond-a"]\noutcome = "waited"\ncluster = "group"\n'
+REFUSED = {
+    "no exploratory_only": TEXT.replace("exploratory_only = true\n", ""),
+    "exploratory_only false": TEXT.replace("exploratory_only = true", "exploratory_only = false"),
+    "exploratory_only of the wrong type": TEXT.replace("exploratory_only = true", 'exploratory_only = "true"'),
+    "a family instead": TEXT.replace("exploratory_only = true", 'holm_family = ["a-vs-b"]'),
+    "no descriptives table": NOTHING,
+    "an empty descriptives table": NOTHING + "[descriptives]\n",
+    "a descriptive that is not a table": NOTHING.replace(
+        "exploratory_only = true\n", "exploratory_only = true\ndescriptives = { rate = 1 }\n"
+    ),
+    "a descriptive with a blank name": NOTHING + BLANK,
+}
+
+
+@pytest.mark.parametrize("text", REFUSED.values(), ids=REFUSED.keys())
+def test_s21_every_file_with_no_contrast_but_the_one_form_is_refused_for_having_none_and_names_the_form(text):
+    """S21: the descriptives alone do not make a preregistration, nor does the flag alone; a file that was refused
+    before is refused for the same key, now with a message that names the form that is accepted."""
     message = refusal(text)
-    assert "key 'contrasts' must declare at least one contrast" in message
+    assert message.startswith("inline: top level: key 'contrasts' must declare at least one contrast")
     assert "exploratory_only = true" in message
     assert "[descriptives.<name>]" in message
-
-
-@pytest.mark.parametrize("tail", ["", "[descriptives]\n"], ids=["no table", "an empty table"])
-def test_s21_no_contrast_with_exploratory_only_and_no_descriptives_is_still_refused(tail):
-    """S21: nothing declared is not a preregistration, whether the table is left out or is empty."""
-    text = TEXT[: TEXT.index("[descriptives.waited-in-a]")] + tail
-    assert "key 'contrasts' must declare at least one contrast" in refusal(text)
-
-
-def test_s21_a_file_refused_before_for_a_bad_flag_is_refused_for_the_same_reason():
-    """S21: the loader reads exploratory_only for this form only when it is true, so a file with no contrast and a flag
-    of the wrong type is refused for having no contrast, as it was."""
-    text = TEXT.replace("exploratory_only = true", 'exploratory_only = "true"')
-    assert "key 'contrasts' must declare at least one contrast" in refusal(text)
 
 
 def test_s21_a_contrast_beside_the_descriptives_loads_as_before():
@@ -127,6 +122,16 @@ def test_s21_a_contrast_beside_the_descriptives_loads_as_before():
     prereg = parsed(TEXT + CONTRAST)
     assert list(prereg.contrasts) == ["a-vs-b"]
     assert list(prereg.descriptives) == ["waited-in-a", "queries-per-placement"]
+
+
+def test_s21_analysis_json_has_no_descriptives_key_when_the_analysis_has_a_contrast():
+    """S21: the key is for an analysis with no contrast; one that has a contrast, with or without one-arm estimates,
+    keeps the analysis.json it had."""
+    with_contrast = analyse([*rows(), *rows("cond-b")], parsed(TEXT + CONTRAST))
+    assert with_contrast.descriptives
+    assert with_contrast.contrasts
+    assert _descriptives_entry(with_contrast) == {}
+    assert list(_descriptives_entry(analyse(rows(), parsed()))) == ["descriptives"]
 
 
 def test_s21_the_analysis_reports_its_descriptives_and_no_contrast():
