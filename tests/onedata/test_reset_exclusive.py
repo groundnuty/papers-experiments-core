@@ -56,7 +56,7 @@ from expcore_onedata.resetgrant import (
     exclusive,
     federation_for,
 )
-from expcore_onedata.resetlock import FEDERATION_RESET, OUTSIDE_CAMPAIGN, RESET_HOLDS
+from expcore_onedata.resetlock import CLOSED, FEDERATION_RESET, OUTSIDE_CAMPAIGN, RESET_HOLDS
 from expcore_onedata.shared_holds import SharedHolds
 from expcore_onedata.testing import write_platform
 from expcore_onedata.tool_admission import shared_admission
@@ -105,12 +105,15 @@ def in_thread(work, name=None):
     return thread, landed
 
 
-def tool_in_thread(config, release, reason=REASON):
-    """A tool outside a campaign holding the shared admission in a thread until `release` is set."""
+def tool_in_thread(config, release, reason=REASON, admissions=None):
+    """A tool outside a campaign holding the shared admission in a thread until `release` is set; its admission is
+    appended to `admissions` when given."""
     holding = threading.Event()
 
     def tool():
-        with shared_admission(config, reason=reason):
+        with shared_admission(config, reason=reason) as admission:
+            if admissions is not None:
+                admissions.append(admission)
             holding.set()
             release.wait(WAIT_S)
 
@@ -167,25 +170,31 @@ def test_o11_a_concurrent_shared_run_holds_the_shortcut_off_until_it_releases(tm
             assert (grant.mode, grant.why) == (EXCLUSIVE, None)
             assert grant.shortcut
             assert grant.held
-            assert not other.held, "the exclusive hold was granted while another run still held its share"
+            # its share of federation.reset, the lock the grant excludes, is marked closed before its flock drops;
+            # its federation.lock (`other.held`) goes after it, the reverse of the order taken in, so may still be held
+            assert other.reset.state == CLOSED, "the exclusive hold was granted while another run still held its share"
             assert time.monotonic() - began >= 0.45
         letting_go.join(WAIT_S)
+    assert not other.held
 
 
 def test_o11_the_shortcut_proceeds_when_a_tools_hold_ends_within_the_bound(tmp_path):
     """O11: a tool outside a campaign that lets go within the bound lets the shortcut reset in; the wait is recorded."""
     config, _, lock = federation(tmp_path)
     release = threading.Event()
-    thread, landed = tool_in_thread(config, release)
+    tools: list = []
+    thread, landed = tool_in_thread(config, release, admissions=tools)
     timer_at = time.monotonic()
     threading.Timer(0.5, release.set).start()
     with lock.held(exclusive=False, timeout_s=PROBE_S):
         began = time.monotonic()  # a loaded runner can spend part of the tool's 0.5 s hold before the wait begins
         with exclusive(config, shortcut()) as grant:
             assert grant.shortcut
-            assert landed == [None], "the tool still held the federation when the exclusive hold was granted"
+            (tool,) = tools  # its thread may still be leaving (`landed`) once its share of the reset lock is let go
+            assert tool.reset.state == CLOSED, "the tool still held the federation when the exclusive hold was granted"
             assert grant.facts()["wait_s"] >= 0.5 - (began - timer_at) - 0.05
     thread.join(WAIT_S)
+    assert landed == [None]
 
 
 def test_o11_a_tools_hold_past_the_bound_refuses_the_section_and_names_the_holders(tmp_path):
