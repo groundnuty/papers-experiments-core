@@ -117,7 +117,20 @@ log the agent can neither read nor rewrite (`docs/interfaces.md`, "The read-log 
 platform declares `[sandbox.apptainer] readlog_collector_sha256`, the SHA-256 of the core's own `readlog/collector.py`
 (`python3 -c "import hashlib,expcore_onedata.readlog.files as f; print(hashlib.sha256(f.collector_file().read_bytes()).hexdigest())"`
 prints it); without it a run has no channel, and the shipped layouts' templates do not name it yet, so a study that needs
-it declares it in its own platform file.
+it declares it in its own platform file. The pin is the file's bytes, so a change to `collector.py` is a new SHA, and a
+platform that declares the old one is refused at the start (C61 raised the log's cap from 48 MiB to 256 MiB, which is
+such a change): a study stamps the SHA of the core it runs on, read with the command above, never one copied from an
+earlier core.
+
+**What a log costs at its cap (C61).** The collector's log holds at most 256 MiB, its end line included (a run's log
+is usually KiB to a few MiB). It is written in the run's work directory (`readlog/`), which is on the node's tmpfs, so it
+counts against the memory of the step that runs the dispatcher (`[hpc] sandbox`) until the run's teardown. At collection
+the driver reads it whole (one 256 MiB `bytes` at the cap) and the reader parses it at about 8 times its size in memory
+(about 2 GiB at the cap, and about 0.2 s of one core per MiB; measured at 4 and 16 MiB on 280-byte records and
+extrapolated). The evidence copy (`read-log.jsonl`) and the side file are two more copies, which a study's executor
+normally writes under the shard's `out/` on the same tmpfs; the shard's archive is an uncompressed tar on the shared
+filesystem and is pulled whole, so each log at the cap adds 512 MiB to it. A layout that expects logs near the cap, or
+several such collections at once, sizes `[hpc] sandbox` memory for them.
 
 - **The collector** is a second helper of the driver's uid beside the egress collector, started before any cell: it binds
   `sock` in an empty 0700 directory (`readlog-sock/` of the run's directory) and writes its log in `readlog/`, which no

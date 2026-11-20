@@ -6,6 +6,7 @@ Pure bytes in, a `Reading` out: no socket here. A run with an unknown log reads 
 import pytest
 from readlog_logs import NONCE, PEER_UID, SHA, canary, encode, lines, log, read
 
+from expcore_onedata.readlog import paths
 from expcore_onedata.readlog import reader as reader_module
 from expcore_onedata.readlog.reader import read_log
 
@@ -109,6 +110,34 @@ def test_o91_a_log_past_the_size_limit_is_not_read():
     """O91: a log past the size limit is not read."""
     reading = reading_of(log(RECORDS), max_bytes=100)
     assert reading.problems == (reader_module.TOO_LARGE,)
+
+
+def test_c61_the_readers_limit_is_the_collectors_cap_of_256_mib_and_one_byte_more_is_not_read():
+    """C61: a log past 256 MiB is refused for its size before any of it is scanned (zero bytes stand for it: they are
+    never touched); the default limit is `paths.MAX_LOG_BYTES` and the figure is 256 MiB (it was 48 MiB)."""
+    assert paths.MAX_LOG_BYTES == 256 * 1024 * 1024
+    assert reading_of(bytes(paths.MAX_LOG_BYTES + 1)).problems == (reader_module.TOO_LARGE,)
+
+
+def test_c61_a_log_exactly_at_the_default_limit_is_read_and_one_byte_past_it_is_not(monkeypatch):
+    """C61: the default limit is `paths.MAX_LOG_BYTES` and a log of exactly that size is read."""
+    data = log(RECORDS)
+    monkeypatch.setattr(paths, "MAX_LOG_BYTES", len(data))
+    assert reading_of(data).intact
+    monkeypatch.setattr(paths, "MAX_LOG_BYTES", len(data) - 1)
+    assert reading_of(data).problems == (reader_module.TOO_LARGE,)
+
+
+def test_c61_a_log_past_the_old_48_mib_cap_is_read_and_intact():
+    """C61: a log of 49 MiB, past the old cap, whose lines are all the collector's own (its start line carries a long
+    extra field the reader ignores, to make the size without a million lines), is intact: the cap is 256 MiB."""
+    out = lines(RECORDS)
+    out[0]["pad"] = "x" * (49 * 1024 * 1024)
+    data = encode(out)
+    assert 48 * 1024 * 1024 < len(data) < paths.MAX_LOG_BYTES
+    reading = reading_of(data)
+    assert reading.intact
+    assert list(reading.reads) == RECORDS
 
 
 def test_o91_a_log_of_another_run_is_unknown():

@@ -131,6 +131,29 @@ def test_o91_the_collectors_cap_is_below_the_side_file_cap():
     assert paths.MAX_LOG_BYTES + paths.END_RESERVE_BYTES < side_module.MAX_SIDE_FILE_BYTES
 
 
+def test_c61_the_side_file_takes_a_log_as_large_as_the_collector_may_write():
+    """C61: a log of exactly the collector's cap, 256 MiB, is stageable: the snapshot names it as the side file, with no
+    `side_file_too_large`. The length is what the decision reads (hashing 256 MiB would cost seconds for nothing), so a
+    one-byte `bytes` that reports the cap's length stands for the log."""
+
+    class FullLog(bytes):
+        def __len__(self):
+            return paths.MAX_LOG_BYTES
+
+    made = snapshot(reader.Reading((), ()), FullLog(b"x"))
+    assert paths.MAX_LOG_BYTES == 256 * 1024 * 1024
+    assert instrument_module.SIDE_TOO_LARGE not in made["unknown"]
+    assert made["side_bytes"] == paths.MAX_LOG_BYTES
+    assert made["side_sha256"] is not None
+
+
+def test_c61_the_side_file_cap_is_272_mib_the_collectors_cap_and_the_headroom_the_two_had():
+    """C61: the side-file cap is raised with the collector's: 16 MiB above the collector's 256 MiB, as 64 MiB was above
+    48 MiB, and above the longest log the collector can write with its reserve."""
+    assert side_module.MAX_SIDE_FILE_BYTES == paths.MAX_LOG_BYTES + 16 * 1024 * 1024 == 272 * 1024 * 1024
+    assert paths.MAX_LOG_BYTES + paths.END_RESERVE_BYTES < side_module.MAX_SIDE_FILE_BYTES
+
+
 def test_o91_the_snapshot_of_a_reading_is_a_function_of_the_reading_and_the_bytes():
     """O91: the snapshot of a reading is a function of the reading and the bytes."""
     data = log(READS)
