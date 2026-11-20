@@ -333,7 +333,11 @@ def _check_no_claim(result: AnalysisResult) -> None:
 
 
 def _exploratory_only(result: AnalysisResult, level: float | None) -> list[str]:
-    """The contrasts of a preregistration with no Holm family (S12): one exploratory table, and no family table."""
+    """The contrasts of a preregistration with no Holm family (S12): one exploratory table, and no family table. A
+    preregistration with no contrast at all, only one-arm estimates (S21), has no contrast section: its estimates are
+    its whole analysis."""
+    if not result.contrasts and result.descriptives:
+        return _descriptives(result, level)
     contrasts = list(result.contrasts)
     with_mde = any(r.minimum_detectable_effect is not None for r in contrasts)
     lines = ["## Exploratory contrasts (every contrast: the preregistration makes no confirmatory claim)", ""]
@@ -790,6 +794,12 @@ def _sensitivity(result: AnalysisResult, level: float | None, left_out: str = "t
     else:
         shown = [r for r in result.contrasts if not _exploratory(r, adjusted)]
         title = f"#### Preregistered contrasts without {left_out} (Holm family of {len(shown)})"
+    if not result.contrasts and result.descriptives:  # one-arm estimates only (S21): a rerun does not repeat them
+        return [
+            title,
+            "",
+            "No contrast declared: the preregistration has one-arm estimates only, which a rerun does not show.",
+        ]
     if not shown:
         return [title, "", "No contrast in the family."]
     with_mde = any(r.minimum_detectable_effect is not None for r in shown)
