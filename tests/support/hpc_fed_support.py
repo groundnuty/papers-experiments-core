@@ -444,6 +444,7 @@ class FakeSlurm:
     sweeps: list = field(default_factory=list)  # each sweep step down launched
     leftovers: dict = field(default_factory=dict)  # node -> the work directories of ours leftovers.py counts there
     step_cancel_rc: int = 0  # a step's scancel ends it but exits so (225: as the site's did on a het job, live slot 5)
+    holder_refused: bool = False  # srun refuses a kept stop's holder (O96): its client exits at once, no step is made
     unending: list = field(default_factory=list)  # step ids neither TERM nor a cancel ends (Slurm never shows it ended)
     ignores_term: list = field(default_factory=list)  # step ids TERM does not end, a cancel does
     termed: list = field(default_factory=list)  # each step sent TERM (`scancel --signal=TERM <id>`), in order
@@ -836,6 +837,14 @@ class FakeSlurm:
             Path(client_log).write_text(srun.refusal, encoding="utf-8")
             self.dead_clients.append(Client(20000 + len(self.spawned), 77))
             return self.dead_clients[-1]
+        if srun.overlap and srun.command[:1] == ["sleep"]:  # a kept stop's holder (O96): listed at once, or refused
+            if self.holder_refused:
+                Path(client_log).write_text("srun: error: Unable to create step for job\n", encoding="utf-8")
+                self.dead_clients.append(Client(20000 + len(self.spawned), 77))
+                return self.dead_clients[-1]
+            self.next_step += 1
+            self.steps[srun.name] = f"{self.listing_of(srun)}.{self.next_step}"
+            return Client(10000 + self.next_step, 77)
         script = Path(srun.command[1]).name
         kind = "oz" if script == "zone.sbatch" else "op"
         service = "zone" if kind == "oz" else srun.command[4]

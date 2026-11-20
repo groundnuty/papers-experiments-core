@@ -79,6 +79,7 @@ class FakeHpc:
         self.stop_hangs = False
         self.stop_noop = False
         self.stop_unconfirmed = False  # the stop answers exit 1, stopped false, while the service goes on stopping
+        self.holder_fails = False  # the stop is confirmed but shows no holder step beside the kept directory (O96)
         self.start_fails: set[str] = set()
         self.never_serving: set[str] = set()
         self.serves_after = 0
@@ -166,6 +167,8 @@ class FakeHpc:
             record = {"service": service, "stopped": False, "ended": ended, "seconds": took + 70.0}
             return CommandResult(1, json.dumps({**record, "service_seconds": took}) + "\n")
         record = {"service": service, "stopped": True, "ended": ended, "seconds": took, "service_seconds": took}
+        if self.holder_fails:
+            record["holder"] = "failed"
         return CommandResult(0, json.dumps(record) + "\n")
 
     def _start(self, service: str) -> CommandResult:

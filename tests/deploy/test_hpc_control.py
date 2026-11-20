@@ -90,13 +90,16 @@ class FakeState:
 
 class FakeLauncher:
     """The step launcher. `steps` is the step list (name to id); `on_control(argv)` answers a control step and may
-    change the list; `on_service(name)` is what a launched service step does to the list (lists it by default)."""
+    change the list; `on_service(name)` is what a launched service step does to the list (lists it by default), and
+    `on_holder(name)` what a kept stop's holder does (O96: listed by default)."""
 
     def __init__(self, state, steps=None):
         self.state, self.steps = state, dict(steps or {})
         self.controls, self.services, self.cancels, self.listings = [], [], [], []
+        self.holders = []
         self.on_control = lambda argv: Done()
         self.on_service = lambda name: self.steps.__setitem__(name, "88.1")
+        self.on_holder = lambda name: self.steps.__setitem__(name, "88.9")
 
     def control(self, node, argv, *, name, timeout_s):
         self.controls.append(
@@ -112,6 +115,10 @@ class FakeLauncher:
             {"node": node, "argv": argv, "kind": kind, "name": name, "log": log, "state": self.state.read()}
         )
         self.on_service(name)
+
+    def holder(self, node, seconds, *, name, log):
+        self.holders.append({"node": node, "seconds": seconds, "name": name, "log": log})
+        self.on_holder(name)
 
     def listed(self, name):
         self.listings.append(name)

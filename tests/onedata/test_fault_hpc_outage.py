@@ -209,6 +209,23 @@ def test_o58_a_stop_answered_unconfirmed_journals_its_duration_with_the_stop_of_
     assert failed["stop"] == lines[2]["stop"]
 
 
+def test_o96_a_stop_with_no_holder_fails_the_injection_and_the_provider_is_restored_at_once(tmp_path):
+    """O96: the stop kept the provider but showed no holder step beside its kept work directory (`"holder": "failed"`):
+    the injection fails as `injector_failure`, before the agent's loop, the journal's stop line carries the word,
+    and the provider is brought back at once with a new identity, its injection cleared: no outage runs without one."""
+    injector, federation = hpc(tmp_path)
+    federation.holder_fails = True
+    with pytest.raises(InfraError) as raised:
+        injector.start(RUN)
+    assert raised.value.kind == INJECTOR_FAILURE
+    lines = journal(tmp_path)
+    assert [line["event"] for line in lines][:4] == ["injecting", "stopping", "stop_unknown", "cleared"]
+    assert lines[2]["stop"]["holder"] == "failed"
+    assert lines[2]["stop"]["stopped"] is True
+    assert federation.launches(SERVICE) == 2
+    assert open_injections(tmp_path) == []
+
+
 def test_o58_a_restore_that_does_not_serve_stays_open_and_a_later_clear_verifies_it_without_a_second_start(tmp_path):
     """O58: the service started anew but its provider does not serve within `ready_timeout_s`: `not_serving`, the
     injection open and the run's record refused; once it serves, a later clear verifies it with no second start."""
