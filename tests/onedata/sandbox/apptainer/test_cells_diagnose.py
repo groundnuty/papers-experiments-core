@@ -99,3 +99,15 @@ def test_o97_the_local_node_gives_its_own_proc_to_read():
     from expcore_onedata.sandbox.apptainer.stuckread import LocalProcReader
 
     assert isinstance(LocalNode().proc_reader(), LocalProcReader)
+
+
+def test_o97_the_fake_node_gives_a_settable_proc_to_read_so_a_runner_test_can_diagnose_through_it():
+    """O97: `FakeNode.proc_reader()` is the node's `/proc` for the survivors; processes made in it are diagnosed."""
+    from fake_node import FakeNode
+
+    node = FakeNode()
+    process = node.survivor_proc.process(7, start="7")
+    process.task(7, syscall=syscall_text(0, 3, 0x7F10, 0x1000)).fd(3, "/data/orchard/a.bin", mnt_id=DATA_MOUNT)
+    tracker = _RunProcesses(SimpleNamespace(node=node, diagnosis=Diagnosis(lambda: ROLES)))
+    found = tracker.diagnose([{"pid": 7, "start": "7", "comm": "python3", "state": "D"}], 5.0)
+    assert found["blocks"][0]["tasks"][0]["objects"] == [{"mount": "data", "space": "orchard"}]

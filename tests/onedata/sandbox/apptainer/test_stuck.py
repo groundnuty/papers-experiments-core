@@ -188,3 +188,17 @@ def test_o97_a_file_off_the_data_mount_has_no_space_whatever_its_path():
     roles, entry = S.Roles("/data"), S.MountEntry(30, "8:2", "/work", "ext3")
     place = roles.place(entry, "/work/out/f")
     assert (place.mount, place.space, place.rest) == (S.WORK, None, None)
+
+
+def test_o97_a_chroots_prefix_is_taken_off_a_path_the_kernel_showed_from_the_readers_side():
+    """O97: a process chrooted at /run/cell sees /data/x where the reader's link says /run/cell/data/x."""
+    assert S.within_root("/run/cell/data/orchard/a", "/run/cell") == "/data/orchard/a"
+    assert S.within_root("/run/cell", "/run/cell") == "/"
+
+
+def test_o97_a_path_not_under_the_root_or_with_no_root_to_go_by_is_as_it_was():
+    """O97: `/` and an unknown root strip nothing, and a name that merely starts alike is not under the root."""
+    assert S.within_root("/data/a", "/") == "/data/a"
+    assert S.within_root("/data/a", "") == "/data/a"
+    assert S.within_root("/run/cellar/x", "/run/cell") == "/run/cellar/x"
+    assert S.within_root(None, "/run/cell") is None

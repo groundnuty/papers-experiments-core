@@ -60,6 +60,8 @@ from expcore_onedata.sandbox.hostops import describe_error
 log = logging.getLogger(__name__)
 
 FDS_READ = 2048  # the most descriptors of a process read for the holdings rule: more is unknown, never a partial set
+DIAGNOSE_SHARE = 0.5  # of the margin left, at most, so that a read that blocks leaves the abort the rest of it
+DIAGNOSE_MAX_S = 10.0
 TEXT_LIMIT, MAPS_LIMIT = 1 << 18, 1 << 22
 WCHAN = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,63}")
 
@@ -175,7 +177,13 @@ class _Reader:
         proc.base = base
         table = self.text(f"{base}/mountinfo")
         proc.mounts = None if table is None else S.parse_mountinfo(table)
-        proc.cwd = S.link_path(self.view.readlink(f"{base}/cwd"))
+        top = S.link_path(self.view.readlink(f"{base}/root"))
+        proc.root = "" if top in (None, "/") else top
+        proc.cwd = self._path(proc, self.view.readlink(f"{base}/cwd"))
+
+    def _path(self, proc: Survivor, target: str | None) -> str | None:
+        """The absolute path a link of the process names, as the process sees it (`stuck.within_root`)."""
+        return S.within_root(S.link_path(target), proc.root)
 
     def _object(self, proc: Survivor, task: Task, base: str) -> None:
         call = task.syscall
@@ -197,7 +205,7 @@ class _Reader:
         entry = None if info.mnt_id is None else S.mount_with_id(proc.mounts, info.mnt_id)
         if target is None or entry is None:
             return None
-        return Waits(self.roles.place(entry, S.link_path(target)), fd, info.pos, info.flags)
+        return Waits(self.roles.place(entry, self._path(proc, target)), fd, info.pos, info.flags)
 
     def _fuse_fds(self, proc: Survivor) -> None:
         """Every FUSE descriptor of the process (once), and whether the list is whole."""
@@ -248,7 +256,7 @@ class _Reader:
         return None if entry is None else [Waits(self.roles.place(entry, absolute))]
 
     def _directory(self, proc: Survivor, base: str, fd: int) -> str | None:
-        return S.link_path(self.view.readlink(f"{base}/fd/{fd}")) if fd >= 0 else None
+        return self._path(proc, self.view.readlink(f"{base}/fd/{fd}")) if fd >= 0 else None
 
     def _holdings(self, proc: Survivor) -> list[Waits] | None:
         """The holdings rule: the FUSE objects the process holds, None when it holds none or any read failed."""
@@ -274,7 +282,7 @@ class _Reader:
         seen: set[str] = set()
         for line in data.decode("utf-8", "replace").splitlines():
             parts = line.split(None, 5)
-            path = S.link_path(parts[5]) if len(parts) == 6 else None
+            path = self._path(proc, parts[5]) if len(parts) == 6 else None
             if path is None or path in seen:
                 continue
             seen.add(path)
@@ -310,7 +318,7 @@ def diagnose(
 
     thread = threading.Thread(target=work, name="stuck-reader", daemon=True)
     thread.start()
-    thread.join(timeout_s)
+    thread.join(min(timeout_s * DIAGNOSE_SHARE, DIAGNOSE_MAX_S))  # the abort that frees the cell keeps the rest
     shown = [survivor_record(proc, reader.roles, reader.known) for proc in procs[:SURVIVORS_KEPT]]
     found: dict[str, Any] = {
         "survivors": shown,

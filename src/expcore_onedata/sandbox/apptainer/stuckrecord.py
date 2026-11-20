@@ -69,6 +69,7 @@ class Survivor:
     tasks: list[Task] | None = None  # None: the process could not be read (gone, another process, hidden)
     mounts: tuple[S.MountEntry, ...] | None = None
     cwd: str | None = None  # the working directory's absolute path
+    root: str = ""  # the process's root directory when it is not `/` (a chroot): its links carry this prefix
     fuse_fds: list[Waits] | None = None
     fds_complete: bool = True
     maps: list[Waits] | None = None

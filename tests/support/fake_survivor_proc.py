@@ -55,6 +55,7 @@ class FakeProcess:
     mapped: list[str] = field(default_factory=list)
     memory: dict[int, dict[int, bytes]] = field(default_factory=dict)  # tid: {address: bytes}
     hidden: bool = False  # `/proc/<pid>/stat` cannot be read
+    root: str = "/"  # the process's root directory: a chroot's links carry its prefix, which its mount table does not
 
     def task(
         self, tid: int, *, state: str = "D", wchan: str = "0", syscall: str | None = None, comm: str | None = None
@@ -153,6 +154,8 @@ class FakeProcReader:
         process, tid, tail = self._find(name)
         if process is None or tid not in process.tasks:
             return None
+        if tail == "root":
+            return process.root
         if tail == "cwd":
             return process.cwd
         if tail.startswith("fd/"):

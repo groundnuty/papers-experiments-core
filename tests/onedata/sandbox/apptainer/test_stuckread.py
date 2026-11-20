@@ -289,6 +289,7 @@ def test_o97_the_reader_opens_only_proc_status_files_never_a_file_the_process_wa
         "syscall",
         "mountinfo",
         "cwd",
+        "root",
         "fd",
         "fdinfo",
         "mem",
@@ -399,3 +400,51 @@ def test_o97_the_local_view_reads_a_real_directory(tmp_path):
     assert view.readlink("8/x") is None
     assert view.read_at("8/mem", 0, 1) is None
     assert view.read_at("7/mem", 2**70, 1) is None
+
+
+def test_o97_a_chrooted_process_is_placed_by_its_own_view_of_the_paths():
+    """O97: a cell chrooted at a directory shows its descriptors, mappings and working directory with that prefix; the
+    reader takes it off, so the file is in its space and not on an unknown mount."""
+    view = FakeProcReader()
+    process = view.process(100, cwd="/run/cell/work").task(100, syscall=BLOCKED_OUTSIDE)
+    process.root = "/run/cell"
+    process.fd(3, "/run/cell/data/orchard/a", mnt_id=DATA_MOUNT).maps("/run/cell/data/orchard/lib.so")
+    found = read(view, survivors(100))
+    assert found["blocks"][0]["tasks"][0]["objects"] == [{"mount": "data", "space": "orchard"}]
+    assert found["survivors"][0]["waits_on"][0]["path"] == "a"
+    assert found["survivors"][0]["cwd_mount"] == "work"
+
+
+def test_o97_a_descriptor_whose_path_is_not_under_the_data_mount_has_the_data_mount_and_no_space():
+    """O97: the signature of a chroot the reader did not know (to hand to whoever reads the live record): the mount id
+    says `data` while the path is not under the mount point, so the space is None and the attribution fails closed."""
+    view = FakeProcReader()
+    process = view.process(100).task(100, syscall=READ_FD3)
+    process.fd(3, "/run/cell/data/orchard/a", mnt_id=DATA_MOUNT)
+    assert read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"] == [{"mount": "data", "space": None}]
+
+
+def test_o97_the_diagnosis_leaves_the_abort_half_of_the_margin_when_a_read_blocks():
+    """O97: a memory read that never returns costs at most half of the time given, so the abort keeps the rest."""
+    view = FakeProcReader()
+    view.process(100).task(100, syscall=OPENAT_CWD).mem_at(100, 0x7F20, "/data/orchard/x\0")
+    gate = view.stall["100/task/100/mem"] = threading.Event()
+    began = time.monotonic()
+    R.diagnose(view, survivors(100), 2.0, ROLES, machine="x86_64")
+    took = time.monotonic() - began
+    gate.set()
+    assert took < 1.5
+
+
+def test_o97_the_diagnosis_never_takes_more_than_its_ceiling_whatever_the_margin():
+    """O97: even a long margin is cut to the ceiling, so one wedged read cannot spend a whole minute."""
+    assert R.DIAGNOSE_SHARE * 1000 > R.DIAGNOSE_MAX_S
+    assert min(1000 * R.DIAGNOSE_SHARE, R.DIAGNOSE_MAX_S) == R.DIAGNOSE_MAX_S
+
+
+def test_o97_a_process_with_a_root_that_cannot_be_read_is_taken_as_rooted_at_slash():
+    """O97: with no root link, the paths are read as they are."""
+    view = FakeProcReader()
+    process = view.process(100).task(100, syscall=READ_FD3).fd(3, "/data/orchard/a", mnt_id=DATA_MOUNT)
+    process.root = ""
+    assert read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"] == [{"mount": "data", "space": "orchard"}]

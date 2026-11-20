@@ -248,6 +248,18 @@ class Roles:
         return Place(role, entry.fstype, below[0] if below else None, "/".join(below[1:])[:REST_KEPT])
 
 
+def within_root(path: str | None, root: str) -> str | None:
+    """`path` as the process with the root directory `root` sees it. The kernel shows a descriptor's, a working
+    directory's and a mapping's path from the reader's side, so for a process that was chrooted (not pivoted) the path
+    carries the root's prefix its own mount table does not: it is taken off. A path not under `root`, and any path with
+    no `root` to go by (`/` or unknown), is as it was."""
+    if path is None or root in ("", "/"):
+        return path
+    if path == root:
+        return "/"
+    return path[len(root) :] if path.startswith(root + "/") else path
+
+
 def link_path(target: str | None) -> str | None:
     """The absolute path a `/proc` link names, None for what is not one (`pipe:[1]`, `anon_inode:...`, `socket:[1]`);
     the kernel's ` (deleted)` mark is dropped."""
@@ -289,4 +301,5 @@ __all__ = [
     "path_call",
     "signed32",
     "under",
+    "within_root",
 ]
