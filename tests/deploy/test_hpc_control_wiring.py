@@ -482,3 +482,216 @@ def test_o58_the_relay_up_starts_beats_and_the_stop_down_runs_ends_it(hpc, tmp_p
         runner.end_client(client, grace_s=2.0)
         with contextlib.suppress(ChildProcessError):
             os.waitpid(client.pid, os.WNOHANG)
+
+
+# -- a kept stop's holder (O96) -------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ticking(fed, monkeypatch):
+    """The verbs' waits on a clock their sleeps advance, so a bound costs no time and never spins."""
+    now = [1000.0]
+    monkeypatch.setattr(fed.hpc.control, "_MONOTONIC", lambda: now[0])
+    monkeypatch.setattr(fed.hpc.control, "_SLEEP", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    return now
+
+
+def holder_of(fed, service):
+    return f"{fed.state()['allocation']['name']}-{service}-hold"
+
+
+def holders(fed):
+    return [srun for srun in fed.fake.spawned if srun.command[:1] == ["sleep"]]
+
+
+def test_o96_a_kept_stop_launches_a_holder_on_the_providers_node_before_teardown_and_records_it(fed, monkeypatch):
+    """O96: the kept stop launches, just before teardown's control step, a detached `sleep` to the allocation's end on
+    the provider's own node in the services' job: `--overlap` (never `--exact`), one core and 64 MB, named
+    `<allocation>-<service>-hold`; the state records it by name and listed id and its srun client; the evidence the
+    verb prints carries no holder word, as before."""
+    until = int(datetime.fromisoformat(END_TIME).timestamp())
+    monkeypatch.setattr(fed.hpc.control, "_STAMP", lambda: until - 3600)
+    status, out, err = fed.verb("stop", "aspen")
+    assert status == 0, err
+    name = holder_of(fed, "aspen")
+    [holder] = holders(fed)
+    record = fed.state()["services"]["aspen"]
+    assert (holder.name, holder.node, holder.job) == (name, record["node"], fed.state()["allocation"]["job"])
+    assert (holder.overlap, holder.exact, holder.cpus, holder.mem) == (True, False, 1, "64M")
+    assert holder.command == ["sleep", "3600"]
+    assert fed.fake.sruns.index(holder) < fed.fake.sruns.index(fed.teardowns[0])  # never a moment with none of ours
+    assert record["holder"] == {"name": name, "id": fed.fake.steps[name]}
+    assert name in fed.state()["clients"]
+    assert "holder" not in json.loads(out)
+    assert json.loads(fed.verb("status", "aspen")[1])["holder"] == fed.fake.steps[name]
+    assert fed.verb("stop", "aspen")[0] == 0  # a stop of the stopped service: no second holder
+    assert len(holders(fed)) == 1
+
+
+def test_o96_a_start_never_ends_the_holder_and_the_next_kept_stop_keeps_it(fed, ticking):
+    """O96: the start launches the new provider step and leaves the holder as it is, listed and recorded (a restart
+    whose own checks fail after its step ran must not leave the kept directory with nothing of ours); the next kept
+    stop of the service finds it by its exact name and launches no second one."""
+    assert fed.verb("stop", "aspen")[0] == 0
+    name = holder_of(fed, "aspen")
+    holder = fed.fake.steps[name]
+    status, _, err = fed.verb("start", "aspen")
+    assert status == 0, err
+    assert fed.state()["services"]["aspen"]["state"] == "running"
+    assert fed.fake.steps[name] == holder
+    assert fed.state()["services"]["aspen"]["holder"] == {"name": name, "id": holder}
+    assert fed.fake.termed == []
+    assert holder not in fed.fake.cancelled
+    status, out, err = fed.verb("stop", "aspen")
+    assert status == 0, err
+    assert "holder" not in json.loads(out)
+    assert len(holders(fed)) == 1
+    assert fed.state()["services"]["aspen"]["holder"] == {"name": name, "id": holder}
+
+
+def test_o96_a_holder_that_cannot_be_launched_leaves_the_stop_standing_and_says_so(fed, ticking):
+    """O96: srun refuses the holder (its client exits at once, no step is made): the stop stands, exit 0 and stopped,
+    and its evidence, printed and recorded in the state's stops, says `"holder": "failed"`; a warning goes to stderr."""
+    fed.fake.holder_refused = True
+    status, out, err = fed.verb("stop", "aspen")
+    assert status == 0, err
+    evidence = json.loads(out)
+    assert (evidence["stopped"], evidence["holder"]) == (True, "failed")
+    record = fed.state()["services"]["aspen"]
+    assert record["state"] == "stopped"
+    assert record["stops"] == [evidence]
+    assert record["holder"] == {"name": holder_of(fed, "aspen"), "id": None}
+    assert "WARNING: no holder step" in err
+
+
+def test_o96_down_ends_a_holder_by_its_id_before_the_services_teardown_and_launches_none(fed):
+    """O96: a down with a holder present and its provider still stopped (whoever runs it: the operator's, the
+    controller's and the fleet's downs are this one) sends the recorded holder TERM by its exact id before any
+    teardown of its own (without --keep), and the TERM ends it (no cancel of it); the holder's srun client is ended
+    with the others, as it is after a job that ended by itself; down's own teardowns, stops that keep nothing, launch
+    no holder."""
+    assert fed.verb("stop", "larch")[0] == 0
+    name = holder_of(fed, "larch")
+    holder = fed.fake.steps[name]
+    client = fed.state()["clients"][name]
+    assert fed.driver.down().startswith("down: the held job 4242 is gone")
+    assert fed.fake.termed == [holder]
+    assert holder not in fed.fake.cancelled
+    term = fed.fake.calls.index(["scancel", "--signal=TERM", holder])
+    teardown = [str(fed.hpc.control.BUNDLE / "teardown.sh")]
+    plain = [i for i, argv in enumerate(fed.fake.calls) if set(teardown) & set(argv) and "--keep" not in argv]
+    assert plain
+    assert term < plain[0]
+    assert len(holders(fed)) == 1
+    assert (client["pid"], client["start"]) in [(c.pid, c.start) for c in fed.fake.ended_clients]
+    assert not fed.root.exists()
+
+
+def test_o96_observe_reads_the_restored_services_own_step_beside_its_lingering_holder(hpc, fed, ticking):
+    """O96: after a restore the holder lingers beside the service: hpcobserve reads the service's own step, the new
+    launch's, by its name, never the holder (no `state_differs`: the step listed under the service's name is the
+    state's), reports the holder's id under `holder`, and adds nothing for a service that records none."""
+    import hpcobserve
+
+    assert fed.verb("stop", "aspen")[0] == 0
+    assert fed.verb("start", "aspen")[0] == 0
+    holder = fed.fake.steps[holder_of(fed, "aspen")]
+    record = fed.state()["services"]["aspen"]
+    found = hpcobserve.read(fed.state(), fed.driver.slurm, accounting_wait_s=0)["services"]
+    assert (found["aspen"]["step"], found["aspen"]["launch"]) == (record["step"]["id"], 2)
+    assert (found["aspen"]["running"], found["aspen"]["state_differs"]) == (True, False)
+    assert found["aspen"]["holder"] == holder != found["aspen"]["step"]
+    assert "holder" not in found["larch"]
+
+
+def test_o96_a_restored_outage_beside_its_lingering_holder_reads_restarted_and_explained_in_the_watch(fed, ticking):
+    """O96: a run's federation window over one outage of a provider, its stop and its restore through the verbs, read
+    end to end (hpcobserve over the fake Slurm, into the federation watch's HPC source) with the holder lingering at
+    the window's end: the provider reads restarted, the restart explained as the injector's outage, no finding."""
+    import uuid
+
+    import hpcobserve
+
+    from expcore_onedata.compose import CommandResult
+    from expcore_onedata.fault_journal import InjectionJournal
+    from expcore_onedata.fedwatch import FederationWatch, HpcSource, Member
+
+    def observe(argv, *, timeout_s):
+        doc = hpcobserve.read(fed.state(), fed.driver.slurm, accounting_wait_s=0)
+        return CommandResult(0, json.dumps(doc) + "\n", "")
+
+    class Live:
+        def get(self, path, *, provider=None, **rest):
+            return {"version": "21.02"}
+
+    journal = fed.root.parent / "fault-journal"
+    moments = iter(range(1_794_880_800, 1_794_890_000, 3600))
+    watch = FederationWatch(
+        (Member("providers[0]", "aspen", "aspen"),), HpcSource(["hpcobserve"], runner=observe), Live(),
+        journal=journal, clock=lambda: float(next(moments)),
+    )  # fmt: skip
+    start = watch.read()
+    lines, entry = InjectionJournal(journal), uuid.uuid4().hex
+    lines.append({"event": "injecting", "id": entry, "target": "a-target", "service": "aspen",
+                  "identity_sha256": "f" * 64, "holder": {"pid": 1, "boot_id": None}})  # fmt: skip
+    lines.append({"event": "stopping", "id": entry})
+    assert fed.verb("stop", "aspen")[0] == 0
+    lines.append({"event": "injected", "id": entry})
+    assert fed.verb("start", "aspen")[0] == 0
+    lines.append({"event": "cleared", "id": entry, "how": "restored"})
+    assert holder_of(fed, "aspen") in fed.fake.steps  # the holder lingers at the window's end
+    result = watch.window(start)
+    seen = result["services"]["providers[0]"]
+    assert (result["verdict"], seen["status"]) == ("restarted", "restarted")
+    assert [(r["label"], r["explained"]) for r in seen["restarts"]] == [("outage", True)]
+    assert result["findings"] == []
+    assert seen["end"]["unrecorded"] is False
+
+
+def test_o96_down_after_a_restore_ends_the_lingering_holder_and_its_wait_takes_no_service_step_for_it(fed, monkeypatch):
+    """O96: a down after a restore, the holder lingering beside the running provider: it is sent TERM by its id
+    before any teardown; and a holder that outlives its TERM and its cancel is the only step down's wait for the step
+    list cancels, never taken for a service's step (no work directory removed for it), and the down completes."""
+    now = [1000.0]
+    monkeypatch.setattr(fed.driver, "clock", lambda: now[0])
+    monkeypatch.setattr(fed.driver, "sleep", lambda seconds: now.__setitem__(0, now[0] + max(seconds, 1.0)))
+    assert fed.verb("stop", "aspen")[0] == 0
+    assert fed.verb("start", "aspen")[0] == 0
+    holder = fed.fake.steps[holder_of(fed, "aspen")]
+    fed.fake.unending.append(holder)  # neither TERM nor a cancel ends it
+    said = []
+    monkeypatch.setattr(fed.driver, "say", said.append)
+    assert fed.driver.down().startswith("down: the held job 4242 is gone")
+    assert fed.fake.termed == [holder]
+    teardown = str(fed.hpc.control.BUNDLE / "teardown.sh")
+    downs = [i for i, argv in enumerate(fed.fake.calls) if teardown in argv and "--keep" not in argv]
+    assert downs
+    assert fed.fake.calls.index(["scancel", "--signal=TERM", holder]) < downs[0]
+    assert [c for c in fed.fake.cancelled if "." in c] == [holder, holder]  # its own cancel, then the wait's
+    assert not any("its step was cancelled" in line for line in said)
+
+
+def test_o96_a_stop_asked_again_confirms_its_holder_after_teardown_whichever_way_it_is_asked(fed, ticking):
+    """O96 (Codex, round 1): a stop tried again after a failed teardown finds the holder listed before its teardown and
+    keeps it, and still confirms it after: one that ended meanwhile says `"holder": "failed"`; a stop of the stopped
+    service asked again (an answer that was lost) whose recorded holder is no longer listed says so too."""
+    from hpcslurm import Completed
+
+    name = holder_of(fed, "aspen")
+    fed.fake.on_control = lambda srun: FakeProcess(Completed(1, "", "")) if "--keep" in srun.command else fed.node(srun)
+    assert fed.verb("stop", "aspen")[0] == 1  # teardown failed: stopping, the holder listed and kept
+    assert name in fed.fake.steps
+
+    def holder_ends(srun):
+        if "--keep" in srun.command:
+            fed.fake.steps.pop(name)  # the holder ends while teardown runs
+        return fed.node(srun)
+
+    fed.fake.on_control = holder_ends
+    status, out, err = fed.verb("stop", "aspen")
+    assert status == 0, err
+    assert json.loads(out)["holder"] == "failed"
+    assert len(holders(fed)) == 1  # the retry launched none: it kept the one listed
+    status, out, err = fed.verb("stop", "aspen")  # the stopped service: no teardown, the holder looked for
+    assert (status, json.loads(out)["ended"], json.loads(out)["holder"]) == (0, "none", "failed")
+    assert "holder step is not shown" in err

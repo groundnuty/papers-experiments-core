@@ -172,6 +172,21 @@ def test_o58_a_step_of_another_name_or_service_or_tag_or_word_is_never_touched(h
     assert [line["step"] for line in events(lines, "late_step")] == [name("stop")]
 
 
+@pytest.mark.parametrize("verb", ["stop", "start", "status", "exec"])
+def test_o96_a_kept_stops_holder_lingering_beside_the_service_is_never_taken_for_a_late_step(hpc, tmp_path, verb):
+    """O96: the holder of a kept stop lingers beside its service after the restore (`hpcfed_control.holder_name`: no
+    control word and no tag in it): the watch of any verb of that service never cancels it, and cancels the verb's own
+    late step."""
+    import hpcfed_control
+
+    cluster = Cluster(hpc.slurm)
+    word = WORDS[verb][0]
+    cluster.listed = {hpcfed_control.holder_name(PREFIX, SERVICE): f"{JOB}.8", name(word): f"{JOB}.9"}
+    _, lines, _ = run_watch(hpc, tmp_path, cluster, verb=verb)
+    assert cluster.cancelled == [f"{JOB}.9"]
+    assert [line["step"] for line in events(lines, "late_step")] == [name(word)]
+
+
 def test_o58_a_step_listed_under_another_job_is_never_cancelled_even_when_it_has_the_name(hpc, tmp_path):
     """O58: the watch lists the federation's own job alone and cancels through the launcher, which refuses a step of
     any other job: a listing that shows a foreign id under the right name is journalled as refused, never cancelled."""
