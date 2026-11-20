@@ -162,6 +162,9 @@ class ExecResult:
     # the cell's deadline aborted the run's mount and the survivors were the agent's: the mount is to be restored
     # (`MountRestoring.restore_mount`) before anything else runs, and the kill stays the agent's time limit (O34)
     restore_pending: bool = False
+    # the record of the cell's deadline when it fired with a process that outlived the kill, however it ended (the
+    # live dict of `cells.CellRunner`: a restore updates it, so read it after the restore); None for any other cell
+    deadline: dict[str, Any] | None = None
 
 
 @runtime_checkable

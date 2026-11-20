@@ -47,6 +47,7 @@ class ToolRun:
     ends_attempt: bool  # a successful call of a terminal tool
     source_truncated: bool | None = None  # the data source's own limit was hit, as the provider says (L07)
     exec_check: dict[str, Any] | None = None  # what a code tool verified of its exec, as the provider says (O55)
+    cell_deadline: dict[str, Any] | None = None  # what a code tool said of its cell's deadline, as it says (O97)
 
     def record(
         self,
@@ -88,6 +89,7 @@ class ToolRun:
             detail=detail,
             source_truncated=self.source_truncated,
             exec_check=self.exec_check,
+            cell_deadline=self.cell_deadline,
             waits_left_open=waits_left_open,
             terminal=terminal,
             infra_wait_by_kind=dict(waited_by_kind or {}),
@@ -97,6 +99,12 @@ class ToolRun:
 def _checked(output: ToolOutput) -> dict[str, Any] | None:
     """The provider's exec check as the record keeps it: a plain copy, or None when it gave none (O55)."""
     return None if output.exec_check is None else dict(output.exec_check)
+
+
+def _deadline(output: ToolOutput) -> dict[str, Any] | None:
+    """The provider's cell deadline as the record keeps it: a deep copy, so what the provider does to its own object
+    afterwards never changes the record, or None when it gave none (O97)."""
+    return None if output.cell_deadline is None else copy.deepcopy(dict(output.cell_deadline))
 
 
 def serves_a_tool_server(provider: ToolProvider) -> bool:
@@ -264,6 +272,7 @@ class ToolBox:
                 False,
                 output.source_truncated,
                 _checked(output),
+                _deadline(output),
             )
         text, truncated = cap_text(output.text, self.cap_chars)
         return ToolRun(
@@ -276,4 +285,5 @@ class ToolBox:
             spec.terminal,
             output.source_truncated,
             _checked(output),
+            _deadline(output),
         )

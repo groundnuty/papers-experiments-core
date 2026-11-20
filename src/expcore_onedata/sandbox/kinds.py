@@ -77,7 +77,7 @@ from typing import TYPE_CHECKING, Any
 
 from expcore.errors import PROVIDER_OUTAGE, InfraError, register_infra_kind
 from expcore.records.injections import INJECTOR_FAILURE  # the core names it: it sets an attempt aside as this kind
-from expcore_onedata.sandbox import deadline, infradeath, killcause
+from expcore_onedata.sandbox import calldeadline, deadline, infradeath, killcause
 
 if TYPE_CHECKING:
     from expcore.campaign.healthgate import DeferralBound
@@ -206,14 +206,18 @@ def run_ended_error(record: Mapping[str, Any]) -> InfraError:
             f"the mount could not be restored after its abort at cell {record.get('cell')}'s deadline ({why}); "
             "the cell's own result stands: nothing more runs",
         )
+    # what the deadline read of its first survivor, when it read one: the only carrier for a call the loop cut, which
+    # returned no tool output to hold `cell_deadline` (O97); at most 300 characters, with no path and no cell content
+    seen = calldeadline.digest(record)
+    seen = f" [{seen}]" if seen else ""
     if record.get("cell") is not None:  # the cell ran and hit its deadline: its own result stands, a timeout (O72)
         why = record.get("why") or "a process of the cell outlived its kill"
         return InfraError(
             CELL_UNKILLABLE,
-            f"the run was ended at cell {record['cell']}'s deadline ({outcome}): {why}; "
+            f"the run was ended at cell {record['cell']}'s deadline ({outcome}): {why}{seen}; "
             "the cell's own result stands: nothing more runs",
         )
-    return InfraError(CELL_UNKILLABLE, f"the run was ended at a cell's deadline ({outcome}): nothing more runs")
+    return InfraError(CELL_UNKILLABLE, f"the run was ended at a cell's deadline ({outcome}){seen}: nothing more runs")
 
 
 def kill_error(kill: Mapping[str, Any] | None) -> InfraError | None:
