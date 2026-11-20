@@ -21,12 +21,14 @@ docker reported an exit it never saw).
 """
 
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -68,6 +70,14 @@ class Unrecorded(CmdResult):
 def is_signal_helper(argv: Sequence[str]) -> bool:
     """The root half of a signal (`killhelper.py`), run as `PYTHON -I -c SOURCE TERM|KILL` with its request on stdin."""
     return bool(argv) and argv[0] == sys.executable and "-c" in argv and argv[-1] in ("TERM", "KILL")
+
+
+def is_snapshot_helper(argv: Sequence[str]) -> bool:
+    """The root half of the Docker diagnosis (`procsnap.py`, O97), run as `PYTHON -I -B -c SOURCE` with its request on
+    stdin: the program is the helper's own source, which is what tells it from any other `-c` command."""
+    from expcore_onedata.sandbox import sudoproc  # not before it exists: the old code never calls the helper
+
+    return bool(argv) and argv[0] == sys.executable and "-c" in argv and sudoproc.PROGRAM in argv
 
 
 def bootstrap_of(argv: Sequence[str]) -> tuple[str, int, str, str] | None:
@@ -253,6 +263,9 @@ class FakeHost:
         # tests that read it set `ns_mountinfo`, and `ns_override` gives a table (by pid) in place of that one
         self.ns_mountinfo = False
         self.ns_override: dict[int, str] = {}
+        # the bytes of a process's memory (`/proc/<pid>/task/<tid>/mem`), by that path, for the diagnosis's root half
+        self.proc_bytes: dict[str, bytes] = {}
+        self.fusectl_state = "writable"  # what the root half's check of the connection's abort file answers
         self.one_shots: list[FakeContainer] = []  # the `--rm` containers that were run, as they were labelled
         self.stuck_one_shots = False  # a `--rm` container that docker does not remove: it stays, running
         self.oneclient_images: set[str] = set()
@@ -444,6 +457,8 @@ class FakeHost:
             self.calls.append(("run", tuple(argv), sudo))
             if sudo:
                 self.sudo_commands.append(argv)
+            if is_snapshot_helper(argv):  # run for real, on a tree made of this fake's /proc
+                return self._snapshot_helper(input)
             if is_signal_helper(argv):  # never run for real: its pids are this fake's, and the real /proc is the host's
                 return self._signal_helper(argv, input)
             handler = self.run_handlers.get(argv[0])
@@ -452,6 +467,36 @@ class FakeHost:
             if argv[0] == sys.executable and "-c" in argv:  # the copy helper, run for real
                 return self.real(argv, input)
             return self._run_default(argv)
+
+    def _snapshot_helper(self, request: str | None) -> CmdResult:
+        """The root half of the diagnosis (`procsnap.py`, O97) played against this fake's /proc: a tree is made of the
+        files, links and memory the fake holds for its processes, and the helper's own code reads it, so what comes back
+        is what the real one would say of such a process."""
+        from expcore_onedata.sandbox import procsnap
+
+        with tempfile.TemporaryDirectory() as made:
+            root = Path(made)
+            for path, text in self.files.items():
+                if re.match(r"/proc/\d+/", path):
+                    target = root / path[len("/proc/") :]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(text, encoding="utf-8")
+            for path, data in self.proc_bytes.items():
+                target = root / path[len("/proc/") :]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            for path, destination in self.links.items():
+                if re.match(r"/proc/\d+/", path):
+                    target = root / path[len("/proc/") :]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.symlink_to(destination)
+            old, procsnap.PROC_ROOT = procsnap.PROC_ROOT, str(root)
+            try:
+                out, err = io.StringIO(), io.StringIO()
+                code = procsnap.main([], io.StringIO(request or ""), out, err)
+            finally:
+                procsnap.PROC_ROOT = old
+        return CmdResult(code, out.getvalue(), err.getvalue())
 
     def _signal_helper(self, argv: list[str], request: str | None) -> CmdResult:
         """The root half of a signal (`killhelper.py`, O72) played against this fake's /proc: each target is signalled
@@ -502,6 +547,8 @@ class FakeHost:
                 return CmdResult(0, self.routes)
             case "journalctl":
                 return CmdResult(0, self.journal)
+            case "sh" if "fusectl-state" in argv:  # the check of the connection's abort file (`dockerdiag`, O97)
+                return CmdResult(0, self.fusectl_state + "\n")
             case "chmod":
                 return self.real(argv)
             case "chown":  # this user cannot give a file to root: the command is recorded, and nothing changes

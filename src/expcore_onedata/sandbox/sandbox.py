@@ -124,6 +124,7 @@ from expcore_onedata.sandbox.containers import (
     sidecar_run_args,
     trust_targets,
 )
+from expcore_onedata.sandbox.dockerdiag import DockerDiagnosis
 from expcore_onedata.sandbox.hostops import HostOps, describe_error, describe_stderr, stderr_digest
 from expcore_onedata.sandbox.observe import Observer
 from expcore_onedata.sandbox.oneclient_args import DIRECT
@@ -439,13 +440,24 @@ class DockerSandbox:
         escalation = DL.Escalation(
             s.kill_grace_s, self._abort_mount, sleep=self._sleep, clock=self._clock,
             restorable=self.spec.mode is DataPathMode.MOUNT,
-            attribute=attribution.attributer(self._held_down, self._space_holders()),
+            # whose block a survivor's wait is: the providers this run's own injection holds down when the verdict is
+            # asked for, and the holder of each space, both from the spec (`SandboxSpec.held_down`, `space_holders`)
+            attribute=attribution.attributer(self.spec.held_down, self.spec.space_holders),
         )  # fmt: skip
         self._cells = CellRunner(
             self.host, self.obs, self.names, s, self._meta, self.registry, roles, self._started, escalation,
             stop=self._stop_at_deadline, meta_lock=self._meta_lock, output_cap_bytes=self._output_cap,
         )  # fmt: skip
         self._cells.init_sleep = self._init_sleep
+        if share:  # what the deadline reads a survivor of this run with: nothing without a mount, so never the agent's
+            self._cells.diagnosis = DockerDiagnosis(
+                self.host,
+                waits=self.waits,
+                mountpoint=lambda: TD.host_path(self.dir / "mount"),
+                mount_path=str(s.mount.path),
+                inputs=tuple(path for _, path in self._input_copies),
+                clock=self._clock,
+            )
         self._verify_read_only()
         self._verify_resolv()
         if share and s.mount.io_mode == DIRECT:
@@ -1328,17 +1340,6 @@ class DockerSandbox:
         if self._cells is None:
             return {"ok": None, "why": "the sandbox is not running"}
         return self._cells.restore(self._restore_host_mount)
-
-    def _held_down(self) -> frozenset[str]:
-        """The providers the study's own manipulation holds down for this run now, by label (`attribution`, O97): read
-        each time a verdict is asked for, at the `survived` step. The registry that names them is the fault injector's
-        (`fault_owner.held_down`); until it is wired here none is held down, which makes every verdict infrastructure."""
-        return frozenset()
-
-    def _space_holders(self) -> dict[str, str]:
-        """The label of the data provider that holds each space, by the space's name as the mount shows it, from the
-        platform (`SandboxSpec.space_holders`); empty while the spec carries none, so no space is held down."""
-        return dict(getattr(self.spec, "space_holders", None) or {})
 
     def _log_dir_of(self, generation: int) -> Path:
         """The run's own directory for the oneclient log of a generation of the sidecar: the first keeps its name, each
