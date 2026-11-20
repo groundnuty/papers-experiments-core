@@ -19,10 +19,29 @@ the store's id of the attempt), and the verdicts (`FaultGate`, `SettledInjection
 With several entries open, the judged attempt's own wins over any other, and one that names no attempt keeps the
 charge over those of other attempts, so nothing that cannot be told apart is ever spared. A journal that cannot be
 read is no entry at all: its check fails closed and charges, as it did.
+
+**What a run's own injection holds down, now (O97).** A cell whose process outlives its kill is the agent's only when it
+was blocked on a provider that this run's injection took down (`sandbox.attribution`). The injector says so here, in a
+registry of the process: `hold` once its injection is verified (the target seen down), `release` before it restores, so
+an injection under way to be cleared holds nothing. The entry is keyed by the attempt that holds it, `attempt_key()`
+(the token `liveness.current()` gives inside an attempt, None outside one) and the run key, so an entry an attempt left
+behind, one that never reached its clear, is never read by the retry: the retry has another token and reads nothing.
+The sandbox reads it with `held_reader(run_key)`, called where the sandbox is launched, inside the attempt: it takes
+the token then, and the deadline's timer thread, which has no context, reads only that token, never the ContextVar,
+and only when the verdict is asked for, at the `survived` step.
+
+It is a lock-guarded dict, not a `ContextVar`: the injector and the sandbox share one worker process
+(`campaign/attempt.py` runs both under one `asyncio.run`, the injector in `asyncio.to_thread`), but the timer's thread
+is not in the context that held. A hold is let go on every path: by `release` (the injector's `clear`, first, and every
+exit of its `start` and `running`), by the end of the attempt (`liveness.on_end`), and when its injector is gone (the
+entry holds it weakly). A run with no injection, one not verified yet, or one clearing, reads as the empty set: it
+fails closed.
 """
 
 import contextlib
-from collections.abc import Iterable, Iterator, Mapping
+import threading
+import weakref
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextvars import ContextVar
 from typing import Any
 
@@ -96,6 +115,65 @@ def explained() -> frozenset[str]:
     """The labels `explaining` set for the check now running, empty outside one: no injection of the judged attempt is
     explained there."""
     return _EXPLAINED.get()
+
+
+Attempt = tuple[str, str, int] | None  # (process, campaign, attempt id): who holds, None outside any attempt
+_HELD: dict[tuple[Attempt, str], dict[str, "weakref.ReferenceType[object] | None"]] = {}  # {target label: its injector}
+_HELD_LOCK = threading.Lock()
+
+
+def attempt_key() -> Attempt:
+    """The attempt this context runs, as a hold is keyed (`attempt_of` of `liveness.current()`); None outside one."""
+    return attempt_of(liveness.current())
+
+
+def hold(run_key: str, label: str, owner: object | None = None, *, attempt: Attempt) -> None:
+    """Record that the run's injection holds the target `label` down, once it is verified, for `attempt` (the token
+    taken when the injection began). `owner`, the injector, is kept weakly: when it is gone the hold reads as released.
+    The end of the attempt lets it go too, as a last resort (`liveness.on_end`)."""
+    with _HELD_LOCK:
+        _HELD.setdefault((attempt, run_key), {})[label] = None if owner is None else weakref.ref(owner)
+    liveness.on_end(lambda: release(run_key, label, attempt=attempt))
+
+
+def release(run_key: str, label: str | None = None, *, attempt: Attempt) -> None:
+    """Drop the hold on `label` (every label of the run without one) of `attempt`; harmless where nothing is held."""
+    with _HELD_LOCK:
+        held = _HELD.get((attempt, run_key))
+        if held is None:
+            return
+        for name in list(held) if label is None else [label]:
+            held.pop(name, None)
+        if not held:
+            del _HELD[(attempt, run_key)]
+
+
+def held_down(run_key: str, *, attempt: Attempt) -> frozenset[str]:
+    """The labels of the targets the run's injection holds down at this moment, for `attempt`; empty when it holds none:
+    another attempt's hold, even of the same run key, is never read."""
+    if not isinstance(run_key, str):
+        return frozenset()
+    with _HELD_LOCK:
+        held = _HELD.get((attempt, run_key), {})
+        for name, ref in list(held.items()):
+            if ref is not None and ref() is None:  # its injector is gone: nothing holds the target
+                del held[name]
+        if not held:
+            _HELD.pop((attempt, run_key), None)
+        return frozenset(held)
+
+
+def held_reader(run_key: str) -> Callable[[], frozenset[str]]:
+    """What a sandbox reads the set with: called where it is launched, inside the attempt, it takes the attempt's token
+    now; the callable it returns reads that token's holds, from any thread, whenever it is called."""
+    attempt = attempt_key()
+    return lambda: held_down(run_key, attempt=attempt)
+
+
+def reset_held() -> None:
+    """Forget every hold: for a test's fixture, never the product's code."""
+    with _HELD_LOCK:
+        _HELD.clear()
 
 
 def with_note(detail: str, note: str | None) -> str:

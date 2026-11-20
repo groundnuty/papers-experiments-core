@@ -50,6 +50,7 @@ from typing import Any
 
 import fake_readlog
 from fake_host import Unrecorded, bootstrap_of, recorded
+from fake_survivor_proc import FakeProcReader
 
 from expcore_onedata.sandbox import completion
 from expcore_onedata.sandbox.apptainer import argv as AV
@@ -236,6 +237,7 @@ class FakeNode:
         self.wait_for_watch = True
         self.listed = 0
         self.proc_unreadable = False
+        self.survivor_proc = FakeProcReader()  # the `/proc` a cell's survivors are diagnosed from (`proc_reader`, O97)
         self.gate_tokens: list[str] = []
         self.gates: list[Gate] = []
         self.collectors: list[Collector] = []
@@ -378,6 +380,10 @@ class FakeNode:
                 return self.host.alive(pid, start)
             proc = self._find(pid, start)
             return proc is not None and proc.alive
+
+    def proc_reader(self) -> FakeProcReader:
+        """The node's `/proc` for the diagnostics of a cell's survivors: a test makes processes in `survivor_proc`."""
+        return self.survivor_proc
 
     def exit_status(self, process: Spawned) -> int | None:
         if (process.pid, process.start) in self.real_helpers:
