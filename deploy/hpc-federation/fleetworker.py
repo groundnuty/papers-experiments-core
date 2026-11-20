@@ -33,6 +33,8 @@ but its restart count.
 """
 
 import argparse
+import contextlib
+import fcntl
 import importlib.util
 import json
 import os
@@ -43,7 +45,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterator, List, Mapping, Optional, Sequence
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
@@ -256,7 +258,8 @@ def launch(
 
     It holds its federation's own lifecycle lock (`<root>.lifecycle.lock`, which `hpcfed.py up` and `down` hold for
     their whole run), never the fleet's (C57): an add holds the fleet's for its new members' whole ups, their queue
-    wait included, and a join must not wait hours behind it. The record's changes are under the record's own lock."""
+    wait included, and a join must not wait hours behind it. It opens only the lock file its federation's up made,
+    never makes one. The record's changes are under the record's own lock."""
     for path in (HERE, HERE.parents[1] / "deploy" / "compose-federation"):
         if str(path) not in sys.path:
             sys.path.insert(0, str(path))
@@ -264,7 +267,6 @@ def launch(
     import fleetrecord
     import hpclaunch
     import hpcslurm
-    import hpcstate
 
     directory, shards = Path(args.fleet), fleetplan.shards
     runner = runner or hpcslurm.Runner()
@@ -279,9 +281,28 @@ def launch(
             raise fleetrecord.FleetError(why)
         return member
 
+    @contextlib.contextmanager
+    def federation_locked() -> Iterator[None]:
+        """The federation's lifecycle lock (`hpclaunch.StateStore.lifecycle_path`), never waited for, as up and down
+        take it; the file is the one its up made, opened and never made here (no `O_CREAT`)."""
+        path = hpclaunch.StateStore(fleetrecord.root_of(directory, args.member)).lifecycle_path
+        try:
+            descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            raise fleetrecord.FleetError(f"{args.member} has no lifecycle lock its up made: none started") from None
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise fleetrecord.FleetError("an up or down of its federation, or another launch of its worker, is "
+                                             "running; worker launch refused") from None  # fmt: skip
+            yield
+        finally:
+            os.close(descriptor)
+
     try:
         up_member()  # first: the lock beside the root is taken only for a member this fleet made and brought up
-        with hpclaunch.StateStore(fleetrecord.root_of(directory, args.member)).lifecycle("worker launch"):
+        with federation_locked():
             member = up_member()  # again, under the lock: a down may have ended before it was taken
             held = member.get("worker")
             if held and runner.client_alive(hpcslurm.Client(held["pid"], held["start"])):
@@ -314,8 +335,7 @@ def launch(
                 if not runner.client_alive(client):
                     record.update(lambda r: fleetrecord.member_of(r, args.member).update(worker=None))
                     raise fleetrecord.FleetError(f"its worker's step ended at once (see {log.name}): none is running")
-    except (fleetrecord.FleetError, hpcstate.StateError, shards.ShardsError, hpcslurm.SlurmError, OSError,
-            ValueError) as error:  # fmt: skip
+    except (fleetrecord.FleetError, shards.ShardsError, hpcslurm.SlurmError, OSError, ValueError) as error:
         print(f"error: launch: {error}", file=sys.stderr)
         return REFUSED
     print(f"fleetworker: {args.member}: its worker is launched (client pid {client.pid}); its log {log}")

@@ -174,6 +174,19 @@ def test_c57_no_worker_is_launched_while_its_federations_up_or_down_runs(deploy,
     assert member(bench, "fed-1").get("worker") is None
 
 
+def test_c57_a_launch_makes_no_lock_file_its_federations_up_did_not(deploy, bench):
+    """C57: the launch opens only the lifecycle lock its federation's up made, never makes one: without it the launch is
+    refused, with nothing started, recorded or made."""
+    assert bench.up(2)[0] == 0
+    lock = deploy.hpclaunch.StateStore(deploy.fleetrecord.root_of(bench.fleet, "fed-1")).lifecycle_path
+    lock.unlink()
+    runner = StepRunner(bench, "fed-1")
+    assert deploy.fleetworker.launch(arguments(bench, bench.settings()), runner, lambda: NOW, quiet) == 2
+    assert not lock.exists()
+    assert bench.spawned == []
+    assert member(bench, "fed-1").get("worker") is None
+
+
 def test_c57_a_down_of_the_federation_is_refused_while_its_worker_launches(deploy, bench):
     """C57: the other way round, `fleet.py down --member` of the federation whose worker is being launched is refused
     by its `hpcfed.py down` (the federation's lifecycle lock) and leaves the federation up; the launch goes on."""
