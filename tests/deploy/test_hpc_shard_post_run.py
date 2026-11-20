@@ -11,7 +11,6 @@ import os
 import signal
 import sys
 import tarfile
-import threading
 import time
 from pathlib import Path
 
@@ -26,6 +25,9 @@ HOME_NAMES = {"HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG
               "APPTAINER_CACHEDIR", "UV_CACHE_DIR", "PIP_CACHE_DIR", "PYTHONNOUSERSITE", "GIT_CONFIG_GLOBAL",
               "GIT_CONFIG_NOSYSTEM", "TMPDIR"}  # fmt: skip
 SPEC = {"index": 1, "count": 2, "label": "fed-a"}
+
+# a script that tells its step (its parent) to stop, then would run out its bound: the SIGTERM lands while it runs
+STOPS_ITS_STEP = "import os, signal, time\nos.kill(os.getppid(), signal.SIGTERM)\ntime.sleep(60)\n"
 
 
 @pytest.fixture(scope="module")
@@ -269,15 +271,13 @@ def test_o63_a_step_told_to_stop_during_its_post_run_script_archives_the_results
     shards, tmp_path, monkeypatch
 ):
     """O63: SIGTERM to the step during the script kills the script's group; the results, which must not be lost, are
-    archived, not final."""
+    archived, not final. The script sends the SIGTERM itself, to the step (its parent), so it lands while the script
+    runs: a timer started with the step raced the step's work before the script on a loaded machine."""
     monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
-    earlier = signal.signal(signal.SIGTERM, lambda *_: None)  # a SIGTERM that arrives too early is not the test's end
-    timer = threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGTERM))
+    earlier = signal.signal(signal.SIGTERM, lambda *_: None)  # a SIGTERM the step does not take is not the test's end
     try:
-        timer.start()
-        code, _ = run_step(shards, step_args(tmp_path, "import time\ntime.sleep(60)\n"))
+        code, _ = run_step(shards, step_args(tmp_path, STOPS_ITS_STEP))
     finally:
-        timer.cancel()
         signal.signal(signal.SIGTERM, earlier)
     assert code == shards.POST_RUN_FAILED
     assert "killed by signal 9" in manifest_of(tmp_path)["post_run"]["reason"]

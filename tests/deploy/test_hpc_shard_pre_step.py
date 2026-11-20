@@ -12,7 +12,6 @@ import re
 import signal
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -26,6 +25,9 @@ HOME_NAMES = {"HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG
               "APPTAINER_CACHEDIR", "UV_CACHE_DIR", "PIP_CACHE_DIR", "PYTHONNOUSERSITE", "GIT_CONFIG_GLOBAL",
               "GIT_CONFIG_NOSYSTEM"}  # fmt: skip
 NO_HOME = "/dev/null/hpcop-home"
+
+# a script that tells its step (its parent) to stop, then would run out its bound: the SIGTERM lands while it runs
+STOPS_ITS_STEP = "import os, signal, time\nos.kill(os.getppid(), signal.SIGTERM)\ntime.sleep(60)\n"
 
 
 @pytest.fixture(scope="module")
@@ -675,18 +677,16 @@ def test_o63_a_step_told_to_stop_while_its_guard_runs_kills_the_guard_and_makes_
     shards, tmp_path, monkeypatch, capfd
 ):
     """O63: SIGTERM to the step during the guard (a scancel) kills the guard's whole group, which lives in a session of
-    its own, so it is not left to run out its bound; the step is refused, with nothing made."""
+    its own, so it is not left to run out its bound; the step is refused, with nothing made. The guard sends the
+    SIGTERM itself, to the step (its parent), so it lands while the guard runs, never before."""
     monkeypatch.setenv("EXPCORE_FED_ROOT", "/fed/root")
-    earlier = signal.signal(signal.SIGTERM, lambda *_: None)  # a SIGTERM that arrives too early is not the test's end
-    timer = threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGTERM))
+    earlier = signal.signal(signal.SIGTERM, lambda *_: None)  # a SIGTERM the step does not take is not the test's end
     try:
-        timer.start()
         began = time.monotonic()
-        code, seen = run_step(shards, step_args(tmp_path, "import time\ntime.sleep(60)\n"))
+        code, seen = run_step(shards, step_args(tmp_path, STOPS_ITS_STEP))
         assert time.monotonic() - began < 30
         assert signal.getsignal(signal.SIGTERM).__name__ == "<lambda>"  # the step's handlers are put back
     finally:
-        timer.cancel()
         signal.signal(signal.SIGTERM, earlier)
     assert code == shards.PRE_STEP_REFUSED
     assert not seen
