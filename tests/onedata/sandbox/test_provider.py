@@ -172,6 +172,41 @@ def test_o97_a_mount_runs_spec_carries_the_platforms_map_of_each_spaces_data_pro
     assert dict(sandbox.spec.space_holders) == held
 
 
+def test_o97_a_mount_runs_spec_reads_the_holds_of_the_attempt_it_was_launched_in(stage):
+    """O97: `spec.held_down` is made at the launch, inside the attempt, and read later from any thread: it sees that
+    attempt's hold of the run key and no other attempt's."""
+    from expcore.campaign import liveness
+    from expcore_onedata import fault_owner
+
+    fault_owner.reset_held()
+    campaign = liveness.register({5: "running", 6: "running"}.get)
+    try:
+        with liveness.running(campaign, 5):
+            sandbox, _ = run_launch(stage, "mounted")
+        mine = fault_owner.attempt_of({"process": liveness.this_process(), "campaign": campaign, "attempt_id": 5})
+        other = fault_owner.attempt_of({"process": liveness.this_process(), "campaign": campaign, "attempt_id": 6})
+        fault_owner.hold("run-1", "providers[1]", attempt=other)
+        assert set(sandbox.spec.held_down()) == set()
+        fault_owner.hold("run-1", "providers[1]", attempt=mine)
+        assert set(sandbox.spec.held_down()) == {"providers[1]"}
+    finally:
+        liveness.unregister(campaign)
+        fault_owner.reset_held()
+
+
+def test_o97_a_run_with_no_mount_holds_nothing_down_whatever_is_registered(stage):
+    """O97: a REST run has no mount to block on: its spec's `held_down` is always empty."""
+    from expcore_onedata import fault_owner
+
+    fault_owner.reset_held()
+    fault_owner.hold("run-1", "providers[1]", attempt=None)
+    try:
+        sandbox, _ = run_launch(stage, "via-gate")
+        assert set(sandbox.spec.held_down()) == set()
+    finally:
+        fault_owner.reset_held()
+
+
 def test_o97_a_run_with_no_mount_has_no_holder_map(stage, monkeypatch):
     """O97: a REST run has no mount to block on, so its spec carries no map."""
     monkeypatch.setattr(type(stage.config), "space_holders", lambda self: {"orchard": "providers[1]"})

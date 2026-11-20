@@ -151,13 +151,13 @@ def test_o97_a_survivor_the_reader_could_not_read_is_infrastructure():
 def test_o97_the_held_down_set_is_read_when_the_verdict_is_asked_for():
     """O97: a registry that holds the provider by the time of the verdict makes the read the agent's; one released
     before it does not: the closure never takes the set when the sandbox started."""
-    holders = attribution.attributer(lambda: fault_owner.held_down(KEY), HOLDERS)
+    holders = attribution.attributer(fault_owner.held_reader(KEY), HOLDERS)
     view = survivor(FakeProcReader())
     reading = {"reading": _read(view)}
     assert holders(reading)["why"] == "no_injection_in_effect"
-    fault_owner.hold(KEY, "providers[1]")
+    fault_owner.hold(KEY, "providers[1]", attempt=None)
     assert holders(reading)["verdict"] == "agent"
-    fault_owner.release(KEY)
+    fault_owner.release(KEY, attempt=None)
     assert holders(reading)["why"] == "no_injection_in_effect"
 
 

@@ -483,6 +483,7 @@ class FaultInjector:
         self._tried = 0  # restores of the pending injection tried so far: a later one is a retry (`_retry_now`)
         self._left_open = False  # this run's injection, handed to recovery open (`_hand_over`): never verified here
         self._run: dict[str, Any] | None = None
+        self._attempt = None  # the attempt the run's hold is keyed by (`fault_owner.attempt_key`), taken at the start
         self._steps: list[dict[str, Any]] = []
         self._injection: dict[str, Any] | None = None
         self._went_down = False  # the target was seen down during the open injection
@@ -522,8 +523,12 @@ class FaultInjector:
         what a caller's block re-checks in `inject` guards a caller's body (see "A baseline before the stop").
         """
         self._refuse_inside_a_block("start")
-        with self._mutex, self._block_for(identity, own=True) as block:
-            block.inject()
+        try:
+            with self._mutex, self._block_for(identity, own=True) as block:
+                block.inject()
+        except BaseException:
+            self._release_held()  # a start that failed after it registered its hold holds nothing (O97)
+            raise
 
     @contextlib.contextmanager
     def prepared(self, identity: Mapping[str, Any]) -> Iterator[PreparedInjection]:
@@ -580,6 +585,7 @@ class FaultInjector:
             raise FaultRefused("a fault injector is started with the run's identity: its run_key and attempt")
         self._origin, self._steps, self._injection = self._clock(), [], None
         self._run = {"run_key": run_key, "attempt": attempt}
+        self._attempt = fault_owner.attempt_key()  # the start runs inside the attempt's context; later threads do not
         self._admit()
         self._step("sanctioned", True)
         unsettled = self._recover(heal=self._holds_exclusive())  # under the exclusive admission just taken
@@ -686,12 +692,13 @@ class FaultInjector:
         self._injection["injected"] = True
         self._step("injected", True, identity_before_sha256=digest, **stop_record(self._driver))
         if self._run is not None:  # the target is seen down: a cell blocked on its data is this run's own outage (O97)
-            fault_owner.hold(self._run["run_key"], self.target, self)
+            fault_owner.hold(self._run["run_key"], self.target, self, attempt=self._attempt)
 
     def _release_held(self) -> None:
-        """The run no longer holds the target down, from the moment a restore is asked for (`fault_owner.release`)."""
+        """The run no longer holds the target down, from the moment a restore is asked for, or an exit of `start` or
+        `running` is taken (`fault_owner.release`, under the attempt's token taken when the injection began)."""
         if self._run is not None:
-            fault_owner.release(self._run["run_key"], self.target)
+            fault_owner.release(self._run["run_key"], self.target, attempt=self._attempt)
 
     def _wait_owed(self) -> None:
         """When this start's recovery restored a provider an earlier run left down, wait out the drain it owes before
@@ -868,9 +875,11 @@ class FaultInjector:
                 raise
             yield self
         except BaseException as error:
+            self._release_held()  # at once, in this thread: a cancellation must not leave the hold to the clear's thread
             await self._clear_for(bound)
             self._raise_unrestored(error)
             raise
+        self._release_held()
         await self._clear_for(bound)
 
     async def _clear_for(self, bound: float) -> None:

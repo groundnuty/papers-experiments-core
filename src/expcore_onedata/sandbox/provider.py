@@ -79,6 +79,7 @@ from expcore.campaign.lease import Lease, process_gone
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError
 from expcore.plugin import CallContext
+from expcore_onedata import fault_owner
 from expcore_onedata.admission import (
     SANDBOX_STEP,
     begin_token_step,
@@ -485,6 +486,8 @@ class SandboxPlatform:
             inputs=given,
             node_names=self._config.addresses.real_hosts() if self._config.addresses is not None else (),
             space_holders=self._config.space_holders() if mode is DataPathMode.MOUNT else {},
+            # taken here, inside the attempt the launch runs in: the deadline's timer thread reads this attempt's holds
+            held_down=fault_owner.held_reader(run_key) if mode is DataPathMode.MOUNT else (lambda: frozenset()),
         )
 
     def _mint(

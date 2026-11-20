@@ -10,7 +10,7 @@ The data path of a run is one of three kinds. The study's `data_path` factor nam
 """
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Callable, Collection, Mapping
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -124,6 +124,10 @@ class SandboxSpec:
     # `PlatformConfig.space_holders`), which the attribution of a cell's blocked read compares with what the run's own
     # injection holds down (O97). Empty where no space declares a holder: no block is then the agent's.
     space_holders: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    # for a mount run: the labels of the providers the run's own injection holds down at the moment it is called, read
+    # when the deadline asks for a verdict (`attribution.attributer(spec.held_down, spec.space_holders)`). Made at the
+    # launch, inside the attempt, so the timer's thread reads that attempt's holds and no other's (`fault_owner`, O97).
+    held_down: Callable[[], Collection[str]] = dataclasses.field(default=lambda: frozenset(), repr=False, compare=False)
 
 
 RAN = "ran"  # the cell was started: its exit code, timeout and kill say how it ended
