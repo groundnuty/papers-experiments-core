@@ -137,6 +137,7 @@ COLLECTOR_READY = "egress collector ready"
 LOG_UNREAD = "the oneclient log could not be read"
 GATE_ATTEMPTS = 3  # a free port another process took before the gate bound it: tried again with another
 PROBE_S = 60.0
+RESTORE_LOCK_S = 60.0  # the most a stop waits for a restore to end once told to (its step may be an unmount of 30 s)
 
 
 class ApptainerSandbox:
@@ -194,6 +195,9 @@ class ApptainerSandbox:
         self._stopped, self._stop_lock = True, threading.Lock()
         self._abandoned = threading.Event()
         self._created, self._created_lock = 0, threading.Lock()
+        # held by a mount restore for the whole of it, and by a stop around its teardown: the teardown never runs beside
+        # a restore that may still write the token file or start a process (`_restore_host_mount`, `stop`)
+        self._restore_lock = threading.Lock()
         self._cells: AppCellRunner | None = None
         self._watch: Watch | None = None
         self._limits = LM.LimitsCheck(
@@ -631,13 +635,32 @@ class ApptainerSandbox:
             hidden_margin_bytes=self.app.hidden_memory_margin_bytes,
         )  # fmt: skip
         self._watch.start()
-        escalation = DL.Escalation(self.s.kill_grace_s, _no_mount, sleep=self._sleep, clock=self._clock)
+        escalation = self._escalation()
         self._cells = AppCellRunner(
             self.node, self._watch, self.cell_argv, python=self.app.python, settings=self.s, meta=self._meta,
             registry=self.registry, started_epoch=self._started, escalation=escalation, stop=self._stop_at_deadline,
             meta_lock=self._meta_lock, output_cap_bytes=self._output_cap, before_exec=self.image_unchanged,
             sleep=self._sleep, clock=self._clock,
         )  # fmt: skip
+
+    def _escalation(self) -> DL.Escalation:
+        """What the deadline does past the kill: the mount's abort, and, for a mount helper that can both abort and
+        restore, the restorable escalation with the run's attribution (`attribute=`). A run without such a helper keeps
+        `_no_mount`, and a survivor of its kill orders the sandbox's stop, as it always did. Without an attribution no
+        survivor is the agent's, so none is ever restored."""
+        mount = self._mount if self.spec.mode is DataPathMode.MOUNT else None
+        restorable = callable(getattr(mount, "abort", None)) and callable(getattr(mount, "restore", None))
+        return DL.Escalation(
+            self.s.kill_grace_s, self._abort_mount, sleep=self._sleep, clock=self._clock, restorable=restorable,
+            attribute=self._attribute if restorable else None,
+        )  # fmt: skip
+
+    def _abort_mount(self, timeout_s: float) -> dict[str, Any]:
+        """The deadline's abort: the mount helper's, which frees what waits on the run's FUSE connection within
+        `timeout_s` (`HostMount.abort`), or `_no_mount` for a run with no mount of the harness's own. It takes no lock:
+        it runs in the timer's thread while the deadline is decided, which a stop waits for first."""
+        abort = getattr(self._mount, "abort", None)
+        return _no_mount(timeout_s) if abort is None else abort(timeout_s)
 
     def _canary(self) -> None:
         """The egress canary (`expcore.egress`): a connect from inside a cell to a listener of the harness's, the
@@ -908,10 +931,22 @@ class ApptainerSandbox:
         return self._cells.restore(self._restore_host_mount)
 
     def _restore_host_mount(self) -> dict[str, Any]:
-        """What this backend does to bring its mount back: nothing yet, so a restore that was somehow asked for fails
-        and ends the run, as an abort with no restore always did. A backend that restores replaces this body, and builds
-        its `deadline.Escalation` with `restorable=True` and an `attribute`; without those none is ever pending."""
-        return {"ok": False, "why": "this backend cannot restore its mount"}
+        """Bring the mount back as a new generation (`HostMount.restore`), under the restore lock: `{"ok": True,
+        "generation": n, ...}`, or `{"ok": False, "why": ...}` with a fixed phrase, which ends the run
+        (`cells.restore`).
+        Nothing is created once the sandbox is stopped, and a stop that begins meanwhile waits for this to end
+        (`stop`), which it does at its next step."""
+        restore = getattr(self._mount, "restore", None)
+        if restore is None:
+            return {"ok": False, "why": "this backend cannot restore its mount"}
+        with self._restore_lock:
+            if self._stopped:
+                return {"ok": False, "why": "the sandbox is stopped"}
+            self.register_creation()  # a teardown that overlaps a restore is never declared complete
+            try:
+                return dict(restore())
+            except SandboxError as error:
+                return {"ok": False, "why": str(error)}
 
     def _refuse_if_ended(self) -> None:
         if self._cells is None:
@@ -1240,9 +1275,17 @@ class ApptainerSandbox:
         """Tear down in order and verify (`teardown.Teardown`); raise `SandboxError` when anything is not shown gone.
         Idempotent; a SIGTERM cannot cut it short; a cell's deadline under way is waited for first (O34)."""
         if self._cells is not None:
-            self._cells.wait_decided()
+            self._cells.wait_decided()  # a deadline's outcome, and a restore under way up to its bound (O34, O97)
+        refuse = getattr(self._mount, "refuse_restores", None)
+        if refuse is not None:
+            refuse()  # from here no restore writes the token file or starts a process; one running ends soon
         with TERM.sigterm_deferred(), self._stop_lock:
-            self.teardown.run(force)
+            if not self._restore_lock.acquire(timeout=RESTORE_LOCK_S):
+                raise SandboxError("a mount restore is still running: the sandbox's teardown was not run")
+            try:
+                self.teardown.run(force)
+            finally:
+                self._restore_lock.release()
 
     def teardown_left(self) -> dict[str, Any]:
         return self.teardown.left()
