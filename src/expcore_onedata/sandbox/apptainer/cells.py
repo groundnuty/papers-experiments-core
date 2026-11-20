@@ -37,6 +37,7 @@ from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox.api import RAN, ExecResult
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.apptainer.node import NodeOps
+from expcore_onedata.sandbox.apptainer.stuckread import Diagnosis, diagnose_node
 from expcore_onedata.sandbox.apptainer.watch import Watch
 from expcore_onedata.sandbox.cells import (
     CAP_MARGIN_S,
@@ -87,6 +88,12 @@ class _RunProcesses:
         state = self._runner.quiesce("time cap")
         return None if state["killed"] is None else state["left"]
 
+    def diagnose(self, left: list[dict[str, Any]], timeout_s: float) -> dict[str, Any] | None:
+        """What the survivors wait on, read from the node's `/proc` within the margin left (`deadline.Diagnosing`, O97):
+        None when the node has no reader or the runner was given no `diagnosis` (the cell's targets), so such a run is
+        never attributed to the agent."""
+        return diagnose_node(self._runner.node, self._runner.diagnosis, left, timeout_s)
+
 
 class AppCellRunner(CellRunner):
     """Runs cells as `apptainer exec`s on the node and keeps what is known about their kills."""
@@ -117,6 +124,9 @@ class AppCellRunner(CellRunner):
         self.node, self.watch, self._argv_of, self._python = node, watch, argv_of, python
         self._before_exec, self._sleep, self._clock = before_exec, sleep, clock
         self.last_watch: dict[str, Any] = {}  # what the watch saw of the last exec: `seen`, `peak_bytes`, `kills`
+        # what the deadline reads a survivor with (`stuckread.Diagnosis`: the cell's fixed targets and the run's
+        # connection), set by the sandbox that builds this runner; None reads nothing, so nothing is the agent's
+        self.diagnosis: Diagnosis | None = None
         watch.on_run_end = self.run_ended_by_watch
 
     def run_ended_by_watch(self, event: dict[str, Any]) -> None:

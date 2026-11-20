@@ -66,6 +66,8 @@ class ToolCallRecord:
     elapsed_s: float | None = None
     # what a code tool verified of the exec that ran the call's program, as it said (O55); None when it said nothing
     exec_check: dict[str, Any] | None = None
+    # what a code tool said of the cell's deadline when a process outlived its kill (O97); None when it said nothing
+    cell_deadline: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         """Refuse a status outside the closed list."""
