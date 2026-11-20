@@ -35,10 +35,16 @@
 - `resume LEDGER --model M --reason TEXT --actor NAME`: lift an operator's pause of M. It lifts only that pause: a model
   that an undeclared fingerprint also pauses (C48) stays paused until `declare`, and `resume` says so. Refused for a
   model no operator paused. `status` shows each operator pause with its time, actor and reason, and the log of both.
+- `drain LEDGER --label L --reason TEXT --actor NAME`: drain federation L (its label in the ledger, `<site>-<member>`)
+  while the controller runs (C58): it takes no new lease from the dispatcher's next issue, a lease it holds runs to its
+  end and counts, and the controller's next tick retires it once none is in flight. It is the ledger's own drain, with
+  the reason and actor in its `drain` event. Refused for a federation the ledger does not hold, one already drained or
+  proven ended, one past its recorded job end, and, writing nothing, while a live controller does not say it honours
+  operator writes, as `pause` is.
 
-`status`, `raise-ceiling`, `set-cap`, `declare`, `pause` and `resume` work on the ledger file under its own write lock
-and not the dispatcher's, so they run while a dispatcher holds the ledger, and the dispatcher's next lease reads a
-raise, a cap, a declaration or a pause. Exit status: 0
+`status`, `raise-ceiling`, `set-cap`, `declare`, `pause`, `resume` and `drain` work on the ledger file under its own
+write lock and not the dispatcher's, so they run while a dispatcher holds the ledger, and the dispatcher's next lease
+reads a raise, a cap, a declaration, a pause or a drain. Exit status: 0
 done, 1 refused by the ledger (or, for `create`, by the study: not loadable, or code that is not known), 2 a usage
 error or a file that is not a ledger.
 """
@@ -57,6 +63,7 @@ from expcore.campaign.elastic.caps import set_in_file
 from expcore.campaign.elastic.ceilings import raise_in_file
 from expcore.campaign.elastic.config import MICRO, LedgerConfig, lease_grant_usd, ledger_runs, micro_down
 from expcore.campaign.elastic.declarations import declare_in_file
+from expcore.campaign.elastic.drains import drain_in_file
 from expcore.campaign.elastic.ledger import Ledger
 from expcore.campaign.elastic.pauses import pause_in_file, resume_in_file
 from expcore.campaign.elastic.records import LedgerError, Status
@@ -304,6 +311,20 @@ def _resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def _drain(args: argparse.Namespace) -> int:
+    event, controller = drain_in_file(args.ledger, args.label, args.reason, args.actor)
+    print(f"drained federation {args.label}: no new lease; a lease it holds runs to its end, then the controller "
+          f"retires it (event #{event})")  # fmt: skip
+    if controller == AWARE:
+        print("the controller that holds the ledger honours it from its next issue and tick")
+    elif controller == NONE:
+        print("no controller holds this ledger: the next one to open it reads the drain")
+    else:
+        print("warning: could not tell whether a controller holds this ledger: the drain is written; a controller "
+              "older than the operator's pause would only read it at its next tick", file=sys.stderr)  # fmt: skip
+    return 0
+
+
 def _cap_of(text: str) -> int:
     """A cap as typed: a whole number from 1."""
     try:
@@ -375,6 +396,11 @@ def _parser() -> argparse.ArgumentParser:
         pausing.add_argument("--model", required=True, help="the model (it must have runs in the ledger)")
         pausing.add_argument("--reason", required=True, help=f"why it is {name}d, recorded")
         pausing.add_argument("--actor", required=True, help=f"who {name}s it (an operator or an agent), recorded")
+    draining = commands.add_parser("drain", help="drain one federation while the controller runs; its lease runs on")
+    draining.add_argument("ledger", type=Path, help="the ledger file (out/ledger.sqlite)")
+    draining.add_argument("--label", required=True, help="the federation's label in the ledger (<site>-<member>)")
+    draining.add_argument("--reason", required=True, help="why it is drained, recorded")
+    draining.add_argument("--actor", required=True, help="who drains it (an operator or an agent), recorded")
     return parser
 
 
@@ -400,6 +426,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "declare": _declare,
         "pause": _pause,
         "resume": _resume,
+        "drain": _drain,
     }
     try:
         return commands[args.command](args)
