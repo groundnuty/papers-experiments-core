@@ -45,7 +45,7 @@ LINE_VERSION = 1
 MAX_LINE_BYTES = 4096
 MAX_ITEM_CHARS = 1024
 OPS = ("read", "canary")
-MAX_LOG_BYTES = 48 * 1024 * 1024
+MAX_LOG_BYTES = 256 * 1024 * 1024
 END_RESERVE_BYTES = 4096
 
 MIN_LOG_BYTES = 8192  # the least a cap may be: the start line, the end line and their reserve fit

@@ -134,9 +134,10 @@ def test_r14_the_analysis_refuses_a_check_made_under_another_declaration_than_th
         require_current_check(batch, code=CODE, side_files=[LOGGED])
 
 
-def test_r14_the_cap_on_a_side_file_is_64_mib():
-    """R14: the most a side file may hold, since the analysis reads each whole into memory for the scorers."""
-    assert side_module.MAX_SIDE_FILE_BYTES == 64 * 1024 * 1024
+def test_r14_the_cap_on_a_side_file_is_272_mib():
+    """R14: the most a side file may hold, since the analysis reads each whole into memory for the scorers. C61: raised
+    from 64 MiB with the read log's cap (256 MiB), so that the log of a run that filled it is still a side file."""
+    assert side_module.MAX_SIDE_FILE_BYTES == 272 * 1024 * 1024
 
 
 def test_r14_a_side_file_larger_than_the_cap_is_refused_without_reading_past_it(tmp_path, monkeypatch):

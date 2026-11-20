@@ -38,9 +38,11 @@ from typing import Any
 
 STAGE = "side_file"  # the stage of a check failure that a side file causes
 SHA256 = re.compile(r"[0-9a-f]{64}")
-# The most a side file may hold, 64 MiB: the loader reads each whole into memory to hand it to the scorers. It is read
-# where it is used, never bound as a default, so the one value holds for the check, the analysis and re-scoring.
-MAX_SIDE_FILE_BYTES = 64 * 1024 * 1024
+# The most a side file may hold, 272 MiB: the loader reads each whole into memory to hand it to the scorers. It is read
+# where it is used, never bound as a default, so the one value holds for the check, the analysis and re-scoring. It is
+# the read-log collector's cap (256 MiB) and 16 MiB of headroom, so the log of a run that filled that cap is still a
+# side file (a test holds the two apart); it was 64 MiB, over the collector's 48 MiB.
+MAX_SIDE_FILE_BYTES = 272 * 1024 * 1024
 
 
 class SideFileTooLarge(ValueError):

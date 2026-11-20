@@ -256,6 +256,67 @@ def test_o91_a_full_log_stops_at_its_cap_counts_what_it_could_not_write_and_is_u
     assert {reader.CAP_REACHED, reader.UNWRITTEN} <= set(reading.problems)
 
 
+# --- the cap is 256 MiB (C61) -----------------------------------------------------------------------------------------
+
+CAP_256_MIB = 256 * 1024 * 1024
+READ_DATAGRAM = b'{"v":1,"op":"read","item":"file-1"}'
+JUNK_DATAGRAM = b"not json at all"
+
+
+def test_c61_the_collectors_default_cap_is_256_mib_here_and_in_paths():
+    """C61: the collector runs alone, so it repeats the cap `paths` holds; both are 256 MiB (they were 48 MiB)."""
+    assert load_collector().MAX_LOG_BYTES == paths.MAX_LOG_BYTES == CAP_256_MIB
+
+
+def test_c61_a_collector_given_256_mib_as_its_cap_runs_and_names_it_in_its_start_line(rig):
+    """C61: 256 MiB is accepted as an explicit cap (one byte more is refused, with the other bad starts below)."""
+    rig.start(max_bytes=CAP_256_MIB)
+    assert rig.stop() == 0
+    assert lines_of(rig)[0]["max_bytes"] == CAP_256_MIB
+
+
+def fed_with_room(tmp_path, room, datagrams):
+    """The collector's log at its default cap with only `room` bytes left to write below the end-line reserve (a
+    synthetic size: nothing near 256 MiB is written), fed `datagrams` through `receive` as its loop does, then closed
+    with the end line. Returns the log's size as the collector counts it and the counts the end line holds."""
+    collector = load_collector()
+    log = collector.Log(tmp_path / "log.jsonl", collector.MAX_LOG_BYTES)
+    assert log.max_bytes == CAP_256_MIB  # the room below is only the real cap's if the collector's default is 256 MiB
+    log.size = CAP_256_MIB - collector.END_RESERVE_BYTES - room
+    counts = {"records": 0, "malformed": 0, "unwritten": 0, "cap_reached": False}
+    receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    with receiver, sender:
+        for datagram in datagrams:
+            sender.send(datagram)
+            assert collector.receive(receiver, log, counts)
+    log.write("end", **counts)
+    log.close()
+    return log.size, counts
+
+
+def test_c61_a_line_that_fits_below_256_mib_less_the_end_reserve_is_written(tmp_path):
+    """C61: with 1 KiB of room below the end-line reserve, a record and a malformed line are written and counted."""
+    _, counts = fed_with_room(tmp_path, 1024, [READ_DATAGRAM, JUNK_DATAGRAM])
+    assert counts == {"records": 1, "malformed": 1, "unwritten": 0, "cap_reached": False}
+
+
+def test_c61_a_line_past_256_mib_less_the_end_reserve_is_counted_unwritten_and_never_written(tmp_path):
+    """C61: with one byte of room no datagram is written: each is counted unwritten, the cap is reached, and nothing of
+    a datagram reaches the file but the end line, which says so."""
+    _, counts = fed_with_room(tmp_path, 1, [READ_DATAGRAM, JUNK_DATAGRAM, READ_DATAGRAM])
+    assert counts == {"records": 0, "malformed": 0, "unwritten": 3, "cap_reached": True}
+    written = [json.loads(line) for line in (tmp_path / "log.jsonl").read_text().splitlines()]
+    assert [line["event"] for line in written] == ["end"]
+    assert (written[0]["unwritten"], written[0]["cap_reached"]) == (3, True)
+
+
+def test_c61_the_end_line_goes_in_the_reserve_so_a_log_never_passes_256_mib(tmp_path):
+    """C61: the log, its end line included, is at most MAX_LOG_BYTES: the figure the reader's limit and the side-file
+    cap are held to, so a log the collector wrote is never refused by either for its size."""
+    size, _ = fed_with_room(tmp_path, 1, [READ_DATAGRAM])
+    assert size <= CAP_256_MIB
+
+
 # --- the peer rule ----------------------------------------------------------------------------------------------------
 
 

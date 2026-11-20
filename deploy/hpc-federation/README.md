@@ -117,7 +117,27 @@ log the agent can neither read nor rewrite (`docs/interfaces.md`, "The read-log 
 platform declares `[sandbox.apptainer] readlog_collector_sha256`, the SHA-256 of the core's own `readlog/collector.py`
 (`python3 -c "import hashlib,expcore_onedata.readlog.files as f; print(hashlib.sha256(f.collector_file().read_bytes()).hexdigest())"`
 prints it); without it a run has no channel, and the shipped layouts' templates do not name it yet, so a study that needs
-it declares it in its own platform file.
+it declares it in its own platform file. The pin is the file's bytes, so a change to `collector.py` is a new SHA, and a
+platform that declares the old one is refused at the start (C61 raised the log's cap from 48 MiB to 256 MiB, which is
+such a change): a study stamps the SHA of the core it runs on, read with the command above, never one copied from an
+earlier core.
+
+**What a log costs at its cap (C61).** The collector's log holds at most 256 MiB, its end line included (a run's log
+is usually KiB to a few MiB). It is written in the run's work directory (`readlog/`), which is on the node's tmpfs, so it
+counts against the memory of the step that runs the dispatcher (`[hpc] sandbox`) until the run's teardown. At collection
+the driver reads it whole (one 256 MiB `bytes` at the cap) and the reader parses it at about 8 times its size in memory
+(about 2 GiB at the cap, and about 0.2 s of one core per MiB; measured at 4 and 16 MiB on 280-byte records and
+extrapolated). The evidence copy (`read-log.jsonl`) and the side file are two more copies; where a study's executor
+writes both under the shard's `out/` (on the same tmpfs), the shard's archive, an uncompressed tar on the shared
+filesystem that is pulled whole, holds both, 512 MiB for each log at the cap. The agent's node is sized for one cell's
+limits plus 4 GiB for the gate, the dispatcher, the collectors, the store and the image (17 GiB in the slots template);
+at collection the cell has stopped, and a log at the cap takes about 3 GiB for that moment (0.75 GiB of tmpfs and about
+2.3 GiB in the driver), so it fits for one run. In the elastic fleet an agent node collects at most one log at a time:
+a federation's worker (`elastic/worker.py`) holds one lease, a lease store holds one run, and the scheduler never has
+one run in flight twice. Two collections can overlap only on the shard-step path with `[scheduler] workers` of 2 or
+more (none is shipped; the examples set 1), and that layout is sized for one cell already, so it sizes `[hpc] sandbox`
+memory for each run it lets overlap. The worker step's `--mem` is the fleet settings' `memory`, not read from the
+template: a stamped fleet's must be at least the agent node's least (17 GiB in the slots template).
 
 - **The collector** is a second helper of the driver's uid beside the egress collector, started before any cell: it binds
   `sock` in an empty 0700 directory (`readlog-sock/` of the run's directory) and writes its log in `readlog/`, which no

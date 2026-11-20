@@ -33,9 +33,11 @@ MAX_LINE_BYTES: Final = 4096  # a client line's most: ASCII, refused by the clie
 OPS: Final = ("read", "canary")  # `op` of a client line
 CANARY_ITEM: Final = "canary"  # the `item` of the harness's canary record
 MAX_ITEM_CHARS: Final = 1024  # the longest `item`
-# The collector writes at most this many bytes of log (the end line has room beyond it); past it a datagram is only
-# counted (`unwritten`) and the end line says `cap_reached`. Well below the side-file cap (64 MiB).
-MAX_LOG_BYTES: Final = 48 * 1024 * 1024
+# The collector writes at most this many bytes of log, its end line included (the end line goes in the
+# END_RESERVE_BYTES the cap holds back); past it a datagram is only counted (`unwritten`) and the end line says
+# `cap_reached`. The reader's default limit is this, and the side-file cap (272 MiB) is above it, so a log the collector
+# wrote is never refused for its size. It was 48 MiB.
+MAX_LOG_BYTES: Final = 256 * 1024 * 1024
 END_RESERVE_BYTES: Final = 4096  # room kept for the end line
 
 # --- the run's record
