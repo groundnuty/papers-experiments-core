@@ -101,11 +101,25 @@ def archive(lease_id: int) -> str:
     return hashlib.sha256(f"the archive of lease {lease_id}".encode()).hexdigest()
 
 
-def completion(lease: Lease | int, spend_usd: float = 0.25, state: str = "done", charged: int = 1) -> Completion:
-    """A completion of the lease naming its archive."""
+def completion(
+    lease: Lease | int,
+    spend_usd: float = 0.25,
+    state: str = "done",
+    charged: int = 1,
+    infra_streak: int | None = None,
+    infra_kind: str | None = None,
+) -> Completion:
+    """A completion of the lease naming its archive, with the streak its store's attempts ended with when given
+    (C58)."""
     lease_id = lease if isinstance(lease, int) else lease.lease_id
     return Completion(
-        lease_id=lease_id, state=state, charged=charged, spend_usd=spend_usd, archive_sha256=archive(lease_id)
+        lease_id=lease_id,
+        state=state,
+        charged=charged,
+        spend_usd=spend_usd,
+        archive_sha256=archive(lease_id),
+        infra_streak=infra_streak,
+        infra_kind=infra_kind,
     )
 
 

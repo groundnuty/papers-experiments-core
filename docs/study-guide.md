@@ -207,6 +207,16 @@ except ConfigError as error:
 shutil.rmtree(misspelt)
 ```
 
+### A run that only ever fails as infrastructure
+
+`max_attempts` counts charged attempts only, so a run whose attempts all end in a kind that costs no attempt (a hold
+such as `budget_hold`, or a platform's `ingest_held` or `federation_busy`) is run again for as long as the campaign
+lives. `max_infra_streak = 3` under `[scheduler]` ends such a run after 3 attempts in a row that ended as
+infrastructure, of any kind, charged or not (C58): it is `infra_exhausted`, listed among the exhausted runs, never
+scored, and the store's log has an `infra_streak` event naming the count and the last kind. An interrupted or
+outage-discarded attempt neither counts nor breaks the streak. The key enters the campaign fingerprint, and an elastic
+campaign's ledger pins it at `create`, counting the streak across leases. Left out, nothing changes.
+
 ### A model served by several deployments
 
 The scheduler checks that every reply of a run was served by the identity the model was first served with: its model id and its serving fingerprint (`system_fingerprint`). A run whose replies change either is set aside as `identity_kind` and run again. A load-balanced endpoint can serve one model id from several deployments, each with its own fingerprint, within one run, and then most long runs would be set aside. If the deployments are the same model (the same weights, the same precision), say so in the model's entry of `models.toml` with `accepted_fingerprints`, the fingerprints of those deployments. That decision is the study's; the core only records it and holds the runs to it:

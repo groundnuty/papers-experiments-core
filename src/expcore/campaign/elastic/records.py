@@ -20,7 +20,8 @@ A **settlement** (`Settlement`, `Ledger.settle`) is not a state: a lease expired
 state, so a completion or a return read later still takes it through the usual path.
 
 A run is `pending`, `leased` (a lease in flight, or a counting completion waiting for its archive), `done`,
-`infra_exhausted` or `harness_error`.
+`infra_exhausted`, `harness_error`, or `infra_streak`: lost by its infrastructure streak (C58), its consecutive
+infrastructure attempts across its leases having reached `max_infra_streak`, and never leased again.
 """
 
 import math
@@ -108,10 +109,17 @@ class Completion:
     spend_usd: float
     archive_sha256: str
     undeclared: tuple[str | None, ...] = ()  # what its run saw that its lease's declared set does not declare (C48)
+    infra_streak: int | None = None  # the streak its store's attempts end with (C58); None: not read
+    infra_kind: str | None = None  # the kind of that streak's last attempt
 
     def __post_init__(self) -> None:
         _lease_id(self.lease_id)
         object.__setattr__(self, "undeclared", undeclared_values(self.undeclared))
+        streak = self.infra_streak
+        if streak is not None and (isinstance(streak, bool) or not isinstance(streak, int) or streak < 0):
+            raise ValueError(f"infra_streak must be a whole number of attempts, got {streak!r}")
+        if self.infra_kind is not None and (not isinstance(self.infra_kind, str) or not streak):
+            raise ValueError(f"infra_kind names the kind of a streak's last attempt, got {self.infra_kind!r}")
         if self.state not in COMPLETION_STATES:
             raise ValueError(f"completion state {self.state!r} must be one of: {', '.join(COMPLETION_STATES)}")
         if isinstance(self.charged, bool) or not isinstance(self.charged, int) or self.charged < 0:
@@ -127,7 +135,11 @@ class Completion:
             "spend_usd": self.spend_usd,
             "archive_sha256": self.archive_sha256,
         }
-        return {**found, "undeclared": list(self.undeclared)} if self.undeclared else found
+        if self.undeclared:
+            found["undeclared"] = list(self.undeclared)
+        if self.infra_streak is not None:  # C58: only a ledger that bounds the streak reads it
+            found |= {"infra_streak": self.infra_streak, "infra_kind": self.infra_kind}
+        return found
 
 
 @dataclass(frozen=True)
@@ -330,6 +342,19 @@ class OperatorPause:
 
 
 @dataclass(frozen=True)
+class StreakEnd:
+    """A run lost by its infrastructure streak (C58): when, its latest lease, how many consecutive infrastructure
+    attempts its leases' completions gave, the kind of the last, and the bound they reached."""
+
+    run_key: str
+    at: float
+    lease_id: int | None
+    streak: int
+    infra_kind: str | None
+    max_infra_streak: int
+
+
+@dataclass(frozen=True)
 class Status:
     """The ledger's money in micro-dollars. `ceiling_micro` is None with no budget (then `remaining_micro` is too);
     `locked_*` is what unsettled leases hold as their grants (in flight, expired, reported, lost), by lease state and
@@ -337,7 +362,8 @@ class Status:
     the history of its changes, oldest first; `declared` is each model's declared fingerprints (None: "none") and
     `declarations` the log, oldest first, both None for a ledger made before the log; `paused` is each model paused by
     what a lease's run saw undeclared, with those values (C48); `operator_pauses` is each model an operator has paused
-    and not resumed, with the pause that holds it, and `pause_log` every pause and resume, oldest first (C55)."""
+    and not resumed, with the pause that holds it, and `pause_log` every pause and resume, oldest first (C55);
+    `streak_ended` is every run lost by its infrastructure streak, oldest first (C58)."""
 
     ceiling_micro: int | None
     committed_micro: int
@@ -355,3 +381,4 @@ class Status:
     paused: Mapping[str, tuple[str | None, ...]] = field(default_factory=dict)
     operator_pauses: Mapping[str, OperatorPause] = field(default_factory=dict)
     pause_log: tuple[OperatorPause, ...] = ()
+    streak_ended: tuple[StreakEnd, ...] = ()

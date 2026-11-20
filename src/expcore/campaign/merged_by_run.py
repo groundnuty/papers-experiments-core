@@ -85,9 +85,12 @@ def _declared(found: Declaration) -> dict[str, Any]:
 
 def _exhausted(lost: LostRun) -> dict[str, Any]:
     """A run the ledger exhausted for its lost leases: its run, condition and model, its charged attempts, every lease
-    it was given and why each ended, and its last lease's federation and site, which place it."""
+    it was given and why each ended, and its last lease's federation and site, which place it. A run lost by its
+    infrastructure streak (C58) also says how long the streak was (`infra_streak`) and its last attempt's kind."""
     last = lost.last
+    streak = {} if lost.streak is None else {"infra_streak": lost.streak[0], "infra_kind": lost.streak[1]}
     return {
+        **streak,
         "run_key": lost.run.run_key,
         "condition": lost.run.condition,
         "model": lost.run.model,

@@ -23,10 +23,16 @@ Verification (C11). A result is scored only once a post-run check has looked at 
 check verified nothing, so `unverified` turns every result `classify` would score, treatment included, into
 infrastructure of the untreatable kind `post_check_unverified`, set aside and run again: the one decision, by
 `classify` itself, so the deferral path and the store never disagree on what is scored.
+
+Infrastructure streak (C58). With `[scheduler] max_infra_streak` set, a run whose consecutive attempts ended as
+infrastructure (`infra_fail`, of any kind, charged or not) reach it ends, however few attempts it was charged: an
+uncharged kind, or attempts that never reach the charged count, would otherwise retry the run without end. The streak
+is `infra_streak`'s: interrupted and outage-discarded attempts neither count nor break it; a done or harness-error
+attempt breaks it.
 """
 
 import dataclasses
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -132,6 +138,27 @@ def is_charged(kind: str | None) -> bool:
     """Tell whether an infrastructure failure of this kind costs its run an attempt: not the key's, not the budget's
     (`UNCHARGED_KINDS`) and not a platform's hold (`expcore.errors.uncharged_kinds`)."""
     return kind not in UNCHARGED_KINDS and kind not in uncharged_kinds()
+
+
+STREAK_NEUTRAL = ("interrupted", "outage_discarded", "running")
+"""Attempt states that neither count toward an infrastructure streak nor break it (C58): our own stop, an outage that
+overlapped the attempt, and one not finished yet."""
+
+
+def infra_streak(attempts: Iterable[tuple[str, str | None]]) -> tuple[int, str | None]:
+    """The infrastructure streak at the end of a run's attempts, given oldest first as (state, infra_kind) pairs:
+    how many of the last attempts ended `infra_fail`, skipping the neutral ones (`STREAK_NEUTRAL`) and stopping at any
+    other state, and the kind of the latest of them (None with no streak)."""
+    count, kind = 0, None
+    for state, infra_kind in reversed(list(attempts)):
+        if state in STREAK_NEUTRAL:
+            continue
+        if state != "infra_fail":
+            break
+        if count == 0:
+            kind = infra_kind
+        count += 1
+    return count, kind
 
 
 def unverified(result: AttemptResult, detail: str) -> AttemptResult:

@@ -121,7 +121,9 @@ _SCHEDULER_KINDS: dict[str, type] = {
     "exit_when_blocked": bool,
     "allow_growth": bool,
     "refuse_unpriced": bool,
+    "max_infra_streak": int,
 }
+INFRA_STREAK_CAP = "max_infra_streak"  # the fingerprint's caps hold it only when the campaign sets it (C58)
 
 
 @dataclass(frozen=True)
@@ -141,13 +143,16 @@ class CampaignConfig:
 
     def caps(self) -> dict[str, Any]:
         """The campaign-wide caps as plain data, for the fingerprint: the loop's, the attempt limit and the budget, and
-        the `[shards]` layout and the `[egress]` package indexes only when the campaign declares them."""
+        the `[shards]` layout, the `[egress]` package indexes and the infrastructure streak bound (C58) only when the
+        campaign declares them."""
         budget = self.scheduler.budget
         caps = {
             "agent": self.agent.as_dict(),
             "max_attempts": self.scheduler.max_attempts,
             "budget": None if budget is None else dataclasses.asdict(budget) | {"release_file": None},
         }
+        if self.scheduler.max_infra_streak is not None:
+            caps[INFRA_STREAK_CAP] = self.scheduler.max_infra_streak
         if self.shards is not None:
             caps[SHARDS_CAP] = self.shards.to_json()
         if self.package_indexes:

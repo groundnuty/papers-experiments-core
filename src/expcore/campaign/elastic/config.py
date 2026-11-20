@@ -104,6 +104,9 @@ class LedgerConfig:
     - `hard_term_s`: a lease's hard term (`hard_term_s` builds it); `prior_run_s`: a cell's expected lease time before
       any lease of it counted, by default half the wall cap.
     - `max_attempts`: charged attempts a run may use across its counted leases (C03).
+    - `max_infra_streak`: consecutive infrastructure attempts, charged or not, across every lease's completion read,
+      that end a run as `infra_streak` (C58, `elastic.streaks`). None: off, and the configuration's text is what it
+      was before the field.
     - `caps`: leases in flight or held back at once, per model; a model not listed has no cap.
     - `max_usd`, `per_model_usd`: the budget and the models' ceilings; None: no budget. `grants_usd`: each model's grant
       (`lease_grant_usd`), required for every planned model when there is a budget.
@@ -123,6 +126,7 @@ class LedgerConfig:
     stale_s: float = STALE_S
     site_out_s: float = SITE_OUT_S
     platforms: tuple[str, ...] = ()
+    max_infra_streak: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.fingerprint, str) or not _HEX64.fullmatch(self.fingerprint):
@@ -130,6 +134,8 @@ class LedgerConfig:
         for name in ("hard_term_s", "prior_run_s", "stale_s", "site_out_s"):
             object.__setattr__(self, name, _seconds(name, getattr(self, name)))
         _whole("max_attempts", self.max_attempts, 1)
+        if self.max_infra_streak is not None:
+            _whole("max_infra_streak", self.max_infra_streak, 1)
         caps = {_name("a capped model", m): _whole(f"caps[{m}]", c, 1) for m, c in self.caps.items()}
         object.__setattr__(self, "caps", MappingProxyType(caps))  # read-only: the ledger pinned them
         if self.max_usd is not None:
@@ -157,6 +163,8 @@ class LedgerConfig:
         values = {f.name: getattr(self, f.name) for f in fields(self)}
         if not self.platforms:  # C50: a ledger that declares none pins the text it did before the field
             del values["platforms"]
+        if self.max_infra_streak is None:  # C58: likewise a ledger with no streak bound
+            del values["max_infra_streak"]
         return json.dumps(
             {
                 k: dict(v) if isinstance(v, Mapping) else list(v) if isinstance(v, tuple) else v

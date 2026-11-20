@@ -1798,6 +1798,14 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   for C48's pause, so its federations stay up through the pause; once the other models' runs of the current set are
   done they idle until the model is resumed, since no federation is sent ahead to a later set. Federations, nodes and
   workers never read the pause.
+- **A run that only ever fails as infrastructure** (C58). Set `max_infra_streak = 3` under `[scheduler]` in
+  campaign.toml before the stamp: it is part of the campaign's fingerprint, and `elastic create` pins it in the
+  ledger's configuration. A lease store then stops its run after 3 infrastructure attempts in a row, charged or not
+  (an uncharged hold would otherwise retry it for as long as the job lives), and the ledger adds every completion's
+  streak, superseded ones included (a lease past its hard term is leased again, and its late completion never reaches
+  the charged count). At 3 the run is `infra_streak`: never leased again, a line in `status` (`lost by its
+  infrastructure streak`, with the count, the last kind and the lease), and listed in merge.json's `exhausted` with
+  `infra_streak` and `infra_kind`, read by the analysis as an exhausted run, never scored. Left out, nothing changes.
 - **The sites file** (`--sites`, TOML): `[controller]` with `evidence` (absolute: each retired member's root evidence),
   `interval_s` and `log` (the JSON log: one line per tick with the targets, limits, queue waits and actions, and one
   per result); one `[[site]]` per site with `label` (an operator's label, never a site's name), `fleet` (one site's

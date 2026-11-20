@@ -594,7 +594,9 @@ class AttemptRunner:
         p.crash_hook("before_marker", key)
         write_marker(run_dir, key, begun.id, result)
         p.crash_hook("after_marker", key)
-        status = p.store.finish_attempt(begun.id, result, p.settings.max_attempts, also=also)
+        status = p.store.finish_attempt(
+            begun.id, result, p.settings.max_attempts, also=also, max_infra_streak=p.settings.max_infra_streak
+        )
         p.crash_hook("after_metadata", key)
         return status
 

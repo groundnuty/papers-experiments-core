@@ -103,7 +103,20 @@ def format_status(status: Status) -> str:
                 f"  #{changed.cap_id} {when} model {changed.model} {before} -> {changed.new}"
                 f" by {changed.actor}: {changed.reason}"
             )
-    return "\n".join(lines + _declaration_lines(status) + _pause_lines(status))
+    return "\n".join(lines + _declaration_lines(status) + _pause_lines(status) + _streak_lines(status))
+
+
+def _streak_lines(status: Status) -> list[str]:
+    """Each run lost by its infrastructure streak (C58); nothing when none was, so a status reads as it did."""
+    lines = []
+    for ended in status.streak_ended:
+        when = datetime.fromtimestamp(ended.at, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        lines.append(
+            f"run {ended.run_key}: lost by its infrastructure streak at {when}: {ended.streak} consecutive "
+            f"infrastructure attempts, the last of kind {ended.infra_kind}, reached max_infra_streak "
+            f"{ended.max_infra_streak} (lease {ended.lease_id}); never leased again"
+        )
+    return lines
 
 
 def _value(fingerprint: str | None) -> str:
@@ -187,6 +200,7 @@ def create_ledger(
         hard_term_s=hard_term_s,
         prior_run_s=pricing.limits.time_cap_s / 2 if prior_run_s is None else prior_run_s,
         max_attempts=loaded.campaign.scheduler.max_attempts,
+        max_infra_streak=loaded.campaign.scheduler.max_infra_streak,  # C58: as campaign.toml sets it, or None
         max_usd=max_usd,
         caps=caps or {},
         grants_usd={model: lease_grant_usd(spec, pricing.limits) for model, spec in pricing.models.items()},

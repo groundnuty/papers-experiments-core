@@ -11,7 +11,8 @@ snapshot (`read_ledger`), which the merged batch keeps and binds by its SHA-256.
 their global sequence, and refuses a ledger whose tables say anything else:
 
 - `issue` makes a lease its run's latest, and lease ids rise with the sequence (the fencing token);
-- `report` counts exactly when its lease is its run's latest and the run is not done; any other is superseded;
+- `report` counts exactly when its lease is its run's latest and the run is not done, nor lost by its infrastructure
+  streak (an `infra_streak` event, C58); any other is superseded;
 - `counted` and `superseded` settle a lease whose completion was read so; a `counted` completion that ended `done`
   makes its run done; `lost` settles a lease too, and a lease is settled once.
 
@@ -20,7 +21,8 @@ of a terminal run's counted lease (done, harness_error, or infra_fail for infra_
 give. The ledger's own arithmetic of charged attempts and money (losses, `settle`, raised ceilings) is not repeated:
 the merge reads each lease's charge and the ceilings in force (`elastic.ceilings.effective`). A run's **counted
 lease** is its latest lease when the run is terminal (done, infra_exhausted or harness_error) and that lease is
-`counted`; a run ended by lost leases has none. A lease counted earlier, whose run went back to pending and was
+`counted`; a run ended by lost leases has none, and neither has a run lost by its infrastructure streak
+(`infra_streak`), whose state its event must give. A lease counted earlier, whose run went back to pending and was
 leased again, is not the run's counted lease.
 """
 
@@ -35,6 +37,7 @@ from typing import Any
 from expcore.campaign.elastic.config import LedgerConfig
 from expcore.campaign.elastic.records import HELD, Ceilings, Declaration, Settlement
 from expcore.campaign.elastic.schema import SCHEMA
+from expcore.campaign.elastic.streaks import STREAK_ENDED
 from expcore.campaign.elastic.views import LedgerViews
 from expcore.campaign.storecopy import StoreChanged, store_copy
 
@@ -94,6 +97,7 @@ class LedgerFacts:
     contradicted: frozenset[int] = frozenset()  # leases whose settlement later evidence showed too low
     declarations: tuple[Declaration, ...] | None = None  # the declaration log (C48); None: a ledger made before it
     environments: Mapping[str, str] = field(default_factory=dict)  # each declared platform's pinned environment (C50)
+    streak_ended: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)  # each `infra_streak` event's detail
 
     def unsettled(self, run_key: str) -> list[LeaseRow]:
         """The run's leases in flight, expired, reported or lost that no settlement gave its charged attempts: any of
@@ -181,7 +185,8 @@ def read_ledger(data: bytes, sha256: str, where: object = LEDGER_SNAPSHOT) -> Le
     facts = replace(facts, declarations=None if logged is None else tuple(logged), environments=environments)
     _replay(facts, events, where)
     low = frozenset(e["lease_id"] for e in events if e["kind"] in ("settle_contradicted", "cap_failed"))
-    return replace(facts, contradicted=low)
+    ended = {e["run_key"]: json.loads(e["detail"]) for e in events if e["kind"] == STREAK_ENDED}  # C58
+    return replace(facts, contradicted=low, streak_ended=ended)
 
 
 class _Views(LedgerViews):
@@ -227,6 +232,7 @@ class _Replay:
     def __init__(self, facts: LedgerFacts, where: object) -> None:
         self.facts, self.where = facts, where
         self.done: set[str] = set()
+        self.streak_ended: set[str] = set()  # runs lost by their infrastructure streak (C58)
         self.latest: dict[str, int] = {}
         self.verdicts: dict[int, str] = {}
         self.settled: dict[int, str] = {}
@@ -253,7 +259,8 @@ class _Replay:
                 raise self.refuse(event, "issues a lease id not above every earlier one")
             self.last_issued = self.latest[run] = lease_id
         elif kind == "report":
-            expected = "counts" if self.latest.get(run) == lease_id and run not in self.done else "superseded"
+            ended = run in self.done or run in self.streak_ended
+            expected = "counts" if self.latest.get(run) == lease_id and not ended else "superseded"
             if detail.get("verdict") != expected:
                 raise self.refuse(
                     event, f"records the verdict {detail.get('verdict')!r} where the rule gives {expected!r}"
@@ -269,6 +276,8 @@ class _Replay:
                 self.done.add(run)
         elif kind == "lost":
             self.settled[lease_id] = "lost"
+        elif kind == STREAK_ENDED:
+            self.streak_ended.add(run)
 
 
 def _replay(facts: LedgerFacts, events: list[Mapping[str, Any]], where: object) -> None:
@@ -281,11 +290,13 @@ def _replay(facts: LedgerFacts, events: list[Mapping[str, Any]], where: object) 
             raise replay.refuse(event, "names a lease the ledger does not hold")
         replay.apply(event)
     for key, run in facts.runs.items():
-        if run.lease_id != replay.latest.get(key) or (run.state == "done") != (key in replay.done):
+        streak_ended = (run.state == STREAK_ENDED) != (key in replay.streak_ended)
+        if run.lease_id != replay.latest.get(key) or (run.state == "done") != (key in replay.done) or streak_ended:
             raise LedgerRefused(
                 f"{where}: run {key} is {run.state} on lease {run.lease_id}, but its events give lease "
-                f"{replay.latest.get(key)}{', done' if key in replay.done else ', not done'}: the ledger's tables are "
-                "not what its events give"
+                f"{replay.latest.get(key)}{', done' if key in replay.done else ', not done'}"
+                f"{', lost by its infrastructure streak' if key in replay.streak_ended else ''}: the ledger's tables "
+                "are not what its events give"
             )
         latest = facts.leases.get(run.lease_id) if run.lease_id is not None else None
         ended = None if latest is None or latest.completion is None else latest.completion.get("state")

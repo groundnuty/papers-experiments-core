@@ -8,16 +8,19 @@ where a counted store's attempt belongs must name that store's lease.
 """
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from elastic_support import SITE, join, leased, make, plan
+from elastic_support import HARD_TERM_S, SITE, archive, completion, join, leased, make, plan
 
 from expcore.campaign.elastic import Return, SiteReading
 from expcore.campaign.lease_facts import LeaseStore
 from expcore.campaign.ledger_read import read_ledger, take_ledger_snapshot
 from expcore.campaign.merge import MergeRefused
-from expcore.campaign.merge_by_run import Evidence, check_by_run, require_records, spend_micro
+from expcore.campaign.merge_by_run import Evidence, _counted, check_by_run, require_records, spend_micro
+from expcore.campaign.merged_by_run import _exhausted
 from expcore.campaign.run_lease import RunLease
 
 RECORD = "d1/try1/r1.1.json"
@@ -197,3 +200,72 @@ def test_c50_the_merge_refuses_a_federation_on_a_platform_the_ledger_does_not_de
     narrowed = dataclasses.replace(facts, config=dataclasses.replace(facts.config, platforms=(DOCKER,)))
     with pytest.raises(MergeRefused, match="no platform the ledger declares"):
         check_platform_environments([store_on(on_hpc, ENV_HPC), store_on(on_vm, ENV_VM)], narrowed)
+
+
+# -- C58: a run lost by its infrastructure streak ---------------------------------------------------------------------
+
+
+def streak_lost(tmp_path: Path):
+    """A ledger with one run lost by its streak of three uncharged infrastructure attempts: one counted lease, one
+    that outlived its hard term and reported late (superseded) while the run was leased again, and that last lease,
+    expired too, whose late completion is read after the run was lost (superseded): the replay must give the same
+    verdicts as the ledger did."""
+    ledger, clock = make(tmp_path, plan(tasks=1, conditions=("api-none",)), max_infra_streak=3)
+
+    def infra(lease, streak):
+        found = completion(lease, state="infra_fail", charged=0, infra_streak=streak, infra_kind="budget_hold")
+        ledger.observe_site(SITE, SiteReading(completions=(found,)))
+        return ledger.verify_archive(lease.lease_id, archive(lease.lease_id))
+
+    def expire(lease):
+        clock.advance(HARD_TERM_S + 1)
+        ledger.observe_site(SITE, SiteReading(heartbeats={lease.lease_id: 1}))
+
+    for label in ("fed-a", "fed-b", "fed-c"):
+        join(ledger, clock, label)
+    assert infra(leased(ledger, "fed-a"), 1) == "counted"
+    slow = leased(ledger, "fed-b")
+    expire(slow)
+    last = leased(ledger, "fed-c")
+    assert infra(slow, 2) == "superseded"
+    expire(last)
+    assert ledger.run(last.run_key).state == "infra_streak"
+    assert infra(last, 1) == "superseded"
+    return ledger, last
+
+
+def plan_of(ledger) -> SimpleNamespace:
+    """The plan the ledger's runs are: each run's key, place and model, as `_counted` reads a manifest."""
+    rows = [
+        SimpleNamespace(key=SimpleNamespace(text=run.run_key, factors={"model": run.model}), seq=run.seq)
+        for run in ledger.runs()
+    ]
+    return SimpleNamespace(rows=rows)
+
+
+def test_c58_a_run_lost_by_its_streak_is_merged_as_exhausted_with_its_streak_whatever_its_charged_attempts(tmp_path):
+    """C58: the replay accepts the ledger, and the merge takes the run as lost though it was charged no attempt (a run
+    exhausted for its lost leases below `max_attempts` is refused), naming its streak and kind in merge.json."""
+    ledger, lease = streak_lost(tmp_path)
+    plan_rows = plan_of(ledger)
+    facts = facts_of(tmp_path, ledger.path)
+    ledger.close()
+    assert facts.runs[lease.run_key].charged == 0
+    counted, lost = _counted(facts, {}, plan_rows)
+    assert counted == []
+    (run,) = lost
+    assert run.streak == (3, "budget_hold")
+    entry = _exhausted(run)
+    assert (entry["run_key"], entry["infra_streak"], entry["infra_kind"]) == (lease.run_key, 3, "budget_hold")
+    assert entry["lease_id"] == lease.lease_id
+
+
+def test_c58_a_streak_loss_below_the_ledgers_bound_is_refused(tmp_path):
+    """C58: a run the tables hold as lost by a streak its event does not show at the bound is not merged as lost."""
+    ledger, lease = streak_lost(tmp_path)
+    plan_rows = plan_of(ledger)
+    facts = facts_of(tmp_path, ledger.path)
+    ledger.close()
+    shorter = replace(facts, streak_ended={lease.run_key: {"streak": 2, "infra_kind": "budget_hold"}})
+    with pytest.raises(MergeRefused, match=f"run {lease.run_key} is infra_streak .* a streak of 2"):
+        _counted(shorter, {}, plan_rows)

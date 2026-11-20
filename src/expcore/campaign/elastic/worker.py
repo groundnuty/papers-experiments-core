@@ -18,7 +18,8 @@ channel's inbox (`elastic.channel`) by listing it, and for each lease, in lease-
 3. **Reports it.** From the lease store (never from the exit status): with at least one attempt, the store's `out/` is
    archived to `archives/lease-<id>.out.tar` and a completion names the lease, its run, the store, the archive's
    SHA-256, the last attempt's state, this store's attempts, the highest attempt number it used and its charged attempts
-   (the lease's base not included), and its spend as the budget gate counts it (`selection_ledger.spend_of`), in
+   (the lease's base not included), the infrastructure streak its attempts end with and the streak's last kind
+   (`attempts.infra_streak`, C58), and its spend as the budget gate counts it (`selection_ledger.spend_of`), in
    micro-dollars rounded up (the grant, its bound, when that is unknown). A lease that began no attempt (refused by the
    kernel, or held before any attempt) is returned, with what its store spent. Both name what the store saw that the
    lease's declared set does not declare (`undeclared_fingerprints`, C48; a fingerprint, or null: a reply with none),
@@ -49,6 +50,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from expcore.campaign import out_snapshot
+from expcore.campaign.attempts import infra_streak
 from expcore.campaign.deployments import UNDECLARED_META
 from expcore.campaign.elastic import channel as ch
 from expcore.campaign.elastic.config import micro_up, usd_of
@@ -124,6 +126,8 @@ class Outcome:
     spend_micro_usd: int
     spend_known: bool
     undeclared: tuple[str | None, ...] = ()  # what its replies showed that the lease does not declare (C48)
+    infra_streak: int = 0  # the infrastructure streak its attempts end with (C58, `attempts.infra_streak`)
+    infra_kind: str | None = None  # the kind of the streak's last attempt; None with no streak
 
 
 def store_outcome(study: Path, lease: RunLease) -> Outcome | None:
@@ -134,12 +138,13 @@ def store_outcome(study: Path, lease: RunLease) -> Outcome | None:
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     try:
-        rows = connection.execute("SELECT attempt, state, charged FROM attempts ORDER BY id").fetchall()
+        rows = connection.execute("SELECT attempt, state, charged, infra_kind FROM attempts ORDER BY id").fetchall()
         spend = _spend(study, lambda sql, args=(): connection.execute(sql, args).fetchall())
         kept = connection.execute("SELECT value FROM meta WHERE key=?", (UNDECLARED_META,)).fetchone()
     finally:
         connection.close()
     known = spend is not None
+    streak, kind = infra_streak((row["state"], row["infra_kind"]) for row in rows)
     return Outcome(
         attempts=len(rows),
         attempts_started=max((int(row["attempt"]) for row in rows), default=0),
@@ -148,6 +153,8 @@ def store_outcome(study: Path, lease: RunLease) -> Outcome | None:
         spend_micro_usd=micro_up(spend) if spend is not None else lease.grant_micro_usd,
         spend_known=known,
         undeclared=_undeclared(None if kept is None else kept[0]),
+        infra_streak=streak,
+        infra_kind=kind,
     )
 
 
@@ -445,6 +452,8 @@ class Worker:
                 "spend_known": found.spend_known,
                 "exit_status": status,
                 "undeclared_fingerprints": list(found.undeclared),
+                "infra_streak": found.infra_streak,
+                "infra_kind": found.infra_kind,
             },
         )
         return "ran"

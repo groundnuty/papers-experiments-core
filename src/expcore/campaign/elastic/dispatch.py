@@ -193,6 +193,12 @@ class Dispatcher:
         completions: list[Completion] = []
         returns: list[Return] = []
         expected: dict[int, tuple[str, str]] = {}
+        bounded = self.ledger.config.max_infra_streak is not None  # C58: only then is a completion's streak read
+
+        def streak_of(record: Mapping[str, Any]) -> dict[str, Any]:
+            if not bounded:
+                return {}
+            return {"infra_streak": record.get("infra_streak", 0), "infra_kind": record.get("infra_kind")}
 
         def owned(label: str, lease_id: Any, record: Mapping[str, Any]) -> Lease | None:
             lease = leases.get(lease_id) if isinstance(lease_id, int) and not isinstance(lease_id, bool) else None
@@ -224,6 +230,7 @@ class Dispatcher:
                         spend_usd=_spend_usd(record),
                         archive_sha256=record.get("archive_sha256"),
                         undeclared=record.get("undeclared_fingerprints", ()),
+                        **streak_of(record),
                     )
                 except (TypeError, ValueError) as error:
                     done.dropped.append(f"{label}: completion of lease {lease.lease_id}: {error}")

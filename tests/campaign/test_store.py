@@ -1,5 +1,6 @@
 """The store: factor columns, the transaction refusals, charging by cause (C03), migrations (C20) and C01."""
 
+import json
 import sqlite3
 import threading
 from dataclasses import replace
@@ -698,3 +699,52 @@ def test_c04_recovery_treats_a_marker_with_the_wrong_kinds_like_an_interrupted_a
     event = store.q("SELECT kind, detail FROM events WHERE kind='recovered_marker_refused'")[0]
     assert event["detail"].startswith(key)
     assert key in [r["run_key"] for r in store.pending()]  # run again under the same number
+
+
+# --- C58: the infrastructure streak -----------------------------------------------------------------------------------
+
+
+def run_streak(store, key, result, max_infra_streak, max_attempts=3):
+    """One attempt of the run ended with `result`, the store bounding the streak at `max_infra_streak`."""
+    kinds = store.schema.treatment_kinds[
+        store.schema.condition_named(
+            json.loads(store.q("SELECT factors FROM runs WHERE run_key=?", (key,))[0]["factors"]), key
+        )
+    ]
+    begun = store.begin_attempt(key, NOW, 1234, "")
+    return store.finish_attempt(
+        begun.id, replace(result, treatment_kinds=kinds), max_attempts, max_infra_streak=max_infra_streak
+    )
+
+
+def test_c58_uncharged_infrastructure_attempts_in_a_row_end_the_run_at_max_infra_streak(tmp_path):
+    """C58: a lease store retries a run that an uncharged kind set aside for as long as it lives; with the bound the
+    third such attempt in a row ends it infra_exhausted, no attempt charged, and an event names the count and kind.
+    An interrupted attempt in between neither counts nor breaks the streak."""
+    store, _, manifest = planned_store(tmp_path)
+    key = manifest.rows[0].key.text
+    assert run_streak(store, key, infra("key_rejected"), 3) == "pending"
+    store.begin_attempt(key, NOW, 1, "")
+    recover(store, LATER, 3)  # interrupted: neutral
+    assert run_streak(store, key, infra("budget_hold"), 3) == "pending"
+    assert run_streak(store, key, infra("budget_hold"), 3) == "infra_exhausted"
+    assert store.charged_attempts(key) == 0
+    (event,) = store.q("SELECT detail FROM events WHERE kind='infra_streak'")
+    assert event["detail"].startswith(f"{key}: 3 consecutive infrastructure attempts, the last of kind budget_hold")
+
+
+def test_c58_charged_infrastructure_counts_toward_the_streak(tmp_path):
+    """C58: charged kinds are in the streak too: three in a row end the run though `max_attempts` is 5."""
+    store, _, manifest = planned_store(tmp_path)
+    key = manifest.rows[0].key.text
+    statuses = [run_streak(store, key, infra("sandbox"), 3, max_attempts=5) for _ in range(3)]
+    assert statuses == ["pending", "pending", "infra_exhausted"]
+    assert store.charged_attempts(key) == 3
+
+
+def test_c58_unset_uncharged_infrastructure_attempts_keep_the_run_pending_as_today(tmp_path):
+    """C58: without the bound a run an uncharged kind sets aside stays pending however often it happens."""
+    store, _, manifest = planned_store(tmp_path)
+    key = manifest.rows[0].key.text
+    assert {run_streak(store, key, infra("budget_hold"), None) for _ in range(6)} == {"pending"}
+    assert store.q("SELECT COUNT(*) c FROM events WHERE kind='infra_streak'")[0]["c"] == 0

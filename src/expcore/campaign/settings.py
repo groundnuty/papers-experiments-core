@@ -17,6 +17,8 @@ class SchedulerConfig:
     """What `campaign.toml` holds for the dispatcher, as values.
 
     - `max_attempts`: charged attempts a run may use (C03).
+    - `max_infra_streak`: consecutive infrastructure attempts, charged or not, that end a run (C58,
+      `attempts.infra_streak`); None: off, and a run whose infrastructure attempts cost nothing runs again for ever.
     - `workers`: runs in flight at once on this host, quarantined leases counted among them.
     - `unit_caps`: runs in flight at once per unit (a key the platform names); a unit not listed has no cap of its own.
     - `retry_delay_s`: how long a run waits after an attempt that must be run again.
@@ -55,12 +57,16 @@ class SchedulerConfig:
     exit_when_blocked: bool = False
     allow_growth: bool = False
     refuse_unpriced: bool = True
+    max_infra_streak: int | None = None
 
     def __post_init__(self) -> None:
         """Refuse limits that cannot work."""
         problems = []
         if self.max_attempts < 1 or self.workers < 1 or self.unit_fail_threshold < 1:
             problems.append("max_attempts, workers and unit_fail_threshold must be at least 1")
+        streak = self.max_infra_streak
+        if streak is not None and (isinstance(streak, bool) or not isinstance(streak, int) or streak < 1):
+            problems.append("max_infra_streak must be a whole number of at least 1, or left out")
         if any(cap < 1 for cap in self.unit_caps.values()):
             problems.append("a unit cap must be at least 1")
         if min(self.unit_pause_s, self.recheck_s, self.health_timeout_s, self.poll_interval_s, self.max_defer_s) <= 0:

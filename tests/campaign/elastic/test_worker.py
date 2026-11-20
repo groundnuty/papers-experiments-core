@@ -5,10 +5,12 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tarfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from channel_support import FakeHandle, FakeRunner, FakeSsh, channel_of, outcome_of, site_of, transport
@@ -24,7 +26,7 @@ from expcore.campaign.elastic import channel as ch
 from expcore.campaign.elastic.control import Settle, SiteSettings
 from expcore.campaign.elastic.dispatch import TICK_S, Dispatcher
 from expcore.campaign.elastic.records import Lease
-from expcore.campaign.elastic.worker import Occupied, ProcessRunner, Worker, WorkerError, main
+from expcore.campaign.elastic.worker import Occupied, ProcessRunner, Worker, WorkerError, main, store_outcome
 from expcore.campaign.run_lease import LEASE_JOURNAL, read_lease
 
 __all__ = ["clean_environment"]  # a fixture the tests below use, imported from the support module
@@ -513,3 +515,20 @@ def test_c47_a_lost_lease_at_an_ssh_site_settles_at_its_journals_spend_and_a_fai
         spend_micro, source, charged = found
         assert (source, charged) == ("root", 0)
         assert 0 < spend_micro < 5_000_000  # the journal's spend, not the grant of the model (5 USD)
+
+
+def test_c58_the_store_reading_says_the_infrastructure_streak_its_attempts_ended_with(tmp_path):
+    """C58: the attempts in a row that ended as infrastructure, an interrupted one between them skipped, and the kind
+    of the last, which the completion carries to the ledger."""
+    out = tmp_path / "study" / "out"
+    out.mkdir(parents=True)
+    db = sqlite3.connect(out / "state.sqlite")
+    db.execute("CREATE TABLE attempts(id INTEGER PRIMARY KEY, attempt INT, state TEXT, charged INT, infra_kind TEXT)")
+    db.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+    rows = [(1, "infra_fail", 1, "sandbox"), (2, "infra_fail", 0, "budget_hold"), (2, "interrupted", 0, None)]
+    rows.append((2, "infra_fail", 0, "key_rejected"))
+    db.executemany("INSERT INTO attempts(attempt, state, charged, infra_kind) VALUES(?,?,?,?)", rows)
+    db.commit()
+    db.close()
+    found = store_outcome(tmp_path / "study", SimpleNamespace(grant_micro_usd=7))
+    assert (found.state, found.charged, found.infra_streak, found.infra_kind) == ("infra_fail", 1, 3, "key_rejected")

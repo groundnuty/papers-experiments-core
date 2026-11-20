@@ -7,9 +7,10 @@ time on a lease (`issue`, `choice`). A site reading (`observe_site`) brings hear
 shown ended; the sweep expires what it must.
 
 - **Fencing.** The lease id is the token. A completion counts only if it comes from its run's latest lease and the run
-  is not done; any other is `superseded`: kept, its spend counted, never scored. The rule reads lease order and never
-  outcomes, and the events' sequence records every step of it. The run counts as done only once its archive is
-  verified (`verify_archive`); one that never verifies is `lost` and its run goes back to pending.
+  is not done (nor lost by its streak, `infra_streak`); any other is `superseded`: kept, its spend counted, never
+  scored. The rule reads lease order and never outcomes, and the events' sequence records every step of it. The run
+  counts as done only once its archive is verified (`verify_archive`); one that never verifies is `lost` and its run
+  goes back to pending.
 - **Expiry.** A lease expires when its site was read and its counter stood still for `stale_s` of reads, when it is
   past its hard term, or when its site went unread for `site_out_s`. After a restart no lease expires until its site
   is read, save by the site's own `site_out_s`, counted from the reopen. Expiry puts the run back to pending at once.
@@ -29,6 +30,9 @@ shown ended; the sweep expires what it must.
   value seen is declared.
 - **Operator pause.** An operator pauses one model's issue at once and resumes it, two kinds of event in the log
   (`pauses`, C55): no new lease of the model, leases out run on, and `resume` lifts only this pause, not C48's.
+- **Infrastructure streak.** With `max_infra_streak` pinned (C58, `streaks`), every completion read adds the streak
+  its store's attempts ended with, superseded ones included, and a pending run whose streak reaches the bound is lost
+  as `infra_streak`, never leased again; a late completion of its latest lease is superseded, as for a done run.
 - **Settling and raising.** A lost lease (`settle`) is charged the spend read from its dead federation instead of its
   grant, and the difference goes back to the budget (`settling`). A ceiling is raised mid-campaign, recorded, never
   lowered or set below what is committed, and never part of the fingerprint (`ceilings`); `status` shows the money,
@@ -42,7 +46,7 @@ from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.elastic import attempts, caps, ceilings, declarations, pauses, schema, settling
+from expcore.campaign.elastic import attempts, caps, ceilings, declarations, pauses, schema, settling, streaks
 from expcore.campaign.elastic.awareness import PauseAwareMark
 from expcore.campaign.elastic.choice import InFlight, Pending, choose
 from expcore.campaign.elastic.config import LedgerConfig, LedgerRun, check_plan, micro_up
@@ -143,9 +147,12 @@ class Ledger(LedgerViews):
     # --- transactions -----------------------------------------------------------------------------------------
 
     def _transact(self, fn: Callable[[], Any]) -> Any:
+        """Run `fn` in one BEGIN IMMEDIATE transaction; before it commits, end the pending runs whose infrastructure
+        streak is due (`streaks.end_due`, C58), so no path that puts a run back to pending can lease it again."""
         self.db.execute("BEGIN IMMEDIATE")
         try:
             result = fn()
+            streaks.end_due(self.db, self.config, self._clock())
             self.db.execute("COMMIT")
         except BaseException:
             self.db.execute("ROLLBACK")
@@ -416,7 +423,7 @@ class Ledger(LedgerViews):
             raise CompletionConflict(f"lease {row['id']} was {row['state']}: a completion of it cannot be read")
         declarations.see(self.db, now, row, completion.undeclared)  # whatever its verdict (C48)
         run = self.db.execute("SELECT * FROM runs WHERE run_key=?", (row["run_key"],)).fetchone()
-        counts = run["lease_id"] == row["id"] and run["state"] != "done"
+        counts = run["lease_id"] == row["id"] and run["state"] not in ("done", streaks.STREAK_ENDED)
         verdict = "counts" if counts else "superseded"
         self.db.execute(
             "UPDATE leases SET state='reported', slot=0, verdict=?, completion=?, reported_at=? WHERE id=?",

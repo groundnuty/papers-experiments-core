@@ -48,6 +48,7 @@ from expcore.campaign.attempts import (
     SchemaMismatch,
     TreatmentKindsMismatch,
     classify,
+    infra_streak,
 )
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.manifest import ManifestRow, relative_order_problem
@@ -690,7 +691,13 @@ class Store:
         self.transact(write)
 
     def finish_attempt(
-        self, attempt_id: int, result: AttemptResult, max_attempts: int, *, also: Callable[[], None] | None = None
+        self,
+        attempt_id: int,
+        result: AttemptResult,
+        max_attempts: int,
+        *,
+        also: Callable[[], None] | None = None,
+        max_infra_streak: int | None = None,
     ) -> str:
         """Record how an attempt ended and move its run on, in one transaction; return the run's new status.
 
@@ -699,8 +706,9 @@ class Store:
         raises, the result is not recorded either and the attempt stays running.
 
         The state, the charge and the treatment mark follow from the cause and the run's condition (`classify`). A run is
-        done on an agent outcome or a treatment fault, exhausted when its charged attempts reach `max_attempts`, set
-        aside as a harness error when our own code crashed, and otherwise pending again. An attempt that is not running is refused: its result would be recorded twice. So is a
+        done on an agent outcome or a treatment fault, exhausted when its charged attempts reach `max_attempts`, or its
+        consecutive infrastructure attempts, charged or not, reach `max_infra_streak` (C58, an `infra_streak` event says
+        so), set aside as a harness error when our own code crashed, and otherwise pending again. An attempt that is not running is refused: its result would be recorded twice. So is a
         result whose `treatment_kinds` or `treatment_targets` differ from the condition's declaration, or whose record's
         treatment flag differs from the store's own decision from the outcome, the declared kinds and targets, the
         completed turns and the injected targets, taken with the rules of the record's schema version (both are
@@ -767,6 +775,8 @@ class Store:
                 ),
             )
             status = self._status_after(row["run_key"], state, max_attempts)
+            if status == "pending" and state == "infra_fail" and max_infra_streak is not None:
+                status = self._streak_status(row["run_key"], max_infra_streak, result.ended_utc)
             self.db.execute("UPDATE runs SET status=? WHERE run_key=?", (status, row["run_key"]))
             if also is not None:
                 also()
@@ -790,3 +800,20 @@ class Store:
             )
             return "infra_exhausted" if charged >= max_attempts else "pending"
         return "pending"
+
+    def _streak_status(self, run_key: str, max_infra_streak: int, ts: str) -> str:
+        """`infra_exhausted` once the run's infrastructure streak in this store (`attempts.infra_streak`) reaches
+        `max_infra_streak`, with an `infra_streak` event naming the count and the last kind; `pending` otherwise. Call
+        inside the transaction that recorded the attempt."""
+        rows = self.db.execute("SELECT state, infra_kind FROM attempts WHERE run_key=? ORDER BY id", (run_key,))
+        count, kind = infra_streak((row["state"], row["infra_kind"]) for row in rows)
+        if count < max_infra_streak:
+            return "pending"
+        self.event(
+            ts,
+            "infra_streak",
+            None,
+            f"{run_key}: {count} consecutive infrastructure attempts, the last of kind {kind}, reached "
+            f"max_infra_streak {max_infra_streak}: the run is infra_exhausted",
+        )
+        return "infra_exhausted"

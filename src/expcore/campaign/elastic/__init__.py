@@ -34,6 +34,7 @@ from expcore.campaign.elastic.records import (
     SettleRefused,
     SiteReading,
     Status,
+    StreakEnd,
     Wait,
 )
 from expcore.campaign.elastic.views import LedgerReader
@@ -65,6 +66,7 @@ __all__ = [
     "Settlement",
     "SiteReading",
     "Status",
+    "StreakEnd",
     "Wait",
     "hard_term_s",
     "lease_grant_usd",

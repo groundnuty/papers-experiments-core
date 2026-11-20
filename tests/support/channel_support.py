@@ -103,8 +103,10 @@ def complete(
     spend_micro_usd: int = 250_000,
     archive: bytes | None = None,
     sha256: str | None = None,
+    **extra: Any,
 ) -> str:
-    """The node's archive and completion for a lease; the archive's SHA-256 (or the one the completion claims)."""
+    """The node's archive and completion for a lease, with `extra` fields (a store's streak, C58); the archive's
+    SHA-256 (or the one the completion claims)."""
     directory = channel_of(site, label)
     ch.make_dirs(directory)
     data = archive if archive is not None else f"the store of lease {lease.lease_id}".encode()
@@ -121,6 +123,7 @@ def complete(
             "state": state,
             "charged": charged,
             "spend_micro_usd": spend_micro_usd,
+            **extra,
         },
     )
     return claimed

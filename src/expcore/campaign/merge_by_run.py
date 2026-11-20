@@ -21,7 +21,9 @@
    of the stores' identity); a campaign whose fingerprint is not the one the ledger was made for;
 4. **not exactly one counted lease per run:** a run of the plan that is not terminal in the ledger (it has no counted
    lease yet; a run the ledger ended as infra_exhausted for its lost leases has none, and is listed as an exhausted
-   run once none of its leases is unsettled, see 6), a run whose counted lease's store is not given (its archive is
+   run once none of its leases is unsettled, see 6; a run the ledger lost by its infrastructure streak, `infra_streak`
+   (C58), has none either, whatever its charged attempts, and is listed as exhausted with its streak, once its event
+   shows the streak at the ledger's bound), a run whose counted lease's store is not given (its archive is
    the run's only record), a counted store whose run ended otherwise than the ledger says; a store of a counted or
    superseded lease that is not given (the ledger verified its archive, so it is evidence to keep);
 5. spend: every lease is counted at what the ledger charges it (its measured spend once its completion verified,
@@ -64,6 +66,7 @@ from dataclasses import dataclass
 
 from expcore.campaign.elastic.config import micro_up, usd_of
 from expcore.campaign.elastic.records import HELD
+from expcore.campaign.elastic.streaks import STREAK_ENDED
 from expcore.campaign.lease_facts import LeaseStore
 from expcore.campaign.ledger_read import TERMINAL, LeaseRow, LedgerFacts, RunRow
 from expcore.campaign.manifest import Manifest, fingerprint_sha256
@@ -94,12 +97,14 @@ class Evidence:
 
 @dataclass(frozen=True)
 class LostRun:
-    """A run the ledger ended as infra_exhausted for its lost leases, with no counted lease and so no store: every one
-    of its leases (none of them unsettled) and the run as the ledger holds it. It is listed as exhausted, never
-    analysed; its placement is its last lease's."""
+    """A run the ledger ended as infra_exhausted for its lost leases, or lost by its infrastructure streak (C58), with
+    no counted lease: every one of its leases (none of them unsettled) and the run as the ledger holds it, and for a
+    streak its length and the kind of its last attempt. It is listed as exhausted, never analysed; its placement is its
+    last lease's."""
 
     run: RunRow
     leases: tuple[LeaseRow, ...]
+    streak: tuple[int, str | None] | None = None
 
     @property
     def last(self) -> LeaseRow:
@@ -278,6 +283,9 @@ def _counted(
     counted, lost = [], []
     for key in sorted(planned, key=planned.__getitem__):
         run = ledger.runs[key]
+        if run.state == STREAK_ENDED:
+            lost.append(_streak_lost(ledger, run))
+            continue
         lease_id = ledger.counted(key)
         if lease_id is None and run.state == "infra_exhausted":
             if run.charged < ledger.config.max_attempts:
@@ -309,6 +317,19 @@ def _counted(
             )
         counted.append(store)
     return counted, lost
+
+
+def _streak_lost(ledger: LedgerFacts, run: RunRow) -> LostRun:
+    """4: a run the ledger lost by its infrastructure streak (C58), whose event shows a streak at the ledger's bound."""
+    bound, event = ledger.config.max_infra_streak, ledger.streak_ended.get(run.run_key, {})
+    streak = event.get("streak")
+    if bound is None or not isinstance(streak, int) or streak < bound:
+        raise MergeRefused(
+            f"run {run.run_key} is {STREAK_ENDED} in the ledger, but its event shows a streak of {streak} where the "
+            f"ledger's max_infra_streak is {bound}: its loss is not what its leases give"
+        )
+    leases = tuple(r for r in ledger.leases_of(run.run_key) if r.state != "cancelled")
+    return LostRun(run, leases, (streak, event.get("infra_kind")))
 
 
 def _check_models(ledger: LedgerFacts, plan: Manifest) -> None:

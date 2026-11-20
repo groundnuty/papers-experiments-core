@@ -456,3 +456,21 @@ def test_c44_a_lease_with_both_a_completion_and_a_return_is_read_by_its_completi
     clock.advance(TICK_S)
     assert dispatch.tick()[SITE].read
     assert ledger.lease(lease.lease_id).state == "counted"
+
+
+@pytest.mark.parametrize("bound", [3, None])
+def test_c58_a_completion_files_streak_reaches_the_ledger_only_when_it_bounds_the_streak(tmp_path, bound):
+    """C58: the worker's completion says the streak its store ended with; a ledger with `max_infra_streak` reads it
+    and loses the run at the bound, and one without keeps the completion it kept before and leases the run again."""
+    ledger, clock, _, site, dispatch, lease = sent_lease(tmp_path, **ONE_RUN, max_infra_streak=bound)
+    complete(site, "fed-1", lease, state="infra_fail", charged=0, infra_streak=3, infra_kind="budget_hold")
+    ticks(dispatch, clock, 3)
+    assert ledger.lease(lease.lease_id).state == "counted"
+    kept = json.loads(ledger.db.execute("SELECT completion FROM leases WHERE id=?", (lease.lease_id,)).fetchone()[0])
+    if bound is None:
+        assert "infra_streak" not in kept
+        assert ledger.run(lease.run_key).state in ("pending", "leased")
+    else:
+        assert (kept["infra_streak"], kept["infra_kind"]) == (3, "budget_hold")
+        assert ledger.run(lease.run_key).state == "infra_streak"
+    assert_invariants(ledger)

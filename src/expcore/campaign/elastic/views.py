@@ -28,8 +28,10 @@ from expcore.campaign.elastic.records import (
     Run,
     Settlement,
     Status,
+    StreakEnd,
 )
 from expcore.campaign.elastic.settling import read as read_settlements
+from expcore.campaign.elastic.streaks import STREAK_ENDED
 
 _LEASE_SQL = "SELECT l.*, f.ended_at AS fed_ended FROM leases l JOIN federations f ON f.label = l.federation"
 # The meta key of the environment pinned at the first join: one for the campaign, or with declared platforms (C50) one
@@ -238,7 +240,21 @@ class LedgerViews:
             paused=self.paused(),
             operator_pauses=self.operator_pauses(),
             pause_log=tuple(self.pause_log()),
+            streak_ended=self.streak_ended(),
         )
+
+    def streak_ended(self) -> tuple[StreakEnd, ...]:
+        """Every run lost by its infrastructure streak (C58), from the log, oldest first."""
+        rows = self.db.execute(
+            "SELECT at, run_key, lease_id, detail FROM events WHERE kind=? ORDER BY seq", (STREAK_ENDED,)
+        )
+        ended = []
+        for at, run_key, lease_id, detail in rows:
+            found = json.loads(detail)
+            ended.append(
+                StreakEnd(run_key, at, lease_id, found["streak"], found["infra_kind"], found["max_infra_streak"])
+            )
+        return tuple(ended)
 
 
 class LedgerReader(LedgerViews):

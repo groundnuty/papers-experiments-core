@@ -372,3 +372,24 @@ def test_o95_egress_package_indexes_is_read_sorted_and_enters_the_caps_only_when
 )
 def test_o95_an_egress_table_that_cannot_work_is_refused_naming_the_key(tmp_path, table, fragments):
     refused(tmp_path, VALID + f"\n[egress]\n{table}\n", *fragments)
+
+
+def test_c58_max_infra_streak_is_optional_and_enters_the_caps_only_when_declared(tmp_path):
+    """C58: left out it is off and the caps (so the fingerprint) are what they were; declared, it is in them, so a
+    federation of a campaign with another bound is of another experiment."""
+    plain = load(tmp_path)
+    assert plain.scheduler.max_infra_streak is None
+    assert "max_infra_streak" not in plain.caps()
+    declared = load(tmp_path, VALID.replace("max_attempts = 2\n", "max_attempts = 2\nmax_infra_streak = 3\n"))
+    assert declared.scheduler.max_infra_streak == 3
+    assert declared.caps()["max_infra_streak"] == 3
+
+
+@pytest.mark.parametrize("value", ["0", "true", "2.5"])
+def test_c58_a_streak_bound_that_cannot_work_is_refused_naming_the_key(tmp_path, value):
+    """C58: a bound below 1, or not a whole number, is refused at load."""
+    refused(
+        tmp_path,
+        VALID.replace("max_attempts = 2\n", f"max_attempts = 2\nmax_infra_streak = {value}\n"),
+        "max_infra_streak",
+    )
