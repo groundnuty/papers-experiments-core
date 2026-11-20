@@ -129,8 +129,9 @@ def test_c61_a_log_exactly_at_the_default_limit_is_read_and_one_byte_past_it_is_
 
 
 def test_c61_a_log_past_the_old_48_mib_cap_is_read_and_intact():
-    """C61: a log of 49 MiB, past the old cap, whose lines are all the collector's own (its start line carries a long
-    extra field the reader ignores, to make the size without a million lines), is intact: the cap is 256 MiB."""
+    """C61: a log of 49 MiB, past the old cap, is intact: the cap is 256 MiB. Its lines are a valid log's, but the start
+    line carries a long extra field (the reader ignores it; the collector never writes one) to make the size without a
+    million lines, so this tests the size limit and not what a real log of that size parses like."""
     out = lines(RECORDS)
     out[0]["pad"] = "x" * (49 * 1024 * 1024)
     data = encode(out)

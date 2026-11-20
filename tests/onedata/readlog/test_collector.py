@@ -281,6 +281,7 @@ def fed_with_room(tmp_path, room, datagrams):
     with the end line. Returns the log's size as the collector counts it and the counts the end line holds."""
     collector = load_collector()
     log = collector.Log(tmp_path / "log.jsonl", collector.MAX_LOG_BYTES)
+    assert log.max_bytes == CAP_256_MIB  # the room below is only the real cap's if the collector's default is 256 MiB
     log.size = CAP_256_MIB - collector.END_RESERVE_BYTES - room
     counts = {"records": 0, "malformed": 0, "unwritten": 0, "cap_reached": False}
     receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
