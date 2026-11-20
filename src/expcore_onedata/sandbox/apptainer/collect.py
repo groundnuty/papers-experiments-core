@@ -16,7 +16,9 @@ file of evidence the collection writes is scanned for the data-path token: one t
 collection fails, since a secret is never evidence (O05). The two collectors' logs are scanned in memory, and their
 copies are written and their bytes handed on (`Collection.egress_bytes`, `readlog_bytes`) only once the scan has passed:
 a collection that fails before then has written and exposed neither (C63). A mount run's guard closes its window here
-and its log is copied too (O60, `hostmount`).
+and its log is copied too (O60, `hostmount`); a mount that was restored (O97) has one log for each generation of its
+oneclient, copied as `mount-watch.jsonl` (the first, as it always was) and `mount-watch-<g>.jsonl`, each scanned for the
+token like the rest of the evidence.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from expcore.mountguard import logs_of
 from expcore_onedata.fault_drain import GATE
 from expcore_onedata.sandbox import copyout, gatelog, inputs, kinds
 from expcore_onedata.sandbox.api import DataPathMode, SandboxError
@@ -43,6 +46,12 @@ log = logging.getLogger(__name__)
 EGRESS_COPY = "egress.jsonl"
 MOUNT_WATCH_COPY = "mount-watch.jsonl"
 GATE_COPY = "gate-requests.jsonl"
+
+
+def mount_watch_copy(generation: int) -> str:
+    """The name of the copy of generation `generation`'s watcher log (the first generation is 1): the first keeps the
+    name it always had, so a run with one generation is as it was, and each later one is numbered (O97)."""
+    return MOUNT_WATCH_COPY if generation == 1 else f"mount-watch-{generation}.jsonl"
 
 
 class Collection:
@@ -86,8 +95,11 @@ class Collection:
             if readlog is not None:
                 logs[dest / readlogrun.COPY] = readlog
         if box.spec.mode is DataPathMode.MOUNT:
-            written.append(self._mount_watch(dest))
-            result["mount_watch_log"] = MOUNT_WATCH_COPY if written[-1] is not None else None
+            copies, names = self._mount_watch(dest)
+            written.extend(copies)
+            result["mount_watch_log"] = names[0] if names else None
+            if len(names) > 1:  # a restored mount: one log for each generation, None for one that is missing
+                result["mount_watch_logs"] = names
         (dest / "metadata.json").write_text(json.dumps(box.metadata(), indent=1, default=str), encoding="utf-8")
         written.append(dest / "metadata.json")
         self._scan([path for path in written if path is not None], logs)
@@ -238,15 +250,25 @@ class Collection:
         channel.stop()
         return channel.read()
 
-    def _mount_watch(self, dest: Path) -> Path | None:
+    def _mount_watch(self, dest: Path) -> tuple[list[Path], list[str | None]]:
         """Close the mount guard's window, now that every process of the run is shown gone, and copy its log (O60): the
-        guard's verdict is then in the metadata this collection writes. A helper without a guard has none."""
+        guard's verdict is then in the metadata this collection writes. A helper without a guard has none. A restored
+        mount has one log for each generation (O97): the copies written, and the name of each generation's (None for a
+        log that is missing, so the list is as long as the generations started)."""
         found = self.box.mount_watch_log()
         if found is None:
-            return None
-        target = dest / MOUNT_WATCH_COPY
-        target.write_bytes(found)
-        return target
+            return [], []
+        copies: list[Path] = []
+        names: list[str | None] = []
+        for generation, data in enumerate(logs_of(found), start=1):
+            if data is None:
+                names.append(None)
+                continue
+            target = dest / mount_watch_copy(generation)
+            target.write_bytes(data)
+            copies.append(target)
+            names.append(target.name)
+        return copies, names
 
     def _scan(self, paths: Sequence[Path], logs: dict[Path, bytes]) -> None:
         """A file of evidence that holds the token is removed, and the collection fails (O05). So does a log of the two
