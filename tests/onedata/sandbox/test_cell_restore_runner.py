@@ -4,10 +4,12 @@ outside the metadata's lock and publishes `mount_restored`, or ends the run as k
 execs while it is pending; a run whose body ends first needs none; and an end already published stands."""
 
 import threading
+import time
 
 import pytest
 
 from expcore.errors import InfraError
+from expcore_onedata.sandbox import cells as cells_module
 from expcore_onedata.sandbox import deadline, kinds
 from expcore_onedata.sandbox.api import ExecResult, SandboxError
 
@@ -242,20 +244,124 @@ def test_o97_a_run_whose_body_ends_with_a_restore_pending_needs_none(cells):
     assert cells.restore(lambda: {"ok": True})["ok"] is None
 
 
-def test_o97_a_settle_during_a_restore_under_way_leaves_it_to_publish_its_own_outcome(cells):
-    """O97: the loop cut the call while the restore ran in its thread: `settle` never marks it `not_needed`, so the
-    restore's own outcome, `mount_restored` or a failure, stands."""
-    record, seen = pending(), {}
+def running_in_a_thread(cells, fn):
+    """Start `cells.restore(fn)` in a thread, as the code tool's `to_thread` does, once it is under way."""
+    thread = threading.Thread(target=lambda: cells.restore(fn), daemon=True)
+    thread.start()
+    return thread
+
+
+def test_o97_a_settle_waits_for_a_restore_under_way_and_leaves_its_outcome_to_stand(cells, monkeypatch):
+    """O97: the loop cut the call while the restore ran in its thread, and `launch` settles: nothing runs beside a
+    restore, so the settle waits for it (at most `RESTORE_WAIT_S`) and then finds `mount_restored`, never marking it
+    `not_needed` and never ending the run."""
+    record, entered, release = pending(), threading.Event(), threading.Event()
     cells._publish(1, record)
 
     def restore() -> dict:
-        cells.settle()
-        seen["state"] = record["restore"]
+        entered.set()
+        release.wait(10)
         return {"ok": True, "generation": 2}
 
-    cells.restore(restore)
-    assert seen["state"] == deadline.RESTORE_RUNNING
-    assert record["outcome"] == deadline.MOUNT_RESTORED
+    thread = running_in_a_thread(cells, restore)
+    assert entered.wait(10)
+    threading.Timer(0.2, release.set).start()
+    assert cells.settle() is None
+    thread.join(10)
+    assert (record["outcome"], record["restore"]) == (deadline.MOUNT_RESTORED, deadline.RESTORE_DONE)
+    assert cells.ended is None
+
+
+def test_o97_a_restore_that_outlasts_the_wait_ends_the_run_and_its_late_answer_changes_nothing(cells, monkeypatch):
+    """O97: a restore still running after `RESTORE_WAIT_S` of the settle is given up on: the run is ended as the
+    restore's failure (`mount_lost`, by `restore`, "not finished before the run's end"), the pending state is cleared,
+    and when the restore returns, as a success even, the record and the end stay as they were: a stopped run's
+    mount is never made good by a thread that outlived it."""
+    monkeypatch.setattr(cells_module, "RESTORE_WAIT_S", 0.2)
+    record, entered, release = pending(), threading.Event(), threading.Event()
+    cells._publish(1, record)
+
+    def restore() -> dict:
+        entered.set()
+        release.wait(10)
+        return {"ok": True, "generation": 2}
+
+    thread = running_in_a_thread(cells, restore)
+    assert entered.wait(10)
+    ended = cells.settle()
+    assert ended == {"outcome": deadline.MOUNT_LOST, "by": deadline.RESTORE, "cell": 1,
+                     "why": "not finished before the run's end"}  # fmt: skip
+    assert record["restore"] == deadline.RESTORE_FAILED
+    assert entered.is_set()
+    assert cells.pending_restore is None
+    assert kinds.run_ended_error(ended).kind == "sandbox"
+    release.set()
+    thread.join(10)
+    assert (record["outcome"], record["restore"]) == (deadline.MOUNT_ABORTED, deadline.RESTORE_FAILED)
+    assert [s["step"] for s in record["steps"]].count("restored") == 0
+    assert cells.ended is ended
+
+
+def test_o97_a_stop_waits_for_a_restore_under_way_before_it_tears_anything_down(cells, monkeypatch):
+    """O97: the sandbox's stop calls `wait_decided` first: it waits for a restore under way, so its teardown never
+    runs beside the restore (a token file written after the teardown's token step, an oneclient started after it
+    read what to stop), and gives up on one that outlasts `RESTORE_WAIT_S`."""
+    record, entered, release = pending(), threading.Event(), threading.Event()
+    cells._publish(1, record)
+
+    def restore() -> dict:
+        entered.set()
+        release.wait(10)
+        return {"ok": True, "generation": 2}
+
+    thread = running_in_a_thread(cells, restore)
+    assert entered.wait(10)
+    threading.Timer(0.2, release.set).start()
+    cells.wait_decided()
+    assert record["restore"] == deadline.RESTORE_DONE  # it had finished when the stop was let go on
+    thread.join(10)
+    monkeypatch.setattr(cells_module, "RESTORE_WAIT_S", 0.2)
+    again, held, stuck_entered = pending(), threading.Event(), threading.Event()
+    cells.ended = cells.pending_restore = None
+    cells._publish(2, again)
+
+    def stuck_restore() -> dict:
+        stuck_entered.set()
+        held.wait(10)
+        return {"ok": True}
+
+    stuck = running_in_a_thread(cells, stuck_restore)
+    assert stuck_entered.wait(10)
+    cells.wait_decided()
+    assert again["restore"] == deadline.RESTORE_FAILED
+    assert cells.ended["by"] == deadline.RESTORE
+    held.set()
+    stuck.join(10)
+
+
+def test_o97_a_settle_with_no_restore_under_way_does_not_wait(cells, monkeypatch):
+    """O97: the idle flag is set whenever no restore runs: a settle, a stop's wait and `wait_restored` do not wait."""
+    monkeypatch.setattr(cells_module, "RESTORE_WAIT_S", 60.0)
+    began = time.monotonic()
+    assert cells.settle() is None
+    cells.wait_decided()
+    assert cells.wait_restored(60.0) is True
+    assert time.monotonic() - began < 5
+
+
+def test_o97_the_idle_flag_is_set_again_whatever_the_restore_did(cells):
+    """O97: a restore that fails, raises or succeeds leaves the run's waits free."""
+    for answer in ({"ok": True}, {"ok": False}, RuntimeError("x")):
+        cells.ended = cells.pending_restore = None
+        cells._publish(1, pending())
+
+        def restore(answer=answer) -> dict:
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        cells.restore(restore)
+        assert cells.wait_restored(1.0) is True
 
 
 # --------------------------------------------------------------------------------------------------------- the sandbox

@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import threading
 import time
 from collections.abc import Callable, Collection, Mapping
 from typing import Any, Protocol
@@ -91,6 +92,12 @@ INFRASTRUCTURE = "infrastructure"  # any other verdict: the survivors are the ha
 VERDICTS = (AGENT, INFRASTRUCTURE)
 UNKNOWN_BLOCK = "blocking_object_unknown"  # the `why` of a verdict the escalation could not get at all
 DIAGNOSTIC_KEYS = ("survivors", "survivors_cut", "connection")  # what `Tracker.diagnose` may add to the record
+# a diagnosis is the one step of the escalation that reads the survivors' own memory maps, which take the target's mmap
+# lock: a process in D inside a FUSE page fault holds it, so a read may never return. It is bounded by its own seconds
+# and run in a thread that is given up on, and it never takes the time the abort and the second grace need
+DIAGNOSE_S = 5.0
+ABORT_RESERVE_S = 5.0  # kept for the abort itself beyond the second grace, whatever the diagnosis takes
+READING = "reading"  # the key of a diagnosis that holds every process it read, each with its `pid` and `start`
 ATTRIBUTION_KEYS = ("verdict", "why", "target", "space_holder")  # what the record keeps of `attribute`'s answer
 # from the least severe to the most: an outcome never falls below a step already taken. The two stops are in STOPS and
 # order the same stop, so their order never changes what is done; `survived_kill`, where nothing shows the cell gone, is
@@ -128,7 +135,15 @@ class Diagnosing(Protocol):
     """A tracker that can also say what the survivors are blocked on: `diagnose(left, timeout_s)` reads each process
     of `left` (from `/proc` alone, never the file it waits on: that would block the reader too) within `timeout_s`, and
     answers with the record keys of `DIAGNOSTIC_KEYS` (`survivors`, `survivors_cut`, `connection`), or None when it
-    could not. It is optional: the escalation reads it with `getattr`, so a tracker that has none is unchanged."""
+    could not. It is optional: the escalation reads it with `getattr`, so a tracker that has none is unchanged.
+
+    The answer carries the reading the verdict is made on under `READING` (`"reading"`): one entry for EVERY process
+    of `left` it read, uncapped, each entry holding the `pid` and the `start` of the process exactly as `left` lists
+    them, beside what was read of it (`comm`, `state`, `tasks`; `sandbox/attribution.py` names the rest). These two
+    keys are required of every entry, and `reading` is never recorded (the record keeps the capped `survivors`). The
+    escalation asks for a verdict only when the entries cover every `(pid, start)` of `left`; anything less, or no
+    `reading`, is `infrastructure` and `attribute` is never called. A diagnosis is given at most `Escalation.diagnose_s`
+    seconds, in a thread of its own that is given up on when they run out."""
 
     def diagnose(self, left: list[dict[str, Any]], timeout_s: float) -> dict[str, Any] | None: ...
 
@@ -152,6 +167,9 @@ class Escalation:
     poll_s: float = POLL_S
     restorable: bool = False
     attribute: Callable[[dict[str, Any] | None], Mapping[str, Any]] | None = None
+    diagnose_s: float = (
+        DIAGNOSE_S  # the most a diagnosis may take; less when the margin left is short (`_Run.diagnose`)
+    )
 
     @property
     def margin_s(self) -> float:
@@ -274,35 +292,69 @@ class _Run:
 
     def diagnose(self, left: list[dict[str, Any]] | None) -> dict[str, Any] | None:
         """What the survivors are blocked on, read by the tracker (`Diagnosing`) at the `survived` step, before the
-        mount is aborted, within the margin left; its keys are merged into the record (`DIAGNOSTIC_KEYS`, nothing
-        else). None when the tracker cannot diagnose, nothing is left to read or the margin is spent, and when the
-        reading raised (a `raised` step, never an exception: the abort that follows is what frees the cell)."""
+        mount is aborted; its keys are merged into the record (`DIAGNOSTIC_KEYS`, nothing else). It is bounded: at most
+        `Escalation.diagnose_s`, and never so long that the abort and the second grace lack their time
+        (`ABORT_RESERVE_S` beyond the grace). It runs in a daemon thread that is joined for that long and given up on
+        after, so a read that never returns (a survivor in D holds the mmap lock `/proc/<pid>/mem` and `maps` take)
+        never holds the timer's thread: the step `diagnosis_timed_out` is recorded, and the answer is None. None too
+        when the tracker cannot diagnose, nothing is left to read, and when the reading raised (a `raised` step).
+        Never raises: the abort that follows is what frees the cell."""
         diagnose = getattr(self.tracker, "diagnose", None)
-        budget = self.left()
-        if diagnose is None or not left or budget <= 0:
+        if diagnose is None or not left:
             return None
-        try:
-            found = diagnose(left, budget)
-        except Exception as error:
-            self.step("raised", during="diagnosis", error=f"the diagnosis raised {type(error).__name__}")
+        budget = min(self.esc.diagnose_s, self.left() - self.esc.grace_s - ABORT_RESERVE_S)
+        if budget <= 0:
+            self.step("diagnosis_timed_out", budget_s=0.0, why="no time was left for it")
             return None
+        box: dict[str, Any] = {}
+        listed = [dict(p) for p in left]
+
+        def read() -> None:
+            try:
+                box["found"] = diagnose(listed, budget)
+            except Exception as error:
+                box["error"] = error
+
+        reader = threading.Thread(target=read, name="cell-diagnosis", daemon=True)
+        reader.start()
+        reader.join(budget)
+        if reader.is_alive():
+            self.step("diagnosis_timed_out", budget_s=round(budget, 3))
+            return None
+        if "error" in box:
+            self.step("raised", during="diagnosis", error=f"the diagnosis raised {type(box['error']).__name__}")
+            return None
+        found = box.get("found")
         if not isinstance(found, Mapping):
             return None
-        kept = {key: found[key] for key in DIAGNOSTIC_KEYS if key in found}
-        self.record.update(kept)
+        self.record.update({key: found[key] for key in DIAGNOSTIC_KEYS if key in found})
         return dict(found)
+
+    @staticmethod
+    def covers(left: list[dict[str, Any]], diagnostics: Mapping[str, Any] | None) -> bool:
+        """Whether a diagnosis read every survivor listed: its `reading` holds an entry with a `pid` and a `start` for
+        each `(pid, start)` of `left`, and every entry holds both. Nothing less is a verdict (`attribution`)."""
+        reading = diagnostics.get(READING) if isinstance(diagnostics, Mapping) else None
+        if not isinstance(reading, list) or not reading:
+            return False
+        if not all(isinstance(e, Mapping) and "pid" in e and "start" in e for e in reading):
+            return False
+        read = {(e["pid"], e["start"]) for e in reading}
+        return all((p.get("pid"), p.get("start")) in read for p in left)
 
     def attribution(self, left: list[dict[str, Any]] | None, diagnostics: dict[str, Any] | None) -> str | None:
         """Whose the survivors are, asked of `Escalation.attribute` at the `survived` step and recorded as the record's
         `attribution`; the verdict. None when the escalation has no `attribute` (nothing is recorded: a backend that
         does not attribute keeps its record as it was). Fails closed: survivors that could not be listed (`left` None:
-        unknown is never gone, so never the agent's), an answer that raises, is no mapping or names no verdict is
-        `infrastructure` with the reason `UNKNOWN_BLOCK`, so a restore is never made pending by a guess."""
+        unknown is never gone, so never the agent's), no diagnosis, one that does not cover every survivor listed
+        (`covers`: `attribute` is never called on a reading of some of them), an answer that raises, is no mapping or
+        names no verdict is `infrastructure` with the reason `UNKNOWN_BLOCK`, so a restore is never made pending by a
+        guess."""
         attribute = self.esc.attribute
         if attribute is None:
             return None
         answer: Any = None
-        if left is not None:
+        if left is not None and self.covers(left, diagnostics):
             try:
                 answer = attribute(diagnostics)
             except Exception as error:
@@ -401,9 +453,11 @@ def _escalate(run: _Run, esc: Escalation) -> dict[str, Any]:
 
 
 __all__ = [
+    "ABORT_RESERVE_S",
     "AGENT",
     "ATTRIBUTION_KEYS",
     "COMMANDS_S",
+    "DIAGNOSE_S",
     "DIAGNOSTIC_KEYS",
     "ESCALATED",
     "INFRASTRUCTURE",
@@ -412,6 +466,7 @@ __all__ = [
     "MOUNT_LOST",
     "MOUNT_RESTORED",
     "OUTCOMES",
+    "READING",
     "RECORDED",
     "RESTORE",
     "RESTORE_DONE",
