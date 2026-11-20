@@ -64,7 +64,10 @@ class DockerDiagnosis:
         began = self._clock()
         view = SudoProcReader.snapshot(self._host, left, timeout_s * SNAPSHOT_SHARE, self._clock)
         spent = self._clock() - began
-        return stuckread.diagnose(view, left, timeout_s - spent, self.roles(), connection=self.connection)
+        until = began + timeout_s
+        return stuckread.diagnose(
+            view, left, timeout_s - spent, self.roles(), connection=lambda: self.connection(until - self._clock())
+        )
 
     def _device(self) -> str | None:
         """The device of the run's mount in the host's table now; None when it is not exactly one FUSE mount there, or
@@ -77,10 +80,13 @@ class DockerDiagnosis:
         data mount; with none known, any FUSE mount there is (the agent has no FUSE of its own)."""
         return S.Roles(data=self._mount_path, device=self._device(), inputs=self._inputs)
 
-    def connection(self) -> dict[str, Any] | None:
+    def connection(self, budget_s: float | None = None) -> dict[str, Any] | None:
         """Whether the run's connection has an abort file the root user can write, `{"fusectl": ...}` for the record;
-        None when it cannot be told. The abort is made in the sidecar, which mounts fusectl itself where it is
-        absent."""
+        None when it cannot be told, or when `budget_s`, the time the diagnosis has left, is spent: the check never
+        takes a reading that was complete past its time. The abort is made in the sidecar, which mounts fusectl itself
+        where it is absent."""
+        if budget_s is not None and budget_s <= 0:
+            return None
         device = self._device()
         number = None if device is None else TD._conn(device)
         if number is None:
@@ -92,7 +98,7 @@ class DockerDiagnosis:
             FUSECTL_STATE,
             FUSECTL_STATE_NAME,
             str(TD.FUSECTL / number / "abort"),
-            timeout_s=self._waits.probe_s,
+            timeout_s=self._waits.probe_s if budget_s is None else min(self._waits.probe_s, budget_s),
         )
         state = done.stdout.strip() if done.returncode == 0 else ""
         return {"fusectl": state} if state in ("writable", "absent", "not_writable") else None

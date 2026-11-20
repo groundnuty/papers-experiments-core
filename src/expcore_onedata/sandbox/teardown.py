@@ -259,10 +259,12 @@ def _cgroup_threads(host: HostOps, cid: str) -> list[int] | None:
 
 
 def _live_thread(host: HostOps, pid: int, tids: list[int]) -> str | None:
-    """The state of the first thread of the zombie leader `pid` that is not itself a zombie, among the container's
-    thread ids `tids`; None when none is left; `UNKNOWN` when a thread's state cannot be read or parsed. A thread id is
-    this process's when `/proc/<pid>/task/<tid>/stat` exists: ENOENT there is another process's thread, not an unknown
-    (a leader that went meanwhile has no `task` entry at all, which is none left, as `_stat` reads ENOENT)."""
+    """The state of the first thread of the zombie leader `pid` that waits in uninterruptible sleep (D), among the
+    container's thread ids `tids`; None when none does; `UNKNOWN` when a thread's state cannot be read or parsed. Only a
+    thread in D can outlive the SIGKILL that made its leader a zombie (a killable wait on a FUSE request reads as D); one
+    in R or S is exiting, as every thread of a killed process is for an instant, and counting it would end a run whose
+    cell was killed cleanly. A thread id is this process's when `/proc/<pid>/task/<tid>/stat` exists: ENOENT there is
+    another process's thread, not an unknown (a leader that went meanwhile has no `task` entry at all)."""
     found = None
     for tid in tids:
         if tid == pid:
@@ -277,7 +279,7 @@ def _live_thread(host: HostOps, pid: int, tids: list[int]) -> str | None:
         rest = text[close + 2 :].split()
         if close < 0 or not rest:
             return UNKNOWN
-        if rest[0] not in ("Z", "X", "x") and found is None:
+        if rest[0] == "D" and found is None:
             found = rest[0]
     return found
 
@@ -321,8 +323,8 @@ def _readers(host: HostOps, agent: dict, *, zombie_threads: bool = False) -> lis
     that a signal sent later goes only to the process listed here (O72).
 
     With `zombie_threads`, a zombie leader that a thread of still waits (a reader in a thread other than the main one,
-    after its SIGKILL: the leader ends, the thread waits in the kernel) is listed too, in that thread's state and with
-    `zombie_leader` set; its pid and start are the leader's, which a signal and a reading identify it by. One whose
+    after its SIGKILL: the leader ends, the thread waits in the kernel, in uninterruptible sleep) is listed too, as `D`
+    and with `zombie_leader` set; a thread that is only exiting is not one; its pid and start are the leader's, which a signal and a reading identify it by. One whose
     threads cannot all be read makes the list unknown, never a process taken for gone (O97). The cell's tracker asks for
     it; the teardown's own use is as it was."""
     procs = _cgroup_procs(host, agent["id"])

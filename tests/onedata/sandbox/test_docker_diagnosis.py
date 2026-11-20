@@ -53,18 +53,26 @@ def start(world, *, held=("providers[1]",), holders=HOLDERS) -> DockerSandbox:
     return DockerSandbox.start(world.host, world.s, spec, **start_options(world))
 
 
-def wedge(world, sbx, *, syscall=READ_FD_3, fd="/data/space-a/file", mount="data", thread_state="D", links=None):
+def wedge(
+    world, sbx, *, syscall=READ_FD_3, fd="/data/space-a/file", mount="data", thread_state="D", zombie=True, links=None
+):
     """The cell's python is a zombie leader with a thread that waits in a read of descriptor 3 (a file at `fd`, on the
-    mount `mount`: the data mount, or `/work`); a thread in `thread_state`. The process's mount table, root, working
+    mount `mount`: the data mount, or `/work`); a thread in `thread_state` (with `zombie` False the process is not a
+    zombie, and its one thread is its main one, in `thread_state`). The process's mount table, root, working
     directory and descriptors are the live thread's, as the kernel shows them there. Unkillable until the sidecar's
     abort frees it. Returns the cell's pids."""
     host = world.host
     pids = cell_processes(world, sbx)
     leader = pids["python"]
-    host.add_stat(leader, "python", 6999, state="Z")
-    host.add_threads(host.containers[sbx.names.agent], leader, {leader: "Z", THREAD: thread_state})
+    thread = THREAD if zombie else leader
+    host.add_stat(leader, "python", 6999, state="Z" if zombie else thread_state)
+    host.add_threads(
+        host.containers[sbx.names.agent],
+        leader,
+        {leader: "Z", THREAD: thread_state} if zombie else {leader: thread_state},
+    )
     host.unkillable.add(leader)
-    base = f"/proc/{leader}/task/{THREAD}"
+    base = f"/proc/{leader}/task/{thread}"
     host.files[f"{base}/wchan"] = "request_wait_answer"
     if syscall is not None:
         host.files[f"{base}/syscall"] = syscall
@@ -190,7 +198,7 @@ def test_o97_the_record_carries_what_the_reader_found_and_nothing_a_record_may_n
         (("providers[1]",), HOLDERS, {"fd": "/work/out", "mount": "work"}, attribution.NOT_DATA_MOUNT),
         (("providers[1]",), HOLDERS, {"syscall": None}, attribution.UNKNOWN),
         (("providers[1]",), HOLDERS, {"syscall": "running\n"}, attribution.UNKNOWN),
-        (("providers[1]",), HOLDERS, {"thread_state": "S"}, attribution.NOT_IN_D),
+        (("providers[1]",), HOLDERS, {"thread_state": "S", "zombie": False}, attribution.NOT_IN_D),
         (("providers[1]",), HOLDERS, {"syscall": "39 0x0 0x0 0x0 0x0 0x0 0x0 0x7ffd 0x7f11\n"}, attribution.UNKNOWN),
     ],
     ids=[
@@ -200,7 +208,7 @@ def test_o97_the_record_carries_what_the_reader_found_and_nothing_a_record_may_n
         "the file is on /work",
         "syscall unreadable",
         "task not in a syscall",
-        "thread not in D",
+        "process not in D",
         "a call that is not resolved",
     ],
 )

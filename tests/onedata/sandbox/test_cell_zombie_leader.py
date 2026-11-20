@@ -3,9 +3,12 @@
 A reader in a thread other than the main one leaves a zombie leader (the SIGKILL ended the main thread) and a thread
 in uninterruptible sleep, waiting on its FUSE request. Docker's listing took a zombie for gone, so the deadline found
 nothing left and recorded the cell as cleanly killed while the thread still waited. The cell's tracker lists such a
-process, in the state of the thread that waits; the teardown's own listing is unchanged, and unknown is never gone.
+process, as D, when a thread of it is in uninterruptible sleep, the one state that can outlive a SIGKILL (a thread
+that is only exiting is in R or S for an instant, and is not a survivor); the teardown's own listing is unchanged, and
+unknown is never gone.
 """
 
+import pytest
 from deadline_support import cell_processes
 from fake_host import FakeHost
 
@@ -36,6 +39,16 @@ def test_o97_a_zombie_leader_with_a_thread_in_d_is_listed_in_the_threads_state(w
     assert listed[pids["python"]]["zombie_leader"] is True
     assert listed[pids["python"]]["start"] == "1"
     assert pids["child"] in listed  # the rest of the cell is listed as it was
+
+
+@pytest.mark.parametrize("state", ["R", "S", "X", "Z"])
+def test_o97_a_zombie_leader_whose_thread_is_only_exiting_is_not_listed(world, mounted, state):
+    """O97: every thread of a killed process is in R or S for an instant while it exits, with a zombie leader: only a
+    thread in uninterruptible sleep (D) can outlive the SIGKILL, so only that is a survivor. Counting an exiting one
+    would end a run whose cell was killed cleanly, at the sweep after every cell."""
+    pids = zombie_leader(world, mounted, {LEADER: "Z", THREAD: state})
+    listed = {p["pid"] for p in teardown._readers(world.host, agent_of(world, mounted), zombie_threads=True)}
+    assert pids["python"] not in listed
 
 
 def test_o97_a_zombie_leader_whose_threads_are_all_gone_is_not_listed(world, mounted):

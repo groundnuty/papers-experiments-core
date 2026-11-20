@@ -16,6 +16,7 @@ from deadline_support import cell_processes  # noqa: F401  (the fixtures' cell)
 from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import hostops
 from expcore_onedata.sandbox import remount as RM
+from expcore_onedata.sandbox.hostops import CmdResult
 from expcore_onedata.sandbox.sandbox import TOKEN_FILE
 
 ATTRIBUTION = {"verdict": "agent", "why": "blocked_on_held_down_holder", "target": "providers[1]", "space_holder": "x"}
@@ -122,15 +123,21 @@ def test_o97_the_old_sidecars_end_is_the_harness_and_the_new_ones_death_is_not(a
 
 
 def test_o97_the_metadata_says_the_mount_was_aborted_and_restored_with_no_path_or_name(aborted):
-    """O97: `aborted` stays true (it was), `remounts` counts the restores and each generation says its seconds; nothing
-    of the run's directory or the sidecar's name."""
+    """O97: `aborted` stays true (it was), `remounts` counts the restores, and `generations` lists every generation as
+    the Apptainer host mount does (`wait_s`, `fusectl`, `abort`), the one the restore closed with what its log showed;
+    nothing of the run's directory or the sidecar's name."""
     sbx = aborted.sandbox
     sbx.restore_mount()
     mount = sbx.metadata()["mount"]
     assert mount["aborted"] is True
     assert mount["remounts"] == 1
-    assert [g["generation"] for g in mount["generations"]] == [2]
-    assert isinstance(mount["generations"][0]["wait_s"], float)
+    first, second = mount["generations"]
+    assert first["wait_s"] == mount["wait_s"]
+    assert first["abort"]["ok"] is True
+    assert first["io_mode"]["declared"] == sbx.s.mount.io_mode
+    assert isinstance(second["wait_s"], float)
+    assert second["abort"] is None
+    assert "io_mode" not in second  # the live generation is read at the collection
     text = json.dumps(mount)
     assert str(sbx.dir) not in text
     assert sbx.names.sidecar not in text
@@ -148,7 +155,9 @@ def test_o97_a_second_restore_after_a_second_abort_is_generation_three(aborted):
     sbx._cells._publish(2, record)
     assert sbx.restore_mount()["generation"] == 3
     assert (sbx.dir / "oneclient-log-3").is_dir()
-    assert sbx.metadata()["mount"]["remounts"] == 2
+    mount = sbx.metadata()["mount"]
+    assert mount["remounts"] == 2
+    assert [bool(g["abort"]) for g in mount["generations"]] == [True, True, False]  # each abort is on its generation
 
 
 @pytest.mark.parametrize(
@@ -250,3 +259,100 @@ def test_o97_the_direct_io_lines_of_every_generation_stand_and_an_unread_one_is_
     assert RM.direct_lines([], [], order=("detect",)) == []
     assert RM.direct_lines([None], ["detect"], order=("detect",)) is None
     assert RM.direct_lines([["detect"]], None, order=("detect",)) is None
+
+
+def log_of(mounted, generation: int):
+    name = "oneclient-log" if generation == 1 else f"oneclient-log-{generation}"
+    return str(mounted.dir / name / "oneclient.INFO")
+
+
+START_LOG = (
+    "Log file created at: 2026/11/20 10:00:00\n"
+    "I1120 10:00:00.100300     1 logging.cc:84] Forced direct IO: {direct}\n"
+    "I1120 10:00:00.100400     1 logging.cc:85] Forced proxy IO: {proxy}\n"
+)
+PROXY_LOG = START_LOG.format(direct="0", proxy="1")
+NO_FORCED_LOG = START_LOG.format(direct="0", proxy="0")
+
+
+@pytest.mark.parametrize(
+    ("first", "agrees"),
+    [(PROXY_LOG, True), (NO_FORCED_LOG, False), (None, False)],
+    ids=["the first oneclient agreed", "the first ran in no forced mode", "the first log cannot be read"],
+)
+def test_o97_the_io_mode_of_a_restored_mount_is_the_worst_of_its_generations(aborted, first, agrees):
+    """O97: a restored run had two oneclients, and the second one's log alone would show a mount that agrees with its
+    declared mode while the first ran in another: each generation's log is judged (the first one's read from the run's
+    own log directory when it was closed) and the worst stands, so a first oneclient is never unjudged; one whose log
+    cannot be read is unknown, which is never agreement."""
+    sbx, host = aborted.sandbox, aborted.host
+    assert sbx.s.mount.io_mode == "proxy"
+    if first is not None:
+        host.files[log_of(sbx, 1)] = first
+    sbx.restore_mount()
+    sbx._read_sidecar_log = lambda: PROXY_LOG  # the live generation's own log agrees
+    sbx._note_io_mode()
+    assert sbx.mount_io_mode()["agree"] is agrees
+
+
+def test_o97_a_copy_of_the_dead_mount_left_in_the_agents_namespace_is_detached_before_the_new_one(aborted):
+    """O97: the host's unmount did not reach the agent's own mount table (the table the teardown reads and detaches for
+    the same reason): the restore detaches it from inside the namespace, shows it gone, and only then starts the new
+    sidecar, so the new mount is not shown there twice."""
+    sbx, host = aborted.sandbox, aborted.host
+    agent = host.containers[sbx.names.agent]
+    stale = "1 0 8:1 / / ro - overlay overlay ro\n99 25 0:900 / /data ro - fuse.oneclient s ro\n"
+    host.ns_override[agent.pid] = stale
+    detached = []
+
+    def nsenter(argv):
+        detached.append(argv)
+        host.ns_override.pop(agent.pid)  # the copy is gone: the table is the propagation's again
+        return CmdResult(0)
+
+    host.run_handlers["nsenter"] = nsenter
+    assert sbx.restore_mount()["ok"] is True
+    assert len(detached) == 1
+    assert detached[0][-1] == "/data"
+
+
+def test_o97_a_copy_of_the_dead_mount_that_cannot_be_detached_fails_the_restore_before_a_sidecar_starts(aborted):
+    """O97: the stale copy stays: the restore fails in fixed words and starts no sidecar, so nothing is made beside a
+    mount that would show twice."""
+    sbx, host = aborted.sandbox, aborted.host
+    agent = host.containers[sbx.names.agent]
+    host.ns_override[agent.pid] = "1 0 8:1 / / ro - overlay overlay ro\n99 25 0:900 / /data ro - fuse.oneclient s ro\n"
+    host.run_handlers["nsenter"] = lambda argv: CmdResult(1, "", "busy")
+    start = len(host.calls)
+    assert sbx.restore_mount() == {"ok": False, "why": "the dead mount is still in the agent's mount table"}
+    assert ("docker", "run", ()) not in calls_after(host, start)
+    host.ns_override.clear()
+    host.run_handlers.pop("nsenter")
+
+
+def test_o97_a_restore_given_up_on_while_it_waits_for_the_mount_stops_waiting_and_adds_nothing(aborted):
+    """O97: the new sidecar is started but its mount does not come up in time for a stop that waited its bound: the
+    runner gives the restore up (nothing is pending any more), and the restore leaves its wait at the next look instead
+    of running its whole minute, so the teardown that follows finds the sidecar it registered and nothing else."""
+    sbx, host = aborted.sandbox, aborted.host
+    real_run = host.docker
+    state = {"looks": 0}
+
+    def docker(*args, **kwargs):
+        if args[0] == "run" and "--name" in args and sbx.names.sidecar in args:
+            done = real_run(*args, **kwargs)
+            host.mounts.pop(str(sbx.dir / "mount"), None)  # the mount never comes up
+            return done
+        if args[0] == "inspect":
+            state["looks"] += 1
+            if state["looks"] >= 2:
+                sbx._cells.pending_restore = None  # the stop gave up on it
+        return real_run(*args, **kwargs)
+
+    host.docker = docker
+    try:
+        answer = sbx._cells.restore(sbx._restore_host_mount)
+    finally:
+        host.docker = real_run
+    assert answer == {"ok": False, "why": "the restore is not wanted any more"}
+    assert not sbx._token_files_left()

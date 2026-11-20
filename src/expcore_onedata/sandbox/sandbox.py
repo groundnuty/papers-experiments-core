@@ -230,11 +230,11 @@ class DockerSandbox:
         self._inputs: tuple[ReadOnlyInput, ...] = ()  # the spec's read-only inputs, their sources resolved
         self._input_copies: list[tuple[Path, str]] = []  # each input's copy in the run's directory, and its path
         self._token_files: list[Path] = []  # the run's files of the token, on the host only while their holder starts
-        # the oneclient sidecar's generation: 1 at the start, one more for each restore after a cell's deadline aborted
-        # the mount (O97); and what each generation a restore closed showed of its oneclient log, read from the run's
-        # own log directory before the next one began (`_close_generation`)
-        self._mount_generation = 1
-        self._closed_generations: list[dict[str, Any]] = []
+        # the oneclient sidecar's generations, the live one last: one at the start, one more for each restore after a cell's
+        # deadline aborted the mount (O97). Each is what the record keeps of it, as the Apptainer host mount keeps it
+        # (`wait_s`, `fusectl`, `abort`), and, once a restore has closed it, what its oneclient log showed (`io_mode`, and
+        # for a direct mount `direct_lines`), read from the run's own log directory before the next one began
+        self._gens: list[dict[str, Any]] = [{"wait_s": None, "fusectl": None, "abort": None}]
         # the read-log channel (`readlog_channel`): the nonce the collector is told, the one sender uid it accepts (the
         # declared agent uid: a cell runs as it), what the start made, and the log as the collection read it
         self._readlog_pin = settings.readlog_collector_sha256  # None: this run has no channel
@@ -748,6 +748,9 @@ class DockerSandbox:
                 raise SandboxError("the oneclient mount did not appear")
             self._sleep(0.2)
         self._meta["mount"]["wait_s"] = round(time.monotonic() - t0, 3)
+        self._gens[0]["wait_s"] = self._meta["mount"]["wait_s"]
+        self._meta["mount"]["remounts"] = 0  # every run says how many times its mount was restored (a covariate, O97)
+        self._meta["mount"]["generations"] = self._gens  # the live list: `metadata()` copies it as it stands
         started = self.host.docker("logs", names.sidecar, check=False, timeout=30)  # the entrypoint's one line, first
         self._meta["mount"]["image_config"] = image_config_record(started.stdout if started.returncode == 0 else None)
         self._remove_token_files(self.dir / TOKEN_FILE)  # oneclient read it as it started; its bind outlives this copy
@@ -1072,7 +1075,7 @@ class DockerSandbox:
         restore (O97) the lines of every generation's log stand, the ones a restore closed and the live one's: a
         generation whose log could not be read makes the whole unknown, never direct."""
         text = self._read_sidecar_log()
-        earlier = [g["direct_lines"] for g in self._closed_generations if "direct_lines" in g]
+        earlier = [g["direct_lines"] for g in self._gens if "direct_lines" in g]
         return RM.direct_lines(
             earlier, None if text is None else directio.marker_lines(text), order=tuple(directio.MARKERS)
         )
@@ -1104,6 +1107,9 @@ class DockerSandbox:
             log.error("the sidecar's oneclient log could not be read for the I/O mode: %s", describe_error(error))
             text = None
         reading = iomode.judge(self.s.mount.io_mode, text)
+        earlier = [g["io_mode"] for g in self._gens if "io_mode" in g]  # the generations a restore closed (O97)
+        if earlier:  # the worst of them stands, so a first oneclient that ran in another mode is never unjudged
+            reading = iomode.worst([*earlier, reading]) or reading
         with self._meta_lock:  # `metadata()` may be reading it from another thread
             self._meta["mount"]["effective"] = reading
 
@@ -1363,7 +1369,7 @@ class DockerSandbox:
         the runner still wants the restore, so one it gave up on creates nothing the stop does not know."""
         if self.spec.mode is not DataPathMode.MOUNT or self.names.sidecar not in self._containers:
             return {"ok": False, "why": RM.NO_MOUNT}
-        generation, began = self._mount_generation + 1, self._clock()
+        generation, began = len(self._gens) + 1, self._clock()
         try:
             why = self._remount(generation)
         except Exception as error:  # the class only reaches the record: its text may name a path
@@ -1374,12 +1380,8 @@ class DockerSandbox:
             return {"ok": False, "why": why}
         wait_s = round(float(self._clock() - began), 3)
         with self._meta_lock:
-            mount = self._meta.setdefault("mount", {})
-            mount["remounts"] = generation - 1
-            mount.setdefault("generations", []).append(
-                {"generation": generation, "wait_s": wait_s, "closed": self._closed_generations[-1]}
-            )
-        self._mount_generation = generation
+            self._gens.append({"wait_s": wait_s, "fusectl": None, "abort": None})  # the live list `metadata()` copies
+            self._meta.setdefault("mount", {})["remounts"] = generation - 1
         return {"ok": True, "generation": generation, "wait_s": wait_s}
 
     def _remount(self, generation: int) -> str | None:
@@ -1403,11 +1405,13 @@ class DockerSandbox:
             return RM.UNMOUNT
         if not self._restore_wanted():
             return RM.NOT_WANTED
+        if (why := self._clear_agent_copy()) is not None:
+            return why
         try:
             token = self._write_token_file(TOKEN_FILE, again=True)
         except (OSError, SandboxError):
             return RM.TOKEN
-        why: str | None = None
+        why = None
         try:
             why = self._start_next_sidecar(generation, token, mountpoint)
         finally:
@@ -1425,14 +1429,28 @@ class DockerSandbox:
             old_devices=old_devices,
         )
 
+    def _clear_agent_copy(self) -> str | None:
+        """Show that no copy of the dead mount is left in the agent container's own mount namespace, and detach one that
+        the host's unmount did not reach (`teardown._unmount_namespaces`, which the teardown makes for the same reason):
+        a new mount that propagates in beside a stale one would be shown there twice. None, or why not."""
+        agent = TD._inspect(self.host, self.names.agent, self.waits)
+        if agent is None or agent.get("unknown") or not agent.get("running") or agent["pid"] <= 0:
+            return RM.AGENT_TABLE
+        clean = TD._unmount_namespaces(self.host, [("agent", agent["pid"])], self.waits, _no_step_log)
+        return None if clean else RM.STALE_IN_AGENT
+
     def _start_next_sidecar(self, generation: int, token: Path, mountpoint: str) -> str | None:
         """Start the sidecar of the next generation, wait until its mount is in the host's table, and give the watch on
-        the containers its baseline: the old sidecar's end was the harness's, the new one's is its own. None, or why not."""
+        the containers its baseline: the old sidecar's end was the harness's, the new one's is its own. None, or why not.
+        The runner is asked again before the sidecar is started and at every look at the mount, since a stop that gave up
+        on the restore removes by name what it knew of."""
         log_dir = self._log_dir_of(generation)
         try:
             log_dir.mkdir(mode=0o700)
             log_dir.chmod(0o700)  # whatever the driver's umask
-            self._register_creation()  # the name is the one the stop already knows: a stop that ran meanwhile is not the last
+            if not self._restore_wanted():
+                return RM.NOT_WANTED
+            self._register_creation()  # the name is the one the stop knows: a stop that ran meanwhile is not the last
             self.host.docker(
                 *sidecar_run_args(
                     self.s, self.names, self._label_args(), self.dir / "mount", self.s.oneclient.id,
@@ -1444,11 +1462,15 @@ class DockerSandbox:
         deadline = self._clock() + MOUNT_WAIT_S
         try:
             while not hostops.is_fuse_mounted(self.host.read_text("/proc/self/mountinfo"), mountpoint):
+                if not self._restore_wanted():
+                    return RM.NOT_WANTED
                 if (hostops.inspect(self.host, self.names.sidecar) or {}).get("State", {}).get("Running") is not True:
                     return RM.NEW_SIDECAR
                 if self._clock() > deadline:
                     return RM.NOT_MOUNTED
                 self._sleep(0.2)
+            if not self._restore_wanted():
+                return RM.NOT_WANTED
             self.watch_container("sidecar", self.names.sidecar)
         except (OSError, SandboxError):
             return RM.NEW_SIDECAR
@@ -1471,9 +1493,9 @@ class DockerSandbox:
 
     def _close_generation(self, generation: int) -> None:
         """What generation `generation` of the sidecar showed of its oneclient log, read as root from the run's own log
-        directory (the container that wrote it is stopped), kept before the next generation begins: the I/O mode it
-        showed and, for a direct mount, which lines of detection or fallback it logged; None where the log could not be
-        read, which is unknown and never direct."""
+        directory (the container that wrote it is stopped), kept with the generation before the next one begins: the I/O
+        mode it showed and, for a direct mount, which lines of detection or fallback it logged; None where the log could
+        not be read, which is unknown and never direct."""
         text: str | None = None
         try:
             done = self.host.run(
@@ -1482,10 +1504,11 @@ class DockerSandbox:
             text = done.stdout if done.returncode == 0 else None
         except (OSError, SandboxError):
             text = None
-        closed: dict[str, Any] = {"generation": generation, "io_mode": iomode.judge(self.s.mount.io_mode, text)}
+        shown: dict[str, Any] = {"io_mode": iomode.judge(self.s.mount.io_mode, text)}
         if self.s.mount.io_mode == DIRECT:
-            closed["direct_lines"] = None if text is None else directio.marker_lines(text)
-        self._closed_generations.append(json.loads(json.dumps(closed, default=str)))
+            shown["direct_lines"] = None if text is None else directio.marker_lines(text)
+        with self._meta_lock:  # `metadata()` may be reading the generations from another thread
+            self._gens[generation - 1].update(json.loads(json.dumps(shown, default=str)))
 
     def settle_deadline(self) -> dict[str, Any] | None:
         """Before anyone decides how the run ended (`launch`, `collect`): a cell still running has its deadline enforced
@@ -1508,7 +1531,7 @@ class DockerSandbox:
         the sidecar, which holds the mount and SYS_ADMIN (`containers.sidecar_abort_args`), nothing in the agent's
         container, within `timeout_s`, what the deadline's margin has left. The connection is the device of the run's
         mount in the host's table, read without touching the mount. `ok` is None when there is no mount to abort; once it
-        is True the mount is dead for the rest of the run."""
+        is True the mount is dead until the run restores it (`_restore_host_mount`, O97)."""
         if self.spec.mode is not DataPathMode.MOUNT or self.names.sidecar not in self._containers:
             return {"ok": None, "why": "the run has no FUSE mount"}
         until = self._clock() + timeout_s
@@ -1533,7 +1556,9 @@ class DockerSandbox:
             log.error("the sidecar could not abort the mount's FUSE connection: %s", describe_stderr(failed[0].stderr))
         else:
             with self._meta_lock:
-                self._meta.setdefault("mount", {})["aborted"] = True  # dead for the rest of the run
+                self._meta.setdefault("mount", {})["aborted"] = True  # it was, once at least; a restore brings it back
+        with self._meta_lock:  # what was done to this generation, as the Apptainer host mount keeps it (O97)
+            self._gens[-1]["abort"] = {k: note[k] for k in ("ok", "connections", "rc", "stderr") if k in note}
         return note
 
     def _stop_at_deadline(self) -> dict[str, Any]:
