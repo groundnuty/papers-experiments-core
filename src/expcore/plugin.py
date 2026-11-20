@@ -53,6 +53,11 @@ class ToolOutput:
     the program arrived whole; `exit_status`, the status its completion record saw; `nonce_matched`, whether a record
     of that exec came back. The record keeps it on the call as given (`tool_calls[i].exec_check`); None, the default,
     for a tool that runs no program, and the call then has none.
+
+    `cell_deadline` is what a code tool says of a cell whose process outlived its kill at the cell's deadline (O34,
+    O97): the deadline's outcome and steps, what each survivor was waiting on, and whose block the verdict made it. The
+    record keeps it on the call as given (`tool_calls[i].cell_deadline`, the last field of a call); None, the default,
+    for every call whose deadline did not fire with a survivor, and the call then has none.
     """
 
     text: str
@@ -60,16 +65,19 @@ class ToolOutput:
     error_class: str | None = None
     source_truncated: bool | None = None
     exec_check: Mapping[str, Any] | None = None
+    cell_deadline: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         """Refuse an error class on a result that is not an error, a source flag that is not a boolean, and an exec
-        check that is not an object."""
+        check or a cell deadline that is not an object."""
         if self.error_class is not None and not self.is_error:
             raise ValueError("error_class is only for a result with is_error set")
         if self.source_truncated is not None and not isinstance(self.source_truncated, bool):
             raise ValueError(f"source_truncated must be True, False or None, not {self.source_truncated!r}")
         if self.exec_check is not None and not isinstance(self.exec_check, Mapping):
             raise ValueError(f"exec_check must be an object or None, not {type(self.exec_check).__name__}")
+        if self.cell_deadline is not None and not isinstance(self.cell_deadline, Mapping):
+            raise ValueError(f"cell_deadline must be an object or None, not {type(self.cell_deadline).__name__}")
 
 
 # The kinds of wait on infrastructure, a closed vocabulary. Each is time the agent neither controls nor causes: the

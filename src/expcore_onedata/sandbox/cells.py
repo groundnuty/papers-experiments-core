@@ -77,6 +77,8 @@ QUIESCE_ROUNDS = (
 HOST_CALL_MARGIN_S = 30.0  # what the docker client may take beyond the cell's own limit before it is given up on
 KILL_S = 20.0  # a `kill` of the agent's processes through the host's privilege
 SETTLE_SLACK_S = 30.0  # beyond a deadline's margin, what its commands' own timeouts may overrun it by
+RESTORE_WAIT_S = 100.0  # the most a settle or a stop waits for a restore under way: the mount's start (60 s), its watch
+# armed (30 s) and slack; one still running after it is given up on, and the run is ended (`_abandon_restore`)
 RESTORE_WHY_CHARS = 200  # what the record keeps of why a restore failed: a sentence, never a path or a log
 OUTPUT_CAP_BYTES = (
     1 << 20
@@ -249,6 +251,11 @@ class CellRunner:
         self.ended: dict[str, Any] | None = None  # the deadline that ended the run: a process outlived its kill
         # the record of the deadline whose mount restore is pending or under way (`deadline.RESTORING`), else None
         self.pending_restore: dict[str, Any] | None = None
+        # set when no restore is running: a restore clears it for its whole run, so that a settle, a collection and a
+        # stop never run beside it (the teardown would remove a token file that a restore writes, and miss the oneclient
+        # it starts); the loop may cut the call that runs it, and its thread goes on
+        self._restore_idle = threading.Event()
+        self._restore_idle.set()
         self._running: CellTimer | None = None  # the timer of the cell running now, while its `run` lasts
         self.cells: list[dict[str, Any]] = []
         self._events_seen: dict[str, int] | None = None
@@ -475,13 +482,8 @@ class CellRunner:
             log.error("a cell's deadline was not decided within its margin: the run is ended as %s", DL.SURVIVED)
             with self.meta_lock:
                 self.ended = self.ended or self._unknown("not decided within its margin")
+        self._settle_restore()  # a restore not begun is retired, one under way is waited for: nothing runs beside it
         with self.meta_lock:
-            pending = self.pending_restore
-            if pending is not None and pending.get("restore") == DL.RESTORE_PENDING:
-                # the body is over, and nothing reads the mount again: the collection takes the outputs as they are. A
-                # restore already under way is left to publish its own outcome (`restore`), never marked here
-                self._amend(pending, restore=DL.RESTORE_NOT_NEEDED)
-                self.pending_restore = None
             return self.ended
 
     # ------------------------------------------------------------------------------------------------ the restore
@@ -520,13 +522,25 @@ class CellRunner:
             if record is None or record.get("restore") != DL.RESTORE_PENDING:
                 return {"ok": None, "why": "no restore is pending"}
             self._amend(record, restore=DL.RESTORE_RUNNING)
+            self._restore_idle.clear()
         began = time.monotonic()
         try:
-            note: dict[str, Any] = dict(fn())
-        except Exception as e:
-            note = {"ok": False, "why": f"the restore raised {type(e).__name__}"}
-        took = round(time.monotonic() - began, 3)
+            try:
+                note: dict[str, Any] = dict(fn())
+            except Exception as e:
+                note = {"ok": False, "why": f"the restore raised {type(e).__name__}"}
+            self._publish_restore(record, note, round(time.monotonic() - began, 3))
+        finally:
+            self._restore_idle.set()
+        return note
+
+    def _publish_restore(self, record: dict[str, Any], note: dict[str, Any], took: float) -> None:
+        """How the restore went, on the record and as the run's end when it failed (`restore`). A restore the run had
+        already given up on (`_abandon_restore`: it outlasted `RESTORE_WAIT_S` of a settle or a stop) changes nothing:
+        the run is ended, and a late success never makes a stopped run's mount good."""
         with self.meta_lock:
+            if record.get("restore") != DL.RESTORE_RUNNING:
+                return
             if note.get("ok") is True:
                 generation = note.get("generation")
                 step = {"step": "restored", "s": took}
@@ -543,7 +557,45 @@ class CellRunner:
                     self.ended = {"outcome": DL.MOUNT_LOST, "by": DL.RESTORE, "cell": record.get("cell"), "why": why}
                 log.error("the mount could not be restored after its abort at a cell's deadline: %s", why)
             self.pending_restore = None
-        return note
+
+    def _abandon_restore(self) -> None:
+        """A restore still running when the run's body is over, or its stop begins, and after `RESTORE_WAIT_S`: the run
+        is ended as the restore's failure (`mount_lost`, by `restore`, "not finished before the run's end"), so nothing
+        more runs on a mount that is half made, and the late answer of the restore changes nothing."""
+        with self.meta_lock:
+            record = self.pending_restore
+            if record is None or record.get("restore") != DL.RESTORE_RUNNING:
+                return
+            why = "not finished before the run's end"
+            record["steps"].append({"step": "restore_failed", "why": why})
+            self._amend(record, restore=DL.RESTORE_FAILED)
+            if self.ended is None:
+                self.ended = {"outcome": DL.MOUNT_LOST, "by": DL.RESTORE, "cell": record.get("cell"), "why": why}
+            self.pending_restore = None
+        log.error("the mount's restore had not finished when the run ended: the run is ended as %s", DL.MOUNT_LOST)
+
+    def wait_restored(self, timeout_s: float = RESTORE_WAIT_S) -> bool:
+        """Wait for a restore under way, at most `timeout_s`; whether none is running now. A settle and a stop call it
+        first (`_settle_restore`)."""
+        return self._restore_idle.wait(timeout_s)
+
+    def _settle_restore(self) -> None:
+        """Before a settle, a collection or a stop goes on, once the cell's deadline is decided: retire a restore not
+        begun, then wait for one under way, at most `RESTORE_WAIT_S`, and give up on one that outlasts it.
+
+        The retirement comes first, under `meta_lock`: the body is over and nothing reads the mount again, so a pending
+        restore is `not_needed`, and a `restore()` that reaches its lock after this finds nothing pending and does
+        nothing (the loop cut the call as the code tool handed the restore to its thread: that thread enters
+        `restore()` after the settle began, and would otherwise run beside the teardown). `restore()` takes its lock
+        to set `running` and clear the idle flag in one hold, so what is not retired here is already running, the flag
+        already clear, and the wait below sees it."""
+        with self.meta_lock:
+            pending = self.pending_restore
+            if pending is not None and pending.get("restore") == DL.RESTORE_PENDING:
+                self._amend(pending, restore=DL.RESTORE_NOT_NEEDED)
+                self.pending_restore = None
+        if not self.wait_restored(RESTORE_WAIT_S):
+            self._abandon_restore()
 
     def wait_decided(self) -> None:
         """Wait for the outcome of a cell's deadline already under way, at most its margin and `SETTLE_SLACK_S`; never
@@ -552,6 +604,7 @@ class CellRunner:
             timer = self._running
         if timer is not None:
             timer.wait_decided(self.decide_s)
+        self._settle_restore()  # the teardown never runs beside a restore: it would miss what the restore starts
 
     def _stop_after(self, record: dict[str, Any]) -> None:
         """The sandbox's stop a deadline ordered, once its outcome is recorded; how it went is the record's last step,
@@ -749,7 +802,10 @@ class CellRunner:
             if record is None:
                 return False
             entry["deadline"] = record
-            if record["outcome"] in (DL.KILLED, DL.MOUNT_RESTORED):
+            if record["outcome"] == DL.KILLED:
+                return False
+            res.deadline = record  # a process outlived the kill: the code tool says so on the call (`cell_deadline`)
+            if record["outcome"] == DL.MOUNT_RESTORED:
                 return False
             if not DL.ends_run(record):
                 res.restore_pending = record.get("restore") == DL.RESTORE_PENDING
