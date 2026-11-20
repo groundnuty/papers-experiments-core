@@ -324,6 +324,7 @@ from expcore.campaign import liveness
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError, uncharged_kinds
 from expcore.records.injections import FAULT_NAMESPACE
+from expcore_onedata import fault_owner
 from expcore_onedata.admission import (
     INJECTOR,
     Admission,
@@ -571,6 +572,7 @@ class FaultInjector:
     def _prepare(self, identity: Mapping[str, Any]) -> None:
         """The first half of `start`: everything before the target's lock."""
         self._require_sanction()
+        self._release_held()  # a hold of an earlier run of this injector never outlives that run's injection
         if self._pending is not None and not self._clear():  # an earlier start of this injector was never cleared
             raise self._fail(f"an earlier injection of {self.target} by this injector is still not cleared")
         run_key, attempt = identity.get("run_key"), identity.get("attempt")
@@ -683,6 +685,13 @@ class FaultInjector:
             raise self._fail(f"{self.target} could not be taken down, seen down and journalled ({why})") from None
         self._injection["injected"] = True
         self._step("injected", True, identity_before_sha256=digest, **stop_record(self._driver))
+        if self._run is not None:  # the target is seen down: a cell blocked on its data is this run's own outage (O97)
+            fault_owner.hold(self._run["run_key"], self.target, self)
+
+    def _release_held(self) -> None:
+        """The run no longer holds the target down, from the moment a restore is asked for (`fault_owner.release`)."""
+        if self._run is not None:
+            fault_owner.release(self._run["run_key"], self.target)
 
     def _wait_owed(self) -> None:
         """When this start's recovery restored a provider an earlier run left down, wait out the drain it owes before
@@ -1011,7 +1020,11 @@ class FaultInjector:
         waits for the target to show not running. An injector discarded with its restore still unverified lets the lock
         go when it is collected, so recovery can settle it. A clear while a `prepared` block's body runs returns at
         once and makes that block's `inject` take nothing down, so nothing is stopped after a clear has returned.
+
+        The run's hold on the target (`fault_owner.hold`) is released first, before the wait for a start and before the
+        restore, so that no cell is called the agent's for a target a clear is already bringing back (O97).
         """
+        self._release_held()
         with self._mutex:
             if self._block is not None:  # the caller's way to cancel a block: never waits for its baseline
                 self._block._cleared = True
@@ -1024,6 +1037,7 @@ class FaultInjector:
                 give_up()
 
     def _clear(self) -> bool:
+        self._release_held()  # also for a restore reached by another way than `clear` (a failed start, a new start)
         if self._pending is None:
             return not self._left_open  # one handed to recovery is still open, whoever restores it later
         if self._tried and not self._retry_now():  # a retry inside the token's window: handed to recovery instead
