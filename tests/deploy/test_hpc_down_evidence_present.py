@@ -60,7 +60,7 @@ def _gated(rig, **options):
     """The state after down's gate: down is stopped right after it (the state goes with the root at the end of a whole
     down, so it is read before)."""
 
-    def stopped():
+    def stopped(node_checked=None):
         raise RuntimeError("stopped for the test, after the gate")
 
     rig.driver.take_down = stopped
@@ -466,7 +466,42 @@ def test_a_root_of_every_run_file_names_every_kind_in_a_fixed_order(hpc, tmp_pat
         "the relay's journals",
         "a shard claim",
         "the day-0 wiring",
+        "the ingest's evidence",
     )
+
+
+def test_a_root_holding_only_the_ingests_evidence_is_refused_uncollected_before_anything_is_stopped(
+    hpc, tmp_path, site
+):
+    """O63: `ingest-evidence.json` at the root (a study's `ingest run --out <root>/ingest-evidence.json`, the id map the
+    study reads back) is evidence a run left: a root that holds it and nothing else of a run, uncollected, is refused
+    with the kind named (never the file or a path), nothing cancelled, and the root stays."""
+    rig = Rig(hpc, tmp_path, site)
+    leave_what_up_leaves(rig.root)
+    _write(rig.root, "ingest-evidence.json", EVIDENCE["ingest-evidence.json"])
+    assert hpc.evidence.present_evidence(rig.root) == ("the ingest's evidence",)
+    with pytest.raises(RuntimeError) as refused:
+        rig.driver.down()
+    message = str(refused.value)
+    assert re.search(r"holds evidence.*the ingest's evidence.*not collected", message)
+    assert "ingest-evidence.json" not in message
+    assert str(rig.root) not in message
+    assert rig.fake.cancelled == []
+    assert rig.fake.calls == []
+    assert rig.root.exists()
+
+
+def test_an_empty_ingest_evidence_file_is_no_evidence_and_a_root_without_it_goes_down_as_before(hpc, tmp_path, site):
+    """O63: the rule for every run file: a file with nothing in it is no evidence, so an ingest that wrote none (or a
+    file made and not yet written) does not stop `down`; and with no such file the root is what it always was."""
+    rig = Rig(hpc, tmp_path, site)
+    leave_what_up_leaves(rig.root)
+    assert hpc.evidence.present_evidence(rig.root) == ()
+    _write(rig.root, "ingest-evidence.json", b"")
+    assert hpc.evidence.present_evidence(rig.root) == ()
+    printed = rig.driver.down()
+    assert "evidence" not in printed
+    assert not rig.root.exists()
 
 
 UP_PATH = (

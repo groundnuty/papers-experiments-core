@@ -379,3 +379,18 @@ def test_o76_verdicts_of_different_runs_are_refused_for_any_guard(prereg):
     reordered = type(seen)(tuple(reversed(seen.runs)), seen.sensitivity, seen.refused)
     with pytest.raises(ValueError, match="same runs"):
         guards_analysis(rows, [], prereg, egress, mount, reordered)
+
+
+def test_the_combined_rerun_keeps_a_package_index_only_run_and_leaves_out_an_outside_one(prereg):
+    """O95: the combined rerun reads the egress flags alone, so a run whose only hit is a declared index's install
+    is kept and one with an outside connection is left out."""
+    rows = rows_of_pairs(4)
+    runs = []
+    for i, row in enumerate(rows):
+        instruments = {EGRESS_NS: EGRESS["flagged" if i == 0 else "clean"](), MOUNT_NS: MOUNT["clean"]()}
+        run = EL.record(run_key=row.run_key, instruments=instruments, cells=["!pip install pandas"])
+        runs.append((run, row.condition))
+    egress = egress_analysis(runs, rows, [], prereg, package_indexes=["pypi.org"])
+    both = guards_analysis(rows, [], prereg, egress, mount_guard_analysis(runs, rows, [], prereg))
+    assert [run.run_key for run in both.left_out] == [rows[0].run_key]
+    assert both.sensitivity.contrast("a-vs-b").n_pairs == 3

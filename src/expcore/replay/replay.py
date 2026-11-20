@@ -50,7 +50,14 @@ from expcore.records.digest import digest
 from expcore.records.record import RunRecord
 from expcore.records.recording import RecordingBackend
 from expcore.records.redact import Redactor
-from expcore.records.schema import SCHEMAS, TOOL_SERVER_TOOLS, RecordError, SchemaVersion, config_defaults
+from expcore.records.schema import (
+    CODE_CELL_TOOLS,
+    SCHEMAS,
+    TOOL_SERVER_TOOLS,
+    RecordError,
+    SchemaVersion,
+    config_defaults,
+)
 from expcore.replay.clock import EXECUTOR_CLOCK_LABELS, ReplayClock
 from expcore.replay.compare import compare
 from expcore.replay.divergence import Halt, ReplayDivergence
@@ -74,6 +81,7 @@ def config_of(record: RunRecord, schemas: Sequence[SchemaVersion] = SCHEMAS) -> 
     merged = {**config_defaults(record.schema_version, schemas), **record.agent_config}
     merged.pop("terminal_tools", None)  # the tool box adds it to the record; it follows from the recorded tools
     merged.pop(TOOL_SERVER_TOOLS, None)  # so does this one: the box is given the recorded names (L17)
+    merged.pop(CODE_CELL_TOOLS, None)  # and this one (L18)
     try:
         limits = Limits(**merged.pop("limits"))
         return AgentConfig(limits, **merged)
@@ -142,6 +150,7 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
             cap_chars=config.limits.output_cap_chars,
             recorded=rec.tool_calls,
             tool_servers=rec.agent_config.get(TOOL_SERVER_TOOLS, ()),  # the record says which tools the bound reached
+            code_cells=rec.agent_config.get(CODE_CELL_TOOLS, ()),  # and which tools the cell limit reached (L18)
         )
     except ValueError as exc:
         raise ReplayDivergence("tools", f"the recorded tools cannot be offered ({exc})") from None
@@ -171,7 +180,7 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
         replayed = _build_record(
             result,
             recording,
-            identity=RunIdentity(rec.run_key, rec.factors, rec.attempt),
+            identity=RunIdentity(rec.run_key, rec.factors, rec.attempt, lease_id=rec.lease_id),
             system=_prompt(rec.prompt["system"]),
             user=_prompt(rec.prompt["user"]),
             specs=[ToolSpec(**spec) for spec in rec.tools],
@@ -181,6 +190,7 @@ async def replay_async(record: RunRecord | dict[str, Any], *, schemas: Sequence[
             instrument_refusal=rec.instrument_refusal,  # carried over like the instruments; absent when absent
             reserved_capped=rec.totals.get("reserved_capped"),  # the campaign's, not the loop's: served as recorded
             reply_cap_unheld=rec.totals.get("reply_cap_unheld"),
+            deployment_switched=rec.totals.get("deployment_switched", False),  # as recorded, never filled in (B20)
             treatment_kinds=rec.treatment_kinds,
             treatment_targets=rec.treatment_targets,
             schema_version=rec.schema_version,  # the rule of the record's own version decides its treatment flag

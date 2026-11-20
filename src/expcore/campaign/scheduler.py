@@ -69,9 +69,10 @@ from expcore.campaign.probe_spend import MeteredProbes
 from expcore.campaign.recovery import Recovery
 from expcore.campaign.reservation import Reservations
 from expcore.campaign.resume import open_campaign
+from expcore.campaign.run_lease import RunLease
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.shard import META_SHARD
-from expcore.campaign.shard_run import ShardStart
+from expcore.campaign.shard_run import ShardStart, refuse_lease_misfit
 from expcore.campaign.store import Store, column_for
 from expcore.campaign.topup import Ledger
 from expcore.campaign.units import UnitHealth, history_from_attempts
@@ -287,6 +288,8 @@ class Scheduler:
             self.models.require_priced(self.plan_models)
         if cfg.budget is not None:  # the reservation bounds the request past the token cap by the window (C25)
             self.models.require_context_window(self.plan_models)
+        if self.shard is not None and isinstance(self.shard.spec, RunLease):  # before any store is opened (C41)
+            refuse_lease_misfit(self.shard.spec, fingerprint_sha256(self.fingerprint), cfg)
         self.store, self.recovery = open_campaign(
             self.root / STATE_FILE,
             self.schema,
@@ -314,7 +317,10 @@ class Scheduler:
         )
         self.stops = HarnessStops(store, cfg.harness_stop)
         self.reconcile_accounting()
-        self.identities = ServedIdentities(store, self.stamp, {m: self.models.resolve(m) for m in self.plan_models})
+        lease = self.shard.spec if self.shard is not None and isinstance(self.shard.spec, RunLease) else None
+        leased = None if lease is None or lease.declared is None else dict.fromkeys(self.plan_models, lease.declared)
+        specs = {m: self.models.resolve(m) for m in self.plan_models}
+        self.identities = ServedIdentities(store, self.stamp, specs, leased)  # a lease's declared set (C48)
         self.budget, self.ledger = None, None
         paying = None  # with a budget: the ledger admission's probes are paid from (C26)
         if cfg.budget is not None:
@@ -372,6 +378,9 @@ class Scheduler:
                 reserved_capped=self._admitted_capped,
                 reply_cap_unheld=self._reply_cap_unheld,
                 campaign=self._campaign,
+                lease_id=self.shard.spec.lease_id
+                if self.shard is not None and isinstance(self.shard.spec, RunLease)
+                else None,
             )
         )
 
@@ -602,6 +611,11 @@ class Scheduler:
             return Hold("harness_errors", stopped[model], temporary=False)
         if model in self.not_admitted:
             return Hold("not_admitted", self.not_admitted[model], temporary=False)
+        undeclared = self.identities.undeclared(model)
+        if undeclared:  # a lease's run saw a deployment its lease does not declare: the lease ends here (C48)
+            shown = ", ".join("none" if value is None else value for value in undeclared)
+            why = f"{model} was served under undeclared fingerprint(s) {shown}; the ledger pauses it until declared"
+            return Hold("undeclared_fingerprint", why, temporary=False)
         reason = None if budget is None else budget.reason(model)
         return None if reason is None else Hold("budget", reason, temporary=False)
 

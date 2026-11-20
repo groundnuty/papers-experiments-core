@@ -176,7 +176,7 @@ def _discarded(rig):
     """What a `down --discard-evidence` left in the state file: down is stopped right after its gate, so the state,
     which goes with the root at the end of a whole down, is still there to read."""
 
-    def stopped():
+    def stopped(node_checked=None):
         raise RuntimeError("stopped for the test, after the gate")
 
     rig.driver.take_down = stopped
@@ -222,7 +222,7 @@ def test_nothing_is_recorded_when_there_was_nothing_to_discard(hpc, tmp_path, si
     """O63: the flag on a root with no step record, or whose evidence is collected, records nothing."""
     rig = Rig(hpc, tmp_path, site)
 
-    def stopped():
+    def stopped(node_checked=None):
         raise RuntimeError("stopped for the test")
 
     rig.driver.take_down = stopped

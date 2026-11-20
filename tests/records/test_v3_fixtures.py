@@ -478,3 +478,72 @@ def test_o72_the_eleventh_fixture_pins_a_cell_that_hit_its_deadline_and_a_run_th
     assert "cell 1's deadline (survived_kill)" in record.outcome["detail"]
     assert "sweep" not in record.outcome["detail"]
     assert replay_record(record).dumps().encode("utf-8") == eleventh[0].read_bytes()
+
+
+def test_c41_the_twelfth_fixture_pins_the_lease_an_attempt_ran_on_and_the_eleven_before_it_hold_none():
+    """C41 and R03: the twelfth merge point adds one optional field to the record, `lease_id`: the fencing token of the
+    lease a run was taken on (`campaign.run_lease`), whole numbers from 1, absent for an attempt that ran on none. Its
+    fixture is the fifth's record with lease 3 written by the code of that merge; it validates and replays to its own
+    bytes (the parametrized tests above), the replay serving the lease back as it serves the instruments' output. None
+    of the eleven before it holds the key, and none is filled in with one."""
+    twelfth = [p for p in FIXTURES if p.name.startswith("12-")]
+    assert [p.name for p in twelfth] == ["12-lease-id.json"]
+    record = load_record(twelfth[0])
+    assert record.lease_id == 3
+    assert list(json.loads(twelfth[0].read_text(encoding="utf-8")))[-1] == "lease_id"
+    assert all("lease_id" not in json.loads(p.read_text(encoding="utf-8")) for p in FIXTURES if p != twelfth[0])
+    fifth = load_record(DIRECTORY / "05-reserved-capped.json")
+    assert dataclasses.replace(record, lease_id=None) == fifth
+    assert replay_record(record).lease_id == 3
+
+
+def test_f02_the_thirteenth_fixture_pins_the_deployment_a_turn_names_and_the_twelve_before_it_hold_none():
+    """B20 and R03: the thirteenth merge point adds one optional field to a turn, `deployment_id`: the deployment a
+    front named in the reply's header, the last field of the turn, absent for a turn whose reply named none. Its fixture
+    is the fifth's record with a name on its second turn, written by the code of that merge; it validates and replays
+    to its own bytes (the parametrized tests above). None of the twelve before it holds the key, and none is filled in
+    with one."""
+    thirteenth = [p for p in FIXTURES if p.name.startswith("13-")]
+    assert [p.name for p in thirteenth] == ["13-deployment-id.json"]
+    record = load_record(thirteenth[0])
+    assert ["deployment_id" in turn for turn in record.transcript] == [False, True]
+    assert list(record.transcript[1])[-1] == "deployment_id"
+    earlier = [json.loads(p.read_text(encoding="utf-8")) for p in FIXTURES if p != thirteenth[0]]
+    assert all("deployment_id" not in turn for body in earlier for turn in body["transcript"])
+    assert all("deployment_switched" not in body["totals"] for body in earlier)
+    fifth = load_record(DIRECTORY / "05-reserved-capped.json")
+    bare = [{k: v for k, v in turn.items() if k != "deployment_id"} for turn in record.transcript]
+    unswitched = {k: v for k, v in record.totals.items() if k != "deployment_switched"}
+    assert record.totals["deployment_switched"] is True  # a turn without the id among turns with it is one more
+    assert list(record.totals)[-1] == "deployment_switched"
+    assert dataclasses.replace(record, transcript=bare, totals=unswitched) == fifth
+    named = [turn.get("deployment_id") for turn in replay_record(record).transcript]
+    assert named == [None, record.transcript[1]["deployment_id"]]
+
+
+def test_l18_the_fourteenth_fixture_pins_a_declared_code_cell_limit_and_the_thirteen_before_it_hold_none():
+    """L18 and R03: the fourteenth merge point adds `agent_config.code_cell_bound_s`, the study's optional wall limit on
+    one code cell, which a study that declares none leaves out, with the names of the tools it reached beside it
+    (`code_cell_tools`). Its fixture, written by the code of that merge on the record tests' fake clock, declares a
+    limit of 60 s over a code tool and another tool: the code cell ran past it and was killed there, which is the code
+    tool's timeout result of 60 s, and the agent's next call, to the other tool, was answered and the run finished. It
+    validates and replays to its own bytes (the parametrized tests above); none of the thirteen before it holds either
+    key, and none is filled in with one."""
+    fourteenth = [p for p in FIXTURES if p.name.startswith("14-")]
+    assert [p.name for p in fourteenth] == ["14-code-cell-bound.json"]
+    record = load_record(fourteenth[0])
+    assert record.agent_config["code_cell_bound_s"] == 60.0
+    assert list(record.agent_config)[-3:] == ["code_cell_bound_s", "terminal_tools", "code_cell_tools"]
+    assert record.agent_config["code_cell_tools"] == ["python"]  # the limit did not reach `echo`
+    assert [(c["name"], c["status"], c["error_class"], c["elapsed_s"]) for c in record.tool_calls] == [
+        ("python", "error", "timeout", 60.0),
+        ("echo", "ok", None, 0.0),
+    ]
+    assert "ran past its 60 s limit and was killed" in record.tool_calls[0]["text"]
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("finished", None)
+    assert replay_record(record).dumps().encode("utf-8") == fourteenth[0].read_bytes()
+    for earlier in FIXTURES[:13]:
+        held = load_record(earlier)
+        assert "code_cell_bound_s" not in held.agent_config
+        assert "code_cell_tools" not in held.agent_config
+        assert replay_record(held).dumps().encode("utf-8") == earlier.read_bytes()

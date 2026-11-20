@@ -11,7 +11,8 @@ one admission checked. The executor never builds a backend of its own and never 
 record names another endpoint than the one admitted is the fault C14 describes.
 """
 
-from collections.abc import Callable, Mapping, Sequence
+import os
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -27,9 +28,10 @@ from expcore.models.adapters import ModelBackend
 from expcore.models.factory import build_backend
 from expcore.plugin import ToolProvider
 from expcore.prompt.templates import RenderedPrompt
-from expcore.records.build import DefectSink, PromptText, RunIdentity, record_attempt
+from expcore.records.build import DefectSink, PromptText, RunIdentity, model_secrets, record_attempt, redactor_for
 from expcore.records.injections import injected_targets
 from expcore.records.record import RunRecord
+from expcore.records.redact import MIN_SECRET_LEN, Redactor, secret_env_names
 from expcore.records.schema import first_turn_rule, outcome_from_entry, target_rule, unread_replies
 
 
@@ -74,6 +76,16 @@ def default_backend_factory(
     return build_backend(spec, seed=seed, limits=limits, base_url=base_url, time_left=time_left)
 
 
+@dataclass
+class DeclaredSecrets:
+    """The secret values an executor told the core about before it started its instruments
+    (`RunRequest.declare_secrets`): the values it gave, and the values of the variables it named, read when it declared
+    them."""
+
+    secrets: tuple[str, ...] = ()
+    called: bool = False  # `declare_secrets` was called and its check passed: only then is a diagnostic shown (C40)
+
+
 @dataclass(frozen=True)
 class RunRequest:
     """One attempt, as the executor sees it.
@@ -91,13 +103,16 @@ class RunRequest:
     - `defect_log`: where the attempt's harness defects leave their redacted traceback (`defect_log.DefectLog`); it
       also keeps what an executor's own sink raised, which the attempt reports once the result is stored.
       `record_run` passes it on, so a crash the loop catches is logged too, redacted with every secret the executor
-      hands `record_run`.
+      declared or hands `record_run`.
     - `reserved_capped`: the bound the budget gate reserved the run by when it admitted it, the value the store's
       attempt row keeps (True: the reply maximum, False: the window, None: no gate decided it). `record_run` writes it
       into the record's `totals.reserved_capped`, left out for None (C27).
     - `reply_cap_unheld`: with a budget, a function that tells whether the campaign has taken the run's model off the
       reply maximum, read when the loop has ended; None without one. `record_run` writes it into the record's
       `totals.reply_cap_unheld`, left out when there is no function or it answers None (C27).
+    - `declared`: the secrets the executor has declared (`declare_secrets`), which `record_run` merges with its own
+      `secrets`. A caller of `record_attempt` that does not go through `record_run` forwards them itself:
+      `secrets=[*request.declared.secrets, ...]`.
     """
 
     identity: RunIdentity
@@ -113,11 +128,74 @@ class RunRequest:
     defect_log: DefectSink | None = None
     reserved_capped: bool | None = None
     reply_cap_unheld: Callable[[], bool | None] | None = None
+    declared: DeclaredSecrets = field(default_factory=DeclaredSecrets)
 
     @property
     def run_key(self) -> str:
         """The run's key text."""
         return self.identity.run_key
+
+    def declare_secrets(
+        self,
+        *,
+        secrets: Iterable[str] | str = (),
+        secret_env: Iterable[str] | str = (),
+        environ: Mapping[str, str] | None = None,
+    ) -> None:
+        """Tell the core the run's secrets before the executor starts its instruments (C40).
+
+        An executor starts its instruments before `record_run`, so a secret it names only to
+        `record_run(secrets=, secret_env=, environ=)` is not known when an instrument's start fails, and the diagnostic
+        of the failed start (which goes to the row, the marker and the export) would keep it. Declared here, the secret
+        is in the attempt's redaction context from now on: the diagnostic and the harness-defect log are redacted with
+        it, and `record_run` merges it with its own `secrets`, so the record is too. Call it first, in the executor's
+        own task, once or more; a secret already declared is not declared again. **Only a call shows a failed start's
+        diagnostic in the export and the report** (never a diagnostic redacted against a partial list of the run's
+        secrets): without one the row and the marker keep a stub, and the text goes to the campaign's local log alone. A
+        call with no argument says there is nothing beyond the environment's, the models' keys and the registry. A
+        `record_run` that is given secrets is not a declaration.
+
+        `secrets` are values; `secret_env` are names of variables whose values are secrets whatever the names, read
+        from `environ` (the process's by default) **now** and kept as values. A given `environ` is the mapping the
+        executor gives `record_run`: what that redacts from it (the variables named like a secret, the models' keys)
+        is kept here too. It never replaces the process: the secrets of the process (a variable named like one, a
+        model's key) are kept as values as well, so they stay redacted when `record_run` is given another environment,
+        and a later declaration with another `environ` takes nothing away. A name with no value is ignored. A string is
+        one secret or one name, not its characters.
+
+        A secret too short to redact (a value, or the value of a variable) is refused here with a `ConfigError` that
+        names the variable and never shows the value, as `record_attempt` refuses it: nothing of this call is kept, and
+        the attempt's redaction context is left one that cannot be built, so what it would redact (the traceback of
+        the error that escapes the executor, a diagnostic) is withheld and not written with the secret in it.
+        """
+        given, names = _values(secrets), _values(secret_env)
+        shown = dict(os.environ if environ is None else environ)  # a copy: the caller may change its own later
+
+        def checked() -> Redactor:
+            return redactor_for(self.backend, environ=shown, secrets=given, secret_env=names, models=self.models)
+
+        if self.defect_log is not None:
+            # as `record_attempt` does: the redactor goes in before it is checked, so a secret too short to redact
+            # leaves the log one that cannot be built, which withholds the traceback of the ConfigError
+            self.defect_log.redact_with(checked)
+        checked()  # refuses a secret too short to redact, naming the variable
+        # The values the redactor reads from the environments are kept as values: the declared names' and, with a given
+        # environment, what `record_run` redacts from it (variables named like a secret, the models' keys); and the
+        # process's own, which `record_attempt` stops reading when `record_run` is given an environment of its own. A
+        # process secret too short to redact is left out: `record_attempt` would not have looked at it either.
+        read = [shown[name] for name in secret_env_names(shown, names)]
+        read += model_secrets(self.backend, self.models, shown)[1]
+        if environ is not None:
+            process = dict(os.environ)
+            kept = [process[name] for name in secret_env_names(process)] + model_secrets(
+                self.backend, self.models, process
+            )[1]
+            read += [value for value in kept if len(value) >= MIN_SECRET_LEN]
+        held = tuple(dict.fromkeys([*self.declared.secrets, *given, *read]))
+        self.declared.secrets = held
+        self.declared.called = True  # after the check: a refused declaration declares nothing
+        if self.defect_log is not None:
+            self.defect_log.redact_with(lambda: redactor_for(self.backend, secrets=held, models=self.models))
 
 
 class RunExecutor(Protocol):
@@ -167,9 +245,24 @@ async def record_run(
             "reserved_capped": request.reserved_capped,
             "reply_cap_unheld": request.reply_cap_unheld,
             **_sink_failure_to(request),
-            **options,
+            **_with_declared(request, options),
         },
     )
+
+
+def _with_declared(request: RunRequest, options: Mapping[str, Any]) -> dict[str, Any]:
+    """The options of `record_run` with the secrets the executor declared first (`RunRequest.declare_secrets`) added to
+    the `secrets` it passed, so the record is redacted with every secret the run has, whatever environment it is given;
+    the options as they are when it declared none."""
+    merged = dict(options)
+    if request.declared.secrets:
+        merged["secrets"] = (*request.declared.secrets, *_values(options.get("secrets", ())))
+    return merged
+
+
+def _values(given: Iterable[str] | str) -> tuple[str, ...]:
+    """What a caller gave as secrets or names: a string is one value, any other iterable its items."""
+    return (given,) if isinstance(given, str) else tuple(given)
 
 
 def _sink_failure_to(request: RunRequest) -> dict[str, Any]:

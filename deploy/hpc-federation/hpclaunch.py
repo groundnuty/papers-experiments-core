@@ -10,7 +10,9 @@ service verbs (`hpcfed_control.py`, M4) through the hook in `hpcfed.py` (DESIGN.
   and raises `TimeoutError` at its bound after cancelling that step by its id; `service(node, argv, *, kind, name,
   log)` launches a detached service step of the kind's size; `listed(name)` is the step id `squeue -s` lists under a
   name, asked of every id the federation's steps are listed under (`listings`: the held job's, and its agent's
-  component's own or the agent's own job's); `cancel(step_id)` cancels that one step.
+  component's own or the agent's own job's); `cancel(step_id)` cancels that one step; `holder(node, seconds, *, name,
+  log)` launches a kept stop's holder (O96), a detached `sleep` of one core and 64 MB that overlaps every other step;
+  `term(step_id)` sends one step TERM (down's end of a holder).
 """
 
 import contextlib
@@ -34,6 +36,7 @@ STEP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 # make first and fill (a ~/.curlrc, a git configuration) before the step reads it.
 NO_HOME = "/dev/null/hpcop-home"
 CLIENT_LOG_SUFFIX = ".client"  # a service step's srun client writes its own log beside the step's run log
+HOLDER_CPUS, HOLDER_MEMORY_MIB = 1, 64  # a kept stop's holder (O96), as the one proven live: shared, never reserved
 
 
 def client_log(log: str) -> str:
@@ -188,13 +191,21 @@ class Launcher:
         job: Optional[str] = None,
     ) -> Step:
         job, group, component, site = self._where(node, name, job)
-        size = self.settings.control if kind == "control" else self.settings.size(kind)
+        if kind == "holder":
+            cpus, memory_mib = HOLDER_CPUS, HOLDER_MEMORY_MIB
+        else:
+            size = self.settings.control if kind == "control" else self.settings.size(kind)
+            cpus, memory_mib = size.cpus, size.memory_mib
         # never the account's home: none at all, until the bundle's scripts point it into the service's own work
         # directory on the node's tmpfs, once they know it (lib.sh, home_in)
-        env = allowlist(site.step_path, site.node_tmp, home_env(NO_HOME))
+        # HPC_NODE_DOMAIN only when the site sets it, so a step of a site that does not is exactly what it was: the node
+        # name the steps derive (nodefacts.py, lib.sh's node_fqdn) is the one rule, from the one value
+        domain = {"HPC_NODE_DOMAIN": site.node_domain} if site.node_domain else {}
+        env = allowlist(site.step_path, site.node_tmp, {**home_env(NO_HOME), **domain})
         return Step(
-            job, node, name, size.cpus, size.memory_mib, env, tuple(argv), output, group, component, site.step_network
-        )
+            job, node, name, cpus, memory_mib, env, tuple(argv), output, group, component, site.step_network,
+            overlap=kind == "holder",
+        )  # fmt: skip
 
     def control(
         self, node: str, argv: Sequence[str], *, name: str, timeout_s: float, job: Optional[str] = None
@@ -216,8 +227,21 @@ class Launcher:
         in the state, by the step's name, for `down` to end once the step is gone."""
         if kind not in ("oz", "op"):
             raise ValueError("a service step is of kind oz or op")
-        client = self.slurm.service(self._step(node, argv, name, kind, output=log), client_log(log))
+        self._record_client(name, self.slurm.service(self._step(node, argv, name, kind, output=log), client_log(log)))
 
+    def holder(self, node: str, seconds: int, *, name: str, log: str) -> None:
+        """A kept stop's holder (O96) on one of the services' nodes: `sleep <seconds>` as a detached step of one core
+        and 64 MB that overlaps every other step (`--overlap`, so it holds back no control or service step), so a
+        process of ours stays on the node while its service is stopped; its srun client writes to `log`'s client log
+        and is recorded in the state, by the step's name, as a service step's is."""
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds < 1:
+            raise ValueError("a holder sleeps a whole number of seconds, 1 or more")
+        if node not in (self.store.read()["allocation"].get("nodes") or []):
+            raise hpcstate.StateError("refusing a holder on a node that is not one of the services'")
+        step = self._step(node, ["sleep", str(seconds)], name, "holder")
+        self._record_client(name, self.slurm.service(step, client_log(log)))
+
+    def _record_client(self, name: str, client: Any) -> None:
         def record(state: Dict[str, Any]) -> Dict[str, Any]:
             state.setdefault("clients", {})[name] = {"pid": client.pid, "start": client.start}
             return state
@@ -240,11 +264,21 @@ class Launcher:
                 return step
         return None
 
-    def cancel(self, step_id: str) -> None:
-        """Cancel one step of the federation's own jobs: the held job, a component of it, or the agent's own job."""
+    def _ours(self, step_id: str, what: str) -> None:
+        """StateError unless the step id is one of the federation's own jobs': the held job, a component of it, or the
+        agent's own job."""
         state = self.store.read()
         sandbox = state.get("sandbox") or {}
         ours = {state["allocation"].get("job"), sandbox.get("job"), sandbox.get("component_job")} - {None}
         if "." not in step_id or step_id.split(".")[0].split("+")[0] not in ours:
-            raise hpcstate.StateError("refusing to cancel a step of another job")
+            raise hpcstate.StateError(f"refusing to {what} a step of another job")
+
+    def cancel(self, step_id: str) -> None:
+        """Cancel one step of the federation's own jobs: the held job, a component of it, or the agent's own job."""
+        self._ours(step_id, "cancel")
         self.slurm.cancel_step(step_id)
+
+    def term(self, step_id: str) -> None:
+        """Send TERM to one step of the federation's own jobs by its id, without cancelling it (`Slurm.term_step`)."""
+        self._ours(step_id, "signal")
+        self.slurm.term_step(step_id)

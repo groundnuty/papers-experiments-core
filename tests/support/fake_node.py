@@ -251,7 +251,7 @@ class FakeNode:
         self.cell_left: list[FakeProc] = []  # processes a cell leaves behind (set by a handler)
         self.cgroup: dict[str, Any] = {"depth": 0, "max_bytes": 1 << 34, "events": {"oom": 0, "oom_kill": 0},
                                        "peak_bytes": 0}  # fmt: skip
-        self.cgroup_path: str | None = CGROUP  # None: a v1 host
+        self.cgroup_path: str | None = CGROUP  # None: the driver's own cgroup cannot be read
         self.cgroup_slack = 0  # anonymous bytes the cgroup charges that no process holds
         self.cgroup_unreadable = False
         self.children_unreadable = False

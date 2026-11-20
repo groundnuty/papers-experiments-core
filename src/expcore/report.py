@@ -50,12 +50,19 @@ are the same text: no clock, no path and no random number enters it.
 - A campaign whose interrupted attempts kept a call log (its export has `interrupted_spend`, C05) gets a section
   "Interrupted attempts' spend" after that (`expcore.report_interrupted`): per model, how many were charged measured,
   measured plus a request in flight, or at their bound. A report of an export without it is the text it was before.
+- A campaign whose attempts kept a diagnostic snapshot (its export has `attempt_diagnostics`, C40) gets a section
+  "Instrument start failures" after that (`expcore.report_diagnostics`): per condition, instrument, kind and state, the
+  attempts, how many were charged and, in four columns that add up to the attempts, how many diagnostics were shown,
+  withheld, never given or could not be kept, with a row of zeros for a condition that had none. A report of an export
+  without it is the text it was.
 - A batch merged from shards (its export has `shards`, and each run entry its `shard`) gets one more section after the
   conditions (`expcore.report_shards`): per shard, with its label and start, the runs of each condition by how they
   ended with their rates, the infrastructure attempts by kind, and the wall time, turn latency and reset time, each
   figure with its N or `not recorded` (never 0). The shards are a check that the hosts are interchangeable, not a
   factor of the design: every figure is descriptive, no test across shards is made, and no score is shown by shard.
   Without `shards` the report is byte for byte what it was before shards existed (#154).
+- A batch merged by run (C45) gets, after the guards' sections, the balance of its runs over sites and federations
+  and the federation-effect rerun beside the primary result (`expcore.report_balance`); no other report has either.
 - The report says under "Provenance" whether the analysis is partial, and lists the attempts left out (run key,
   attempt and reason) in a section of their own. What each number counts is stated in the report itself, beside the
   table that shows it.
@@ -69,6 +76,12 @@ are the same text: no clock, no path and no random number enters it.
   interest" after the contrast tables (`expcore.report_smallest`): the estimate with its sign and its interval against
   it, the decision, the minimum detectable effect and whether the design detects it; its terminal line adds the
   decision with the signed estimate. A report with none has neither, so it keeps its bytes.
+- A report given the model usage (`model_usage`, C39) has a section "Model usage and spend" after the conditions
+  (`expcore.report_model_usage`) and one line of the provenance: per model, what it spent in all, on the analysed
+  attempts and on the rest, each dollar on the basis it was charged on (measured, measured plus a request in flight,
+  bound, top-ups, probes), the attempts, tokens and dollars by what became of each attempt, the attempts set aside by
+  kind, the requests retried inside an attempt and the served model ids and fingerprints. A report given none is the
+  text it was.
 - The fixed prose beside the tables is in `expcore.report_notes`.
 - The header names the preregistration hash (with `+override` when the copy was marked as a test copy), the code stamp,
   the core version and the version of each scorer, so a report says which scorers made the numbers in it (R13). An
@@ -89,6 +102,9 @@ from expcore.guards import GuardsAnalysis
 from expcore.mountguard.sensitivity import MountGuardAnalysis
 from expcore.readlog.scan import KINDS
 from expcore.readlog.sensitivity import ReadLogAnalysis
+from expcore.report_balance import LEFT_OUT as FEDERATION_LEFT_OUT
+from expcore.report_balance import balance_lines, federation_lines
+from expcore.report_diagnostics import section as start_failures
 from expcore.report_egress import egress_lines
 from expcore.report_families import (
     check_equivalence_families,
@@ -102,6 +118,8 @@ from expcore.report_guards import summary_lines as guards_summary_lines
 from expcore.report_holds import section as operator_holds
 from expcore.report_interrupted import section as interrupted_spend
 from expcore.report_lost import section as lost_in_kill
+from expcore.report_model_usage import provenance_line as usage_provenance
+from expcore.report_model_usage import section as model_usage_section
 from expcore.report_mountguard import LEFT_OUT as NOT_CLEAN
 from expcore.report_mountguard import mount_guard_lines
 from expcore.report_notes import (
@@ -110,6 +128,7 @@ from expcore.report_notes import (
     BUDGET_HOLD_NOTES,
     CONDITION_NOTES,
     COUNT_DEFINITIONS,
+    DECLARATION_NOTES,
     DEPLOYMENT_NOTES,
     DESCRIPTIVE_NOTES,
     FAMILY_NOTES,
@@ -138,6 +157,7 @@ from expcore.report_visibility import LEFT_OUT as HID_OR_UNKNOWN
 from expcore.report_visibility import visibility_lines
 from expcore.stats.analysis import CONCLUSIONS, UNTESTABLE, AnalysisResult, ContrastResult
 from expcore.stats.armruns import LOST_CAUSES
+from expcore.stats.federation_effect import FederationAnalysis
 from expcore.stats.pairing import MISSING_CAUSES
 from expcore.stats.ratio import RATIO_CAUSES, RatioForm
 from expcore.visibility.sensitivity import VisibilityAnalysis
@@ -313,7 +333,11 @@ def _check_no_claim(result: AnalysisResult) -> None:
 
 
 def _exploratory_only(result: AnalysisResult, level: float | None) -> list[str]:
-    """The contrasts of a preregistration with no Holm family (S12): one exploratory table, and no family table."""
+    """The contrasts of a preregistration with no Holm family (S12): one exploratory table, and no family table. A
+    preregistration with no contrast at all, only one-arm estimates (S21), has no contrast section: its estimates are
+    its whole analysis."""
+    if not result.contrasts and result.descriptives:
+        return _descriptives(result, level)
     contrasts = list(result.contrasts)
     with_mde = any(r.minimum_detectable_effect is not None for r in contrasts)
     lines = ["## Exploratory contrasts (every contrast: the preregistration makes no confirmatory claim)", ""]
@@ -668,6 +692,7 @@ def _conditions(export: Mapping[str, Any]) -> list[str]:
         *operator_holds(export, _table),  # only an export with such a hold has it (C11)
         *lost_in_kill(export, _table),  # only an export whose store a kill took spend out of has it (O62)
         *interrupted_spend(export, _table),  # only an export whose interrupted attempts kept a call log has it (C05)
+        *start_failures(export, _table),  # only an export whose attempts kept a diagnostic snapshot has it (C40)
     ]
 
 
@@ -769,6 +794,12 @@ def _sensitivity(result: AnalysisResult, level: float | None, left_out: str = "t
     else:
         shown = [r for r in result.contrasts if not _exploratory(r, adjusted)]
         title = f"#### Preregistered contrasts without {left_out} (Holm family of {len(shown)})"
+    if not result.contrasts and result.descriptives:  # one-arm estimates only (S21): a rerun does not repeat them
+        return [
+            title,
+            "",
+            "No contrast declared: the preregistration has one-arm estimates only, which a rerun does not show.",
+        ]
     if not shown:
         return [title, "", "No contrast in the family."]
     with_mde = any(r.minimum_detectable_effect is not None for r in shown)
@@ -805,6 +836,7 @@ def _egress_summary(egress: EgressAnalysis) -> list[str]:
     lines = [
         f"egress: {counts['flagged']} of {counts['analysed']} analysed run(s) flagged ({counts['outside']} outside, "
         f"{counts['log_unknown']} unknown log, {counts['static_scan']} static scan)"
+        + (f"; {counts['package_index']} with a package-index hit (not a flag)" if egress.package_indexes else "")
     ]
     if egress.refused is not None:
         return [*lines, f"sensitivity: not computed ({egress.refused})"]
@@ -976,6 +1008,47 @@ def _deployments(export: Mapping[str, Any]) -> list[str]:
     return ["## Deployments", "", *_table(header, rows), "", *totals, "", *DEPLOYMENT_NOTES, ""]
 
 
+def _deployment_switches(export: Mapping[str, Any]) -> list[str]:
+    """For each model whose analysed attempts named a deployment (`deployment_ids`) or switched (`deployment_switched`):
+    how many named one and how many switched (B20); nothing for an export with neither. An attempt switched when its
+    turns show more than one deployment, by the ids the front named or by the replies' system fingerprints, a turn
+    without the id or the fingerprint among turns with it counting as one more (a front that overflows to another
+    service, an endpoint that routes each request to a deployment of its own). Visibility only: a switched attempt is
+    analysed like any other."""
+    named: dict[str, int] = {}
+    switched: dict[str, int] = {}
+    for entry in export["analysed_attempts"]:
+        if "deployment_ids" in entry or entry.get("deployment_switched"):
+            model = str(entry["factors"]["model"])
+            named[model] = named.get(model, 0) + ("deployment_ids" in entry)
+            switched[model] = switched.get(model, 0) + bool(entry.get("deployment_switched"))
+    if not named:
+        return []
+    lines = [
+        f"- {model}: {named[model]} analysed attempt(s) named a deployment, {switched[model]} switched deployment"
+        for model in sorted(named)
+    ]
+    note = (
+        "An attempt switched deployment when its turns show more than one, by the deployment header or by the system "
+        "fingerprint of the replies, a turn without the header or the fingerprint among turns with it counting as one "
+        "more. It is analysed like any other."
+    )
+    return ["## Deployment switches", "", *lines, "", note, ""]
+
+
+def _declarations(export: Mapping[str, Any]) -> list[str]:
+    """The ledger's declaration log (C48), oldest first; nothing for an export without one (only a batch merged by
+    run from a ledger that keeps the log has it)."""
+    if "fingerprint_declarations" not in export:
+        return []
+    rows = [
+        [e["model"], "none" if e["fingerprint"] is None else e["fingerprint"], e["at_utc"], e["actor"], e["reason"]]
+        for e in export["fingerprint_declarations"]
+    ]
+    body = _table(["Model", "Fingerprint", "Declared (UTC)", "Actor", "Reason"], rows) if rows else ["None."]
+    return ["## Fingerprint declarations", "", *body, "", *DECLARATION_NOTES, ""]
+
+
 def _share(value: float | None) -> str:
     """A fraction as a percentage to four significant figures; n/a without a denominator."""
     return UNKNOWN if value is None else f"{value * 100:.4g}%"
@@ -1010,7 +1083,10 @@ def render_report(
     mount_guard: MountGuardAnalysis | None = None,
     guards: GuardsAnalysis | None = None,
     visibility: VisibilityAnalysis | None = None,
+    model_usage: Mapping[str, Any] | None = None,
     read_log: ReadLogAnalysis | None = None,
+    balance: Mapping[str, Any] | None = None,
+    federation: FederationAnalysis | None = None,
 ) -> str:
     """Render the report as Markdown.
 
@@ -1021,9 +1097,11 @@ def render_report(
     without it, #179), `mount_guard` the same of a batch whose mount was guarded (no section without it, O60),
     `guards` the rerun without the runs any guard leaves out (a batch checked by two or more, O60, O76), `visibility`
     the process-visibility verdicts and rerun of a batch whose sandbox watched for hidden processes (no section without
-    it, O56), `read_log` the read-log scan's verdicts and rerun of a batch whose records carry the `read_log` instrument
-    (no section without it, S20). A partial analysis is described by the export (`partial`, `running_attempts`,
-    `excluded_attempts`).
+    it, O56), `model_usage` what each model spent and what served and retried its requests (`campaign.model_usage`: no
+    section and no provenance line without it, C39), `read_log` the read-log scan's verdicts and rerun of a batch whose
+    records carry the `read_log` instrument (no section without it, S20), `balance` and `federation` the balance over
+    sites and federations and the federation-effect rerun of a batch merged by run (no section without them, C45). A
+    partial analysis is described by the export (`partial`, `running_attempts`, `excluded_attempts`).
     What each number counts is stated in the report beside it. The text ends with a newline.
     """
     state = "dirty: " + str(code.get("why")) if code.get("dirty") else "clean"
@@ -1051,6 +1129,7 @@ def render_report(
         "attempt), "
         f"{len(export['unfinished_runs'])} unfinished, {len(left_out)} left out of the analysis",
         _partial_line(export),
+        *usage_provenance(model_usage),
     ]
     if result.exploratory_only:
         lines.append(f"- **Confirmatory claims**: none; {NO_CLAIM}")
@@ -1061,16 +1140,23 @@ def render_report(
     both = guards_lines(guards, _table, lambda r: _sensitivity(r, interval_level, left_out_label(guards)))  # O60
     seen = visibility_lines(visibility, _table, lambda r: _sensitivity(r, interval_level, HID_OR_UNKNOWN))  # O56
     scanned = read_log_lines(read_log, _table, lambda r: _sensitivity(r, interval_level, TOUCHED_THE_CHANNEL))  # S20
+    placed = balance_lines(balance, _table)  # only a batch merged by run has these two (C45)
+    refit = federation_lines(federation, _table, lambda r: _sensitivity(r, interval_level, FEDERATION_LEFT_OUT))
     sections = (
         _contrasts(result, interval_level)
         + _conditions(export)
         + shards
+        + model_usage_section(model_usage, export, _table)
         + checked
         + guarded
         + seen
         + scanned
         + both
+        + placed
+        + refit
         + _deployments(export)
+        + _deployment_switches(export)
+        + _declarations(export)
         + _left_out(left_out)
     )
     return "\n".join(lines + sections)

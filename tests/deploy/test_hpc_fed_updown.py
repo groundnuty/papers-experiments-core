@@ -217,6 +217,36 @@ def test_o57_without_the_variable_no_step_names_a_network_option(hpc, tmp_path, 
     assert not any(word.startswith("--network") for call in rig.fake.calls for word in call)
 
 
+def node_domains(sruns) -> set:
+    """The HPC_NODE_DOMAIN each step's environment holds, None for a step with none."""
+    return {dict(word.split("=", 1) for word in s.env).get("HPC_NODE_DOMAIN") for s in sruns}
+
+
+def test_a_sites_node_domain_reaches_every_step_and_is_recorded_so_down_needs_no_environment(hpc, tmp_path, site):
+    """HPC_NODE_DOMAIN is in the environment of every step up launches: the node facts step, which makes the node's
+    name and address, and the zone's and the providers' steps, whose configure makes the same name; it is recorded in
+    the state, so the steps of a down run where site.env was not sourced carry it all the same."""
+    rig = Rig(hpc, tmp_path, {**site, "HPC_NODE_DOMAIN": "nodes.example"})
+    rig.up()
+    assert rig.state()["site"]["node_domain"] == "nodes.example"
+    assert {"nodefacts.py", "zone.sbatch", "provider.sbatch"} <= scripts_of(rig.fake.sruns)
+    assert node_domains(rig.fake.sruns) == {"nodes.example"}
+    rig.fake.sruns.clear()
+    words = ["--layout", str(LAYOUT), "--root", str(rig.root)]
+    assert hpc.cli.main([*words, "down"], {}, runner=rig.fake) == 0
+    assert "teardown.sh" in scripts_of(rig.fake.sruns)
+    assert node_domains(rig.fake.sruns) == {"nodes.example"}
+
+
+def test_without_a_node_domain_no_step_environment_names_one(hpc, tmp_path, site):
+    """A site that sets no HPC_NODE_DOMAIN is unchanged: no step carries the variable, and the state records none."""
+    rig = Rig(hpc, tmp_path, site)
+    rig.up()
+    assert rig.state()["site"]["node_domain"] == ""
+    assert rig.fake.sruns
+    assert node_domains(rig.fake.sruns) == {None}
+
+
 COMPONENT_ZERO_STEPS_BEFORE_THE_FIRST_MINT = 12  # six nodes' facts and six services: the next step failed live
 
 
@@ -700,7 +730,16 @@ def test_with_core_step_the_core_runs_as_a_control_step_on_the_zones_node(hpc, t
     """O57: [hpc] core = "step" (the fallback when the login node cannot reach the services) runs the core's phase in
     a control step on the zone's node, with the core's Python in isolated mode and this driver's own arguments."""
     rig = Rig(hpc, tmp_path, {**site, "HPC_CORE_PYTHON": "/shared/venv/bin/python"}, layout=step_layout)
+
+    def the_nodes_own_core_phase(srun):
+        """What the node's `hpcfed.py core` leaves in the root's state when it returns: the phase ended `bootstrapped`,
+        which `up`'s last write (compare-and-set on it) moves to `linked`."""
+        if "hpcfed.py" in " ".join(srun.command):
+            rig.driver.set(lambda s: s.update(phase="bootstrapped", core_unfinished=False))
+
+    rig.fake.on_control = the_nodes_own_core_phase
     assert rig.up().startswith("core: the link check passed")
+    assert rig.state()["phase"] == "linked"
     core = next(s for s in rig.fake.sruns if "hpcfed.py" in " ".join(s.command))
     assert core.node == "node01"
     assert core.command[:3] == ["/shared/venv/bin/python", "-I", "-B"]  # isolated, and no bytecode written

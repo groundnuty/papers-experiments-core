@@ -57,6 +57,7 @@ import dataclasses
 import functools
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -213,6 +214,14 @@ def _hashing(blocks: Iterable[tuple[int, bytes]], hasher: Any) -> Iterator[tuple
     for offset, block in blocks:
         hasher.update(block)
         yield offset, block
+
+
+def _finish_time(record: Any) -> float | None:
+    """A final transfer record's `finishTime` as seconds, None when it gives no finite number of zero or more."""
+    value = record.get("finishTime") if isinstance(record, Mapping) else None
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
+        return None
+    return float(value)
 
 
 def next_page_token(page: Any) -> str | None:
@@ -1223,6 +1232,47 @@ class Provisioner:
         """Return `(provider, transfer id, kind)` of every transfer the log says this provisioner scheduled."""
         return [(x["provider"], x["id"], x["kind"]) for x in self._lines() if x.get("action") == "transfer"]
 
+    def note_ended(self, provider: str, records: Mapping[str, Any]) -> None:
+        """Log that these jobs of this provisioner's own reported an ended state on `provider` (`records`, id to the
+        final record a wait that required them ended read there), with the finish time each record gives, None for one
+        with no number: `transfers_from` then knows which cannot bear on a later window. One line for the lot; none for
+        no job."""
+        if records:
+            finished = {tid: _finish_time(record) for tid, record in sorted(records.items())}
+            self._write("transfer_ended", provider=provider, finished=finished)
+
+    def log_mark(self) -> int:
+        """The change log's length in lines now: a run's window that begins here is told by it (`transfers_from`)."""
+        return len(self._lines())
+
+    def transfers_from(self, mark: int, before: float) -> tuple[list[tuple[str, str, str]], int]:
+        """The transfers a run whose window began at `mark` (`log_mark`) must account for, as `transfers` gives them,
+        and how many earlier ones are left out: every one scheduled since is kept, and every one scheduled before it
+        too, unless the log noted before the mark that it ended (`note_ended`) with a finish time after 0 and before
+        `before`, the transfer walk's cutoff (the window's start less the clock-skew allowance and the margin,
+        `transferlog.py`). That is the walk's criterion for a harness job absent from the listing by design
+        (`TransferLog._ended_before_cutoff`), met by ONE provider's final record, the one the wait that saw the job end
+        read, where the walk asks every tracked provider's and requires them to agree: the change log is kept across
+        runs, and its every earlier job read again at each run's end cost
+        about 40 minutes a run once it held thousands. A job that ended after the cutoff, or whose end was not noted,
+        is kept, so its absence from the listing still flags the listing. One reading of the log gives both."""
+        lines = self._lines()
+        finished: dict[tuple[str, str], Any] = {}
+        for x in lines[:mark]:
+            if x.get("action") == "transfer_ended":
+                finished.update(((x["provider"], tid), moment) for tid, moment in x["finished"].items())
+        kept: list[tuple[str, str, str]] = []
+        left_out = 0
+        for index, x in enumerate(lines):
+            if x.get("action") != "transfer":
+                continue
+            moment = finished.get((x["provider"], x["id"]))
+            if index < mark and isinstance(moment, float) and 0 < moment < before:
+                left_out += 1
+                continue
+            kept.append((x["provider"], x["id"], x["kind"]))
+        return kept, left_out
+
     def replicate(self, path: str, to_provider: str) -> dict[str, Any]:
         """Replicate a whole file to a provider and return a record once its block map there covers the file (O01).
 
@@ -1272,6 +1322,7 @@ class Provisioner:
                 ),
                 "replication",
             )
+            self.note_ended(to_provider, done.records)
             for state, count in done.states().items():
                 states[state] = states.get(state, 0) + count
             if deadline is None:
@@ -1347,6 +1398,7 @@ class Provisioner:
                 ),
                 "eviction",
             )
+            self.note_ended(from_provider, done.records)
             if attempt == EVICTION_ATTEMPTS:  # the last: wait the whole settle bound, then refuse (NotPlaced)
                 confirmation = self.require_empty(from_provider, [entry.file_id])
                 break

@@ -4,15 +4,18 @@ Every step goes through the shared launcher (`hpclaunch.Launcher`) and every cha
 store (`hpclaunch.StateStore`), written before the action it enables, so `down` finds whatever `up` reached.
 """
 
+import contextlib
+import dataclasses
 import json
 import os
 import re
 import secrets
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import hpcdata
 import hpcexclude
@@ -30,12 +33,12 @@ from fedlayout import ROOT_MARKER, Layout
 from fedpki import private_directory, write_secret
 from fedspec import Spec
 from fedtools import check_artifacts, check_launchable
-from hpcboot import core_phase, hpc_spec, hpc_values, load_owner, load_readings, verify_ingested
+from hpcboot import core_phase, hpc_spec, hpc_values, load_owner, load_readings, recorded_space_ids, verify_ingested
 from hpcca import ca_certificates
 from hpcdown import BUNDLE, WORKDIR_LINE, Down
 from hpclaunch import Launcher, StateStore, client_log
 from hpcsettings import HpcSettings, Site
-from hpcslurm import READBACK, Allocation, Client, Shape, Slurm, SlurmError
+from hpcslurm import ENDED_STATES, READBACK, Allocation, Client, Shape, Slurm, SlurmError
 
 HERE = Path(__file__).resolve().parent
 CORE_MISMATCH = 97  # the exit status of a core step whose interpreter imports another core
@@ -45,7 +48,9 @@ TIMEOUTS = {
     "step": 600.0,  # a control step: node facts, a token's mint and delivery, an export, a check
     "core": 5400.0,  # the core's phase as a step: the bootstrap, the baseline and the link check
     "cancel": 300.0,  # the held job leaving the queue after its cancel
+    "leave": 120.0,  # a refused up's cancelled jobs leaving the live list, under the fleet's lock, before it is let go
 }
+PLACEMENT_ATTEMPTS = 3  # declared bound: how often an up of a fleet is tried when it is placed on another's node
 VERDICT = {"oz": "hpcop: OK zone", "op": "hpcop: OK provider"}
 FAILED = ("FINISH FAILED", "hpcop: ERROR")
 TOKEN_WAIT = "waiting for the registration token"
@@ -108,6 +113,7 @@ class Driver(Down):
     environ: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     timeouts: Dict[str, float] = field(default_factory=lambda: dict(TIMEOUTS))
     removal: Dict[str, Any] = field(default_factory=dict)  # the root's removal's file calls (hpcdown), for a stand-in
+    placement_lock: Optional[Path] = None  # an up of a fleet: the lock its ups share (hpcexclude), so a bounded retry
 
     @property
     def spec(self) -> Spec:
@@ -354,13 +360,24 @@ class Driver(Down):
             time_s=self.settings.time_s,
             het=(Shape(1, agent.cpus, agent.memory_mib),) if het and agent is not None else (),
             exclude=tuple(exclude),
+            exclusive=site.exclusive_nodes,
         )
 
     def sandbox_allocation(
-        self, state: Mapping[str, Any], site: Site, exclude: Sequence[str] = ()
+        self, state: Mapping[str, Any], site: Site, exclude: Sequence[str] = (), after: Optional[str] = None
     ) -> Optional[Allocation]:
         """The agent's own held job under `separate` (one node of its own shape), else None. It keeps off the same
-        nodes as the services' job: an agent's sandbox never runs on a node that hosts an Onedata service."""
+        nodes as the services' job: an agent's sandbox never runs on a node that hosts an Onedata service.
+
+        `after` is the services' job, and is set (by `hold_once`, with `HPC_EXCLUSIVE_NODES=1` only) on the agent's job
+        that is submitted beside it: `--dependency=after:<that job>` (Slurm's "begin after the job starts", never
+        `afterok`, which would wait for its end), so it cannot start before the services' job does, and a services job
+        still pending in the queue does not leave the agent's node billing alone. What remains: once the services' job
+        has started, the agent's job still waits for a node of its own, and the services' job may run meanwhile; and a
+        services job cancelled before it starts (its wait failing at the queue bound) also satisfies the dependency,
+        so the agent's job may start in the seconds before the same failure cancels it (`release_held`). The
+        dependency is read back as the job is submitted (`Slurm.check_dependency`). Without exclusive nodes the agent's
+        job is submitted only once the services' job runs (`hold_once`), and carries none."""
         record, agent = state.get("sandbox"), self.settings.sandbox_node()
         if record is None or agent is None or record["placement"] != "separate":
             return None
@@ -374,6 +391,8 @@ class Driver(Down):
             time=self.settings.time,
             time_s=self.settings.time_s,
             exclude=tuple(exclude),
+            after=after,
+            exclusive=site.exclusive_nodes,
         )
 
     # -- up -----------------------------------------------------------------------------------------------------------
@@ -407,30 +426,237 @@ class Driver(Down):
         return digest
 
     def bring_up(self, site: Site, tree: Optional[str] = None) -> str:
-        excluded = self.other_federations_nodes()  # before anything is made: an unreadable read refuses here
-        state = self.store.create(self.initial_state(site, tree, len(excluded)))
-        self.make_storage(state)  # recorded above, made before any job exists to bill for it
-        asked, alone = self.allocation(state, site, excluded), self.sandbox_allocation(state, site, excluded)
-        held = [(self.submit(asked, "allocation"), asked)]
-        if alone is not None:  # sandbox_placement = "separate": the agent's own held job, exactly as the first
-            held.append((self.submit(alone, "sandbox"), alone))
-        for job, wanted in held:
-            self.slurm.wait_running(job, self.timeouts["queue"], name=wanted.name, note=self.queue_note(wanted))
-        # Once more on the running jobs: the scheduler may allocate more than a pending request showed.
-        records = [(job, shape, record) for job, wanted in held for shape, record in zip(
-            wanted.shapes(), self.slurm.checked(job, wanted))]  # fmt: skip
-        placed = self.placed_nodes(records)
-        self.keep_off_other_federations([job for job, _ in held], placed)
-        self.set(lambda s: self.place(s, placed, [record for _, _, record in records]))
+        self.hold_and_place(site, tree)
         self.node_facts()
         self.zone_up()
         self.providers_up()
         self.export_zone()
         out = self.run_core()
         with self.store.core_phase("the end of this up"):  # no rerun by hand is in flight: its check has not ended
-            self.set(lambda s: s.update(phase="linked"))
+            self.link()
         retried = self.retried()
         return f"{out}\n{retried}\n{self.start_relay()}" if retried else f"{out}\n{self.start_relay()}"
+
+    def hold_and_place(self, site: Site, tree: Optional[str]) -> None:
+        """Hold this federation's jobs, running, and place every role on its node: what `up` needs before any step. An
+        up of a fleet (`placement_lock`) whose jobs run on a node another live federation holds is refused, its jobs
+        released, and is tried again, up to `PLACEMENT_ATTEMPTS` times in all, each submit excluding the nodes held by
+        then; the last refusal ends the up as it always did. An up run by hand is tried once."""
+        attempts = PLACEMENT_ATTEMPTS if self.placement_lock is not None else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return self.hold_once(site, tree, first=attempt == 1)
+            except hpcexclude.SharedNode as error:
+                if attempt == attempts or not error.released:  # a cancel that failed is down's: never resubmitted over
+                    raise
+                self.say(f"{error}; trying again ({attempt + 1} of {attempts})")
+        raise AssertionError("unreachable: the last attempt returns or raises")
+
+    def placing(self) -> Any:
+        """The fleet-wide lock around what two ups must not do at once: read the account's live jobs and submit on it,
+        and read them again once the jobs run. Waited for; none for an up run by hand. It is never held across a wait
+        and never taken inside itself (an `flock` on a descriptor of its own would deadlock the second)."""
+        if self.placement_lock is None:
+            return contextlib.nullcontext()
+        return hpcexclude.placement_lock(self.placement_lock)
+
+    @staticmethod
+    def forget_released(state: Dict[str, Any], excluded: int) -> None:
+        """A later attempt's state, as the first attempt's was before its submit: the new read's count, and no job. The
+        jobs of the attempt before were all cancelled (an up whose cancel failed is never tried again), and a state that
+        still named them would hide a job this attempt submits and dies before it records from `down`, which looks a job
+        up by name only when the state names none."""
+        state["allocation"].update(job=None, readback=None, excluded_nodes=excluded)
+        if state.get("sandbox") is not None:
+            state["sandbox"].update(job=None, component_job=None, readback=None)
+
+    def hold_once(self, site: Site, tree: Optional[str], first: bool) -> None:
+        """One attempt to hold this federation's jobs, from the first read of the account's live jobs to the placement
+        of every role. A later attempt reuses the state file, its names and its storage, forgets the released jobs
+        (`forget_released`) and records the new read's count and, as it submits, the new jobs. A failure anywhere from
+        the first sbatch to the end of the placement releases every held job of this attempt (`releasing`): none is
+        left to start and bill with no federation.
+
+        Under `separate`, without `HPC_EXCLUSIVE_NODES`, the agent's job is submitted only once the services' job runs
+        and its nodes are read, and `--exclude` names those nodes beside the other federations' (live, 18 Nov: the
+        two jobs submitted together, and Slurm packed the agent's onto a services node, which no exclusion read before
+        the submit could name, the up's own nodes being unknown: four ups failed). It needs no `--dependency`: the
+        services' job already runs. The cost: the services' nodes bill while the agent's job queues, which the queue
+        bound (`HPC_QUEUE_WAIT_S`) limits. With `HPC_EXCLUSIVE_NODES=1` both jobs hold whole nodes that no other job
+        shares, so exclusivity already keeps the agent off the services' nodes: the two are submitted together, the
+        agent's with `--dependency=after:<services job>` (`sandbox_allocation`), and wait together. A heterogeneous job
+        (`het`) is one job, whose components Slurm gives nodes of their own: unchanged. Every held job is read back
+        once more when all of them run, as it always was: a services' job that ended during the agent's wait, and
+        whose id Slurm reused, is found then (`Slurm.checked`), not placed from a record the wait made stale.
+
+        The fleet's lock (`placing`) is held around the first read with the services' submit (and, exclusive, the
+        agent's), around the agent's submit once the services' job runs (its exclusion is the first read's, which the
+        second read below checks), and around the second read: never across a wait, so the rest of the up runs in
+        parallel with the others'."""
+        held: List[Tuple[str, Allocation]] = []
+        with self.releasing(held):
+            with self.placing():
+                excluded = self.other_federations_nodes()  # before anything is made: an unreadable read refuses here
+                if first:
+                    state = self.store.create(self.initial_state(site, tree, len(excluded)))
+                    self.make_storage(state)  # recorded above, made before any job exists to bill for it
+                else:
+                    state = self.set(lambda s: self.forget_released(s, len(excluded)))
+                asked, alone = self.allocation(state, site, excluded), self.sandbox_allocation(state, site, excluded)
+                if site.exclusive_nodes:
+                    self.say("HPC_EXCLUSIVE_NODES=1: every held job asks for whole nodes (--exclusive), and is read "
+                             "back as exclusive")  # fmt: skip
+                self.submit(asked, "allocation", held)
+                if alone is not None and site.exclusive_nodes:
+                    # sandbox_placement = "separate", whole nodes: the agent's own held job, as the first, held until
+                    # the services' job starts (`after`): a pending services job never leaves the agent's node billing
+                    # alone
+                    self.submit(dataclasses.replace(alone, after=held[0][0]), "sandbox", held)
+            self.wait_held(held)
+            records = self.running_records(held)
+            if alone is not None and not site.exclusive_nodes:
+                own = self.placed_nodes(records)[0]  # the services' nodes, as the running job holds them
+                agent = dataclasses.replace(alone, exclude=tuple(sorted({*excluded, *own})), own=len(own))
+                self.say(f"the services' job runs: the agent's own held job is submitted now, off its {len(own)} "
+                         f"node(s) and the {len(excluded)} of other live federations")  # fmt: skip
+                with self.placing():
+                    self.submit(agent, "sandbox", held)
+                self.wait_held(held[1:])
+                records = self.running_records(held)  # every held job once more: the first record is as old as the wait
+            placed = self.placed_nodes(records)
+            with self.placing():
+                self.keep_off_other_federations(held, placed)
+            self.set(lambda s: self.place(s, placed, [record for _, _, record in records]))
+
+    def running_records(self, held: Sequence[Tuple[str, Allocation]]) -> List[Tuple[str, Any, Dict[str, str]]]:
+        """Each component's record of the running held jobs, read once more now they run: the scheduler may allocate
+        more than a pending request showed."""
+        return [
+            (job, shape, record)
+            for job, wanted in held
+            for shape, record in zip(wanted.shapes(), self.slurm.checked(job, wanted, self.say))
+        ]
+
+    @contextmanager
+    def releasing(self, held: List[Tuple[str, Allocation]]) -> Iterator[None]:
+        """Whatever fails inside releases every held job of this up in `held` that has not ended, by its own id
+        (`release_held`), and says so: a Slurm failure ends with what was released, any other is raised as it was after
+        the operator is told. An operator's Ctrl-C during a wait that may last hours is one of them. `held` grows as the
+        jobs are submitted, each as soon as sbatch prints its id. With nothing left to release (one held job, cancelled
+        by its own failed wait or read-back) the failure is as it was. A `SharedNode` is as it was too: the refusal
+        that raises it has cancelled every held job itself, and said so, and an up is tried again only on that type."""
+        try:
+            yield
+        except hpcexclude.SharedNode:
+            raise
+        except BaseException as error:
+            said = self.release_held(held)
+            if not said:
+                raise
+            if isinstance(error, SlurmError):
+                raise SlurmError(f"{error}; {said}") from None
+            self.say(said)
+            raise
+
+    def wait_held(self, held: Sequence[Tuple[str, Allocation]]) -> None:
+        """Wait for each held job of this up to run, in turn, at the queue bound. A wait that fails (a job past the
+        bound, or ended before it ran) cancels its own job; `releasing` releases the others. A read of the job that
+        fails is a missed poll, said once per streak and waited out (`Slurm.wait_running`)."""
+        for job, wanted in held:
+            self.slurm.wait_running(
+                job, self.timeouts["queue"], name=wanted.name, note=self.queue_note(wanted), say=self.say
+            )
+
+    def release_held(self, held: Sequence[Tuple[str, Allocation]]) -> str:
+        """Release what a failed wait leaves: each of this up's own held jobs that has not ended, by its id (`release`).
+        A job Slurm no longer knows, or that has ended, needs none (the wait that failed cancelled it); one that carries
+        another name now is another's, since Slurm reuses ids, and is never cancelled; one whose record cannot be read
+        is not guessed at: `down` checks it the same way. Empty when nothing was left to say."""
+        return self.release_held_report(held)[0]
+
+    def release_held_report(self, held: Sequence[Tuple[str, Allocation]]) -> Tuple[str, bool]:
+        """`release_held`, and whether nothing of this up is left held: False when a cancel failed or a job could not be
+        read (an up is tried again only when it is True)."""
+        ours, other, unread = [], [], []
+        for job, wanted in held:
+            try:
+                records = self.slurm.components(job) or []
+            except SlurmError:
+                unread.append(job)
+                continue
+            if records and records[0].get("JobName") != wanted.name:
+                other.append(job)
+            elif any(record.get("JobState") not in ENDED_STATES for record in records):
+                ours.append(job)
+        said, released = [], not unread
+        if ours:
+            text, cancelled = self.release_report(ours)
+            said.append(text)
+            released = released and cancelled
+        if other:
+            said.append(f"job(s) {', '.join(other)} carry another job's name and were not cancelled")
+        if unread:
+            said.append(f"job(s) {', '.join(unread)} could not be read: run down to release them")
+        return "; ".join(said), released
+
+    def link(self) -> None:
+        """`up`'s last write, with the core-phase lock held: `bootstrapped` becomes `linked`, and nothing else does. A
+        phase another command wrote since `up`'s own core phase ended (a `down`'s `stopping`) is never overwritten, and
+        a core phase that began after it and did not end (its link check failed, or it died: `core_unfinished`) is
+        no check `up` may say `linked` over. Either fails `up` in fixed words and leaves the state as it was. Before it
+        says `linked` it records each ingested space's Onezone ID from the facts its core's phase wrote
+        (`record_space_ids`), which the marker `verify-data` leaves is bound to."""
+        state = self.store.read()
+        if state.get("core_unfinished"):
+            raise RuntimeError(
+                "a core phase run on this federation after up's own did not end (its link check failed, or it died): "
+                "the federation stays bootstrapped, which shards plan refuses; down, then up again"
+            )
+        self.record_space_ids(state)
+        if not self.move_phase("bootstrapped", "linked"):
+            raise RuntimeError(
+                f"the federation's phase is not bootstrapped (it is {self.store.read().get('phase')}): up does not "
+                "say linked"
+            )
+
+    def record_space_ids(self, state: Mapping[str, Any]) -> None:
+        """Record in `data.ingested` the Onezone ID facts.json holds for each ingested space, as `up` leaves the
+        federation: the ID a later `verify-data`, rerun and `shards.py plan` compare the space with. A root with no
+        facts file (a core's phase that wrote none) records none, says so, and has no marker that `plan` takes (a
+        space with no recorded ID is verified by no one); a facts file that holds no ID for a space fails `up`."""
+        recorded = (state.get("data") or {}).get("ingested") or {}
+        if not recorded:
+            return
+        if not self.layout.facts.exists():
+            self.say("no facts file: the ingested spaces' IDs are not recorded, so verify-data will refuse them")
+            return
+        ids = recorded_space_ids(self.layout)
+        absent = sorted(space for space in recorded if not ids.get(space))
+        if absent:
+            raise RuntimeError(f"{', '.join(absent)}: the facts hold no ID for the space: up does not say linked")
+        self.set(lambda s: [s["data"]["ingested"][space].update(space_id=ids[space]) for space in recorded])
+
+    def space_identity(self, state: Mapping[str, Any]) -> Tuple[Optional[str], List[str]]:
+        """Whether each ingested space is the one `up` recorded, by the Onezone ID facts.json holds for it now (the
+        core's phase rewrites it from the zone it finds, and makes a space that is missing again by name under a new
+        ID): None and no names when each is, else the refusal, in fixed words that name the spaces and no ID, and the
+        names of the spaces to clear the marker of. A space whose ID `up` never recorded (a state an older `up` wrote)
+        cannot be shown to be the one verified. RuntimeError when facts.json cannot be read."""
+        recorded = (state.get("data") or {}).get("ingested") or {}
+        ids = recorded_space_ids(self.layout)
+        moved = sorted(s for s, r in recorded.items() if r.get("space_id") is not None and ids.get(s) != r["space_id"])
+        if moved:
+            return f"{', '.join(moved)}: the space is not the one up recorded (it was made again since up)", moved
+        unknown = sorted(s for s, r in recorded.items() if r.get("space_id") is None)
+        if unknown:
+            return f"{', '.join(unknown)}: its state records no ID for the space (its up predates it)", unknown
+        return None, []
+
+    def forget_markers(self, spaces: Sequence[str]) -> None:
+        """Clear the verified marker of each of `spaces`: no pass of `verify-data` outlives the space it read."""
+        self.set(
+            lambda s: [s["data"]["ingested"][n].update(verified=None) for n in spaces if n in s["data"]["ingested"]]
+        )
 
     def other_federations_nodes(self) -> List[str]:
         """The nodes of every live job of the account that carries the federation prefix (`hpcexclude`, DESIGN.md
@@ -450,37 +676,77 @@ class Driver(Down):
     @staticmethod
     def queue_note(wanted: Allocation) -> str:
         """What the queue bound's failure adds for a job that excluded nodes: Slurm keeps a job pending when what is
-        left does not fit it, and the bound is the one `up` always had."""
+        left does not fit it, and the bound is the one `up` always had. The agent's job under `separate` counts the
+        federation's own services' nodes (`Allocation.own`) apart from the other federations'."""
         if not wanted.exclude:
             return ""
+        lack = "Slurm may be keeping it pending for lack of others"
+        others = len(wanted.exclude) - wanted.own
+        if not wanted.own:
+            return f" (it excluded {others} node(s) of other live federations of this account: {lack})"
         return (
-            f" (it excluded {len(wanted.exclude)} node(s) of other live federations of this account: Slurm may be "
-            "keeping it pending for lack of others)"
+            f" (it excluded {wanted.own} node(s) of this federation's own services job and {others} of other live "
+            f"federations of this account: {lack})"
         )
 
-    def keep_off_other_federations(self, jobs: Sequence[str], placed: Sequence[Sequence[str]]) -> None:
+    def keep_off_other_federations(
+        self, held: Sequence[Tuple[str, Allocation]], placed: Sequence[Sequence[str]]
+    ) -> None:
         """Once the held jobs run and before any step, none of this federation's nodes may hold another live
         federation's job (a service's, or an agent's: an agent never runs beside a service): two ups that read the
         account's jobs at once both excluded nothing. One that does is refused, every held job of this up cancelled
-        by its own id, and the roles named (the zone, providers[i], the agent), never a host. `placed` is each
-        component's nodes, the services' first. Fail closed: with the jobs unreadable nothing proves the nodes are
-        this federation's own, and the same release follows."""
-        try:
-            others = set(hpcexclude.nodes_of(hpcexclude.live_jobs(self.slurm), own=jobs))
-        except SlurmError as error:
-            raise SlurmError(f"{error}; {self.release(jobs)}") from None
-        held = [(hpcexclude.role(index), node) for index, node in enumerate(placed[0])]
-        held += [(hpcexclude.AGENT, node) for nodes in placed[1:] for node in nodes]
-        shared = [role for role, node in held if node in others]
+        by its own id, and the roles named (the zone, providers[i], the agent), never a host (`hpcexclude.SharedNode`;
+        under a fleet, with the lock held, the cancelled jobs are first waited out of the live list, so that the next
+        up does not read them still holding the node). `held` is this up's jobs, each with what it asked, and `placed`
+        is each component's nodes, the services' first. Fail closed: with the jobs unreadable nothing proves the nodes
+        are this federation's own, and the release follows. A read of the account's jobs that fails or times out (a
+        slow controller, with the jobs already running) is read again, backed off, and fails only once every read has
+        failed for ten minutes (`Slurm.ride_out`); a line it cannot take apart ends it at once. Either failure
+        propagates to `releasing`, and the refusal here releases through `release_held_report`: each reads every held
+        job and cancels it only while it still carries the name `up` gave it, since ten minutes later a job may have
+        ended and Slurm reused its id, which a cancel by the saved id would hit."""
+        jobs = [job for job, _ in held]
+
+        def read() -> List[str]:
+            return hpcexclude.nodes_of(hpcexclude.live_jobs(self.slurm), own=jobs)
+
+        others = set(self.slurm.ride_out(read, "the read of the account's live jobs", self.say))
+        roles = [(hpcexclude.role(index), node) for index, node in enumerate(placed[0])]
+        roles += [(hpcexclude.AGENT, node) for nodes in placed[1:] for node in nodes]
+        shared = [role for role, node in roles if node in others]
         if shared:
-            raise SlurmError(
+            said, released = self.release_held_report(held)
+            said = said or "no held job of this up was left to cancel"
+            if released and self.placement_lock is not None:
+                self.wait_unlisted(jobs)
+            raise hpcexclude.SharedNode(
                 f"{', '.join(shared)} would run on a node another live federation of this account holds, and two "
-                f"federations never share one; no service started, and {self.release(jobs)}"
+                f"federations never share one; no service started, and {said}",
+                released,
             )
+
+    def wait_unlisted(self, jobs: Sequence[str]) -> None:
+        """Wait, at most `timeouts["leave"]`, for the jobs just cancelled to leave `squeue --me`'s live list, which is
+        what the next up reads (a completing job still lists its nodes). Never an error: a list that cannot be read, or
+        jobs still there at the bound, are left to the next up's own read, which fails closed or is refused and tried
+        again."""
+        deadline = self.clock() + self.timeouts["leave"]
+        while True:
+            try:
+                listed = {job.job for job in hpcexclude.live_jobs(self.slurm)}
+            except SlurmError:
+                return
+            if not listed & set(jobs) or self.clock() >= deadline:
+                return
+            self.sleep(self.poll_s)
 
     def release(self, jobs: Sequence[str]) -> str:
         """Cancel each held job of this up by its own id, and say so; a cancel that fails is said, and `down` finishes
         it."""
+        return self.release_report(jobs)[0]
+
+    def release_report(self, jobs: Sequence[str]) -> Tuple[str, bool]:
+        """`release`, and whether every cancel went through (an up is tried again only then)."""
         failed = []
         for job in jobs:
             try:
@@ -488,8 +754,8 @@ class Driver(Down):
             except SlurmError:
                 failed.append(job)
         if failed:
-            return f"cancelling job(s) {', '.join(failed)} failed: run down to release them"
-        return f"the held job(s) {', '.join(jobs)} were cancelled"
+            return f"cancelling job(s) {', '.join(failed)} failed: run down to release them", False
+        return f"the held job(s) {', '.join(jobs)} were cancelled", True
 
     def make_storage(self, state: Mapping[str, Any]) -> None:
         """The providers' storage directories on scratch, as the state records them (hpcstorage.create); none without a
@@ -519,11 +785,12 @@ class Driver(Down):
         self.set(lambda s: s.update(fault_relay="serving"))  # only now: `relay` above is written at the spawn
         return "fault relay: serving"
 
-    def submit(self, asked: Allocation, key: str) -> str:
+    def submit(self, asked: Allocation, key: str, held: List[Tuple[str, Allocation]]) -> str:
         """Submit one held job (`key`: "allocation", the services' job, or "sandbox", the agent's own); its id is
-        recorded as soon as sbatch prints it, before the read-back, which cancels that one job unless Slurm recorded
-        every component as asked."""
+        recorded, and added to `held`, as soon as sbatch prints it, before the read-back, which cancels that one job
+        unless Slurm recorded every component as asked."""
         job = self.slurm.submit(asked)
+        held.append((job, asked))
 
         def submitted(state: Dict[str, Any]) -> None:
             state[key]["job"] = job
@@ -534,7 +801,8 @@ class Driver(Down):
         self.set(submitted)
         self.say(f"held job {job} submitted ({sum(s.nodes for s in asked.shapes())} nodes); reading back what Slurm "
                  "recorded")  # fmt: skip
-        records = self.slurm.checked(job, asked)
+        records = self.slurm.checked(job, asked, self.say)
+        self.slurm.check_dependency(job, asked, records, self.say)  # at submit time only: it is gone once the job runs
         self.set(lambda s: self.record_readback(s, key, records))
         return job
 
@@ -548,16 +816,16 @@ class Driver(Down):
     def placed_nodes(self, records: Sequence[Any]) -> List[List[str]]:
         """Each component's nodes, the services' first and the agent's last, as Slurm placed them. A component on
         another count of nodes than asked, or on a node another holds (no node runs two services, nor the agent beside
-        one), fails up, its job cancelled by its id before any step."""
+        one), fails up before any step, and `releasing` cancels every held job of this up, by its id: the other one
+        would otherwise run, and bill, with no federation."""
         found: List[List[str]] = []
         seen: set = set()
         for job, shape, record in records:
             nodes = self.slurm.hostnames(record.get("NodeList", ""))
             twice = sorted((set(nodes) & seen) | {n for n in nodes if nodes.count(n) > 1})
             if len(nodes) != shape.nodes or twice:
-                self.slurm.cancel(job)
                 why = f"on {', '.join(twice)}, held twice" if twice else f"on {len(nodes)} node(s)"
-                raise SlurmError(f"job {job} was placed {why}, not on the {shape.nodes} asked for; it was cancelled")
+                raise SlurmError(f"job {job} was placed {why}, not on the {shape.nodes} asked for")
             seen.update(nodes)
             found.append(nodes)
         return found
@@ -985,12 +1253,22 @@ class Driver(Down):
         relink = was_linked and self.move_phase("linked", "bootstrapped")
         if relink:
             self.say("the federation was linked: it is bootstrapped unless this core phase's link check passes")
+        # marked before it runs and cleared only when it returns, so one that fails, or dies, leaves the mark `up`'s own
+        # last write reads (`link`); a phase refused before it starts (no owner, a mount not proved) is never marked
+        self.set(lambda s: s.update(core_unfinished=True))
         try:
             out = self.core(placed, owner, values, environ=self.environ)
         except Exception:
+            self.clear_moved_markers()  # it may have made a space again and written its new ID before it failed
             if relink:
                 self.say("the core's phase failed: the federation stays bootstrapped, which shards plan refuses")
             raise
+        self.set(lambda s: s.update(core_unfinished=False))
+        moved = (
+            self.refuse_moved_spaces()
+        )  # the core's phase made a space that was missing again by name: read after it
+        if relink:
+            why = moved or why
         if not was_linked:
             self.move_phase(before, "bootstrapped")  # a `down`'s `stopping`, written meanwhile, is kept
         elif relink and why is not None:
@@ -998,6 +1276,27 @@ class Driver(Down):
         elif relink and self.move_phase("bootstrapped", "linked"):
             self.say("the core's phase and its link check passed: the federation is linked again")
         return out
+
+    def refuse_moved_spaces(self) -> Optional[str]:
+        """The reason a rerun that has just run its core's phase must not link the federation again for the ingested
+        spaces' IDs, or None: a space whose ID in the facts it wrote is not the one `up` recorded was made again
+        (empty), so its marker is cleared, and facts that cannot be compared refuse in fixed words too. Read after the
+        phase, which is what rewrites the IDs (`relink_refusal`'s own checks are made before it)."""
+        try:
+            said, spaces = self.space_identity(self.store.read())
+        except (RuntimeError, OSError, ValueError, KeyError, TypeError):
+            return "its ingested spaces' IDs could not be compared with the ones up recorded"
+        if spaces:
+            self.forget_markers(spaces)
+        return said
+
+    def clear_moved_markers(self) -> None:
+        """`refuse_moved_spaces` for a core phase that failed: what it finds goes nowhere (the phase's own error is the
+        one raised), and a state that cannot be read or written now is said, never allowed to hide that error."""
+        try:
+            self.refuse_moved_spaces()
+        except Exception:
+            self.say("the ingested spaces' markers could not be checked after the core's phase failed")
 
     def verify_data(self) -> str:
         """After the study's ingest, show that each ingested space holds exactly the data its manifest declares (O57,
@@ -1019,6 +1318,11 @@ class Driver(Down):
         owner = tuple(state["owner"] or ())
         if len(owner) != 2:
             raise RuntimeError("the state names no owner of the providers' storage: the node facts did not run")
+        # the spaces read are the ones up recorded, by ID: a marker is bound to the space it read, never to a name
+        refusal, _ = self.space_identity(state)
+        if refusal is not None:
+            raise RuntimeError(f"{refusal}: not verified; down, then up")
+        ids = recorded_space_ids(self.layout)
         found = self.verify(self.placed_layout(state), owner, manifests)
         passed = {space: manifests[space] for space, said in found.items() if not said}
 
@@ -1026,7 +1330,8 @@ class Driver(Down):
             for space, record in state["data"]["ingested"].items():
                 manifest = passed.get(space)
                 record["verified"] = None if manifest is None else {
-                    "manifest": manifest.digest(), "files": len(manifest.files), "bytes": manifest.bytes}  # fmt: skip
+                    "manifest": manifest.digest(), "files": len(manifest.files), "bytes": manifest.bytes,
+                    "space_id": ids[space]}  # fmt: skip
 
         self.set(mark)
         failed = [hpcdata.failure(space, said, recorded[space]["declared"]) for space, said in found.items() if said]

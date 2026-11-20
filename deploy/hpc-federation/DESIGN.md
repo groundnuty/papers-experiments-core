@@ -68,12 +68,16 @@ a port per federation would patch the shim, the guard and the images, for a plac
 answer. Asking the site for whole nodes (`--exclusive`) was the other option: it would change the held job's shape and
 what it bills (above), which this problem does not need.
 
-- **Which jobs.** Every live job of the account (`squeue --me`, read-only, ids, names, states and node lists) whose
+- **Which jobs.** Every live job of the account (`squeue --me --all`, read-only, in every partition, ids, names, states and node lists; it
+  names no state, so squeue's own default applies, which lists a suspended job and a running one with a stop or a
+  signal pending as well as a plain running one, and the call runs with no `SQUEUE_*` variable (but `SQUEUE_ALL`, which only widens) and none of Slurm's
+  output-format variables in its environment, so a login shell's own cannot hide a job) whose
   name starts with `hpcop-` (`hpcexclude.JOB_PREFIX`, the one prefix `up` names its jobs by, and the bundle's batch
   scripts carry): the held job, the agent's own job (`-sandbox`), the older scripts' `hpcop-zone` and `hpcop-provider`. A
   job is read whole, a heterogeneous job's components together, so another federation's agent's node is one of its nodes:
-  the agent's sandbox never runs on a node that hosts an Onedata service. A pending job holds none, a completing one still
-  does.
+  the agent's sandbox never runs on a node that hosts an Onedata service. A pending job holds none unless
+  it names its nodes (a list that cannot be expanded refuses, naming the job's own name, as one of any other state
+  does), a completing one still does.
 - **Before the submit** (section 5, step 2): the nodes of those jobs go to every component of every held job `up`
   submits as `--exclude`, named on every component so that nothing depends on Slurm passing it on, and only when there
   are some, so
@@ -83,15 +87,27 @@ what it bills (above), which this problem does not need.
 - **After the allocation, before any step** (step 3): a second read; any of this federation's nodes (a service's or the
   agent's) in another live federation's jobs (this up's own jobs left out by their ids) refuses `up`. Its held jobs are
   cancelled by their ids, none of the placement is recorded, and the refusal names the roles (`zone`, `providers[i]`,
-  `agent`), never a host. A failed second read refuses and releases the same way. Two ups that read before either
+  `agent`), never a host. A second read that fails for ten minutes refuses and releases the same way (one that fails
+  once, as a slow controller does with the jobs already running, is read again: `Slurm.ride_out`). Two ups that read before either
   submitted are the case: the one whose job runs later sees the other's nodes and is refused, and both are when both
   ran before either read again.
 - **Too few nodes.** Slurm keeps a job pending, or sbatch refuses it, when the exclusion leaves none that fits. `up`
-  waits no longer than the queue bound it always had (30 min, step 3) and its message says that it excluded N nodes of
+  waits no longer than the queue bound it always had (30 min, step 3; `HPC_QUEUE_WAIT_S` sets it) and its message says that it excluded N nodes of
   other live federations; an sbatch refusal says the same, the nodes' names Slurm repeats removed. What the site's
   sbatch does is not known (a live slot sees it).
 - **A fleet** (below) is N such federations: each member's `up` reads the others' jobs, so members brought up one after
-  another take distinct nodes by this rule alone; members brought up at once may race and the later one is refused.
+  another take distinct nodes by this rule alone. Members brought up at once (`HPC_FLEET_PARALLEL` above 1) share one
+  lock, the file `<fleet>/.placement.lock` (`hpcexclude.placement_lock`), taken for each up's first read together with
+  its submits, for the agent's own submit once the services' job runs (under `separate` without exclusive nodes, with
+  the first read's exclusion and the services' nodes: no read of its own) and for its second read once its jobs run,
+  and for nothing else, a wait included: the rest of every up (the services, the core's phase, the link check) runs in
+  parallel. Two members whose pending jobs end on one node are told apart by the
+  second read: the one that reads first is refused, its jobs cancelled and gone from the live list before the lock is
+  let go (a completing job still lists its nodes), and it is tried again (`hpcdriver.PLACEMENT_ATTEMPTS`, 3 in all),
+  each retry reading the jobs now held and submitting with their nodes excluded; only the last refusal fails the
+  member, as it did. An `up` run by hand takes no lock and is tried once. Two fleets of one account do not share a
+  lock: each is kept apart from the other's federations by the second read alone, and both may be refused (each is then
+  tried again).
 
 ### The agent's node: a component of its own
 
@@ -103,10 +119,18 @@ the default:
 
 ```
 sbatch --parsable --job-name=<name> --account --partition --no-requeue --time --nodes=<1 + N> --ntasks-per-node=1 \
-       --cpus-per-task=<service node> --mem=<service node> --chdir=/ --output=/dev/null --export=NONE \
+       --cpus-per-task=<service node> --mem=<service node> [--exclusive] --chdir=/ --output=/dev/null --export=NONE \
        --wrap='exec sleep <seconds>' \
-     : --account --partition --time --nodes=1 --ntasks-per-node=1 --cpus-per-task=<S> --mem=<S>
+     : --account --partition --time --nodes=1 --ntasks-per-node=1 --cpus-per-task=<S> --mem=<S> [--exclusive]
 ```
+
+`--exclusive` is on every component, and on the agent's own job under `separate`, only when the site sets
+`HPC_EXCLUSIVE_NODES=1` (the held jobs ask a few cores per node, so Slurm packed several federations' jobs onto one node
+when ups ran at once, and a pending job has no nodes for another `up` to exclude). The read-back then also requires
+`OverSubscribe=NO` in each component's record, and accepts `NumCPUs` at or above the asked count (an exclusive job holds
+every core of its nodes); `OverSubscribe` is read only when the job was asked exclusive, and is no part of the state's
+`readback`. A failure anywhere from the first sbatch to the end of the placement releases every held job of the `up`
+that has not ended, by its own id (`Driver.releasing`).
 
 - **Component 0 holds the services' nodes, component 1 holds S.** Its leader's id (component 0's) is the job's id.
   **Every step names its component:** `--het-group=0` on a service node, `--het-group=1` on S. The site's Slurm
@@ -120,10 +144,19 @@ sbatch --parsable --job-name=<name> --account --partition --no-requeue --time --
   is cancelled by its leader's id, which ends every component. Component 1's own job id (its record's `JobId`) is
   recorded, since squeue -s and sacct list its steps under it.
 - **The fallback, should a site refuse heterogeneous jobs: `sandbox_placement = "separate"`**, a second held job for S
-  alone, named `<name>-sandbox`, submitted, read back and cancelled exactly as the first, and never stopped or started:
-  its gate reaches the providers over the network, as it does in a component. Its steps take its own job id. The two
-  jobs are scheduled apart, so the first can run, and bill, while the second waits (bounded as the first), and a
-  partition that allows one submitted job per user (reason 5 above) refuses the second.
+  alone, named `<name>-sandbox`, read back and cancelled exactly as the first, and never stopped or started: its gate
+  reaches the providers over the network, as it does in a component. Its steps take its own job id. The two jobs are
+  scheduled apart, and the order they are submitted in depends on the nodes. Without `HPC_EXCLUSIVE_NODES` the second
+  is submitted once the services' job runs and its nodes are read, with `--exclude` naming them and the other
+  federations' nodes, so Slurm cannot pack it onto a services node (it needs no dependency: the first already runs);
+  while it queues the first runs, and bills, bounded as the first by the queue bound. With `HPC_EXCLUSIVE_NODES=1`
+  whole nodes are never shared, so the two are submitted together, the second to start after the first
+  (`--dependency=after:<first>`, Slurm's "begin after the job starts", never `afterok`; read back with the job), so a
+  services job that pends in the queue does not leave S's node billing alone. What remains there: once the first runs,
+  it can still run, and bill, while the second waits for a node of its own (bounded as the first); a first job
+  cancelled before it started (its wait failing at the bound) satisfies the dependency too, so the second may start in
+  the seconds before the same failure cancels it. A partition that allows one submitted job per user (reason 5 above)
+  refuses the second either way.
 - **On a site whose switch plugin gives each job a virtual network identifier, `separate` is the placement to start
   from** (the second live slot, 16 Nov 2026). There a heterogeneous job's steps on component 0 failed from a point on
   (`srun: error: task 0 launch failed: Error configuring interconnect`: after the zone and five providers had started,
@@ -160,7 +193,8 @@ under one record. One federation's job failing ends one shard's step, never anot
   section 11, whenever the site sets its keys) is asked once too, ahead of it, at `up` and at `add`: it has no estimate to
   multiply, so one read answers for all N, and a full home refuses the call before the fleet's directory, a slot or a job
   is made. `HPC_FLEET_PARALLEL` (1 by default) is how
-  many ups or downs run at once.
+  many ups or downs run at once. Neither setting may pass `HPC_FLEET_CEILING`, the site's own ceiling, a whole number
+  from 1 to 512 (64 when unset, so nothing changes unless the site sets it; a fleet of 66 needs it at 66 or more).
 - **One process per federation.** A federation's driver changes process-wide state (the umask its secrets are written
   under), so each `up` and `down` is `hpcfed.py` in a child of its own, with `-I`, from the fleet's 0700 directory,
   its output in `<fleet>/logs/<label>.<command>.log`. One that fails is reported; the others go on.
@@ -213,10 +247,57 @@ under one record. One federation's job failing ends one shard's step, never anot
   step carries into the study: it moves a shard only to a federation whose `platform.toml` leaves `[placement]
   reset_shortcut` off (the default), under which every reset takes the full reads; one that turns it on is refused.
   It cannot see a study's own request for one full reset (O51), so a study that turns the shortcut on moves no shard.
+- **A stuck shard (`step-stop`, `fleetstuck.py`; O68).** A step that hangs is ended from the login node by the ids the
+  fleet recorded for it and nothing else: its srun client (pid and start tick, `Runner.client_state`: a pid that holds
+  another process now is never signalled, and refuses the whole stop) and its Slurm step, whose `<job>.<n>` id is not
+  known at the spawn and is read at the stop, from the job the federation's state names, by the one step name the fleet
+  gave it, then cancelled through the federation's launcher (which refuses another job's step) and recorded, only while the
+  recorded client is alive and exactly one step carries the name (the name is not the fleet's alone: a line run by
+  hand has it too, and a live client is what vouches for the step). It never cancels by name or user. The shard then moves as above, and its `--resume` step carries the nonce of the running mark
+  the killed step left (`--over`, which `shards.claim_running` takes only for the mark it names), after the proof
+  `shards.py resume-line` takes and the fleet reuses (`shardresume.check_no_live_step`: no step of the user's carries the
+  shard's step name, and the step the mark names is listed nowhere), asked through every federation that held or ran the
+  shard. A shard whose holder still runs is refused and launched nowhere.
 - **The shards' results are copied back before `down`.** The shards' archives, archive manifests, journals, each root's evidence archive and (when newer than the archive) newest snapshot are on the shared filesystem the site's scratch policy cleans, and `down` ends the federation: the operator pulls them to their own host after `collect` and checks them with `shards.py verify-copy` before `down` (section 5, "Before `down`").
 - **Not built:** a fleet's `down` of a failed federation on its own (the operator decides when a failed `up`'s job
   goes), a watch of each job's walltime, and a fleet across accounts (the maximum is one fleet's, not the account's:
   two fleets of one account must share it by hand).
+
+### The elastic controller
+
+Step 5 of #462 (C43; `fleetcontrol.py`, `fleetobserve.py`, `fleetexecute.py`; the decision in
+`expcore.campaign.elastic.control`; README, "The elastic fleet's controller"). It runs where the campaign's ledger is,
+in the process that drives the ledger (the ledger's lock admits one), and keeps each site's fleet at a target.
+
+- **Decision and action are apart.** `decide` is a pure function of one ledger view, one read per site and the sites'
+  declared settings; every action it returns is the call an operator makes by hand, rendered once, so the dry run
+  prints exactly what a live tick runs and step 6 can run with an agent taking the actions.
+- **The site's read is read-only and whole.** `sinfo` and `scontrol show job -o <id>` on the ids the fleet's record
+  and state files name, and the quota command. One job read that fails makes the site dark for the tick: unknown is
+  never taken for ended, so no proof and no retirement come from a site that could not be read.
+- **What each limit counts.** The maximum counts every member that may hold a job. Free whole nodes are idle ones only
+  (`--exclusive` takes whole nodes; mixed ones are logged), less 7 for each up whose job has not started. Inodes are
+  the guard's line less the usage less one whole estimate for each member whose data is not all on scratch yet, so
+  parallel ups never share one reading; the reservation is read from the fleet's record, never memory, and survives a
+  restart. The allowance is declared and charged each member's whole `--time` from the moment it is made. The login
+  node's memory (a per-account cgroup) is budgeted per login node: the relays beating there (each read by its
+  heartbeat's pid and start tick, so one on another login node counts there), the ups and verify-data in flight, and a
+  reserve, against the declared cap.
+- **Relays and money.** A relay recorded serving whose heartbeat is gone drains its federation, recorded with its last
+  heartbeat. A lost lease is settled each tick to the spend its dead federation's call log shows, through a reader
+  step 6 hooks up (`fleetidentity.locator`); the ledger's locked dollars are printed and logged every tick.
+- **Down only through the fleet.** A retirement is collect, verify-copy against collect's own hash, then
+  `fleet.py down --member`, whose `hpcfed.py down` still refuses evidence not collected and cancels only the ids its up
+  recorded. The ledger is checked again just before: drained or proven ended, and no lease issued or sent. The proof
+  `cancelled` comes only once the record shows the down verified.
+- **Step 6 (Helios, local transport; a remote site over ssh).** The dispatcher ticks in this process, on the ledger the
+  controller holds (the ledger's lock admits one holder), and a joining federation's worker is launched from the
+  controller (`fleetworker.py`, README, "The elastic fleet's worker"), with the identity it joins with and the reader of
+  a lost lease's spend (`fleetidentity.py`). A site with `transport = "ssh"` (`fleetssh.py`) is one remote campaign's:
+  the ledger and the archives stay on this host's local disk and every call at the site is one bounded ssh call whose
+  failure is the site unread; a retirement there is collect, the pull of its copy here, `verify-copy` here, then
+  `down` (README, "A remote site"); a lost lease's place on the login node is fetched over ssh for the spend reader.
+  **Not built:** `--time` per up, and the watchdog's command. `fleet.py`'s commands are unchanged; the controller only adds to a fleet `up` made.
 
 ## 2. Sizing: service steps, control steps, and the node
 
@@ -363,7 +444,7 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
   "command": ["<python>", "-I", "-B", "<.../hpcfed.py>", "--layout", "<path>", "--root", "<root>"],
   "site": {"account": "...", "partition": "...", "images": "...", "logs": "...", "step_path": "...",
            "node_tmp": "/tmp", "node_python": "python3.11", "core_python": "...", "admin_mail": "...",
-           "billing_weight": null, "step_network": "", "study_artifacts": "<directory, or empty>",
+           "billing_weight": null, "step_network": "", "node_domain": "", "study_artifacts": "<directory, or empty>",
            "storage_root": "<scratch root, or empty>"},
   "study_artifacts_tree_sha256": "<64 hex: the digest of that directory's tree, taken in the preflight (section 8); absent without one>",
   "storage": {"root": "<the site's scratch root>", "parent": "<root>/<allocation name>", "token": "<32 hex>",
@@ -432,10 +513,16 @@ checks, the same mark): a 0700 directory, here **on a filesystem the login node 
 - **`data.ingested`** (O57, C06) names each space whose data is the study's own, put there after `up` (section 6a),
   written by `up` from the layout alone: `manifest` is the SHA-256 of the manifest it is to be verified against
   (`Manifest.digest()`: the declared file's, or the empty manifest's for a space that declares none), `declared` whether
-  the layout declares it, and `verified` is `null` until `hpcfed.py verify-data` has read the space back and found
-  exactly that manifest, then `{"manifest": <the digest it compared with>, "files": n, "bytes": n}`. **A state without
-  `data`** (an `up` of an earlier driver) cannot be shown verified, and `shards.py plan` refuses it. Every run of
-  `verify-data` sets `verified` back to `null` first, and a pass sets it again.
+  the layout declares it, `space_id` the space's Onezone ID (`null` until `up` has recorded it from the facts its core's
+  phase wrote, just before it says `linked`), and `verified` is `null` until `hpcfed.py verify-data` has read the space
+  back and found exactly that manifest, then `{"manifest": <the digest it compared with>, "files": n, "bytes": n,
+  "space_id": <the ID of the space it read>}`. **A state without `data`**, or a space with no `space_id` (an `up` of an
+  earlier driver), cannot be shown verified, and `shards.py plan` refuses it. Every run of `verify-data` sets `verified`
+  back to `null` first, and a pass sets it again. A rerun of the core's phase that finds another ID than the recorded
+  one (the space was deleted and made again by name, empty) clears the marker and leaves the phase `bootstrapped`.
+- **`core_unfinished`** (C06, O63) is `true` while a core phase runs and after one that failed or died, `false` after
+  one that returned: set before the phase runs, cleared only when it returns, under the core-phase lock. `up`'s own last
+  write reads it (below, "The core's phase holds the root's core-phase lock").
 - **`storage`** is `null` without a scratch root (`HPC_STORAGE_ROOT`, section 11), else the provider storage `up` makes
   on scratch, recorded before the first `mkdir`; `down` reads its paths here and nowhere else.
 - **Read and changed through one store** (`hpclaunch.StateStore`): `read()` the whole file; `update(fn)` a
@@ -643,12 +730,12 @@ image's test CA (section 7 of `up`); the cluster's Erlang names are the node's a
 
 **`up` and `down` each hold the root's lifecycle lock** (`<root>.lifecycle.lock`, beside the root, `flock`, never
 waited for) from start to end, so a `down` never runs between an `up`'s state and its `sbatch` (it would find no job
-and remove the root); the service verbs do not take it. **It lies outside the root and is never removed.** On the
+and remove the root); the service verbs do not take it. A worker's launch (`fleetworker.py launch`) holds it from its checks to its spawn, so it never meets a `down` of its federation (C57). **It lies outside the root and is never removed.** On the
 site's shared filesystem (NFS) a file held open while it is removed becomes a silly-rename file (`.nfsXXXX`) until its
 last close: the first live `down` held the lock inside the root it removed, which was then not empty. A lock file
 removed while held would let the next `up` or `down` lock another file of the same name, so it stays.
 
-**The core's phase holds the root's core-phase lock** (`<root>/core-phase.lock`, `flock`, never waited for) from its first read of the state to its last write of the phase: `up`'s own (in its process, or in the node's step under `[hpc] core = "step"`) and a rerun of it by hand (`hpcfed.py core`); `up`'s own write of `linked`, after its core phase, takes it too, so a rerun by hand that started in the step's teardown makes `up` fail with the federation `bootstrapped`, never `linked` over a check that has not ended. A second core phase on the root is refused at once, naming the state, and changes nothing. It is not the lifecycle lock, which `up` holds around the step. A rerun on a `linked` federation sets `bootstrapped` before the phase runs and `linked` again only if it returns (its link check passed, and the facts file, the layout's digest, the platform template's hash (`render-identity.json`) and the ingested spaces' manifests are what `up` recorded, so the rerun can vouch for the federation: otherwise it ends `bootstrapped` and says why); an overlapping second one would have read that `bootstrapped` as no rerun of a linked federation, and the first could have linked it over the second's failed check. The lock file is in the root and is closed when the phase ends, so `down` removes it with the root; it is no evidence.
+**The core's phase holds the root's core-phase lock** (`<root>/core-phase.lock`, `flock`, never waited for) from its first read of the state to its last write of the phase: `up`'s own (in its process, or in the node's step under `[hpc] core = "step"`) and a rerun of it by hand (`hpcfed.py core`); `up`'s own write of `linked`, after its core phase, takes it too, so a rerun by hand that started in the step's teardown makes `up` fail with the federation `bootstrapped`, never `linked` over a check that has not ended; the write is a compare-and-set (`bootstrapped` to `linked`: a `down`'s `stopping` is never overwritten), and `up` also fails when the state's `core_unfinished` is set, which a rerun that began after `up`'s own core phase and failed (or died) leaves, since that rerun leaves the phase `bootstrapped` as `up`'s own did. A second core phase on the root is refused at once, naming the state, and changes nothing. It is not the lifecycle lock, which `up` holds around the step. A rerun on a `linked` federation sets `bootstrapped` before the phase runs and `linked` again only if it returns (its link check passed, and the facts file, the layout's digest, the platform template's hash (`render-identity.json`) and the ingested spaces' manifests are what `up` recorded, so the rerun can vouch for the federation: otherwise it ends `bootstrapped` and says why); an overlapping second one would have read that `bootstrapped` as no rerun of a linked federation, and the first could have linked it over the second's failed check. The lock file is in the root and is closed when the phase ends, so `down` removes it with the root; it is no evidence.
 
 **`down`** (login node), whatever `up` reached:
 
@@ -708,7 +795,7 @@ removed while held would let the next `up` or `down` lock another file of the sa
 **Before `down`: the copy back, a required step of the operator's, not of `down`'s.** Nothing durable may live only on scratch: a site's scratch policy can remove files 30 days after creation, a job directory 7 days after its job and all of scratch after 20 days with no job submitted. The cluster cannot push to the operator's host, so after `shards.py collect` (run once every step has ended) the operator pulls the results directory (rsync or scp, from their host) and runs `shards.py verify-copy MANIFEST LOCAL_DIR --manifest-sha256 HASH` there. **What the required pull covers is what the manifest lists,** per shard: the archive `<label>.out.tar`; its manifest `<label>.out.json`; every file under `<label>/journals/` (a spend journal per step, which holds what a step killed outright spent and which `--resume` counts as `lost_in_kill`, so it is held nowhere else); and the newest snapshot that verifies, only when it is newer than the archive. **Why snapshots are not otherwise required:** a snapshot is a copy of `out/` taken while its step ran, and it names the archive its step started from (`_run_step`: `facts = {"shard": spec, "base": base}`). The snapshots of the step that wrote an archive name an earlier archive or none, and the last of them was taken after the dispatcher exited and before the archive, so the verified archive holds all they do; `--resume` agrees (`restore_newest` returns none for a snapshot whose `base` is not the archive's SHA-256, the archive being newer). **The exception:** a step resumed from the archive and killed before it archived leaves snapshots that name that archive, so the newest holds the runs that step reached, which the archive lacks and the merge will not have; `collect` picks it as `--resume` would (`restore_newest` with the verified archive as the base, restored into a private directory that is removed), warns, and lists every file of it. Plain `collect` does not refuse that state (the merge it prints is of the archive, and the operator may mean to run it): the warning and the manifest keep the snapshot from being lost with the scratch. `collect --run`, which runs the merge at once, refuses in that state (exit 2, naming the shard and the snapshot: resume the shard so its runs reach a new archive, or run `collect` without `--run` and merge the line it prints yourself), because the merge has no flag to leave a shard short and would analyse an incomplete campaign. `collect` writes `archives.sha256.json` beside the archives: the plan's id, then each archive's, and each other file's, relative name, size and SHA-256, read by `collect` (an archive from its private verified copy, never from a step's claim; a link anywhere among the journals or the snapshot refuses the collect), sorted, with no path or timestamp, and prints the file's own hash on stderr; the hash must come from that output, never from the pulled files, or a manifest damaged or swapped in the pull would vouch for itself. `verify-copy` is standard library only and is dispatched before the plan is loaded, so it runs on a host without the core (a test runs it under `python -I -S`); it checks each file as a regular file under plain directories (a link on the way is not followed) and refuses a manifest with no list of the files beside the archives, which an earlier tip wrote. `down` does not see the operator's host and does not check that this was done: the order is the operator's rule, and the README states it as a required step.
 
 
-**`down` and the root's evidence (O63).** `down` removes the root, which holds the files the study's post-check and the facts read, so it does not remove one whose evidence was not collected. The evidence is an allow-list (`hpcevidence.py`): the state, `platform.toml`, `facts.json`, `link-check.json`, `render-identity.json`, `day0-wiring.toml` where present, `shard-claim.json` and `shard-claim.lock` where present (the study's pre-step guard), `data-manifests/*.json` (the manifests each space's data identity in `platform.toml` is the hash of), `shard-steps/*.json`, the whole of `fault-journal/` (its journals, `link-epoch.json`, the holder, drain and intent records and the lock files the pilot's heal flocks: read as they are, never locked) and the fault relay's `late-steps.jsonl` and its request, taken and answer files. Never in it: `secrets/` (the zone's passphrase, the CA key, the admin credential, the users' passwords), any file that holds a token, key or password whatever its name, the relay's heartbeat and lock, the CA, the shim, a provider's data. The state is the one file of the list that holds site values (account, partition, paths, the administrator's mail address) and no credential: the pulled archive is private like the journals. Each file is opened below a descriptor of the root with no link followed and read once, and the tar is built from those bytes; a file that is a link, or that holds the content of a file of `secrets/`, refuses the collect naming it. `collect` publishes `<label>.root.tar` and `<label>.root.json` beside the shard archives and lists both in `archives.sha256.json`, so `verify-copy` checks them. `down` cannot see the results directory, so it gates on what the root holds: **evidence present, not a step run.** `shards.py step` leaves `shard-steps/<label>.json` in its root, but a root that only ran Day-0 measurements has no step and holds evidence all the same, so the gate counts the files a run, a step or the operator leaves (`RUN_FILES`, `RUN_TREES`: any step record, a file of the fault journal with something in it at any depth, the relay's `late-steps.jsonl` and its request, taken and answer files, the shard claims, the pilot's `day0-wiring.toml`; an empty file, such as a lock file, is none, nor is an NFS silly-rename file, a removed file still held open that a `down` run again after a removal cut short finds (only a regular file is taken for one: a directory, a link or a special file named like one is looked at as what it is), and a link or a special file counts, since it proves no absence, as does a file with a line in it at any depth: a tree nested past the archive's bound, or with an odd name, counts for what it holds) and not the files `up` writes (`UP_FILES`, `UP_TREES`: the state, `link-check.json`, `platform.toml`, `facts.json`, `render-identity.json`, `data-manifests/`). `up` writes no line of the fault journal and takes no admission (its link check goes through `linkrecord` into the root, not the journal, and a test pins that no module on its path imports, directly, what takes an admission or writes the journal), and the relay it starts makes only empty directories, `relay.lock` and a heartbeat, which are in neither set, so a root after `up` alone, or a failed `up`'s, holds no evidence and goes down as it always did: an emergency teardown is never blocked. `collect` writes `evidence-collected.json` there once its manifest is written (the root archive's hash, the digest of the step records it read and the hash of each file archived; `collect --roots-only` writes one whatever the root holds, from a plan (`--shard`) or from the root itself (`--root R --into DIR`, no plan), so a Day-0-only root can be marked), so `down`, which reads both before it stops anything (`Down.evidence_gate`), refuses a root that holds evidence and has no current marker (naming its shards when it has step records, else the kinds of evidence, never a file), and one where a file a step, the study or `up` writes is no longer what the marker names (a later step, a step still writing the journals when `collect` ran, a line appended, a changed file: it reads the root's evidence again and compares file by file, `hpcevidence.check_collected`; a `down` that began is not gated again). **Two sets.** What is compared strictly is the fault journal, the relay's journals (`late-steps.jsonl` among them), the shard claims, the step records, the data manifests and the files `up` writes once (`facts.json`, `platform.toml`, `render-identity.json`) with the pilot's `day0-wiring.toml`. The self-rewritten set (`SELF_REWRITTEN_FILES`) is the two files the running federation rewrites itself, the state (each state update) and `link-check.json` (each link check); a change to them post-dates every run once `collect` has run, so it does not refuse `down` and needs no second archive: `down` names the files that changed, by name only, in its output and in the state (`evidence_rewritten_after_collect`), and the collect-time copy stays what the post-check reads. Every file of the allow-list is in exactly one set (a test asserts it), and one in neither compares strictly. A check a step runs appends to the fault journal's holds too, so a step still running after the collect refuses `down` through the journal; `--discard-evidence` removes the root without it, the output says so, and the use is recorded in the state file (`evidence_discarded`: time, shards, the kinds of evidence, reason from `--discard-reason`; it goes with the root, so down's output is what outlives it). The archive is named by the shard's label and its manifest records a hash of the root's path (`root_id`, no path): a shard a fleet moves to another federation gets a root archive made of the second, and the first's is put aside as `<label>.<12 hex digits>.root.*` (never overwritten) and listed with the rest; `collect --roots-only [--shard L]` archives and marks the roots alone, for the shard about to move while the others are not final, and `collect --roots-only --root R --into DIR` does the same for ONE federation that ran no campaign and has no plan (a stop measurement through the relay's verbs): the same archive and exclusions, written to `DIR/federation.root.tar` and `.root.json` with an `archives.sha256.json` of its own form (`expcore-hpc-root-archives/1`: exactly that pair), the marker last, and a copy never replaced (a root that changed since is collected into a new directory). The root archive, like the shard's `pass-env.json` (listed in the evidence when present), is private: `package.spec.never_selected` keeps both out of any `expcore package`, wherever they lie. A root with no evidence a run left goes down as before. `collect` itself is atomic: everything is staged in a private directory beside `--into` and the manifest is the last write to the results directory and `--into`.
+**`down` and the root's evidence (O63).** `down` removes the root, which holds the files the study's post-check and the facts read, so it does not remove one whose evidence was not collected. The evidence is an allow-list (`hpcevidence.py`): the state, `platform.toml`, `facts.json`, `link-check.json`, `render-identity.json`, `day0-wiring.toml` where present, `ingest-evidence.json` where present (a study's `ingest run --out <root>/ingest-evidence.json`: the id map the study reads back), `shard-claim.json` and `shard-claim.lock` where present (the study's pre-step guard), `data-manifests/*.json` (the manifests each space's data identity in `platform.toml` is the hash of), `shard-steps/*.json`, the whole of `fault-journal/` (its journals, `link-epoch.json`, the holder, drain and intent records and the lock files the pilot's heal flocks: read as they are, never locked) and the fault relay's `late-steps.jsonl` and its request, taken and answer files. Never in it: `secrets/` (the zone's passphrase, the CA key, the admin credential, the users' passwords), any file that holds a token, key or password whatever its name, the relay's heartbeat and lock, the CA, the shim, a provider's data. The state is the one file of the list that holds site values (account, partition, paths, the administrator's mail address) and no credential: the pulled archive is private like the journals. Each file is opened below a descriptor of the root with no link followed and read once, and the tar is built from those bytes; a file that is a link, or that holds the content of a file of `secrets/`, refuses the collect naming it. `collect` publishes `<label>.root.tar` and `<label>.root.json` beside the shard archives and lists both in `archives.sha256.json`, so `verify-copy` checks them. `down` cannot see the results directory, so it gates on what the root holds: **evidence present, not a step run.** `shards.py step` leaves `shard-steps/<label>.json` in its root, but a root that only ran Day-0 measurements has no step and holds evidence all the same, so the gate counts the files a run, a step or the operator leaves (`RUN_FILES`, `RUN_TREES`: any step record, a file of the fault journal with something in it at any depth, the relay's `late-steps.jsonl` and its request, taken and answer files, the shard claims, the pilot's `day0-wiring.toml`; an empty file, such as a lock file, is none, nor is an NFS silly-rename file, a removed file still held open that a `down` run again after a removal cut short finds (only a regular file is taken for one: a directory, a link or a special file named like one is looked at as what it is), and a link or a special file counts, since it proves no absence, as does a file with a line in it at any depth: a tree nested past the archive's bound, or with an odd name, counts for what it holds) and not the files `up` writes (`UP_FILES`, `UP_TREES`: the state, `link-check.json`, `platform.toml`, `facts.json`, `render-identity.json`, `data-manifests/`). `up` writes no line of the fault journal and takes no admission (its link check goes through `linkrecord` into the root, not the journal, and a test pins that no module on its path imports, directly, what takes an admission or writes the journal), and the relay it starts makes only empty directories, `relay.lock` and a heartbeat, which are in neither set, so a root after `up` alone, or a failed `up`'s, holds no evidence and goes down as it always did: an emergency teardown is never blocked. `collect` writes `evidence-collected.json` there once its manifest is written (the root archive's hash, the digest of the step records it read and the hash of each file archived; `collect --roots-only` writes one whatever the root holds, from a plan (`--shard`) or from the root itself (`--root R --into DIR`, no plan), so a Day-0-only root can be marked), so `down`, which reads both before it stops anything (`Down.evidence_gate`), refuses a root that holds evidence and has no current marker (naming its shards when it has step records, else the kinds of evidence, never a file), and one where a file a step, the study or `up` writes is no longer what the marker names (a later step, a step still writing the journals when `collect` ran, a line appended, a changed file: it reads the root's evidence again and compares file by file, `hpcevidence.check_collected`; a `down` that began is not gated again). **Two sets.** What is compared strictly is the fault journal, the relay's journals (`late-steps.jsonl` among them), the shard claims, the step records, the data manifests and the files `up` writes once (`facts.json`, `platform.toml`, `render-identity.json`) with the pilot's `day0-wiring.toml` and the study's `ingest-evidence.json`. The self-rewritten set (`SELF_REWRITTEN_FILES`) is the two files the running federation rewrites itself, the state (each state update) and `link-check.json` (each link check); a change to them post-dates every run once `collect` has run, so it does not refuse `down` and needs no second archive: `down` names the files that changed, by name only, in its output and in the state (`evidence_rewritten_after_collect`), and the collect-time copy stays what the post-check reads. Every file of the allow-list is in exactly one set (a test asserts it), and one in neither compares strictly. A check a step runs appends to the fault journal's holds too, so a step still running after the collect refuses `down` through the journal; `--discard-evidence` removes the root without it, the output says so, and the use is recorded in the state file (`evidence_discarded`: time, shards, the kinds of evidence, reason from `--discard-reason`; it goes with the root, so down's output is what outlives it). The archive is named by the shard's label and its manifest records a hash of the root's path (`root_id`, no path): a shard a fleet moves to another federation gets a root archive made of the second, and the first's is put aside as `<label>.<12 hex digits>.root.*` (never overwritten) and listed with the rest; `collect --roots-only [--shard L]` archives and marks the roots alone, for the shard about to move while the others are not final, and `collect --roots-only --root R --into DIR` does the same for ONE federation that ran no campaign and has no plan (a stop measurement through the relay's verbs): the same archive and exclusions, written to `DIR/federation.root.tar` and `.root.json` with an `archives.sha256.json` of its own form (`expcore-hpc-root-archives/1`: exactly that pair), the marker last, and a copy never replaced (a root that changed since is collected into a new directory). The root archive, like the shard's `pass-env.json` (listed in the evidence when present), is private: `package.spec.never_selected` keeps both out of any `expcore package`, wherever they lie. A root with no evidence a run left goes down as before. `collect` itself is atomic: everything is staged in a private directory beside `--into` and the manifest is the last write to the results directory and `--into`.
 
 A job already ended (its `--time`, a failure) skips 2 and 3: Slurm stopped its steps, the bundle's cleanup removed
 what its time allowed, and the next job of ours on a node sweeps what is left (`sweep_leftovers`). `down` says which
@@ -845,7 +932,8 @@ read that dies half way, leaves none. On a pass it records the marker in
 **`shards.py plan` and `lines`** (`federation()`, so a shard is never planned past it) refuse a federation whose
 ingested spaces lack a marker bound to the manifest `up` recorded, and to the manifest the platform file names now (a
 file edited after the verification changes the hash the fingerprint carries, which the pass was not for), naming the
-shard and the spaces. A later ingest needs another `verify-data`: nothing watches the space after the pass. Reading
+shard and the spaces, and refuse a marker whose space ID is not the one `up` recorded and the platform file names now
+(a space made again since the pass holds none of its data), naming the shard and the spaces. A later ingest needs another `verify-data`: nothing watches the space after the pass. Reading
 every file's bytes through the owner holds each whole in memory (16 workers): a very large ingested file is the limit. `verify-data` runs on the login node, as `[hpc] core = "login"`
 runs the core's phase: it reaches the services' 8443 from there, and has no `core = "step"` form yet.
 
@@ -978,7 +1066,12 @@ for the launch it stopped. `--keep-until` is the allocation's end: Slurm's `EndT
 node's local time, as `scontrol` printed it. **Every stop's evidence** is printed and appended to `stops` in the
 state, confirmed or not: `stopped`, `ended` (`exit`, `kill`, `none`), `seconds` (from the request to the verb's
 verdict) and `service_seconds` (the service's own end after its SIGTERM, as teardown measured it on the node); the
-core journals it (section (e)).
+core journals it (section (e)). **The holder (O96):** just before teardown the stop launches a detached `sleep` to the
+allocation's end on the service's node (`<allocation>-<service>-hold`, `--overlap`, one core, 64 MB), recorded as
+`services.<n>.holder`, because a kept work directory with no process of ours on its node was removed from outside the
+core during outages (live, 19 Nov 2026). A start leaves it running (a restart that fails its own checks later still
+has it); the next kept stop reuses it by name, and `down` ends it by its exact id before its teardown. A holder the stop cannot show adds `"holder": "failed"` to the evidence, and the core then
+fails the injection and restores the provider at once (`hpcfed_control.py`'s docstring has the whole contract).
 
 **(b) START** `hpcfed.py start <service>`: a new detached service step, the same size, on the same node, running
 `restart.sh <oz|op> --workdir W`: no `node-init.sh`, no `configure.sh`, no token wait; `run_service` again on the same
@@ -1156,7 +1249,7 @@ template does not name is left out, and so is the artifacts digest of a site wit
 template writes no record. **The artifacts digest** is taken by `up` once, in its preflight on the login node, before
 the root is made or a job submitted (a tree that cannot be digested fails `up` there), kept in the state file and
 handed to the core's phase among its values, so a core step on a node, whose environment is an allowlist, has it and
-never reads the tree. It is the SHA-256 of one canonical listing: `expcore-artifacts-tree/1` and a NUL, then one record
+never reads the tree. It is the SHA-256 of one canonical listing: `expcore-artifacts-tree/2` and a NUL, then one record
 per entry sorted by its relative path as bytes, none for the directory itself: `F NUL path NUL size NUL sha256 NUL` (a
 regular file), `D NUL path NUL` (a directory), `L NUL path NUL target NUL` (a symbolic link, by its target string, never
 followed, so what it points at must be in the tree to be pinned: the directory is self-contained, its interpreter
@@ -1166,7 +1259,10 @@ goes up one and one at the root is an escape, an absolute target must begin, by 
 path or the path it was declared by, and a path may pass through 40 links at most, so a loop is refused; a link that
 dangles inside is allowed and recorded, and a tree whose links stay inside has its earlier digest). A special file, or a
 root that is not a directory of its own, is refused, naming `HPC_STUDY_ARTIFACTS` and a path relative to the directory, never an absolute one. No mode, owner, time
-or path of the directory is in it, so a copy elsewhere has the same digest. The tree is read below one held descriptor
+or path of the directory is in it, so a copy elsewhere has the same digest; and since version 2 (O94) a file's bytes and
+a link's target are hashed with the directory's own path (its real path and `HPC_STUDY_ARTIFACTS`) replaced by
+`@study_artifacts@`, and the install's bookkeeping (`RECORD`, `direct_url.json`, `uv_cache.json` in a `*.dist-info`;
+all below a `.git` but `HEAD`) is left out, so one recipe built at two sites' paths is one digest. The tree is read below one held descriptor
 with no link followed and never written (the pilot makes it read-only first). A manifest's `expect_render_identity`
 (a path of the study; the lines carry it with its hash as `--expect-render-identity*`) makes `step` compare the
 federation's record with the expected one before it makes anything, beside the pre-step guard and before it, refusing

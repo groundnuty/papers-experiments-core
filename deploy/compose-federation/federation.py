@@ -37,11 +37,14 @@ pulled, and nothing is pruned.
 """
 
 import argparse
+import fcntl
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 from fedboot import Bootstrap
@@ -49,6 +52,7 @@ from fedcompose import render as render_compose
 from fedcontent import Content
 from feddocker import (
     compose,
+    engine,
     gib,
     memory_lines,
     memory_usage,
@@ -61,23 +65,26 @@ from feddocker import (
     require_ports_free,
 )
 from fedfacts import baseline_left_behind, describe, facts_of, root_parent, write_facts
+from fedidentity import write_render_identity
 from fedimport import copy_imports, pending_copies, require_resettable
-from fedlayout import NODE, ROOT_MARKER, Layout
+from fedlayout import CA_DIR_ENV, NODE, ROOT_MARKER, SHARED_CA_KEY, SHARED_CA_PEM, Layout, checked_ca_dir
 from fedlinks import check_after_up
 from fedpki import (
     ensure_secret,
     make_ca,
     make_leaf,
     private_directory,
+    require_private,
     subject_alt_names,
     verify_leaf,
     write_secret,
 )
 from fedreplicas import evict_replicas
 from fedrest import Rest
-from fedspec import LOOPBACK, ZONE, LayoutError, Service, Spec, load_spec
+from fedspec import LOOPBACK, ZONE, LayoutError, Service, Spec, instance, load_spec
 from fedsupport import check_rendered_support
 from fedtools import check_artifacts, study_artifacts_from
+from fedverify import MARKER, locked, verify_data
 
 ZONE_TIMEOUT_S = 1500.0
 PROVIDER_TIMEOUT_S = 1800.0
@@ -136,6 +143,49 @@ def seed(layout: Layout, service: Service, key: Path, cert: Path) -> None:
         (settings / "disable-gui-verification.config").write_text(GUI_CHECK_OFF, encoding="utf-8")
 
 
+def use_shared_ca(layout: Layout) -> None:
+    """Take the host's shared CA (`EXPCORE_FED_CA_DIR`, made by `ca`): its certificate copied into the root, its key
+    left where it is and used from there to sign this root's web certificates. A root that holds another CA (made by
+    an up without the setting, or another shared one) is refused: its certificates were signed by that one."""
+    shared = layout.shared_ca_pem
+    if not shared.is_file() or shared.is_symlink():
+        raise RuntimeError(f"{CA_DIR_ENV} holds no CA ({SHARED_CA_PEM}); make it once with: federation.py ca")
+    require_private(layout.ca_key)
+    text = shared.read_bytes()
+    if layout.ca_pem.exists() and layout.ca_pem.read_bytes() != text:
+        raise RuntimeError(
+            f"the root holds another CA than {CA_DIR_ENV}'s, which signed its certificates: take it down, then up"
+        )
+    if not layout.ca_pem.exists():
+        layout.ca_pem.write_bytes(text)
+        layout.ca_pem.chmod(0o644)
+
+
+def make_shared_ca(environ: Mapping[str, str]) -> str:
+    """`ca`: the host's shared CA in the directory `EXPCORE_FED_CA_DIR` names (made 0700 when it is not there), made
+    once and never replaced; its certificate's SHA-256, which every federation's `platform.toml` then pins alike."""
+    value = environ.get(CA_DIR_ENV)
+    if value is None:
+        raise RuntimeError(f"ca: set {CA_DIR_ENV} to the directory of the host's shared CA")
+    try:
+        directory = checked_ca_dir(value)
+    except ValueError as error:
+        raise RuntimeError(str(error)) from None
+    private_directory(directory)
+    pem, key = directory / SHARED_CA_PEM, directory / SHARED_CA_KEY
+    lock = os.open(directory / ".ca.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # two `ca` at once: one makes it, the other finds it
+        if pem.exists() != key.exists():
+            raise RuntimeError(f"{CA_DIR_ENV} holds half a CA (a certificate or a key alone); refused")
+        made = not pem.exists()
+        make_ca(pem, key, "expcore shared test CA")
+    finally:
+        os.close(lock)
+    digest = hashlib.sha256(pem.read_bytes()).hexdigest()
+    return f"ca: {'made' if made else 'already there'}; its certificate's SHA-256 {digest}"
+
+
 def prepare(layout: Layout) -> None:
     """Make the root and everything the services read from it; a step whose result exists is left as it is.
 
@@ -161,7 +211,12 @@ def prepare(layout: Layout) -> None:
     private_directory(layout.users)
     layout.ca_pem.parent.mkdir(exist_ok=True)
     layout.journal.mkdir(exist_ok=True)
-    make_ca(layout.ca_pem, layout.ca_key, f"{spec.project} test CA")
+    if layout.ca_dir is None:
+        if layout.ca_pem.exists() and not layout.ca_key.exists():
+            raise RuntimeError(f"the root's CA is the host's shared one (no key of its own): set {CA_DIR_ENV}")
+        make_ca(layout.ca_pem, layout.ca_key, f"{spec.project} test CA")
+    else:
+        use_shared_ca(layout)
     work = private_directory(layout.secrets / "work")
     for service in spec.services:
         key, cert = layout.secrets / f"{service.name}.key", layout.ca_pem.parent / f"{service.name}.pem"
@@ -249,6 +304,8 @@ def up(layout: Layout) -> str:
             Content(boot).reset(TRANSFER_TIMEOUT_S)
             timer.mark("baseline")
         written = write_facts(layout, boot, *given)
+        written += write_render_identity(layout, study_artifacts)
+        written += write_compose_file(layout)
         links = check_after_up(layout, dict(boot.ids.spaces))  # last: not ready until every pair transfers (#221)
         timer.mark("links")
     finally:
@@ -270,6 +327,12 @@ def reset_clean(layout: Layout) -> str:
     require_resettable(layout)
     timer = Timer()
     require_up(layout)
+    with locked(layout.root):  # no verdict on the spaces' data stands, nor can one be made, while they are emptied
+        (layout.root / MARKER).unlink(missing_ok=True)
+        return _reset_clean(layout, timer)
+
+
+def _reset_clean(layout: Layout, timer: "Timer") -> str:
     study_artifacts = study_artifacts_from(os.environ)
     check_artifacts(layout.spec, study_artifacts, layout.root)
     given = (study_artifacts,) if study_artifacts else ()
@@ -282,6 +345,7 @@ def reset_clean(layout: Layout) -> str:
         for leftover in layout.journal.iterdir():
             leftover.unlink()
         write_facts(layout, boot, *given)
+        write_render_identity(layout, study_artifacts)  # the file was rendered again: its record with it
     finally:
         rest.close()
     return timer.summary("reset --clean")
@@ -304,6 +368,35 @@ def reset_replicas(layout: Layout) -> str:
     finally:
         rest.close()
     return "\n".join([timer.summary("reset --replicas"), *(f"{space}: {done}" for space, done in evicted.items())])
+
+
+COMPOSE_FILE = "compose.yaml"  # in the root, for a platform file's `[faults] compose_file = "@hpc_root@/compose.yaml"`
+
+
+def write_compose_file(layout: Layout) -> str:
+    """The root's `compose.yaml`: what `federation.py ... compose` prints for this layout and instance, written whole (a
+    draft beside it, renamed over it), so the fault backend's `docker compose --file <root>/compose.yaml` stops and
+    starts this federation's own services."""
+    import tempfile
+
+    descriptor, draft = tempfile.mkstemp(prefix=f".{COMPOSE_FILE}.", dir=layout.root)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(render_compose(layout.spec))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(draft, layout.root / COMPOSE_FILE)
+    return f"; {COMPOSE_FILE} written"
+
+
+def verify(layout: Layout) -> str:
+    """`verify-data`: after the study's ingest, every space the rendered platform.toml declares data for read back
+    against its manifest, and the root's `data-verified.json` written only when each is exactly it (`fedverify`)."""
+    if not layout.owned:
+        require_up(layout)  # refuses: no marked root holds a verdict to remove
+    with locked(layout.root):  # one lock from the invalidation through the check and the marker (fedverify)
+        (layout.root / MARKER).unlink(missing_ok=True)
+        require_up(layout)
+        return verify_data(layout, held=True)
 
 
 def down(layout: Layout) -> str:
@@ -396,15 +489,27 @@ def main(argv: list[str] | None = None) -> int:
         "status": status,
         "memory": memory,
         "describe": describe,
+        "verify-data": verify,
     }
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--layout", type=Path, help="the layout file (default: federation.toml beside this script)")
+    parser.add_argument("--instance", type=int, help="instance N of the layout: its own project, domain, ports, root")
     which = parser.add_mutually_exclusive_group()
     which.add_argument("--clean", action="store_true", help="reset: back to the baseline, ingested data removed")
     which.add_argument("--replicas", action="store_true", help="reset: evict the mirrors' replicas, keep all data")
-    parser.add_argument("command", choices=("up", "reset", "down", "status", "memory", "describe", "compose"))
+    parser.add_argument(
+        "command", choices=("up", "reset", "down", "status", "memory", "describe", "compose", "ca", "verify-data")
+    )
     args = parser.parse_args(argv)
     command = args.command
+    try:
+        engine()  # the container engine's setting, checked before anything runs
+        if command == "ca":
+            print(make_shared_ca(os.environ))
+            return 0
+    except (RuntimeError, OSError) as error:
+        print(f"error: {command}: {error}", file=sys.stderr)
+        return 2 if command != "ca" else 1
     if command == "reset" and not (args.clean or args.replicas):
         print(f"error: reset: {RESET_CHOICE}", file=sys.stderr)  # nobody wipes ingested data by accident
         return 2
@@ -415,6 +520,8 @@ def main(argv: list[str] | None = None) -> int:
         command = "reset --clean" if args.clean else "reset --replicas"
     try:
         spec: Spec = load_spec(args.layout)
+        if args.instance is not None:
+            spec = instance(spec, args.instance)
     except LayoutError as error:
         print(f"error: {command}: {error}", file=sys.stderr)
         return 2
@@ -422,7 +529,8 @@ def main(argv: list[str] | None = None) -> int:
         print(render_compose(spec), end="")
         return 0
     try:
-        layout = Layout.from_environment(spec=spec)  # before anything is touched: a root elsewhere is refused
+        # before anything is touched: a root elsewhere is refused
+        layout = Layout.from_environment(spec=spec, instance=args.instance is not None)
     except ValueError as error:
         print(f"error: {command}: {error}", file=sys.stderr)
         return 2

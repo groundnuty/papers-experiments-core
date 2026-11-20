@@ -31,8 +31,9 @@ class Proc:
     `pidns` its PID namespace (`pid:[<inode>]`), None when the link could not be read; `rss` its resident anonymous and
     shared-memory bytes (`RssAnon` + `RssShmem`), None when `status` could not be read; `tags` which of the strings the
     caller asked for its environment or its command line holds; `anon` its `RssAnon` alone (what a cgroup's `anon`
-    counts of it), None when there is none (a zombie); `cgroup` its cgroup v2 path, None when it could not be read;
-    `threads` its tasks (`Threads:` of `status`, which Docker's pids.max counts), None when the line is not a number."""
+    counts of it), None when there is none (a zombie); `cgroup` its memory cgroup's path (v2, or v1's memory
+    controller's), None when it could not be read; `threads` its tasks (`Threads:` of `status`, which Docker's pids.max
+    counts), None when the line is not a number."""
 
     pid: int
     start: str
@@ -130,7 +131,8 @@ def parse_cpus_allowed(text: str) -> frozenset[int] | None:
 
 
 def stat_value(text: str, key: str) -> int | None:
-    """The value of `key` in a cgroup v2 `memory.stat` (lines `<key> <bytes>`); None when it is absent or no number."""
+    """The value of `key` in a `memory.stat` or a v1 `memory.oom_control` (lines `<key> <number>`); None when it is
+    absent or no number."""
     for line in text.splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[0] == key:
@@ -139,8 +141,8 @@ def stat_value(text: str, key: str) -> int | None:
 
 
 def in_cgroup(path: str | None, root: str) -> bool:
-    """Whether a process's cgroup v2 path is `root` or below it: a v2 `memory.stat` counts its descendants too. A
-    path that could not be read is in none."""
+    """Whether a process's memory cgroup path is `root` or below it: a v2 `memory.stat` and a v1 `total_rss` count the
+    descendants too. A path that could not be read is in none."""
     if path is None or not path.startswith("/"):
         return False
     if root == "/":
@@ -198,10 +200,28 @@ def tags_in(cmdline: bytes, environ: bytes, tags: Collection[str]) -> frozenset[
     return frozenset(t for t in tags if any(e.startswith(t) for e in entries) or any(t in a for a in args))
 
 
-def cgroup_path(text: str) -> str | None:
-    """The cgroup v2 path of `/proc/<pid>/cgroup` (its `0::<path>` line), None on a v1 or hybrid host."""
+def parse_uids(text: str) -> tuple[int, int] | None:
+    """The real and the effective uid of `/proc/<pid>/status` (the first two fields of `Uid:`), None when the line is
+    missing or they are not numbers."""
     for line in text.splitlines():
-        if line.startswith("0::"):
+        if line.startswith("Uid:"):
+            parts = line.split()
+            ok = len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit()
+            return (int(parts[1]), int(parts[2])) if ok else None
+    return None
+
+
+def cgroup_path(text: str, *, v1: bool = False) -> str | None:
+    """The memory cgroup of `/proc/<pid>/cgroup`: the `0::<path>` line's (cgroup v2), or with `v1` the path of the line
+    whose controller list names `memory` (`<n>:<controllers>:<path>`, cgroup v1). None when that line is not there or
+    its path is not absolute."""
+    for line in text.splitlines():
+        if v1:
+            _, _, rest = line.partition(":")
+            controllers, _, path = rest.partition(":")
+            if "memory" in controllers.split(","):
+                return path.strip() if path.startswith("/") else None
+        elif line.startswith("0::"):
             path = line[3:].strip()
             return path if path.startswith("/") else None
     return None
@@ -221,6 +241,7 @@ __all__ = [
     "parse_stat",
     "parse_threads",
     "parse_uid",
+    "parse_uids",
     "stat_value",
     "tags_in",
 ]

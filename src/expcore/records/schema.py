@@ -33,6 +33,17 @@ failure that names no target, a condition that declares none. Where a declaratio
 holds a version-3 record to its target clause (`target_rule`): the failure must name that target and the run's fault
 injector must have held it down in this attempt (`expcore.records.injections`). A record that declares no target is
 decided as before, so the clause changes nothing for a version-3 record written before it.
+Version 3 also says which lease an attempt ran on, in one more optional field of the record, `lease_id` (C41): the
+fencing token of the lease that took the run (`campaign.run_lease`), a whole number from 1. It is absent for an attempt
+that ran on no lease, which is every attempt of an unsharded campaign, a shard and a selection. Two leases of one run
+can each have an attempt of one number, so the lease id, with the run key and the attempt, names an attempt.
+Version 3 also says, in one more optional field of a turn, which deployment served its reply (B20): `deployment_id`,
+what a front named in the response header the model entry's `deployment_header` names, beside `system_fingerprint`.
+It is the last field of a turn, absent for a turn whose reply named none (never a null), and a present one is plain
+printable text of 1 to 128 characters (`expcore.models.fleetheaders`). The totals say, in one more optional field,
+when the attempt's turns show more than one deployment (`deployment_switched`, written only when true: by their ids or
+by their system fingerprints, a turn without the id or the fingerprint among turns with it counting as one more;
+visibility only, nothing is set aside for it).
 Version 3 also says, in two optional fields of the totals, whether the attempt was held to the reservation R (C27):
 `reserved_capped`, the bound the budget gate reserved the run by, the value the campaign store keeps for the attempt
 (True: by the reply maximum, False: by the window), and `reply_cap_unheld`, whether the campaign had taken the
@@ -72,6 +83,7 @@ from expcore.errors import TARGET_LABEL, infra_kinds, is_treatable, targeted_kin
 from expcore.loop.config import AgentConfig
 from expcore.loop.outcomes import HarnessDefect, Outcome
 from expcore.loop.records import TOOL_STATUSES
+from expcore.models.fleetheaders import DEPLOYMENT_ID_MAX, deployment_id_ok
 from expcore.models.usage import USAGE_EXTRA_CAP, USAGE_EXTRA_NAME_MAX, usage_name_ok, usage_number_ok
 from expcore.plugin import WAIT_KINDS
 from expcore.records.injections import injected_targets
@@ -106,6 +118,7 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "redacted_paths": (list,),
         "treatment_targets": (dict,),
         "instrument_refusal": (dict,),
+        "lease_id": (int,),
     },
     "prompt": {"system": (dict,), "user": (dict,), "tools_sha256": (str,)},
     "prompt_part": {"text": (str,), "sha256": (str,), "template_sha256": (str, NONE), "slots": (dict, NONE)},
@@ -125,6 +138,7 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "retries": (list,),
         "waits_left_open": (int,),
         "infra_wait_by_kind": (dict,),
+        "deployment_id": (str,),
     },
     "neutral": {"text": (str,), "reasoning": (str, NONE), "tool_calls": (list,)},
     "neutral_call": {
@@ -206,6 +220,7 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "final_text": (str, NONE),
         "reserved_capped": (bool,),
         "reply_cap_unheld": (bool,),
+        "deployment_switched": (bool,),
     },
 }
 FAILURE_KINDS = ("infra", "context_overflow", "abandoned", "error", "cut")
@@ -270,17 +285,19 @@ SCHEMAS: tuple[SchemaVersion, ...] = (
         f"{SCHEMA_PREFIX}3",
         added={
             "usage": ("extra", "extra_cut"),
-            "record": ("treatment_targets", "instrument_refusal"),
+            "turn": ("deployment_id",),
+            "record": ("treatment_targets", "instrument_refusal", "lease_id"),
             "outcome": ("infra_target",),
-            "totals": ("reserved_capped", "reply_cap_unheld"),
+            "totals": ("reserved_capped", "reply_cap_unheld", "deployment_switched"),
             "tool_call": ("elapsed_s", "exec_check"),
             "exec_check": ("source_whole", "exit_status", "nonce_matched"),
         },
         optional={
             "usage": ("extra", "extra_cut"),
-            "record": ("treatment_targets", "instrument_refusal"),
+            "turn": ("deployment_id",),
+            "record": ("treatment_targets", "instrument_refusal", "lease_id"),
             "outcome": ("infra_target",),
-            "totals": ("reserved_capped", "reply_cap_unheld"),
+            "totals": ("reserved_capped", "reply_cap_unheld", "deployment_switched"),
             "tool_call": ("elapsed_s", "exec_check"),
             "exec_check": ("source_whole", "exit_status", "nonce_matched"),
         },
@@ -328,6 +345,10 @@ TOOL_SERVER_CALL_BOUND_FROM = f"{SCHEMA_PREFIX}3"
 # the record keeps, as it adds the terminal tools, and the replay judges a call by them, since the one provider of a
 # replay cannot say which tools were a tool server's.
 TOOL_SERVER_TOOLS = "tool_server_tools"
+# The same for the optional wall limit on one code cell (L18): `code_cell_bound_s` in the agent configuration, left out
+# when the study declares none, and beside it and only with it `code_cell_tools`, the tools that run code cells.
+CODE_CELL_BOUND = "code_cell_bound_s"
+CODE_CELL_TOOLS = "code_cell_tools"
 
 
 def reply_count_rule(version: str) -> bool:
@@ -467,6 +488,8 @@ def _check_turn(turn: dict, version: str, where: str, schemas: Sequence[SchemaVe
     check_section("neutral", turn["neutral"], version, f"{where}.neutral", schemas)
     _check_list("neutral_call", turn["neutral"]["tool_calls"], version, f"{where}.neutral.tool_calls", schemas)
     check_section("usage", turn["usage"], version, f"{where}.usage", schemas)
+    if "deployment_id" in turn and not deployment_id_ok(turn["deployment_id"]):  # optional, from version 3 (B20)
+        raise RecordError(f"{where}.deployment_id: plain printable text of 1 to {DEPLOYMENT_ID_MAX} characters")
     if "extra" in turn["usage"] or "extra_cut" in turn["usage"]:  # optional, from version 3
         _check_usage_extra(turn["usage"], f"{where}.usage")
     if turn["native"].get("role") != "assistant":
@@ -578,6 +601,12 @@ def _check_treatment_targets(targets: Any, kinds: list[str]) -> None:
         raise RecordError("treatment_targets: the kinds are written sorted")
 
 
+def _check_lease_id(lease_id: Any) -> None:
+    """Check the lease an attempt ran on (C41): a whole number from 1, the fencing token, never a bool or a null."""
+    if isinstance(lease_id, bool) or not isinstance(lease_id, int) or lease_id < 1:
+        raise RecordError(f"lease_id: a whole number from 1, not {lease_id!r}")
+
+
 def _check_refusal(refusal: Any) -> None:
     """Check the refusal an instrument's post-run check recorded: its keys, a namespace as plain as an instrument's, a
     kind of the registry that no condition can declare as its treatment, and a detail that is text (C31)."""
@@ -601,23 +630,24 @@ def _check_configuration(config: Any, version: str, schemas: Sequence[SchemaVers
 
     `tool_server_call_bound_s` is optional in a record of version 3 or later, and unknown to an earlier one: absent when
     the study declared none, never a null, and a number above nothing and finite when it did (L17). The names of the
-    tools it reached, `tool_server_tools`, are written with it and only with it, as a list of tool names.
+    tools it reached, `tool_server_tools`, are written with it and only with it, as a list of tool names. The code
+    cell limit, `code_cell_bound_s`, and its `code_cell_tools` are the same in every respect (L18).
     """
     later = set(config_defaults(version, schemas))
-    optional = {TOOL_SERVER_CALL_BOUND, TOOL_SERVER_TOOLS}
-    allowed = ({f.name for f in dataclasses.fields(AgentConfig)} | {"terminal_tools", TOOL_SERVER_TOOLS}) - later
+    pairs = ((TOOL_SERVER_CALL_BOUND, TOOL_SERVER_TOOLS), (CODE_CELL_BOUND, CODE_CELL_TOOLS))
+    optional = {name for pair in pairs for name in pair}
+    allowed = ({f.name for f in dataclasses.fields(AgentConfig)} | {"terminal_tools"} | optional) - later
     if _number(version) < _number(TOOL_SERVER_CALL_BOUND_FROM):
         allowed -= optional
     _check_keys("agent_config", config, allowed, required=allowed - optional)
-    bound = config.get(TOOL_SERVER_CALL_BOUND)
-    if TOOL_SERVER_CALL_BOUND in config and not (_fits(bound, NUM) and bound > 0):
-        raise RecordError(
-            f"agent_config.{TOOL_SERVER_CALL_BOUND}: expected a number of seconds above nothing, got {bound!r}"
-        )
-    if (TOOL_SERVER_TOOLS in config) != (TOOL_SERVER_CALL_BOUND in config):
-        raise RecordError(f"agent_config.{TOOL_SERVER_TOOLS}: held when {TOOL_SERVER_CALL_BOUND} is, and only then")
+    for bound_key, tools_key in pairs:
+        bound = config.get(bound_key)
+        if bound_key in config and not (_fits(bound, NUM) and bound > 0):
+            raise RecordError(f"agent_config.{bound_key}: expected a number of seconds above nothing, got {bound!r}")
+        if (tools_key in config) != (bound_key in config):
+            raise RecordError(f"agent_config.{tools_key}: held when {bound_key} is, and only then")
     _check_keys("agent_config.limits", config["limits"], {f.name for f in dataclasses.fields(Limits)})
-    for key in ("terminal_tools", *([TOOL_SERVER_TOOLS] if TOOL_SERVER_TOOLS in config else [])):
+    for key in ("terminal_tools", *(k for k in (TOOL_SERVER_TOOLS, CODE_CELL_TOOLS) if k in config)):
         tools = config[key]
         if not isinstance(tools, list) or any(not isinstance(t, str) for t in tools):
             raise RecordError(f"agent_config.{key}: a list of tool names")
@@ -695,4 +725,6 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
         raise RecordError("redacted_paths: a list of field paths")
     if "instrument_refusal" in body:  # optional, from version 3
         _check_refusal(body["instrument_refusal"])
+    if "lease_id" in body:  # optional, from version 3: only an attempt run on a lease has one (C41)
+        _check_lease_id(body["lease_id"])
     return version

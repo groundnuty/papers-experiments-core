@@ -89,10 +89,15 @@ def check_instruments(instruments: Sequence[Instrument]) -> None:
 def start_instruments(instruments: Sequence[Instrument], identity: Mapping[str, Any]) -> None:
     """Check the instruments, then let each take its first reading. What one raises here reaches the executor's caller:
     an `InfraError` (a fault injector that could not take its target down) is infrastructure of its kind, anything
-    else a defect."""
+    else a defect. An `InfraError` leaves with `origin` naming the instrument whose start raised it, and with the
+    `diagnostic` the instrument gave it, if any: the attempt keeps both, redacted, on its record (C40)."""
     check_instruments(instruments)
     for instrument in instruments:
-        instrument.start(identity)
+        try:
+            instrument.start(identity)
+        except InfraError as error:  # the same error goes on; it now says which instrument's start it came from (C40)
+            error.note_origin("start", instrument.namespace)
+            raise
 
 
 def _method(instrument: Instrument, name: str) -> Any:

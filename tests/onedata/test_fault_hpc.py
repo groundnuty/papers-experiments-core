@@ -15,7 +15,15 @@ from fault_support import FakeClock
 from hpc_support import PING, RESTART_LINK, TOOL, FakeHpc, hpc_driver
 
 from expcore_onedata.compose import RESTART_LINK_SCRIPT, CommandResult, DriverError, Observation
-from expcore_onedata.fault_hpc import EXEC_COMMANDS, HpcDriver, Request, VerbCommand, stop_evidence
+from expcore_onedata.fault_hpc import (
+    EXEC_COMMANDS,
+    HpcDriver,
+    Request,
+    VerbCommand,
+    status_domain_wait,
+    stop_evidence,
+)
+from expcore_onedata.fault_restore import stop_record
 
 LABELS = {"store-one": "providers[0]", "store-two": "providers[1]"}
 SERVICE = "store-two"
@@ -190,6 +198,20 @@ def test_o58_serves_asks_the_probe_only_of_a_running_ready_service_and_raises_wh
     assert asked == [SERVICE]
 
 
+def test_o58_a_figure_beyond_a_floats_range_is_no_figure_and_raises_nothing():
+    """O58 (Codex, 17 Nov 2026): a whole number of 400 digits in a verb's answer (a corrupt or crafted record) made
+    `math.isfinite` raise OverflowError, turning a verb that had succeeded into an exception. It is no figure, as an
+    infinity is: the stop's evidence keeps the figures that are numbers, and a status gives no domain wait."""
+    huge = "1" + "0" * 400
+    answer = f'{{"stopped": true, "ended": "kill", "seconds": {huge}, "service_seconds": 630.5}}'
+    assert stop_evidence(answer) == {"stopped": True, "ended": "kill", "seconds": None, "service_seconds": 630.5}
+    assert stop_evidence(answer.replace("630.5", huge)) == {
+        "stopped": True, "ended": "kill", "seconds": None, "service_seconds": None}  # fmt: skip
+    assert status_domain_wait(f'{{"domain_wait_s": {huge}}}') is None
+    assert status_domain_wait('{"domain_wait_s": -' + huge + "}") is None
+    assert status_domain_wait('{"domain_wait_s": 12}') == 12.0  # a whole number that fits is the figure it was
+
+
 def test_o58_the_stops_evidence_is_kept_checked_and_nothing_else_of_its_answer():
     """O58: the stop's answer says whether it was confirmed, how it ended, how long the verb took to its verdict and
     how long the service took to end after its SIGTERM; the driver keeps those, checked, for the journal, and nothing
@@ -292,3 +314,18 @@ def test_o58_the_driver_is_never_built_without_a_probe():
     """O58: as the Compose driver, it cannot take a running service for one that serves without asking."""
     with pytest.raises(TypeError):
         HpcDriver(VerbCommand([TOOL], Answer(CommandResult(0, ""))))  # type: ignore[call-arg]
+
+
+def test_o96_a_stop_that_kept_the_service_with_no_holder_keeps_the_word_and_fails_the_injection():
+    """O96: a stop whose evidence says `"holder": "failed"` (no holder step beside the kept work directory) keeps
+    that word with the evidence, which the injector journals with the stop (`stop_record`), and raises DriverError, so
+    the injector brings the provider back at once and the attempt is set aside; an answer without the word, or with
+    any other, keeps the four figures alone, as before."""
+    answer = '{"stopped": true, "ended": "exit", "seconds": 40.0, "service_seconds": 30.0, "holder": "failed"}\n'
+    driver, _ = answering(CommandResult(0, answer))
+    with pytest.raises(DriverError, match="no holder step"):
+        driver.stop(SERVICE)
+    kept = {"stopped": True, "ended": "exit", "seconds": 40.0, "service_seconds": 30.0}
+    assert driver.last_stop == {**kept, "holder": "failed"}
+    assert stop_record(driver)["stop"]["holder"] == "failed"
+    assert stop_evidence(answer.replace('"failed"', '"n-1"')) == kept

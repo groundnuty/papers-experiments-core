@@ -19,6 +19,8 @@ EVIDENCE = {
     "link-check.json": b'{"format": "expcore-link-check/1", "ok": true}\n',
     "render-identity.json": b'{"version": "expcore-render-identity/1", "template_sha256": "' + b"a" * 64 + b'"}\n',
     "day0-wiring.toml": b'[wiring]\nzone = "zone"\n',
+    # a study's `ingest run --out <root>/ingest-evidence.json`: the id map the study reads back (invented names and ids)
+    "ingest-evidence.json": b'{"format": "ingest-evidence/1", "ids": {"a.txt": "id-0001", "b.txt": "id-0002"}}\n',
     "fault-journal/injections.jsonl": b'{"event": "injecting", "target": "aspen"}\n{"event": "cleared"}\n',
     "fault-journal/shared-holds.jsonl": b'{"event": "held", "id": "h1"}\n',
     "fault-journal/reset-holds.jsonl": b'{"event": "reset"}\n',

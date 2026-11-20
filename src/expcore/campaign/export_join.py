@@ -25,6 +25,8 @@ snapshot and this module joins the results:
   order, each with `"shard"` added, since each shard counted its own journals against its own share;
 - `interrupted_spend` (C05), when any shard's interrupted attempts kept a call log: every shard's own entries in shard
   order, each with `"shard"` added, since each was charged against its own shard's share;
+- `attempt_diagnostics` (C40), when any shard's attempts kept a diagnostic snapshot: every shard's own entries in shard
+  order, each with `"shard"` added;
 - `shard_retries_by_kind` keeps what the sum of `retries_by_kind` loses: every row of every shard's own table, in shard
   order, with `"shard"` added, so a report can say which host met which kind. A shard with no row has none here, and
   the key is there all the same: it says the set-asides were recorded;
@@ -54,6 +56,7 @@ from expcore.campaign.interrupted_spend import EXPORT_KEY as INTERRUPTED_KEY
 from expcore.campaign.lost_ledger import KEY as LOST_KEY
 from expcore.campaign.reset_settings import EXPORT_KEY as SETTINGS_KEY
 from expcore.campaign.shard import EXPORT_KEY
+from expcore.campaign.start_diagnostic import EXPORT_KEY as DIAGNOSTICS_KEY
 from expcore.errors import CORE_KINDS
 
 SHARD_KEY = "shard"  # the key of each run entry in a merged export: the index of the shard that ran it
@@ -73,19 +76,25 @@ HOLDS = "operator_holds"  # the holds an operator ends (C11): a shard's export h
 _MODEL_SUMS = ("analysed_runs", "runs_without_mix", "mixed_runs", "turns")
 _FINGERPRINT_SUMS = ("turns", "runs")
 # each shard's own entries, joined in shard order with the shard named (C11, O62, C05)
-_ENTRIES = (HOLDS, LOST_KEY, INTERRUPTED_KEY)
+_ENTRIES = (HOLDS, LOST_KEY, INTERRUPTED_KEY, DIAGNOSTICS_KEY)
 # keys that one shard's export may have and another's lack
-_MAY_DIFFER = (EXPORT_KEY, DEPLOYMENTS, HOLDS, SETTINGS_KEY, LOST_KEY, INTERRUPTED_KEY)
+_MAY_DIFFER = (EXPORT_KEY, DEPLOYMENTS, HOLDS, SETTINGS_KEY, LOST_KEY, INTERRUPTED_KEY, DIAGNOSTICS_KEY)
 
 
 def join_exports(
-    exports: Mapping[int, Mapping[str, Any]], seq_of: Mapping[str, int], shards: Sequence[Mapping[str, Any]]
+    exports: Mapping[int, Mapping[str, Any]],
+    seq_of: Mapping[str, int],
+    shards: Sequence[Mapping[str, Any]],
+    *,
+    growing_sets: bool = False,
 ) -> dict[str, Any]:
     """Join the exports of the shards of one campaign, by shard index, into the export of the whole.
 
     `seq_of` gives every planned run's place in the whole plan, which orders the run lists; `shards` is merge.json's
     list. Refuses exports that are not of one campaign: another format, other factors, other keys, or a figure that
-    should agree and does not.
+    should agree and does not. With `growing_sets` (a merge by run, C48) a model's declared fingerprints may differ
+    between the parts, since each lease ran under its model's set at its issue and the set only grows: the joined
+    entry declares their union.
     """
     order = sorted(exports)
     if not order:
@@ -96,7 +105,7 @@ def join_exports(
     joined: dict[str, Any] = {}
     for key in _keys_of_the_join(exports, order):
         if key == DEPLOYMENTS:  # a shard whose plan has no model with a set exports none: it has no entries
-            joined[key] = _join_deployments([exports[index].get(key, ()) for index in order])
+            joined[key] = _join_deployments([exports[index].get(key, ()) for index in order], growing_sets)
             continue
         if key in _ENTRIES:  # a shard that met no hold of an operator's, or lost nothing in a kill, has none
             joined[key] = [{**entry, SHARD_KEY: index} for index in order for entry in exports[index].get(key, ())]
@@ -163,10 +172,10 @@ def _require_the_plan(joined: Mapping[str, Any], seq_of: Mapping[str, int]) -> N
 
 def _keys_of_the_join(exports: Mapping[int, Mapping[str, Any]], order: Sequence[int]) -> list[str]:
     """The keys of the joined export, in the first shard's order, without the shard's own key. `deployment_shares`
-    and `operator_holds` and `reset_settings` are in when any shard's export has them, where `export_run_state` puts
-    them: after `kinds`, in that order."""
+    and `operator_holds`, `reset_settings`, `lost_in_kill`, `interrupted_spend` and `attempt_diagnostics` are in when
+    any shard's export has them, where `export_run_state` puts them: after `kinds`, in that order."""
     keys = [key for key in exports[order[0]] if key != EXPORT_KEY]
-    optional = (DEPLOYMENTS, HOLDS, SETTINGS_KEY, LOST_KEY, INTERRUPTED_KEY)
+    optional = (DEPLOYMENTS, HOLDS, SETTINGS_KEY, LOST_KEY, INTERRUPTED_KEY, DIAGNOSTICS_KEY)
     for position, extra in enumerate(optional):
         if extra not in keys and any(extra in exports[index] for index in order):
             anchors = [keys.index(key) for key in ("kinds", *optional[:position]) if key in keys]
@@ -210,11 +219,12 @@ def _in_plan_order(
     return sorted(entries, key=lambda entry: seq_of[entry["run_key"]])
 
 
-def _join_deployments(parts: Sequence[Sequence[Mapping[str, Any]]]) -> list[dict[str, Any]]:
+def _join_deployments(parts: Sequence[Sequence[Mapping[str, Any]]], growing: bool = False) -> list[dict[str, Any]]:
     """Join the shards' `deployment_shares` (B18), given in shard order, into the whole campaign's: per model, in model
     order, the sums of the runs and turns and the fingerprints of every shard, each share computed again from the
-    sums as `deployments.deployment_shares` computes it. Every shard declares the model's set the same way. A shard
-    with no entries (it exports none) adds nothing."""
+    sums as `deployments.deployment_shares` computes it. Every shard declares the model's set the same way, save in a
+    merge by run (`growing`, C48), where the union is declared and a fingerprint (or a turn with none) is accepted when
+    any lease accepted it. A shard with no entries (it exports none) adds nothing."""
     models: dict[str, dict[str, Any]] = {}
     for part in parts:
         for entry in part:
@@ -223,10 +233,13 @@ def _join_deployments(parts: Sequence[Sequence[Mapping[str, Any]]]) -> list[dict
                 models[entry["model"]] = {**entry, "fingerprints": [dict(f) for f in entry["fingerprints"]]}
                 continue
             if held["accepted_fingerprints"] != entry["accepted_fingerprints"]:
-                raise ExportError(f"the shards' exports declare other accepted fingerprints for {entry['model']!r}")
+                if not growing:
+                    raise ExportError(f"the shards' exports declare other accepted fingerprints for {entry['model']!r}")
+                union = set(held["accepted_fingerprints"]) | set(entry["accepted_fingerprints"])
+                held["accepted_fingerprints"] = sorted(union)
             for field in _MODEL_SUMS:
                 held[field] += entry[field]
-            _join_fingerprints(held["fingerprints"], entry["fingerprints"])
+            _join_fingerprints(held["fingerprints"], entry["fingerprints"], growing)
     for held in models.values():
         with_mix = held["analysed_runs"] - held["runs_without_mix"]
         order = fingerprint_order(held["accepted_fingerprints"])
@@ -250,7 +263,7 @@ def _join_settings(parts: Mapping[int, Mapping[str, Any] | None]) -> dict[str, l
     return joined
 
 
-def _join_fingerprints(held: list[dict[str, Any]], more: Sequence[Mapping[str, Any]]) -> None:
+def _join_fingerprints(held: list[dict[str, Any]], more: Sequence[Mapping[str, Any]], growing: bool = False) -> None:
     """Add one shard's fingerprints of a model to those joined so far (`held`, the join's own copies, changed in
     place): the runs and turns summed, a fingerprint new to the join kept. A fingerprint is confirmed when any shard
     confirmed it; its witness, the step and the run that confirmed it, is the first shard's that did."""
@@ -263,6 +276,8 @@ def _join_fingerprints(held: list[dict[str, Any]], more: Sequence[Mapping[str, A
             continue
         for field in _FINGERPRINT_SUMS:
             cell[field] += row[field]
+        if growing:  # declared under a later lease's set: it was accepted where it was analysed
+            cell["accepted"] = cell["accepted"] or row["accepted"]
         if cell["confirmed_by"] is None and row["confirmed_by"] is not None:
             cell["confirmed_by"], cell["confirming_run"] = row["confirmed_by"], row["confirming_run"]
 
@@ -287,3 +302,72 @@ def _sum_table(name: str, key_fields: tuple[str, ...], parts: Sequence[Sequence[
                 else:
                     cell[field] = cell[field] + value
     return [cell for _, cell in sorted(cells.items(), key=none_last)]
+
+
+LEASE_KEY = "lease_id"  # in an export of a batch merged by run (C45), each entry's: the lease that ran it, as a lease
+# store's own export names it in its run rows (`export.LEASE_KEY`)
+FEDERATION_KEY = "federation"  # each run entry's: the federation that held its counted lease, as the ledger labels it
+SITE_KEY = "site"  # each run entry's: the site of that federation, as the ledger labels it
+PLATFORM_KEY = "platform"  # each run entry's, when the campaign declares its platforms: the one it ran under (C50)
+LEASES_KEY = "leases"  # the top-level key of such an export: merge.json's list of counted leases
+LEASE_RETRIES_KEY = "lease_retries_by_kind"  # each counted lease's own retries rows, with its lease id
+LOST_KEY_FLAG = "lost_federation"  # an exhausted run's entry: true when the ledger exhausted it for its lost leases
+LEDGER_SPEND_KEY = "ledger_spend"  # merge.json's `spend`: the ledger's money at its snapshot, locked dollars included
+DECLARATIONS_KEY = "fingerprint_declarations"  # merge.json's `declarations`: the ledger's declaration log (C48)
+
+
+def by_run_export(
+    joined: Mapping[str, Any],
+    leases: Sequence[Mapping[str, Any]],
+    spend: Mapping[str, Any] | None = None,
+    lost: Sequence[Mapping[str, Any]] = (),
+    seq_of: Mapping[str, int] | None = None,
+    declarations: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """The export of a batch merged by run (C45): the counted leases' exports joined as a merge of shards joins them
+    (`join_exports`, one part per lease), with each run's lease, federation and site in place of a shard.
+
+    Every entry `join_exports` marked with its part (`shard`) is marked with its lease (`lease_id`, as a lease store's
+    own run rows already are) instead, and each entry of a
+    run list (and of the per-entry lists: holds, losses, interrupted spend, diagnostics) gains `federation` and `site`
+    from merge.json's `leases`, which the check and the analysis rebuilt from the ledger. `shards` becomes `leases`
+    and `shard_retries_by_kind` becomes `lease_retries_by_kind`; merge.json's `spend` (the ledger's money at its
+    snapshot: what every lease is charged, the ceilings in force and what unsettled leases still lock) is carried as
+    `ledger_spend`. The runs the ledger exhausted for their lost leases (`lost`, entries as a store's export lists an
+    exhausted run, each with `lost_federation` true) join `exhausted_runs` in plan order (`seq_of`) and count in
+    `planned_runs`: they are exhausted runs like any other, with no analysed attempt. merge.json's `declarations` (the
+    ledger's declaration log, C48) is carried as `fingerprint_declarations`, so the analysis can take the deployment
+    as a sensitivity factor and see when each was admitted. A batch merged otherwise never reaches this."""
+    placed = {entry["lease_id"]: entry for entry in leases}
+    out: dict[str, Any] = {}
+    for key, value in joined.items():
+        if key == SHARDS_KEY:
+            continue
+        if key == SHARD_RETRIES_KEY:
+            out[LEASE_RETRIES_KEY] = [_leased(row, placed, place=False) for row in value]
+        elif isinstance(value, list) and value and all(isinstance(e, dict) and SHARD_KEY in e for e in value):
+            out[key] = [_leased(entry, placed, place=True) for entry in value]
+        elif key == SETTINGS_KEY:  # each change and unknown start names the lease whose store recorded it
+            out[key] = {name: [_leased(entry, placed, place=False) for entry in items] for name, items in value.items()}
+        else:
+            out[key] = value
+    if lost:
+        order = seq_of or {}
+        out["exhausted_runs"] = sorted([*out["exhausted_runs"], *map(dict, lost)], key=lambda e: order[e["run_key"]])
+        out["planned_runs"] += len(lost)
+    out[LEASES_KEY] = [dict(entry) for entry in leases]
+    if spend is not None:
+        out[LEDGER_SPEND_KEY] = dict(spend)
+    if declarations is not None:
+        out[DECLARATIONS_KEY] = [dict(entry) for entry in declarations]
+    return out
+
+
+def _leased(entry: Mapping[str, Any], placed: Mapping[int, Mapping[str, Any]], *, place: bool) -> dict[str, Any]:
+    """An entry with its part's lease id under `lease` in place of `shard`, and its federation and site with `place`."""
+    lease = placed[entry[SHARD_KEY]]
+    found = {key: value for key, value in entry.items() if key != SHARD_KEY}
+    where = {FEDERATION_KEY: lease["federation"], SITE_KEY: lease["site"]} if place else {}
+    if place and PLATFORM_KEY in lease:
+        where[PLATFORM_KEY] = lease[PLATFORM_KEY]
+    return {**found, LEASE_KEY: lease["lease_id"], **where}

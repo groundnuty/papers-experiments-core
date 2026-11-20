@@ -324,6 +324,18 @@ def test_b18_shards_that_declare_other_accepted_fingerprints_are_refused():
         join_exports({1: with_shares("a", one), 2: with_shares("b", other)}, plan("a", "b"), SHARDS)
 
 
+def test_c48_leases_issued_under_a_grown_set_join_in_a_merge_by_run_under_the_sets_union():
+    """C48: each lease of a merge by run ran under its model's declared set at its issue, and the set only grows, so
+    parts that declare other sets for a model join (a join of shards still refuses them) under their union."""
+    one = deployment_shares(declared({}), ONE)
+    other = deployment_shares({**declared({}), "model-b": {"accepted": ["fp-else"], "confirmed": {}}}, TWO)
+    parts = {1: with_shares("a", one), 2: with_shares("b", other)}
+    joined = join_exports(parts, plan("a", "b"), SHARDS, growing_sets=True)
+    (model_b,) = [entry for entry in joined["deployment_shares"] if entry["model"] == "model-b"]
+    assert model_b["accepted_fingerprints"] == ["fp-else", "fp-solo"]
+    assert model_b["turns"] == 5
+
+
 def test_b18_c32_a_shard_that_exports_no_deployment_shares_adds_none_to_those_of_the_others():
     """B18, C32: a shard whose plan has no model with a set exports no `deployment_shares`; in either order it counts
     as no entries, the shares are those of the shards that have them, and the joined export has the key where

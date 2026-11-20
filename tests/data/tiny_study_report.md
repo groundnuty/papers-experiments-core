@@ -9,6 +9,7 @@
 - Scorers: tiny `1`
 - Runs: 22 planned, 22 analysed, 0 exhausted (charged infrastructure attempts reached the limit; no scored attempt), 0 unfinished, 0 left out of the analysis
 - Partial analysis: no
+- Spend: 0.003536 USD in all: 0.003536 measured, 0.000000 measured plus requests in flight, 0.000000 at a bound, 0.000000 in top-ups, 0.000000 in probes; 0.003536 on the analysed attempts and 0.000000 on the rest; see "Model usage and spend"
 
 ## Preregistered contrasts (Holm family of 2, alpha = 0.05)
 
@@ -140,6 +141,70 @@ the campaign's budget could not cover, so it was not sent. They are among the at
 counted by the kind of their own outcome: one an outage overlapped, which the table above counts under the
 outage's kind, is counted here too. They are counted over every run of the campaign, a run a partial analysis
 leaves out included. A model with more of them had its runs stopped by the budget more often than the others.
+
+## Model usage and spend
+
+What each model cost, as the budget gate counts it (the same figures, read from the campaign's snapshot of its store),
+by what became of each attempt. Tokens are the counts the store recorded. A count the endpoint did not report is not
+0: the attempt is counted in Usage incomplete (its totals are known to be short, a count is missing, or it was still
+running). Each attempt's dollars are on one basis. Measured: its counts at the model's price, each request at the tier
+its prompt fell in (a free model's zero is measured too). Measured plus in flight: an interrupted attempt's replies,
+and a request sent and not answered at the most one request can cost. Bound: the most its caps let it cost, because
+its usage is unknown. Top-ups: a send the token cap could not account for, charged one request's bound when it was
+reserved and never refunded. Probes: the sends of admission's probes, charged at the dearest rates of the counts their
+replies reported, or a send's bound. Charged at a bound counts the attempts whose charge holds a bound or a top-up. An
+attempt that failed before any request was sent and was charged a measured zero has 0 tokens and 0 dollars. n/a: not
+known, because the model has no price, the prices are not the ones the campaign ran under, a bound cannot be computed
+or a record cannot be read; it is never 0. An attempt still running (a partial analysis) has no spend of its own known
+yet: its dollars are n/a and Spent has only the top-ups it was charged. Top-ups and probes are what the budget gate
+charged: a campaign without a budget has no gate, so both are 0 there, though its endpoints may have billed what
+nothing counted. Spent is the model's total, On analysed attempts that of the attempts the analysis uses, and On the
+rest everything else (attempts that were never scored, runs left out of a partial analysis, what a kill lost, probes),
+so what scored runs cost can be read beside the overhead.
+
+### Spend by model
+
+| Model | Spent (USD) | On analysed attempts | On the rest | Measured | Measured plus in flight | Bound | Top-ups | Probes |
+|---|---|---|---|---|---|---|---|---|
+| alpha-stub | 0.002300 | 0.002300 | 0.000000 | 0.002300 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+| beta-stub | 0.001236 | 0.001236 | 0.000000 | 0.001236 | 0.000000 | 0.000000 | 0.000000 | 0.000000 |
+
+### Attempts, tokens and spend by what became of the attempt
+
+| Model | Attempts of | Attempts | Input tokens | Output tokens | Cache writes | Cache reads | Usage incomplete | Charged at a bound | Measured (USD) | Measured plus in flight (USD) | Bound (USD) | Top-ups (USD) | Total (USD) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| alpha-stub | analysed runs | 11 | 1972 | 164 | 0 | 0 | 0 | 0 | 0.002300 | 0.000000 | 0.000000 | 0.000000 | 0.002300 |
+| beta-stub | analysed runs | 11 | 1972 | 167 | 0 | 0 | 0 | 0 | 0.001236 | 0.000000 | 0.000000 | 0.000000 | 0.001236 |
+
+### Attempts set aside as infrastructure
+
+Every attempt of the export's `retries_by_kind`, added over the conditions; Charged says whether it used one of the
+run's attempts. A model with none has a row of zeros.
+
+| Model | Kind | State | Charged | Attempts |
+|---|---|---|---|---|
+| alpha-stub | - | - | - | 0 |
+| beta-stub | - | - | - | 0 |
+
+### Requests retried inside an attempt
+
+From the records the batch holds: each retry the model's requests made before a reply, by the kind of error, and the
+seconds it waited. Records are the attempts that kept one.
+
+| Model | Records | Turns | Turns that retried | Retries | Wait (s) |
+|---|---|---|---|---|---|
+| alpha-stub | 11 | 30 | 0 | 0 | 0.00 |
+| beta-stub | 11 | 30 | 0 | 0 | 0.00 |
+
+### Served model ids and fingerprints
+
+What the replies of the model's records say they were served by; not reported is a reply that named none, never the id
+that was asked for.
+
+| Model | Served model id | System fingerprint | Turns | Records |
+|---|---|---|---|---|
+| alpha-stub | not reported | not reported | 30 | 11 |
+| beta-stub | not reported | not reported | 30 | 11 |
 
 ## Attempts left out of the analysis
 

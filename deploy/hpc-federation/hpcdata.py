@@ -111,11 +111,18 @@ def ingested_manifests(layout: Layout, values: Mapping[str, str]) -> Dict[str, M
 
 def ingested_record(layout: Layout, values: Mapping[str, str]) -> Dict[str, Dict[str, Any]]:
     """What the state file records of each ingested space at `up` (`data.ingested`): the digest of the manifest it is
-    to be verified against, whether the layout declares it, and no verdict yet."""
+    to be verified against, whether the layout declares it, no verdict yet, and no Onezone ID yet (`space_id`: `up`
+    records the one the zone gave the space once its core's phase has written the facts, and a marker `verify-data`
+    leaves is bound to it, so a space made again by name under another ID is no space that was verified)."""
     declared = ingested(layout)
     manifests = ingested_manifests(layout, values)
     return {
-        name: {"manifest": manifests[name].digest(), "declared": declared[name] is not None, "verified": None}
+        name: {
+            "manifest": manifests[name].digest(),
+            "declared": declared[name] is not None,
+            "space_id": None,
+            "verified": None,
+        }
         for name in declared
     }
 
@@ -268,11 +275,15 @@ def failure(space: str, found: str, declared: bool) -> str:
 
 def content_reader(boot: Any) -> Callable[[str], Tree]:
     """A space's tree as its owner serves it, over the bootstrap's REST (`fedcontent.Content`): every directory walked
-    page by page, every file's bytes read and hashed. A file that cannot be read is read as no bytes. The link check's
-    own files in the probe space are listed and never read: `check` drops them (`without_link_check_files`), and
+    page by page, every file's bytes streamed through a SHA-256 in fixed chunks, so that what is held at a time is
+    `WORKERS` chunks and one (path, size, digest) per file, never a file, whatever the space holds: `verify-data` runs
+    on the login node, whose account shares one memory limit with the federation's relays. A file that cannot be read,
+    at the start or part-way, is read as no bytes (the digest of nothing, never of the part that arrived). The link
+    check's own files in the probe space are listed and never read: `check` drops them (`without_link_check_files`), and
     reading a probe through the space's owner could replicate it there, or read a retired file again, which the link
     check never does. Their digest is empty, so a name the reader skipped and `check` did not drop is refused."""
     from fedcontent import Content, writer_of
+    from fedrest import RestError
 
     content = Content(boot)
     probe = boot.layout.spec.probe_space
@@ -296,8 +307,13 @@ def content_reader(boot: Any) -> Callable[[str], Tree]:
         def digest(path: str) -> Tuple[str, Tuple[int, str]]:
             if space == probe and is_link_check_entry(path):
                 return path, (sizes[path], "")
-            data = content.read_back(service, files[path]) or b""
-            return path, (sizes[path], hashlib.sha256(data).hexdigest())
+            hasher = hashlib.sha256()
+            try:
+                for chunk in content.read_chunks(service, files[path]):
+                    hasher.update(chunk)
+            except RestError:
+                hasher = hashlib.sha256()  # read as no bytes: the part that arrived is no more the file's than none
+            return path, (sizes[path], hasher.hexdigest())
 
         with ThreadPoolExecutor(WORKERS) as pool:
             return dict(pool.map(digest, sorted(files))), directories

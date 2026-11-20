@@ -46,7 +46,7 @@ import os
 import re
 import threading
 from collections.abc import Iterator, Mapping
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 # endpoint: the model endpoint failed after the retries. key_rejected: HTTP 401 or 403 from the model API.
 # sandbox: the agent's sandbox failed. knowledge: a tool server failed. unattributed_kill: a process was killed
@@ -395,6 +395,11 @@ class InfraError(RuntimeError):
     `billed` is the (input, output) counts of a reply the endpoint answered, and so billed, before the failure was found
     in it (a 200 without choices, say): the recording tells the attempt's spend guard of it (C26, C27). None when no
     reply came back.
+
+    `diagnostic` is what the raiser can say of the failure beyond its detail: a JSON object, such as what an instrument
+    checked and what it saw. It is kept as given; the attempt keeps it, redacted, on its record (C40), and one that
+    cannot be kept is recorded as failed rather than costing the attempt its result. `origin`, set by
+    `start_instruments` and never by the raiser, names the phase and the instrument whose `start` raised.
     """
 
     def __init__(
@@ -404,6 +409,7 @@ class InfraError(RuntimeError):
         *,
         target: str | None = None,
         billed: tuple[int | None, int | None] | None = None,
+        diagnostic: Mapping[str, Any] | None = None,
     ):
         known = infra_kinds()  # one view, for the test and the message alike
         if kind not in known:
@@ -417,6 +423,14 @@ class InfraError(RuntimeError):
         self.detail = detail
         self.target = target
         self.billed = billed
+        self.diagnostic = diagnostic
+        self.origin: dict[str, str] | None = None
+
+    def note_origin(self, phase: str, instrument: str) -> None:
+        """Say which instrument's `phase` raised this error, unless an earlier call already did (C40). Reads `origin`
+        with a default, so a subclass that skips this class's initialiser is named too."""
+        if getattr(self, "origin", None) is None:
+            self.origin = {"phase": phase, "instrument": instrument}
 
 
 class CallTimedOut(InfraError):

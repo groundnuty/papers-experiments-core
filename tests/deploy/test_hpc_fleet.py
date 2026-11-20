@@ -245,6 +245,32 @@ def test_o68_down_touches_no_federation_and_no_job_it_did_not_make(bench):
     assert "7777" not in bench.fake("fed-1").cancelled
 
 
+def test_c54_a_member_its_down_left_unswept_goes_down_only_with_the_operators_node_check(bench, monkeypatch):
+    """C54: fed-1's worker step outlives its TERM and its cancel, so its down cannot sweep the agent's node: down
+    fails with the root kept and the node recorded unswept; a second `down --member fed-1`, its job gone, still keeps
+    the root; `--node-checked TEXT` (the operator's word that the README's sweep in a job on that node passed) takes it
+    down, and the member's down log keeps the text. `--node-checked` without `--member` is refused."""
+    monkeypatch.setattr(sys.modules["hpcdown"], "STEP_TERM_S", 0.0)
+    monkeypatch.setitem(sys.modules["hpcdriver"].TIMEOUTS, "cancel", 0.0)
+    assert bench.up(2)[0] == 0
+    step = f"{job_ids('fed-1')[1]}.9"
+    bench.fake("fed-1").steps[f"{state(bench, 'fed-1')['sandbox']['name']}-worker"] = step
+    bench.fake("fed-1").unending.append(step)
+    assert bench.run("down", "--member", "fed-1")[0] == 1
+    assert state(bench, "fed-1")["unswept"] == ["the agent's node"]
+    code, printed = bench.run("down", "--member", "fed-1")
+    assert code == 1
+    assert "the agent's node was never swept" in printed
+    assert bench.root("fed-1").is_dir()
+    assert bench.run("down", "--node-checked", "looked")[0] == 2
+    checked = "shards.py sweep in a job on its node: exit 0"
+    code, printed = bench.run("down", "--member", "fed-1", "--node-checked", checked)
+    assert code == 0, printed
+    assert not bench.root("fed-1").exists()
+    assert f"the operator checked: {checked}" in (bench.fleet / "logs" / "fed-1.down.log").read_text(encoding="utf-8")
+    assert [m["status"] for m in record(bench)["members"]] == ["down", "up"]
+
+
 def test_o68_down_refuses_a_root_whose_state_is_another_federations(bench):
     """O68: fed-2's state file replaced by one of another federation (another job name): fed-2 is not touched and is
     reported, fed-1 goes down, and down fails."""
@@ -502,7 +528,9 @@ def test_o68_each_federations_up_and_down_is_hpcfed_in_a_process_of_its_own(depl
     assert options["cwd"] == str(tmp_path)
     assert argv[3:] == [str(deploy.fleet.HERE / "hpcfed.py"), "--layout", str(LAYOUT), "--root",
                         str(tmp_path / "fed-1" / "root"), "up"]  # fmt: skip
-    assert options["env"] == {"HPC_ACCOUNT": "invented"}
+    # an up also gets the lock the fleet's ups share (`<fleet>/.placement.lock`, the root's grandparent); a down none
+    lock = str(tmp_path / ".placement.lock")
+    assert options["env"] == {"HPC_ACCOUNT": "invented", "HPC_FLEET_PLACEMENT_LOCK": lock}
     assert (code, printed) == (1, "error: up: refused\n")
     assert log.stat().st_mode & 0o777 == 0o600
     said = deploy.fleet.last_error("hpcfed: zone launched\nerror: up: the zone failed\n")

@@ -478,6 +478,26 @@ def test_R12_ordinary_text_that_looks_like_the_start_of_a_secret_is_untouched_ex
     assert redact_text("x" * 127 + "abcd" + NOTICE, env)[0] == "x" * 127 + REDACTED + NOTICE
 
 
+def test_R12_the_cut_of_a_long_secret_is_marked_whole_when_a_shorter_secret_also_lies_inside_it():
+    """R12: a secret the cap cut, that holds another secret (a URL with a password in it), is one marker before the
+    notice: the shorter secret is not replaced inside the cut tail first, which would leave its start in the text."""
+    long = "postgres://dbuser-private:declared-password-42@db-private.example/main"
+    redactor = Redactor([long, "declared-password-42"])
+    cut = long[:52] + "\n[output truncated: 10 of 62 characters dropped by the harness cap]"
+    assert redactor.text(cut) == f"{REDACTED}\n[output truncated: 10 of 62 characters dropped by the harness cap]"
+    assert redactor.structure({"seen": cut})[0] == {"seen": redactor.text(cut)}
+
+
+def test_R12_a_secret_named_key_inside_json_text_is_redacted_when_a_secret_made_the_text_json():
+    """R12: a string that is JSON only once a secret in it is replaced (the secret holds a quote) has its secret-named
+    keys applied too, after the replacement, as it would be if the replacement came first."""
+    secret = 'quote"in-secret'
+    leaf = '{"token": "undeclared-value-1234", "seen": "' + secret + '"}'
+    redacted, paths = Redactor([secret]).structure({"x": leaf})
+    assert redacted == {"x": '{"token": "[redacted]", "seen": "[redacted]"}'}
+    assert paths == ["x"]
+
+
 def test_R12_a_marker_already_at_the_cut_point_is_not_marked_twice():
     env = {"A_API_KEY": SECRET_FOR_CUTS}
     text = f"head {REDACTED}{NOTICE}"

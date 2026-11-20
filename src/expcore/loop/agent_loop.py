@@ -239,6 +239,7 @@ class _Run:
                 retries=turn.retries,
                 waits_left_open=self._request_waits_left_open,
                 infra_wait_by_kind=self._request_waited_by_kind,
+                deployment_id=turn.deployment_id,
             )
         )
 
@@ -304,8 +305,10 @@ class _Run:
             # the agent's time, which leaves those waits out, or the ceiling is used up (L04, L05). A tool server that
             # runs out of a bound shorter than the time left fails the call as infrastructure (L17); the watch judges
             # an expiry at the time left (L16). A code cell, or any tool that is no tool server's, is never bounded by
-            # the declared bound nor judged by it: its time is the agent's.
-            ctx = WaitContext(self.timer)
+            # the declared bound nor judged by it: its time is the agent's. A code cell under a declared limit shorter than
+            # the time left is handed the limit, and is told so through the context (L18): the sandbox kills the cell
+            # at it, the call returns the cell's timeout, and the run goes on.
+            ctx = WaitContext(self.timer, cell_bound_s=self._cell_bound(tick, call))
             run = await self.watcher.run(self.toolbox.run(call, timeout_s=self._call_bound(tick, call), ctx=ctx), tick)
         except Cut as cut:
             tool_server = self.toolbox.is_tool_server(call.name)
@@ -338,12 +341,26 @@ class _Run:
     def _call_bound(self, tick: Tick, call: ToolCall) -> float:
         """The `timeout_s` a call is handed: the agent's time left (L05), or, for a call to a tool server, the declared
         per-call bound when that is shorter (L17). The call is cut at the time left whatever the provider does; the
-        bound is the tool server's to keep. Any other tool, the code tool above all, gets the time left whatever is
-        declared, so what the model is told about a cell that ran long does not depend on the key."""
+        bound is the tool server's to keep. A code cell gets the time left too, unless the study declares a limit on one
+        cell and it is shorter (`_cell_bound`, L18); any other tool gets the time left whatever is declared, so what the
+        model is told about it does not depend on the keys."""
+        cell = self._cell_bound(tick, call)
+        if cell is not None:
+            return cell
         declared = self.config.tool_server_call_bound_s
         if declared is None or not self.toolbox.is_tool_server(call.name):
             return tick.remaining_s
         return min(declared, tick.remaining_s)
+
+    def _cell_bound(self, tick: Tick, call: ToolCall) -> float | None:
+        """The declared limit on one code cell when it is in force for this call, else None (L18): the call is to a tool
+        that runs code cells, a limit is declared, and it is strictly shorter than the agent's time left. A limit at or
+        past the time left changes nothing: the call is handed the time left, and a cell that reaches it is the loop's
+        cut, as without the key."""
+        declared = self.config.code_cell_bound_s
+        if declared is None or not self.toolbox.is_code_cell(call.name) or not declared < tick.remaining_s:
+            return None
+        return declared
 
     def _waited(self, before: tuple[float, dict[str, float]]) -> tuple[float, dict[str, float]]:
         """The time the call just made spent waiting on infrastructure, in all and by kind: the timer's totals now, less
@@ -439,6 +456,8 @@ class _Run:
         record = {**self.config.as_dict(), "terminal_tools": self.toolbox.terminal_names}
         if self.config.tool_server_call_bound_s is not None:  # which tools the bound reached, so a replay judges alike
             record["tool_server_tools"] = self.toolbox.tool_server_names
+        if self.config.code_cell_bound_s is not None:  # and which tools the cell limit reached (L18)
+            record["code_cell_tools"] = self.toolbox.code_cell_names
         # A billed reply that became no turn is judged by the record, by the rule of its version (`reply_count_rule`).
         incomplete = self.usage_incomplete or bool(info.get("abandoned_request")) or bool(usage.get("missing"))
         return LoopResult(

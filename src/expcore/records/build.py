@@ -30,6 +30,7 @@ from expcore.loop.timer import AgentTimer
 from expcore.loop.toolbox import ToolBox
 from expcore.models import spend
 from expcore.models.adapters import ModelBackend, ModelTurn
+from expcore.models.fleetheaders import attempt_switched
 from expcore.models.route import sdk_version
 from expcore.plugin import ToolProvider, ToolSpec
 from expcore.prompt.templates import RenderedPrompt, sha256_of
@@ -60,11 +61,14 @@ INFRA_PREFIX = "infrastructure: "
 
 @dataclass(frozen=True)
 class RunIdentity:
-    """Who the attempt is: the run key, the factor values it was derived from, and the attempt number."""
+    """Who the attempt is: the run key, the factor values it was derived from, and the attempt number, and, for an
+    attempt that ran on a lease (C41), the lease: two leases of one run can each have an attempt of one number, so the
+    lease id tells them apart. None for every other attempt, and then no record or export says anything of it."""
 
     run_key: str
     factors: Mapping[str, Any]
     attempt: int
+    lease_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -207,6 +211,22 @@ def capped_totals(
     return {name: value for name, value in given.items() if value is not None}
 
 
+def switched_totals(
+    turns: Sequence[Mapping[str, Any]],
+    schema_version: str,
+    schemas: Sequence[SchemaVersion] = SCHEMAS,
+    recorded: bool | None = None,
+) -> dict[str, bool]:
+    """The optional total that says the attempt's turns show more than one deployment (B20): `deployment_switched`,
+    written only when it is true (absent otherwise, and for a version that predates it), from the turns' own ids and
+    system fingerprints (`attempt_switched`). A replay passes `recorded`, what the record holds (False: absent), so a
+    record written before a rule that decides the flag is served as it was, never filled in."""
+    switched = attempt_switched(turns) if recorded is None else recorded
+    if switched and "deployment_switched" in fields_of("totals", schema_version, schemas):
+        return {"deployment_switched": True}
+    return {}
+
+
 def tool_entry(spec: ToolSpec) -> dict[str, Any]:
     """Return a tool spec as the record keeps it: as the provider gave it, before the cap sentence is added."""
     return {
@@ -258,7 +278,7 @@ def turn_entry(
 ) -> dict[str, Any]:
     """Return one model turn as the record keeps it: the neutral and the native message, and what surrounded them."""
     turn = captured.turn
-    return {
+    entry = {
         "index": index,
         "neutral": {
             "text": turn.text,
@@ -278,6 +298,9 @@ def turn_entry(
         "waits_left_open": loop_turn.waits_left_open,
         "infra_wait_by_kind": plain(loop_turn.infra_wait_by_kind),
     }
+    if loop_turn.deployment_id is not None and "deployment_id" in fields_of("turn", schema_version):
+        entry["deployment_id"] = loop_turn.deployment_id  # optional, last: written only when the reply named one (B20)
+    return entry
 
 
 def route_entry(info: Mapping[str, Any], settings: Mapping[str, Any]) -> dict[str, Any]:
@@ -374,6 +397,7 @@ def _build_record(
     instrument_refusal: Mapping[str, Any] | None = None,
     reserved_capped: bool | None = None,
     reply_cap_unheld: bool | None = None,
+    deployment_switched: bool | None = None,
 ) -> RunRecord:
     """Build the record of a finished attempt from the loop's result and the recording wrapper it ran through.
 
@@ -390,6 +414,8 @@ def _build_record(
 
     `reserved_capped` and `reply_cap_unheld` are the two optional totals that say whether the attempt was held to the
     reservation R (`capped_totals`); None leaves one out, and a replay serves back what the record holds.
+    `deployment_switched` is the optional total of B20 (`switched_totals`): None derives it from the turns, and a
+    replay serves back what the record holds, so a record written before a rule that decides it replays to its bytes.
 
     The record is written as `schema_version`, and its outcome's treatment flag follows the rules of that version in
     `schemas`. Private: only a replay of an older record (its own version) and tests building older records choose a
@@ -473,6 +499,7 @@ def _build_record(
             "abandoned_threads": result.abandoned_threads,
             "final_text": result.final_text,
             **capped_totals(reserved_capped, reply_cap_unheld, schema_version, schemas),
+            **switched_totals(turns, schema_version, schemas, deployment_switched),
         },
         "instruments": plain(dict(instruments or {})),
         "scores": {},
@@ -480,6 +507,8 @@ def _build_record(
     }
     if instrument_refusal is not None:  # optional: written only when there is one, served back by a replay
         fields["instrument_refusal"] = plain(dict(instrument_refusal))
+    if identity.lease_id is not None:  # optional: only an attempt run on a lease has one, served back by a replay (C41)
+        fields["lease_id"] = identity.lease_id
     if redactor is None:
         redactor = redactor_for(recording.inner, environ=environ, secrets=secrets, secret_env=secret_env, models=models)
     redacted, paths = redactor.structure(fields)
@@ -499,7 +528,7 @@ def build_record(result: LoopResult, recording: RecordingBackend, **options: Any
     A live run cannot choose an older record version: that would apply an older treatment rule to a new run. The
     keyword options are those of `_build_record` (`identity`, `system`, `user`, `specs`, `code`, `core_version`,
     `instruments`, `instrument_refusal`, `treatment_kinds`, `treatment_targets`, `reserved_capped`, `reply_cap_unheld`,
-    `redactor`, `secrets`, `secret_env`, `models`, `environ`); `schema_version` is refused.
+    `deployment_switched`, `redactor`, `secrets`, `secret_env`, `models`, `environ`); `schema_version` is refused.
     """
     if "schema_version" in options:
         raise TypeError("build_record writes the current record version; a live run cannot choose another")

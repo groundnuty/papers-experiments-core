@@ -16,15 +16,31 @@ campaign. A platform whose admission depends on the note declares that it needs 
 that platform's admission reads when the refusal at load never saw the declaration (an admission a study wrapped
 without it). The post-run check runs inside the same try and sees the note too, so a platform notes from its pre-run
 check alone.
+
+A platform's post-run check may note a structured reading of the platform under `HEALTH_READING` (a small JSON
+object, see `reading_of`). The attempt runner clears the key before the post-run check and keeps what the check left
+there with the attempt, in its marker (`post_run_health`) and in one event: a reading the pre-run check noted is never
+taken for the post-run check's, and a check that notes none leaves none.
+
+Before the post-run check the runner also notes `EXECUTOR_RETURNED`: once the executor has returned nothing of the run
+is in progress, so a platform's check never explains a state as the run's own work in progress (the fault gate, O90).
 """
 
 import contextlib
+import json
 from collections.abc import Iterator
 from contextvars import ContextVar
 from typing import Any
 
 _NOTE: ContextVar[dict[str, Any] | None] = ContextVar("expcore_prerun_note", default=None)
 UNCHECKED = "unchecked"  # the key of a note whose campaign has no health check: no pre-run check will write to it
+HEALTH_READING = "health_reading"  # the key a platform's check notes its structured reading of the platform under
+EXECUTOR_RETURNED = (
+    "executor_returned"  # set by the attempt runner before the post-run check: the executor has returned
+)
+READING_MAX_BYTES = 16_384  # the most a reading's JSON text may be for the attempt to keep it
+READING_MAX_DEPTH = 16  # the deepest a reading may nest (a platform's reading is a shallow object)
+READING_MAX_NODES = 4_096  # the most values a reading may hold, walked before anything is serialised
 
 
 @contextlib.contextmanager
@@ -37,6 +53,43 @@ def opened(*, checked: bool = True) -> Iterator[dict[str, Any]]:
         yield note
     finally:
         _NOTE.reset(token)
+
+
+def _shallow(value: Any) -> bool:
+    """Whether `value` nests at most `READING_MAX_DEPTH` deep and holds at most `READING_MAX_NODES` values, walked with
+    a stack so that no nesting can exhaust the interpreter's recursion (a cycle ends at the depth bound). Serialising
+    first is no test: one dump of a list thousands deep succeeds where the marker's own, which writes it in pieces,
+    raises RecursionError."""
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    seen = 0
+    while stack:
+        item, depth = stack.pop()
+        seen += 1
+        if seen > READING_MAX_NODES or depth > READING_MAX_DEPTH:
+            return False
+        if isinstance(item, dict):
+            stack.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list | tuple):
+            stack.extend((child, depth + 1) for child in item)
+        else:
+            continue
+        if len(stack) + seen > READING_MAX_NODES:  # a container too wide is refused before it is all walked
+            return False
+    return True
+
+
+def reading_of(value: Any) -> dict[str, Any] | None:
+    """The structured reading `value` is, as a detached copy, or None when it is not one: a JSON object (a dict whose
+    contents are plain JSON values) of at most `READING_MAX_BYTES` of text. The attempt keeps the reading its post-run
+    check noted under `HEALTH_READING` in its marker and in an event (`expcore.campaign.attempt`); a platform's reading
+    is its own, and the core reads nothing in it."""
+    if not isinstance(value, dict) or not _shallow(value):
+        return None
+    try:  # a RecursionError is no ValueError: nothing nested is serialised before the walk above has bounded it
+        text = json.dumps(value, sort_keys=True, allow_nan=False)
+        return json.loads(text) if len(text.encode("utf-8")) <= READING_MAX_BYTES else None
+    except (TypeError, ValueError, RecursionError):
+        return None
 
 
 def current() -> dict[str, Any] | None:

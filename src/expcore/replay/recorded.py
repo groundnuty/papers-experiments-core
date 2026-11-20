@@ -201,6 +201,7 @@ class RecordedBackend:
             cache_read_input_tokens=usage["cache_read_input_tokens"],
             served_model=entry["served_model"],
             system_fingerprint=entry["system_fingerprint"],
+            deployment_id=entry.get("deployment_id"),  # optional, from version 3: absent in the record stays None (B20)
             retries=tuple(copy.deepcopy(entry["retries"])),
             # absent in the record stays absent (None): a record of version 1 or 2, or an older writer of version 3
             usage_extra=dict(usage["extra"]) if "extra" in usage else None,
@@ -267,7 +268,8 @@ class ReplayToolBox(ToolBox):
     the cap is recomputed, as the loop did.
 
     The one provider of a replay serves every recorded call, so it cannot say which tools were a tool server's; the
-    record does, in the names of `agent_config.tool_server_tools`, and the box is given them (L17).
+    record does, in the names of `agent_config.tool_server_tools`, and the box is given them (L17); likewise the tools
+    that run code cells, in `agent_config.code_cell_tools` (L18).
     """
 
     def __init__(
@@ -277,8 +279,9 @@ class ReplayToolBox(ToolBox):
         cap_chars: int,
         recorded: Sequence[dict[str, Any]],
         tool_servers: Collection[str] = (),
+        code_cells: Collection[str] = (),
     ):
-        super().__init__(providers, cap_chars=cap_chars, tool_servers=tool_servers)
+        super().__init__(providers, cap_chars=cap_chars, tool_servers=tool_servers, code_cells=code_cells)
         self._unrendered = {c["call_id"]: c for c in recorded if not c.get("rendering_verified", True)}
 
     async def run(self, call: ToolCall, *, timeout_s: float, ctx: CallContext = NO_WAITS) -> ToolRun:

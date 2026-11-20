@@ -270,10 +270,15 @@ class AgentTimer:
 
 
 class WaitContext:
-    """The call context the loop hands a provider: it can mark waits on infrastructure and nothing else of the timer."""
+    """The call context the loop hands a provider: it can mark waits on infrastructure and nothing else of the timer.
 
-    def __init__(self, timer: AgentTimer):
+    `cell_bound_s` is the study's declared wall limit on one code cell, set only for a call that runs under it: the
+    call's `timeout_s` is that bound, shorter than the agent's time left (L18). A code tool reads it to tell a cell it
+    killed at the bound from one that reached the agent's time. None for every other call."""
+
+    def __init__(self, timer: AgentTimer, *, cell_bound_s: float | None = None):
         self._timer = timer
+        self.cell_bound_s = cell_bound_s
 
     def infrastructure_wait(self, kind: str) -> AbstractAsyncContextManager[None]:
         """Pause the agent's clock while the returned context manager is open, for a wait of a known kind (L04)."""

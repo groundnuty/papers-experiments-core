@@ -1539,7 +1539,9 @@ class DockerSandbox:
             copies = [(rel, dest / "work" / rel) for rel in outputs]
             with self._frozen():  # nothing of the agent's can change the tree while it is listed and copied
                 work = self.dir / "work"
-                copied = copyout.copy_tree(self.host, work, copies, max_bytes=self.s.limits.work_disk_bytes)
+                copied = copyout.copy_tree(
+                    self.host, work, copies, max_bytes=self.s.limits.work_disk_bytes, restore_locked=True
+                )
             got = {rel: copied[rel] is not None for rel in outputs}
         except copyout.UnsafeOutput as unsafe:  # the agent's own doing: for the scorers, never a set-aside
             refused = self._meta["refused_output"] = copyout.record(unsafe.refused)

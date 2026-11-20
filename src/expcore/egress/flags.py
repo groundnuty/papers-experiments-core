@@ -12,6 +12,10 @@
 The scan uses the run's recorded declaration (its platform names, and whether its data path is the agent's own network
 calls); a run without a readable snapshot is scanned with an empty declaration, so every URL and every network call in
 its code flags. A flagged run is listed in the report, and the sensitivity analysis leaves it out.
+
+Under the package indexes the campaign declared (`judge(..., package_indexes=...)`, read from the campaign's recorded
+fingerprint), a plain `pip install` and a URL on an index's host are `package_index` hits: `package_index` says the
+run has one, and it is never a flag, so neither rerun leaves the run out for it (O95).
 """
 
 from collections.abc import Mapping, Sequence
@@ -20,6 +24,7 @@ from typing import Any
 
 from expcore.egress.declare import CLASSES, Declaration
 from expcore.egress.instrument import INTACT, NAMESPACE, UNKNOWN, VERSION
+from expcore.egress.package_index import PACKAGE_INDEX
 from expcore.egress.scan import code_cells, scan_cells
 
 OUTSIDE_FLAG, LOG_UNKNOWN, STATIC_SCAN = "outside", "log_unknown", "static_scan"
@@ -48,6 +53,11 @@ class RunEgress:
     @property
     def flagged(self) -> bool:
         return bool(self.flags)
+
+    @property
+    def package_index(self) -> bool:
+        """Whether its code installed from, or named, a declared package index: reported, never a flag (O95)."""
+        return bool(self.scan.get(PACKAGE_INDEX))
 
 
 def _readable(data: Any) -> tuple[Mapping[str, Any] | None, Declaration | None, str | None]:
@@ -100,14 +110,15 @@ def sum_attempts(outside: Sequence[Any]) -> int | None:
     return sum(counts)
 
 
-def judge(record: Any, condition: str) -> RunEgress:
-    """The egress verdict of one analysed run (see the module's text)."""
+def judge(record: Any, condition: str, *, package_indexes: Sequence[str] = ()) -> RunEgress:
+    """The egress verdict of one analysed run (see the module's text), under the package indexes the campaign
+    declared (`expcore.egress.package_index`; none by default)."""
     data, declared, why = _readable(record.instruments.get(NAMESPACE))
     if data is None:
         log, unknown, outside = UNKNOWN, (why,), ()
     else:
         log, unknown, outside = data["log"], tuple(data["unknown"]), tuple(data["outside"])
-    scanned = scan_cells(code_cells(record), declared or NOTHING_DECLARED)
+    scanned = scan_cells(code_cells(record), declared or NOTHING_DECLARED, package_indexes=package_indexes)
     found = set()
     if log != INTACT:
         found.add(LOG_UNKNOWN)

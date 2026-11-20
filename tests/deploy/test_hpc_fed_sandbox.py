@@ -554,14 +554,16 @@ def test_separate_up_holds_the_agents_node_in_a_second_job_read_back_like_the_fi
     assert (facts.job, facts.het_group) == ("4343", None)
 
 
-def test_separate_agents_job_recorded_otherwise_is_cancelled_alone_and_down_cancels_the_first(hpc, tmp_path, site):
-    """O57: the agent's job recorded otherwise than asked is cancelled by its own id, the services' job kept for down,
-    which cancels it by its own id and removes the root."""
+def test_separate_agents_job_recorded_otherwise_is_cancelled_and_so_is_the_first(hpc, tmp_path, site):
+    """O57: the agent's job recorded otherwise than asked is cancelled by its own id and up fails, and the services'
+    job, submitted before it and running, is cancelled by its own: no held job of this up is left to bill. The state
+    still records the services' job; down finds both gone and removes the root."""
     fake = FakeSlurm(component_recorded={("4343", 0): {"MinMemoryNode": "1G"}})
     rig = Rig(hpc, tmp_path, site, placement="separate", fake=fake)
-    with pytest.raises(hpc.slurm.SlurmError, match="MinMemoryNode"):
+    with pytest.raises(hpc.slurm.SlurmError, match="MinMemoryNode") as refused:
         rig.up()
-    assert fake.cancelled == ["4343"]
+    assert fake.cancelled == ["4343", "4242"]
+    assert str(refused.value).endswith("the held job(s) 4242 were cancelled")
     assert rig.state()["allocation"]["job"] == "4242"
     rig.driver.down()
     assert fake.cancelled == ["4343", "4242"]
@@ -610,16 +612,16 @@ def test_separate_down_finds_the_agents_job_by_its_own_name_when_its_id_never_re
     assert not rig.root.exists()
 
 
-def test_separate_agents_job_that_never_starts_is_cancelled_and_down_cancels_the_first(hpc, tmp_path, site):
-    """O57: the agent's job still pending at the queue's bound is cancelled by its id and up fails; down cancels the
-    services' job."""
+def test_separate_agents_job_that_never_starts_is_cancelled_and_so_is_the_first(hpc, tmp_path, site):
+    """O57: the agent's job still pending at the queue's bound is cancelled by its id and up fails, and the services'
+    job, running, is cancelled by its own: no held job of this up is left to bill. down finds both gone."""
     fake = FakeSlurm(job_states={"4343": "PENDING"})
     rig = Rig(hpc, tmp_path, site, placement="separate", fake=fake)
     clock = iter(range(0, 10**7, 100))
     rig.driver.slurm.clock = lambda: next(clock)
     with pytest.raises(hpc.slurm.SlurmError, match="did not start"):
         rig.up()
-    assert fake.cancelled == ["4343"]
+    assert fake.cancelled == ["4343", "4242"]
     rig.driver.down()
     assert fake.cancelled == ["4343", "4242"]
 
@@ -732,4 +734,112 @@ def test_o63_a_sweep_that_fails_leaves_the_root_but_never_the_job_billing(hpc, t
     with pytest.raises(RuntimeError, match="the agent's node could not be verified clean"):
         rig.driver.down()
     assert fake.cancelled == ["4242"]
+    assert rig.root.exists()
+
+
+# -- C54: down ends this federation's live steps in the agent's own job before it sweeps -------------------------
+
+
+def held_by_a_live_step(fake):
+    """A sweep that cannot start while a step of the agent's own job still holds its node: live, the elastic worker's
+    step held the whole job, srun's client for the sweep waited for resources and gave up (`status None`)."""
+
+    def control(srun):
+        from hpcslurm import Completed
+
+        if "sweep" in srun.command and any(step.startswith("4343.") for step in fake.steps.values()):
+            return FakeProcess(Completed(None, "", "srun: Job step creation temporarily disabled, retrying\n"))
+        return None
+
+    return control
+
+
+@pytest.mark.parametrize(("suffix", "obeys"), [("-worker", True), ("-shard-1", True), ("-worker", False)])
+def test_c54_down_ends_a_live_step_of_the_agents_job_by_its_id_and_sweeps_once_it_ended(
+    hpc, tmp_path, site, suffix, obeys
+):
+    """C54: a step of this federation still running in the agent's own job (the elastic worker's, or a shard's) held
+    the whole job live, so down's sweep of the agent's node never started and a second down removed the root unswept:
+    down now sends that step TERM by its own id (the worker removes its own directory, its key files first), cancels
+    it by its id only if it outlives TERM (an outright kill on the site), waits until squeue and sacct show that id
+    ended, and only then sweeps the node; the root goes."""
+    fake = FakeSlurm(ignores_term=[] if obeys else ["4343.9"])
+    fake.on_control = held_by_a_live_step(fake)
+    rig = Rig(hpc, tmp_path, site, "separate", fake)
+    rig.up()
+    fake.steps[f"{rig.state()['sandbox']['name']}{suffix}"] = "4343.9"
+    fake.calls.clear()
+    ticks = itertools.count(0, 60)
+    rig.driver.clock = lambda: next(ticks)
+    rig.driver.down()
+    calls = [" ".join(call) for call in fake.calls]
+    swept = next(i for i, call in enumerate(calls) if call.startswith("srun") and "shards.py sweep " in call)
+    assert calls.index("scancel --signal=TERM 4343.9") < swept
+    assert ("scancel 4343.9" in calls[:swept]) is not obeys
+    assert "sacct -j 4343 -n -P -o JobID,JobName,State,Start,End,ExitCode" in calls[:swept]
+    assert len(fake.sweeps) == 1
+    assert not rig.root.exists()
+
+
+def test_c54_a_step_still_running_after_its_cancel_fails_the_down_closed_and_records_the_node_unswept(
+    hpc, tmp_path, site
+):
+    """C54: the worker's step still runs after its TERM and at its cancel's bound (Slurm never shows it ended): no
+    sweep, both held jobs cancelled all the same, the root kept, and the state records the agent's node as unswept,
+    which the elastic controller reads to never take that member down again by itself."""
+    fake = FakeSlurm(unending=["4343.9"])
+    fake.on_control = held_by_a_live_step(fake)
+    rig = Rig(hpc, tmp_path, site, "separate", fake)
+    rig.up()
+    fake.steps[f"{rig.state()['sandbox']['name']}-worker"] = "4343.9"
+    ticks = itertools.count(0, 60)
+    rig.driver.clock = lambda: next(ticks)
+    with pytest.raises(RuntimeError, match="the agent's node could not be verified clean"):
+        rig.driver.down()
+    assert fake.sweeps == []
+    assert fake.termed == ["4343.9"]
+    assert fake.cancelled.index("4343.9") < fake.cancelled.index("4343")
+    assert "4242" in fake.cancelled
+    assert rig.root.exists()
+    assert rig.state()["unswept"] == ["the agent's node"]
+
+
+def test_c54_a_down_after_one_left_the_node_unswept_keeps_the_root_until_the_operator_says_what_was_checked(
+    hpc, tmp_path, site, capsys
+):
+    """C54: after a down that could not sweep the agent's node, every later down finds the job gone and no node to
+    sweep in it: without `--node-checked` it removes neither the storage nor the root, and says what to do; with it,
+    the operator's word that the node was checked (the README's sweep in a job there), it goes on, and its output (the
+    fleet's down log) records the text."""
+    fake = FakeSlurm(unending=["4343.9"])
+    fake.on_control = held_by_a_live_step(fake)
+    rig = Rig(hpc, tmp_path, site, "separate", fake)
+    rig.up()
+    fake.steps[f"{rig.state()['sandbox']['name']}-worker"] = "4343.9"
+    ticks = itertools.count(0, 60)
+    rig.driver.clock = lambda: next(ticks)
+    with pytest.raises(RuntimeError, match="then run down again with --node-checked"):
+        rig.driver.down()
+    with pytest.raises(RuntimeError, match="the agent's node was never swept and may still hold the operator's key"):
+        rig.driver.down()
+    assert rig.root.exists()
+    assert rig.state()["unswept"] == ["the agent's node"]
+    checked = "shards.py sweep in a job on its node: exit 0, one worker directory removed"
+    printed = rig.driver.down(node_checked=checked)
+    assert f"down: --node-checked: the agent's node not swept by down; the operator checked: {checked}" in printed
+    assert f"the operator checked: {checked}; recorded in the state file" in capsys.readouterr().err
+    assert not rig.root.exists()
+
+
+def test_c54_a_down_that_fails_elsewhere_still_prints_what_the_agents_node_sweep_said(hpc, tmp_path, site, capsys):
+    """C54: the agent's node was swept but another part of the down could not be verified (here every service's
+    teardown failed), so down raises with the root kept: the sweep's own report (what it removed and kept, the
+    worker's directory with the staged keys among them) still reaches down's output, the down log, before the raise."""
+    fake = FakeSlurm(teardown_rc=1)
+    rig = Rig(hpc, tmp_path, site, "separate", fake)
+    rig.up()
+    with pytest.raises(RuntimeError, match="could not be verified clean"):
+        rig.driver.down()
+    assert len(fake.sweeps) == 1
+    assert "shards: sweep: 0 step directory(ies) removed; kept: none" in capsys.readouterr().err
     assert rig.root.exists()

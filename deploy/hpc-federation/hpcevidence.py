@@ -24,7 +24,9 @@ left (`present_evidence`), by who writes it: `UP_FILES` and `UP_TREES` are what 
 check, the platform file, the facts, the render identity, the data manifests), present in every root `up` finished,
 and count for nothing; `RUN_FILES` and `RUN_TREES` are what a run, a step or the operator leaves, and each one with
 something in it counts: a file of the fault journal at any depth, a relay request, taken request, answer or
-`late-steps.jsonl`, a shard claim, the pilot's `day0-wiring.toml`, and any step record (`shard-steps/<label>.json`,
+`late-steps.jsonl`, a shard claim, the pilot's `day0-wiring.toml`, the study's `ingest-evidence.json` (what a study's
+`ingest run --out <root>/ingest-evidence.json` writes at the federation's root, and the study reads its id map from:
+the ingest's own evidence, which no later file of the root holds), and any step record (`shard-steps/<label>.json`,
 which `shards.py step` leaves in the root when a step of that shard starts: the shard's spec and how many steps of
 it started; no path, host or secret). An empty file does not (the injector's lock files, the claim's lock), nor does
 an NFS silly-rename file (a removed file still held open, which a `down` run again after a removal cut short finds),
@@ -43,7 +45,8 @@ compares it with the marker file by file.
 **Two sets, compared differently.** `STRICT_FILES` and the trees (`STRICT_TREES`) hold what a
 step, the study or `up` writes: the fault journal, the relay's journals (`late-steps.jsonl` and its request, taken and
 answer files), the shard claims, the step records, the data manifests, and the files `up` writes once (`platform.toml`,
-`facts.json`, `render-identity.json`) and the pilot's `day0-wiring.toml`. A change to any of them since the collect,
+`facts.json`, `render-identity.json`), the pilot's `day0-wiring.toml` and the study's `ingest-evidence.json` (written
+once by the study's ingest, and read by it afterwards). A change to any of them since the collect,
 a line appended to a journal included, makes the marker stale and `down` refuses. `SELF_REWRITTEN_FILES` holds the two
 files the running federation rewrites itself, which post-date every run once `collect` has run: the state
 (`hpc-federation.json`, rewritten by every state update, such as a resumed step's node or a data verification) and the
@@ -93,11 +96,13 @@ JOURNAL_KIND = "the fault journal"
 RELAY_KIND = "the relay's journals"
 CLAIM_KIND = "a shard claim"
 WIRING_KIND = "the day-0 wiring"
-KINDS = (STEPS_KIND, JOURNAL_KIND, RELAY_KIND, CLAIM_KIND, WIRING_KIND)  # the order `down` names them in
-RUN_FILES = {  # left by the pilot (the wiring a day-0 run reads) or by a step's pre-step guard (who held the root)
+INGEST_KIND = "the ingest's evidence"
+KINDS = (STEPS_KIND, JOURNAL_KIND, RELAY_KIND, CLAIM_KIND, WIRING_KIND, INGEST_KIND)  # the order `down` names them in
+RUN_FILES = {  # left by the pilot (the day-0 wiring), a step's pre-step guard (who held the root) or a study's ingest
     "day0-wiring.toml": WIRING_KIND,
     "shard-claim.json": CLAIM_KIND,
     "shard-claim.lock": CLAIM_KIND,
+    "ingest-evidence.json": INGEST_KIND,  # a study's `ingest run --out <root>/ingest-evidence.json` (its id map)
 }
 RUN_TREES = {  # the injector's journal, the relay's journals and the step records: written by a run, never by `up`
     "fault-journal": JOURNAL_KIND,
@@ -131,13 +136,20 @@ EVIDENCE_TREES = (
 WHOLE_TREES = ("fault-journal",)
 # Every directory of the allow-list is strict: no process of the federation's own rewrites a file in one.
 STRICT_TREES = (*(directory for directory, _ in EVIDENCE_TREES), *WHOLE_TREES)
-_PLAIN_NAME = re.compile(r"[A-Za-z0-9._-]{1,200}")
+MAX_NAME = 200  # the longest plain name (one path component) the archiver takes
+_PLAIN_NAME = re.compile(rf"[A-Za-z0-9._-]{{1,{MAX_NAME}}}")
 # An NFS client's silly-rename file: a file removed while a process still holds it open, which stays (as `.nfsXXXX`)
 # until the last close. It is a removed file, so no evidence: a `down` run again after a removal cut short finds only
 # these, once its state is gone. The same pattern as `hpcremove.SILLY`, which this module cannot import (it uses the
 # standard library alone: `collect` loads it by its path); a test compares the two.
 SILLY = re.compile(r"\.nfs[0-9A-Fa-f]+")
 MAX_DEPTH = 4
+# The longest root-relative path the archiver can hold: the longest tree it walks, `MAX_DEPTH` directories below it and
+# a file, each a name of up to `MAX_NAME` plain characters and a separator (1,018 for the fault journal). The marker
+# accepts every name it can be given and none beyond it.
+MAX_RELATIVE = max(len(tree) for tree in (*(directory for directory, _ in EVIDENCE_TREES), *WHOLE_TREES)) + (
+    (MAX_DEPTH + 1) * (MAX_NAME + 1)
+)
 SCAN_DEPTH = 32  # how deep `down`'s look for evidence goes (a tree below it counts): never the archive's bound
 SECRETS = "secrets"  # never archived; its files' contents are what no archived file may hold
 MIN_SECRET = 8  # the shortest value taken for a secret when scanning (a shorter one would match by chance)
@@ -564,12 +576,14 @@ def _manifest_of(label: str, tar: bytes, files: dict[str, bytes], root_id: str, 
     return (json.dumps(document, sort_keys=True, indent=2) + "\n").encode()
 
 
-def archive_root(root: Path, label: str, root_id: str = "") -> RootArchive:
+def archive_root(root: Path, label: str, root_id: str = "", required: tuple[str, ...] = REQUIRED) -> RootArchive:
     """The evidence of the federation's root as bytes (the module's docstring): the digest of the step records first,
     then each file of the allow-list read once with no link followed, then the check that none holds a secret.
     `root_id` (a hash of the root's path, which the manifest records and no path) tells one federation's archive from
-    another's under one shard label (a shard that moved). `RootGone` when the root is not there; EvidenceError naming
-    the file when a required one is missing, one is a link or holds a secret, or the total is too large."""
+    another's under one shard label (a shard that moved). `required` is what the root must hold: a Compose root
+    (`deploy/compose-federation/composesite.py collect`) has no HPC state file, so it requires `facts.json` alone and
+    its manifest names no up id. `RootGone` when the root is not there; EvidenceError naming the file when a required
+    one is missing, one is a link or holds a secret, or the total is too large."""
     try:
         fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     except FileNotFoundError:
@@ -583,7 +597,7 @@ def archive_root(root: Path, label: str, root_id: str = "") -> RootArchive:
             files[relative] = _read_named(fd, relative)
             if sum(map(len, files.values())) > MAX_TOTAL:
                 raise EvidenceError(f"the evidence is larger than {MAX_TOTAL >> 20} MiB")
-        for name in REQUIRED:
+        for name in required:
             if name not in files:
                 raise EvidenceError(f"{name} is missing: it is what `up` always writes, and the post-check needs it")
         secrets_found = secret_values(fd)
@@ -593,7 +607,7 @@ def archive_root(root: Path, label: str, root_id: str = "") -> RootArchive:
         if any(value in data for value in secrets_found):
             raise EvidenceError(f"{name} holds the content of a file of {SECRETS}/: not archived")
     tar = _tar_of(files)
-    up_id = _up_id(files[STATE])
+    up_id = _up_id(files[STATE]) if STATE in files else ""
     manifest = _manifest_of(label, tar, files, root_id, up_id)
     hashes = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
     return RootArchive(
@@ -612,7 +626,9 @@ def _plain_file(path: Path) -> bytes:
         raise EvidenceError(f"{path.name} cannot be read ({type(error).__name__})") from None
 
 
-def verified_pair(results: Path, stem: str, label: str, root_id: str | None = None) -> RootArchive:
+def verified_pair(
+    results: Path, stem: str, label: str, root_id: str | None = None, required: tuple[str, ...] = REQUIRED
+) -> RootArchive:
     """The root archive `<stem>.root.tar` of `results` and its manifest `<stem>.root.json`, shown to be one
     another's: the manifest names the archive's SHA-256 and size and this shard's `label` (and, with `root_id`, this
     federation's root), and lists exactly the files the archive holds with their sizes and hashes, the required ones
@@ -626,7 +642,7 @@ def verified_pair(results: Path, stem: str, label: str, root_id: str | None = No
         valid = valid and manifest["sha256"] == hashlib.sha256(tar).hexdigest() and manifest["bytes"] == len(tar)
         with tarfile.open(fileobj=io.BytesIO(tar)) as opened:
             held = {m.name: opened.extractfile(m).read() for m in opened.getmembers() if m.isfile()}
-        valid = valid and set(held) == set(listed) and all(name in held for name in REQUIRED)
+        valid = valid and set(held) == set(listed) and all(name in held for name in required)
         valid = valid and all(listed[n] == (len(held[n]), hashlib.sha256(held[n]).hexdigest()) for n in held)
         other = root_id is not None and manifest.get("root_id") != root_id
     except (ValueError, KeyError, TypeError, AttributeError, tarfile.TarError, OSError):
@@ -716,7 +732,7 @@ def _marked_files(value: Any) -> bool:
         return False
     return all(
         isinstance(name, str)
-        and len(name) <= 1000
+        and len(name) <= MAX_RELATIVE
         and all(part not in ("", ".", "..") and _PLAIN_NAME.fullmatch(part) for part in name.split("/"))
         and isinstance(digest, str)
         and SHA256.fullmatch(digest)

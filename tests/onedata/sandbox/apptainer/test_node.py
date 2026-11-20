@@ -170,3 +170,37 @@ def test_o70_the_cores_of_a_process_are_those_of_every_one_of_its_tasks(tmp_path
         while node.alive(process.pid, process.start) and time.monotonic() < until:
             time.sleep(0.02)
     assert node.task_affinity(process.pid, process.start) == frozenset()
+
+
+def _stat_fails(monkeypatch, process, error):
+    """`/proc/<pid>/stat` of `process` raises `error` when the node reads it; every other file reads as it is."""
+    from expcore_onedata.sandbox.apptainer import node as N
+
+    real = N._read
+
+    def read(path):
+        if path.parts[-2:] == (str(process.pid), "stat"):
+            raise error
+        return real(path)
+
+    monkeypatch.setattr(N, "_read", read)
+
+
+@pytest.mark.parametrize("error", [PermissionError(13, "denied"), OSError(5, "I/O error")])
+def test_o70_a_live_process_whose_stat_cannot_be_read_is_unreadable_not_gone(child, monkeypatch, error):
+    """O70: `/proc/<pid>/stat` that exists and cannot be read is a process that is there, not one that is gone: its
+    cores and its children are unreadable (None), where a gone one has none ([]/empty). An unreadable live process
+    read as gone recorded no cores and no `affinity_unreadable`."""
+    node, process = child
+    _stat_fails(monkeypatch, process, error)
+    assert node.task_affinity(process.pid, process.start) is None
+    assert node.hidden_children(process.pid, process.start) is None
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError(2, "gone"), ProcessLookupError(3, "no such process")])
+def test_o70_a_process_whose_stat_is_gone_has_no_cores_and_no_children(child, monkeypatch, error):
+    """O70: a process that ended between the listing and the read (no entry, or the kernel's ESRCH) has none."""
+    node, process = child
+    _stat_fails(monkeypatch, process, error)
+    assert node.task_affinity(process.pid, process.start) == frozenset()
+    assert node.hidden_children(process.pid, process.start) == []

@@ -185,11 +185,14 @@ def test_o73_a_resolver_that_hangs_costs_the_bound_and_leaves_the_host_name_alon
 
 
 def test_o73_a_lookup_that_answers_in_time_is_read_whole_and_a_thread_that_ends_is_not_left_behind(monkeypatch):
-    """O73: the bound costs a quick lookup nothing: its answer is read, nothing is unread, no thread of ours stays."""
+    """O73: the bound costs a quick lookup nothing: its answer is read, nothing is unread, no thread of ours stays. The
+    threads are compared by identity and the lookup's own name, never by a total count: any other thread of the process
+    may start or end meanwhile (a count once went down by one on CI)."""
     _system(monkeypatch, "cn-own-n01", ("cn-own-n01.cluster.example.invalid", [], []))
-    before = threading.active_count()
+    before = set(threading.enumerate())  # a lookup thread an earlier test left ending is in it, and not this call's
     assert loopback.own_names(timeout_s=5) == OwnNames(("cn-own-n01", "cn-own-n01.cluster.example.invalid"))
-    assert threading.active_count() == before
+    left = [t for t in threading.enumerate() if t not in before and t.name == "own-fqdn-lookup"]
+    assert left == []  # it answered in time, so its thread ended before the call returned: none is left behind
 
 
 @pytest.mark.parametrize(

@@ -213,6 +213,19 @@ class Redactor:
         return Redactor(self._values, keys=self._keys, short=self._short, lines=True)
 
     @classmethod
+    def union(cls, *redactors: "Redactor") -> "Redactor":
+        """One redactor that replaces everything each of `redactors` does, the longest secret first across all of them.
+        Applied one after the other, a redactor that holds a shorter secret would replace it inside a longer secret
+        of another and leave the rest of that one (a URL that embeds a key, its user and its host), which one pass over
+        the union never does. A key is redacted by name, and a secret by each of its lines, when any of them does."""
+        return cls(
+            [value for redactor in redactors for value in redactor._values],
+            keys=any(redactor._keys for redactor in redactors),
+            short=[value for redactor in redactors for value in redactor._short],
+            lines=any(redactor._lines for redactor in redactors),
+        )
+
+    @classmethod
     def from_environment(
         cls,
         environ: Mapping[str, str] | None = None,
@@ -246,7 +259,12 @@ class Redactor:
         return key
 
     def text(self, value: str) -> str:
-        """Return the string with every secret replaced, and every fragment of one that a cut left at either end."""
+        """Return the string with every secret replaced, and every fragment of one that a cut left at either end.
+
+        The cut is looked for first, in the text as it came: a shorter secret replaced inside the cut tail of a longer
+        one would stop the tail matching it, and leave its start in the text. After the replacement it is looked for
+        again, as it always was."""
+        value = self._fragments(value) if self._inside else value
         for form in self._inside:
             if form in value:
                 value = value.replace(form, REDACTED)
@@ -305,6 +323,9 @@ class Redactor:
                 if self._keys and not schema:  # first, while the string is still the JSON it was
                     new = in_json_text(new, path)
                 new = self.text(new)
+                # again, once a replaced secret has made it the JSON it was not (one that held a quote)
+                if self._keys and not schema and new != value:
+                    new = in_json_text(new, path)
                 if new != value:
                     paths.append(path)
                 return new

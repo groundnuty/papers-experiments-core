@@ -15,6 +15,7 @@ import re
 from pathlib import Path
 
 from fedboot import Bootstrap, Ids
+from fedcompose import NETWORK
 from feddocker import gib
 from fedlayout import CONTENT_FILE, LISTING_DIR, LISTING_ENTRIES, Layout, import_storage_name
 from fedspec import Space, Spec
@@ -172,11 +173,21 @@ def slot_user_facts(boot: Bootstrap) -> dict:
 
 
 def placeholders(facts: dict) -> dict[str, str]:
-    """The values a platform template names, by placeholder."""
+    """The values a platform template names, by placeholder. The project's names (`compose_project`, its network
+    `compose_network`, `zone_domain` and each `provider_domain.<name>`, the services' domains on that network) let one
+    template name `[sandbox.federation]` and `[faults] project` for every instance of a layout (`fedspec.instance`); the
+    fingerprint holds none of them (`expcore_onedata.runsettings`)."""
     values = {"zone_url": facts["zone"]["url"], "space_name": facts["study_space"]}
+    project = (facts.get("layout") or {}).get("project")
+    if project:
+        values.update(compose_project=project, compose_network=f"{project}_{NETWORK}")
+    if facts["zone"].get("domain_on_project_network"):
+        values["zone_domain"] = facts["zone"]["domain_on_project_network"]
     for name, provider in facts["providers"].items():
         values[f"provider_url.{name}"] = provider["url"]
         values[f"provider_id.{name}"] = provider["id"]
+        if provider.get("domain_on_project_network"):
+            values[f"provider_domain.{name}"] = provider["domain_on_project_network"]
     for name, space in facts["spaces"].items():
         values[f"space_id.{name}"] = space["id"]
     for user, principal in facts["principals"].items():

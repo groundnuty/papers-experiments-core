@@ -611,6 +611,7 @@ OUT = {
     **{f"principals.{plane}.username": USER for plane in ("data_path", "toolserver", "service")},
     **{f"principals.{plane}.user_id": PER_FEDERATION for plane in ("data_path", "toolserver", "service")},
     "toolserver.clone": PATH,
+    "toolserver.artifacts": PATH + " (a role of the command line's federation-neutral form, #451)",
     "sandbox.work_root": PATH,
     "sandbox.name_prefix": HOST,
     "sandbox.label_namespace": HOST,
@@ -642,8 +643,13 @@ OUT = {
     "sandbox.apptainer.binds.*.path": PATH,
     **{f"placement.{key}": C35 for key in (
         "concurrency", "qos_scan", "qos_fulfil_timeout_s", "reset_concurrency", "reset_shortcut",
-        "reset_exclusive_wait_s", "provider_concurrency",
+        "reset_exclusive_wait_s", "provider_concurrency", "wait_mode", "evict_batch",
     )},
+    "placement.transfer_walk_deadline_s": "how long the probes' transfer walk may read before it fails closed: it "
+    "decides whether the listing is known, never what a known one says; recorded and compared at every resume (C35)",
+    "placement.transfer_page_limit": "how many ids a page of the probes' transfer listing asks for: how many records "
+    "past the walk's stop its order check reads, never what a known listing says; recorded and compared at every "
+    "resume (C35)",
     "slots.*.data_path.username": USER,
     "slots.*.data_path.user_id": PER_FEDERATION,
     "slots.*.toolserver.username": USER,

@@ -176,6 +176,37 @@ def test_a_link_among_the_journals_refuses_the_collect_whole_naming_the_shard(sh
     assert not (tmp_path / "merge").exists()
 
 
+@pytest.mark.parametrize("suffix", ["json", "tar"])
+def test_an_archive_or_its_manifest_that_is_a_link_refuses_the_collect_naming_the_shard(shards, tmp_path, suffix):
+    """O63: `<label>.out.json` and `<label>.out.tar` are evidence like the journals: a link to a file with the very
+    same bytes was followed, hashed and collected, though a pull that keeps links (and so `verify-copy`) could not
+    reproduce it. A link refuses the collect whole, naming the shard, with no manifest and no directory left."""
+    plan = make_plan(shards, tmp_path)
+    path = plan.results / f"fed-a.out.{suffix}"
+    original = tmp_path / f"original.{suffix}"
+    path.rename(original)
+    path.symlink_to(original)
+    with pytest.raises(shards.ShardsError, match=r"fed-a.*not a regular file: a link is never followed"):
+        shards.collect(plan, tmp_path / "merge")
+    assert not (plan.results / MANIFEST).exists()
+    assert not (tmp_path / "merge").exists()
+
+
+def test_the_listing_of_an_archive_manifest_never_follows_a_link_put_there_after_it_was_verified(shards, tmp_path):
+    """O63: `evidence_entries` reads `<label>.out.json` again, after `verified` did: a link put in its place between
+    the two is refused by that read too, never followed."""
+    plan = make_plan(shards, tmp_path)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    found = [shards.verified(plan.results, shard, scratch) for shard in plan.shards]
+    path = plan.results / "fed-a.out.json"
+    original = tmp_path / "original.json"
+    path.rename(original)
+    path.symlink_to(original)
+    with pytest.raises(shards.ShardsError, match=r"fed-a.*not a regular file: a link is never followed"):
+        shards.evidence_entries(plan, found, scratch)
+
+
 def test_an_archive_manifest_that_no_longer_names_the_verified_archive_refuses_the_collect(
     shards, tmp_path, monkeypatch
 ):

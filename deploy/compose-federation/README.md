@@ -15,6 +15,8 @@ uv run python deploy/compose-federation/federation.py status   # the project's c
 uv run python deploy/compose-federation/federation.py memory   # each service's limit, current use and peak
 uv run python deploy/compose-federation/federation.py describe # the deployment's table for the day-0 report
 uv run python deploy/compose-federation/federation.py compose  # the Compose file the layout generates
+uv run python deploy/compose-federation/federation.py ca       # the host's shared CA, once (EXPCORE_FED_CA_DIR)
+uv run python deploy/compose-federation/federation.py verify-data  # after an ingest: the declared data read back
 ```
 
 Each takes `--layout PATH` for a layout other than the default; give every command of one federation the same layout.
@@ -70,6 +72,130 @@ Compose (`up`, `reset --replicas` and `down`; see "An imported space").
   gone while containers or networks of the project remain it refuses. It refuses the same way, naming them, when the
   root is gone and a volume labelled with the project remains, as on the retry of a `down` that failed on one: it does
   not run Compose without the root, so the volume is removed with `docker volume rm`.
+
+## Several federations on one host
+
+`--instance K` (1 to 9) makes instance K of the layout, so one layout file and one platform template serve several
+federations on one host: project `<project>-K` (its network `<project>-K_fed`), domain `fK.<domain>`, and every port
+10 higher for each instance before it (instance 1 keeps the layout's ports; a layout whose ports span 10 or more is
+refused). Without `EXPCORE_FED_ROOT` its root is `<parent>/<project>-K`, beside the others. Give every command of one
+federation the same `--layout` and `--instance`. The default layout's three instances publish 29443-29446,
+29453-29456 and 29463-29466 on the loopback, clear of a fleet front on 29440. `memory_limit` stays a layout key: it is
+deploy-only, in no fingerprint. The main study's VM layout sets `memory_limit = "16g"` (a provider's measured peak
+under the study's reads, page cache and shared memory included, with room), two federations per 32-core, 110 GiB VM.
+The roots' location is the host's (`EXPCORE_FED_ROOT_PARENT`): a data volume where there is one, else the root disk.
+
+**The host's shared CA.** The CA's SHA-256 is in the campaign fingerprint (`[tls] ca_file`'s record), and the elastic
+ledger refuses a federation whose fingerprint is not the campaign's, so federations that each made their own CA (what
+`up` does without the setting) can never take leases of one campaign. `federation.py ca` makes the host's CA once in
+the directory `EXPCORE_FED_CA_DIR` names (0700, outside every root; never replaced), and every `up` with the variable
+set copies its certificate into the root and signs the root's certificates with its key, which stays in that
+directory. A root that holds another CA is refused: take it down and up again.
+
+**One CA per study, on every host.** Hosts whose federations should be one declared identity (the same template, the
+same agent image id) need the same CA too: make it once (`federation.py ca` on the first host), then copy that
+directory's two files to each other host's `EXPCORE_FED_CA_DIR` over ssh stdin (a 0700 directory, both files 0600,
+never into a root) instead of running `ca` there. It is a test CA of the study's own, valid 30 days; nothing else
+trusts it.
+
+```sh
+ssh first 'tar -C "$EXPCORE_FED_CA_DIR" -cf - federation-ca.pem ca.key' | \
+  ssh other 'umask 077 && mkdir -p "$DIR" && tar -C "$DIR" -xf - && chmod 600 "$DIR"/*'   # DIR: other's EXPCORE_FED_CA_DIR
+```
+
+**The template's project names.** `@compose_project@`, `@compose_network@`, `@zone_domain@` and
+`@provider_domain.<name>@` fill a template's `[sandbox.federation]` (`network`, `zone`, `providers.<local>`) and
+`[faults] project` for each instance; the fingerprint holds no name, port, address or id, so one template on one CA
+renders one fingerprint for every instance (a `[[spaces]]` entry without `data_manifest` carries its Onezone id, so
+declare one). `up` writes `render-identity.json` into the root as HPC's does (`fedidentity.py`, `hpcidentity.build`):
+the template's and the fingerprint's SHA-256, and the study artifacts' tree with `EXPCORE_FED_STUDY_ARTIFACTS`; no pin
+(Compose has no SIF, shim or bundle: its images are pinned by id in `[sandbox]`).
+
+**The engine.** `EXPCORE_FED_ENGINE` (default `docker`; `podman` is accepted and untested) is the one command every
+engine call of this deploy names (`feddocker.engine`). The sandbox's own Docker calls are not this setting's.
+
+```sh
+export EXPCORE_FED_ROOT_PARENT=/srv/expcore-feds EXPCORE_FED_CA_DIR=/srv/expcore-ca
+uv run python deploy/compose-federation/federation.py ca
+for k in 1 2 3; do uv run python deploy/compose-federation/federation.py --layout L --instance $k up; done
+```
+
+## A Compose site of the elastic fleet (`composesite.py`)
+
+The federations a host's operator brought up are one site of the elastic fleet's controller, its static members
+(`kind = "compose"` in the sites file: `deploy/hpc-federation/README.md`, "The elastic fleet's controller"). The
+controller runs `composesite.py` here over ssh, from the site's directory with its env file sourced:
+
+- **observe**: a member is up while every service its `facts.json` names has a running container of its project bound
+  to its root, linked while its `link-check.json` says ok, and verified only when linked AND every space its
+  `platform.toml` declares data for (`data_manifest`) has a marker in the root's `data-verified.json` (format
+  `expcore-compose-data-verified/2`) naming the space's id, its manifest's core digest (`manifest_sha256`:
+  `Manifest.digest()`, what the campaign fingerprint holds and the study's ingest plans) and the SHA-256 of the
+  manifest file's exact bytes (`manifest_file_sha256`), both from one read and both as the file is now: fail closed,
+  as an HPC member's verify-data markers are; a marker of the earlier format is none. A platform file that
+  declares no data (the baseline files) is verified once linked. The marker is written by `verify-data`
+  (`federation.py --layout L --instance K verify-data`, or `composesite.py verify-data --root R --layout L`, which
+  finds the instance from the root's mark): every declared space read back through its owner, every file's bytes
+  hashed, by the HPC driver's own reader (`hpcdata.content_reader`, on this directory's bootstrap), and compared with
+  its manifest; any difference, or an id that is not `up`'s, refuses, naming the space, and removes an earlier marker
+  (so does `reset --clean`, before it empties a space). A template names each manifest by an absolute path
+  (`@study_artifacts@/...` or `@hpc_root@/...`): a relative one would resolve against the root here and against the
+  study where a run loads the platform file's copy, and is never verified.
+  A Compose site's `prepare` (`fleetprepare.py`, #494's hook) runs the study's ingest and then `verify-data` once per
+  member while it is linked and unverified; its job id is `compose-<project>` and its end 10 years
+  from now (no walltime: the ledger never proves an end the host does not enforce); the site reports no node, so nothing is ever added to it.
+- **launch**: the elastic worker, once, detached in a session of its own, with the allowlisted environment, HOME the
+  site's 0700 `home` (the study's key tree at its models.toml paths, placed by the operator: never copied), a copy of
+  the study with the root's `platform.toml`, and a tag in its environment that every process it starts inherits; a
+  pidfile in `<fleet>/members/<member>/worker.json`.
+- **The proof of its end** is that no process of this user is the worker's: none carries the tag in its environment
+  or names the worker's run directory in its command line (which a lease run's does, and which is readable where its
+  environment is not), the worker's own included. A worker killed with SIGKILL leaves its lease run (a session of its
+  own, still spending) behind, and that run is still found. A worker whose project went down (its containers gone)
+  reads broken (drained, then retired), never ended; a service merely stopped (an injected outage) changes nothing.
+- **Rejoin.** A member retired for the campaign's channel (its worker died, say) whose root reads live and linked
+  again joins as its next generation, `<member>-g2` up to `-g9`: a new ledger label, with its own worker, channel,
+  records and copy. Or the operator adds a member naming the same root after it in the sites file, which takes the
+  root over once the first is retired: members naming one root hold it one at a time, in the file's order. A member
+  retired after a DRAIN (`fleetcontrol.py drain`, to take a federation out for maintenance) stays out: no generation
+  follows it by itself until the operator runs `composesite.py undrain --fleet F --member <its label>` on the host.
+- **stop** (the worker's run directory, and any lease store in it, is kept), **collect** (the root's allow-listed
+  evidence, `hpcevidence.archive_root` with `facts.json` required; a retry takes only this root's whole copy),
+  **retired**: a retirement stops the worker and proves it gone, collects, and, once the copy is pulled and verified
+  on the controller's host, records the member retired for the campaign's channel. **One campaign at a time** (C53,
+  `rootclaim.py`): `launch` claims the federation in its root (`.expcore-worker-claim.json`, under the root's claim
+  lock) and refuses one another campaign's site directory claims; `retired` releases it; `observe` reads a federation
+  another campaign claims as `down`. **No down**: the federation stays
+  up for the next campaign (a new site directory and channel) or the operator's own `down`.
+- **identity**: the campaign fingerprint and environment identity a start at the member pins, read here.
+
+A site of the sites file, every path on the host (`fleetcontrol.py`'s README section for the rest). The study's
+`prepare` ingests and then verifies; `verify-data` hashes every byte, so for the main study's data (about 26 GB)
+ingest and verify together take up to about half an hour on a VM: give the bound room.
+
+```toml
+[[site]]
+label = "vm-a"
+kind = "compose"
+transport = "ssh"
+host = "vm-a"                                    # an alias of ssh_config, this host's private file
+ssh_config = "/path/here/vm-a.ssh_config"
+interpreter = "/srv/core/.venv/bin/python"       # a git checkout's venv: never a git archive copy
+deploy = "/srv/core/deploy/compose-federation"
+env_file = "/srv/site.env"
+fleet = "/srv/fleet-c1"                          # 0700, one per campaign, as the channel
+channel = "/srv/channel-c1"
+study = "/srv/study"
+home = "/srv/home"                               # 0700: the study's key tree at its models.toml paths
+layout = "/srv/layout/vm.toml"
+members = { fed-1 = "/srv/feds/expcore-fed5-1", fed-2 = "/srv/feds/expcore-fed5-2" }
+prepare = ["/srv/study-tools/ingest-and-verify", "{root}", "{layout}"]  # ends with composesite.py verify-data
+prepare_timeout_s = 3600
+pass_env = ["HPC_STUDY_ARTIFACTS"]                # what the study's plugin reads: site.env names it on the host
+```
+
+The host's core must be a git checkout or a built wheel, never a `git archive` copy: an unknown core's commit is in
+no run's fingerprint, and `elastic create`, the identity read and every run refuse it.
 
 ## Declaring a layout
 
@@ -155,6 +281,8 @@ journal, `compose_file`) are relative by default, which is right in the root and
 study. A template that writes them `@hpc_root@/ca/federation-ca.pem`, `@hpc_root@/secrets/admin.token`,
 `@hpc_root@/secrets/users`, `@hpc_root@/fault-journal` and `@hpc_root@/outage.compose.yaml` gets the root's absolute
 path (the name is the HPC render's, `hpcboot.hpc_values`, so one template text names the root on either platform).
+`up` writes the root's `compose.yaml` (what `federation.py ... compose` prints for that layout and instance), so a
+template's `compose_file = "@hpc_root@/compose.yaml"` names this federation's own file with no operator step.
 `up` and `reset --clean` refuse it, before writing `facts.json` or `platform.toml`, unless the root is an absolute path
 of an existing directory that carries this federation's mark, with no symbolic link on any component of its path and
 no `"` or `\` or non-printable character (it lands inside a TOML string as it is); a link is refused rather than

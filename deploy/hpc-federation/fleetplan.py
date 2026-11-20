@@ -48,8 +48,13 @@ OPTIONAL = (
     "post_run_timeout_s",
     "expect_render_identity",
     "pass_env",
-)  # the rest of shards.py's optional keys: the study's own guard, post-run script and expected render identity, and
-# the operator's variables its dispatchers are passed (names only: `pin` reads the values)
+    "home_files",
+    "fleet_hop",
+)  # the rest of shards.py's optional keys: the study's own guard, post-run script and expected render identity, the
+# operator's variables its dispatchers are passed (names only: `pin` reads the values) and the operator's key tree
+# (`home_files`, O63: a path, which a shard step and a worker (`fleetworker.py`) put in their dispatcher's home) and the
+# hop to the group's LLM fleet (`fleet_hop`, O93: the one setting that is a table, which a shard step and a worker keep
+# open while their dispatcher runs: `fleethop.py`)
 SCRIPT = Path(__file__).resolve().parent / "shards.py"
 
 
@@ -70,12 +75,18 @@ def read_settings(path: Path) -> Dict[str, Any]:
                 shards.pass_env_names(value)
             except shards.ShardsError as error:
                 raise FleetError(str(error)) from None
+        elif key == "fleet_hop":  # a table of five values: shards.py checks it as the hop does, naming the key only
+            problem = shards._sibling("fleethop").hop_problem(value)
+            if problem:
+                raise FleetError(f"the shard setting fleet_hop {problem}")
         elif isinstance(value, bool) or not isinstance(value, (str, int, float)):
             raise FleetError(f"the shard setting {key} must be a string or a number")
     return data
 
 
 def _toml(value: Any) -> str:
+    if isinstance(value, dict):  # an inline table, its keys in order: the manifest is compared with the one made again
+        return "{ " + ", ".join(f"{key} = {_toml(value[key])}" for key in sorted(value)) + " }"
     return json.dumps(value, ensure_ascii=False) if isinstance(value, (str, list)) else repr(value)
 
 
@@ -377,24 +388,30 @@ def line_of(plan: shards.Plan, label: str, resume: bool, root: Optional[Path] = 
 
 
 def target_of(plan: shards.Plan, label: str, resume: bool, root: Optional[Path] = None,
-              environ: Optional[Mapping[str, str]] = None) -> Tuple[List[str], Dict[str, Any]]:  # fmt: skip
-    """`line_of`'s line, and the job it lands in as the state names it (`shards.federation`: its id and name)."""
+              environ: Optional[Mapping[str, str]] = None,
+              over: Optional[str] = None) -> Tuple[List[str], Dict[str, Any]]:  # fmt: skip
+    """`line_of`'s line, and the job it lands in as the state names it (`shards.federation`: its id and name). `over` is
+    the nonce of a running mark whose step was shown gone (`fleetstuck.over_proof`), carried as `shards.py resume-line`
+    carries it; a line is never made with one for a first step."""
     (shard,) = [s for s in plan.shards if s.label == label]
     if root is not None and shard.root != root:
         raise FleetError(f"{MANIFEST} gives shard {label} another root than the fleet's record: run plan again")
+    if over is not None and not resume:
+        raise FleetError(f"shard {label}: --over is carried only by a resuming step")
     plan = pin(plan, environ)
     try:
         fed = shards.federation(shard)
         argv = shards.step_argv(plan, shard, fed, SCRIPT)
     except shards.ShardsError as error:
         raise FleetError(str(error)) from None
-    return argv + (["--resume"] if resume else []), fed
+    return argv + (["--resume"] if resume else []) + (["--over", over] if over else []), fed
 
 
 @dataclass(frozen=True)
 class Launch:
     """One shard's step to launch: on which federation, its line, the job it lands in (its id and the name its
-    federation's up gave it), and whether it resumes."""
+    federation's up gave it), whether it resumes, and the nonce of the running mark it takes over (`over`: None when
+    there is no mark)."""
 
     shard: str
     member: str
@@ -403,22 +420,38 @@ class Launch:
     note: str
     job: str
     name: str
+    over: Optional[str] = None
 
 
-def launches(record: Mapping[str, Any], directory: Path, only: Optional[str], resume: bool,
-             running: Callable[[Mapping[str, Any]], Optional[bool]],
-             environ: Optional[Mapping[str, str]] = None) -> Tuple[List[Launch], List[str], List[str]]:  # fmt: skip
-    """The steps `fleet.py step` launches, what it skips (said), and what it refuses, each checked again just before:
-    the federation still ready, still this fleet's, still of the fleet's fingerprint, and a moved shard's resets there
-    full reads. A shard already launched on its federation is launched again only with `resume`, and never while its
-    client runs (`running`: True, False, or None when it cannot be told). `fleet.py step` then asks Slurm of each
-    launch's job before it spawns. `environ` is the operator's: each line pins the declared variables from it, as it
-    holds them now."""
+def current_plan(record: Mapping[str, Any], directory: Path) -> shards.Plan:
+    """The fleet's `shards.toml` as a plan, once it is shown to be the one the record gives (written by `plan`, not
+    edited, not a plan cut short): FleetError otherwise, nothing launched or stopped from it."""
     plan = load(directory / MANIFEST)
     settings, written = record.get("template"), (directory / MANIFEST).read_text(encoding="utf-8")
     if settings is None or written != manifest_text(settings, entries(record, directory, {})):
         raise FleetError(f"the fleet's {MANIFEST} is not the one its record gives (edited, or a plan cut short): run "
-                         "plan again; nothing was launched")  # fmt: skip
+                         "plan again; nothing was launched or stopped")  # fmt: skip
+    return plan
+
+
+# What `launches` asks before it carries a running mark's nonce: (plan, shard's label, the federations that held or ran
+# the shard) -> the nonce, or None when the shard has no mark; FleetError says why the step that holds it is not gone.
+Prove = Callable[[shards.Plan, str, Sequence[str]], Optional[str]]
+
+
+def launches(record: Mapping[str, Any], directory: Path, only: Optional[str], resume: bool,
+             running: Callable[[Mapping[str, Any]], Optional[bool]],
+             environ: Optional[Mapping[str, str]] = None,
+             prove: Optional[Prove] = None) -> Tuple[List[Launch], List[str], List[str]]:  # fmt: skip
+    """The steps `fleet.py step` launches, what it skips (said), and what it refuses, each checked again just before:
+    the federation still ready, still this fleet's, still of the fleet's fingerprint, and a moved shard's resets there
+    full reads. A shard already launched on its federation is launched again only with `resume`, and never while its
+    client runs (`running`: True, False, or None when it cannot be told). A step that resumes (the flag, or a shard
+    that ran before on another federation) carries the nonce of its running mark as `--over` only once `prove` shows
+    the step that holds the mark gone; a shard for which it does not is refused and launched nowhere, and with no
+    `prove` no line carries `--over`. `fleet.py step` then asks Slurm of each launch's job before it spawns. `environ`
+    is the operator's: each line pins the declared variables from it, as it holds them now."""
+    plan = current_plan(record, directory)
     reference = (record.get("reference") or {}).get("sha256")
     found: List[Launch] = []
     said: List[str] = []
@@ -452,8 +485,16 @@ def launches(record: Mapping[str, Any], directory: Path, only: Optional[str], re
             note = (f"moved from {shard['last']}: {holder}'s platform.toml leaves [placement] reset_shortcut off, so "
                     "every reset there takes the full reads, its first included")  # fmt: skip
         check_first_values(plan, label, environ)  # a later step of the shard carries the values its first one did
-        argv, fed = target_of(plan, label, again, root_of(directory, holder), environ)
-        found.append(Launch(label, holder, argv, again, note, str(fed["job"]), str(fed["name"])))
+        over = None
+        if again and prove is not None:  # a killed step's mark is taken over only once its step is shown gone
+            asked = sorted({holder, *(launch["member"] for launch in shard["launches"])})
+            try:
+                over = prove(plan, label, asked)
+            except FleetError as error:
+                refused.append(f"{label}: not launched: {error}")
+                continue
+        argv, fed = target_of(plan, label, again, root_of(directory, holder), environ, over)
+        found.append(Launch(label, holder, argv, again, note, str(fed["job"]), str(fed["name"]), over))
     if found:  # a step that launches nothing reads no core; one that would launch asks first, as the plan did
         require_core(plan)
     return found, said, refused

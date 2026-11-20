@@ -30,6 +30,7 @@ from functools import cached_property
 from typing import Any
 
 from expcore.campaign.factors import FactorSchema, PlanError, RunKey
+from expcore.campaign.run_lease import RunLease
 from expcore.campaign.selection import Selection, SelectionSpec, Spec
 from expcore.campaign.shard import ModelShards, ShardError, ShardSpec, in_shard, layout_of, pair_of, partition
 
@@ -151,6 +152,12 @@ def _plain(label: str, value: Any) -> Any:
     return value
 
 
+def plain(label: str, value: Any) -> Any:
+    """A fingerprint section as plain data, as `build_fingerprint` holds it (a mapping of any kind a dict, a tuple a
+    list); PlanError naming `label` for what is not plain data."""
+    return _plain(label, value)
+
+
 def build_fingerprint(
     schema: FactorSchema,
     *,
@@ -217,7 +224,7 @@ def build_fingerprint(
 
 
 def plan_problem(
-    schema: FactorSchema, manifest: Manifest, fingerprint: Mapping[str, Any], shard: Spec | None = None
+    schema: FactorSchema, manifest: Manifest, fingerprint: Mapping[str, Any], shard: Spec | RunLease | None = None
 ) -> str | None:
     """Describe how a manifest is not the plan its fingerprint declares; None when it is exactly that plan.
 
@@ -225,10 +232,12 @@ def plan_problem(
     different experiment whatever the fingerprint says, so a start whose two disagree is refused. A shard's plan is the
     part of that one its pairs are assigned to, with the assignment made from the whole declared plan (C28) under the
     shard's rule, by model with the `[shards]` layout the fingerprint declares (C32); a selection's is the runs of that
-    plan its levels select (C38).
+    plan its levels select (C38); a lease's is the one run it names (C41).
     """
     keys = schema.expand(fingerprint["tasks"], fingerprint["models"], [int(seed) for seed in fingerprint["seeds"]])
-    if isinstance(shard, SelectionSpec):  # a selection's part is the runs its levels select (C38)
+    if isinstance(shard, RunLease):  # a lease's part is the one run it names (C41)
+        keys = [key for key in keys if key.text == shard.run_key]
+    elif isinstance(shard, SelectionSpec):  # a selection's part is the runs its levels select (C38)
         keys = [key for key in keys if shard.selection.selects(key.factors)]
     elif shard is not None:
         try:

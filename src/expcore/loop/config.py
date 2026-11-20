@@ -24,6 +24,8 @@ CEILING_FACTOR = (
 )
 CLEANUP_DEADLINE_S = 10.0  # how long the loop waits for a cancelled call to stop before it gives up on it
 CEILING_KIND = "ceiling"  # the infrastructure kind of an attempt that passes the ceiling with the agent under its cap
+# the settings a study may leave undeclared: each is left out of the configuration's values then, never a null
+OPTIONAL_BOUNDS = ("tool_server_call_bound_s", "code_cell_bound_s")
 
 
 def config_sha256_of(values: Mapping[str, Any]) -> str:
@@ -66,6 +68,15 @@ class AgentConfig:
       hashed with the rest, and so are the names of the tools it reached (`tool_server_tools`, added to the record by
       the loop); an undeclared one is not written at all, so a configuration that does not declare it is what it was
       before the field existed (its hash, its `agent_config` in the record, and its caps in the fingerprint).
+    - `code_cell_bound_s`: an optional wall limit on one code cell (L18). It is for the tools of a provider that says it
+      runs code cells (`CodeExecutionProvider`: `code_cell` is true), and for no other: a call to such a tool is handed
+      `min(code_cell_bound_s, the agent's time left)` as its `timeout_s`, while the tool server's bound
+      (`tool_server_call_bound_s`) never reaches it. A cell that runs past a bound shorter than the time left is
+      killed, the agent is told so as that cell's result, and the run goes on: the agent's own outcome, never
+      infrastructure. A cell that reaches the time left first is the loop's cut, as without the bound. None, the
+      default, hands the code tool the agent's time left. It is recorded and hashed as `tool_server_call_bound_s` is,
+      with the names of the tools it reached (`code_cell_tools`, added to the record by the loop), and an undeclared
+      one is not written at all.
     """
 
     limits: Limits
@@ -76,6 +87,7 @@ class AgentConfig:
     ceiling_factor: float | None = None
     cleanup_deadline_s: float = CLEANUP_DEADLINE_S
     tool_server_call_bound_s: float | None = None
+    code_cell_bound_s: float | None = None
 
     def __post_init__(self) -> None:
         """Refuse caps that cannot work and an unknown policy, and settle the ceiling and the kind it ends as."""
@@ -89,11 +101,12 @@ class AgentConfig:
             problems.append(f"malformed_policy must be one of {', '.join(MALFORMED_POLICIES)}")
         if not (math.isfinite(self.cleanup_deadline_s) and self.cleanup_deadline_s > 0):
             problems.append("cleanup_deadline_s must be a positive, finite number of seconds")
-        bound = self.tool_server_call_bound_s
-        if bound is not None and not (
-            isinstance(bound, int | float) and not isinstance(bound, bool) and math.isfinite(bound) and bound > 0
-        ):
-            problems.append("tool_server_call_bound_s must be a positive, finite number of seconds when it is given")
+        for name in OPTIONAL_BOUNDS:
+            bound = getattr(self, name)
+            if bound is not None and not (
+                isinstance(bound, int | float) and not isinstance(bound, bool) and math.isfinite(bound) and bound > 0
+            ):
+                problems.append(f"{name} must be a positive, finite number of seconds when it is given")
         problems.extend(self._settle_ceiling())
         if not (math.isfinite(self.min_call_s) and self.min_call_s >= MIN_CALL_S):
             problems.append(
@@ -149,13 +162,14 @@ class AgentConfig:
     def as_dict(self) -> dict[str, Any]:
         """Return every value as the record keeps it.
 
-        `tool_server_call_bound_s` is left out when it is not declared, never written as a null: an optional setting
-        that was never given leaves the record, the hash and the campaign's caps as they were before the setting
-        existed (L17).
+        `tool_server_call_bound_s` and `code_cell_bound_s` are left out when they are not declared, never written as a
+        null: an optional setting that was never given leaves the record, the hash and the campaign's caps as they were
+        before the setting existed (L17, L18).
         """
         values = dataclasses.asdict(self)
-        if values["tool_server_call_bound_s"] is None:
-            del values["tool_server_call_bound_s"]
+        for name in OPTIONAL_BOUNDS:
+            if values[name] is None:
+                del values[name]
         return values
 
     def config_sha256(self) -> str:

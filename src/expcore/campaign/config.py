@@ -6,6 +6,7 @@ The file is validated when it is loaded, with messages that name the file and th
     order_seed = 20260101         # the seed of the run order (C08)
     seeds = [1, 2]                # the integer seeds of the plan
     models = ["model-a", "model-b"]   # model keys of models.toml
+    platform_fingerprints = ["<64 hex>", "<64 hex>"]   # optional: the members' platforms it accepts (C50)
 
     [agent]                       # the loop's caps for every run
     max_tool_rounds = 8
@@ -17,6 +18,8 @@ The file is validated when it is loaded, with messages that name the file and th
     ceiling_s = 270               # optional: the whole-time ceiling in seconds, waits included, not below time_cap_s;
                                   # or `ceiling_factor = 2.25`, a multiple of time_cap_s of at least 1; never both
     tool_server_call_bound_s = 300   # optional: the longest one call to a tool server may take, in seconds (L17)
+    code_cell_bound_s = 3600      # optional: the longest one code cell may run, in seconds; past it the cell is killed,
+                                  # the agent is told, and the run goes on (L18)
 
     [scheduler]                   # optional: every key of `SchedulerConfig` that is a number, a flag or a kind
     max_attempts = 3
@@ -37,10 +40,22 @@ The file is validated when it is loaded, with messages that name the file and th
     [shards]                      # optional: shard by model first, `expcore-shard/3` (C32)
     per_model = { model-a = 2, model-b = 1 }
 
+    [egress]                      # optional: the package indexes an agent may install from (O95)
+    package_indexes = ["files.pythonhosted.org", "pypi.org"]
+
 `[shards] per_model` gives every model of the plan, in the order its shards take, how many shards serve it; N is the
 sum, at least 2, and `run --shard i/N` must give that N. Each such shard runs one run at a time, so the counts of the
 models on one unit are that unit's concurrent runs: a sum above the unit's `[scheduler.unit_caps]` cap is refused. The
 layout is in the campaign's caps, so in the fingerprint every shard shares; without the table nothing changes.
+
+`platform_fingerprints` declares the platforms a campaign's members may run on, each by the SHA-256 of its
+fingerprint (`StudyPlugin.platform`, the `platform` a member's identity read prints): the campaign
+fingerprint then holds the sorted set in the platform's place, and a start on another platform is refused
+(`study.declared_platforms`, C50).
+
+`[egress] package_indexes` names, by bare host, the package indexes whose installs the egress check reports in their
+own class instead of flagging (`expcore.egress.package_index`). The sorted list is in the campaign's caps, so in the
+fingerprint, and only when the table is given; without it nothing changes.
 
 An `[agent]` that gives no ceiling has one of 3 times `time_cap_s`. The ceiling bounds a run's whole time, waits on
 infrastructure included, and a platform that mints tokens for a run lives them as long as it (study guide, "Caps on a
@@ -49,6 +64,7 @@ run's time"). It is in the campaign's caps, so in the fingerprint: another ceili
 
 import dataclasses
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -59,11 +75,27 @@ from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.shard import SHARDS_CAP, ModelShards
 from expcore.config.loading import ConfigError, Section, load_toml
 from expcore.config.models import Limits
+from expcore.egress.package_index import CAP as EGRESS_CAP
+from expcore.egress.package_index import KEY as PACKAGE_INDEXES
+from expcore.egress.package_index import index_hosts
 from expcore.loop.config import MALFORMED_POLICIES, AgentConfig
 
-_TOP_KEYS = ("order_seed", "seeds", "models", "agent", "scheduler", "budget", "endpoints", "shards")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_TOP_KEYS = (
+    "order_seed",
+    "seeds",
+    "models",
+    "agent",
+    "scheduler",
+    "budget",
+    "endpoints",
+    "shards",
+    "platform_fingerprints",
+    "egress",
+)
 _AGENT_KEYS = ("max_tool_rounds", "time_cap_s", "token_budget", "output_cap_chars", "max_output_tokens")
 _CEILING_KEYS = ("ceiling_s", "ceiling_factor")  # optional, and at most one of them
+_BOUND_KEYS = ("tool_server_call_bound_s", "code_cell_bound_s")  # optional, a number of seconds each (L17, L18)
 # The key the per-call bound had before its scope was fixed (L17): it capped every tool call, the code tool's too, which
 # is not what it was for. It is refused with the new name and the reason, never read as the new key.
 RENAMED_BOUND = "tool_call_bound_s"
@@ -104,10 +136,12 @@ class CampaignConfig:
     scheduler: SchedulerConfig
     endpoints: Mapping[str, Endpoint] = field(default_factory=dict)
     shards: ModelShards | None = None  # `[shards] per_model`: shard by model first (C32)
+    platform_fingerprints: tuple[str, ...] = ()  # the members' platforms, sorted; empty: the platform's own (C50)
+    package_indexes: tuple[str, ...] = ()  # `[egress] package_indexes`, sorted; empty: none declared (O95)
 
     def caps(self) -> dict[str, Any]:
         """The campaign-wide caps as plain data, for the fingerprint: the loop's, the attempt limit and the budget, and
-        the `[shards]` layout only when the campaign declares one."""
+        the `[shards]` layout and the `[egress]` package indexes only when the campaign declares them."""
         budget = self.scheduler.budget
         caps = {
             "agent": self.agent.as_dict(),
@@ -116,6 +150,8 @@ class CampaignConfig:
         }
         if self.shards is not None:
             caps[SHARDS_CAP] = self.shards.to_json()
+        if self.package_indexes:
+            caps[EGRESS_CAP] = {PACKAGE_INDEXES: list(self.package_indexes)}
         return caps
 
 
@@ -145,7 +181,7 @@ def _agent(root: Section) -> AgentConfig:
     section = _table(root, "agent")
     if RENAMED_BOUND in section.data:  # refused before the generic message of an unknown key: it names the new key
         raise section.fail(RENAMED_BOUND, RENAMED_BOUND_REASON)
-    section.reject_unknown([*_AGENT_KEYS, *_CEILING_KEYS, "malformed_policy", "tool_server_call_bound_s"])
+    section.reject_unknown([*_AGENT_KEYS, *_CEILING_KEYS, "malformed_policy", *_BOUND_KEYS])
     for key in _AGENT_KEYS:
         if key not in section.data:
             raise section.fail(key, "is required")
@@ -161,9 +197,9 @@ def _agent(root: Section) -> AgentConfig:
     )
     policy = section.optional_string("malformed_policy") or MALFORMED_POLICIES[0]
     ceiling = {key: _typed(section, key, float) for key in given}  # at most one; none gives the default factor
-    bound = _typed(section, "tool_server_call_bound_s", float) if "tool_server_call_bound_s" in section.data else None
+    bounds = {key: _typed(section, key, float) for key in _BOUND_KEYS if key in section.data}  # optional, each alone
     try:
-        return AgentConfig(limits, malformed_policy=policy, tool_server_call_bound_s=bound, **ceiling)
+        return AgentConfig(limits, malformed_policy=policy, **bounds, **ceiling)
     except ValueError as error:
         raise ConfigError(f"{root.file}: {section.where}: {error}") from None
 
@@ -283,4 +319,35 @@ def load_campaign(path: str | os.PathLike[str]) -> CampaignConfig:
         scheduler=scheduler,
         endpoints=endpoints,
         shards=_shards(root, models, scheduler, endpoints),
+        platform_fingerprints=_platforms(root),
+        package_indexes=_egress(root),
     )
+
+
+def _egress(root: Section) -> tuple[str, ...]:
+    """`[egress] package_indexes`: bare host names, each once, sorted; none when the table is absent."""
+    if "egress" not in root.data:
+        return ()
+    section = _table(root, "egress")
+    section.reject_unknown([PACKAGE_INDEXES])
+    if PACKAGE_INDEXES not in section.data:
+        raise section.fail(PACKAGE_INDEXES, "is required: the host names of the package indexes, such as pypi.org")
+    try:
+        return index_hosts(section.data[PACKAGE_INDEXES])
+    except ValueError as error:
+        raise section.fail(PACKAGE_INDEXES, str(error)) from None
+
+
+def _platforms(root: Section) -> tuple[str, ...]:
+    """`platform_fingerprints`: at least one SHA-256 (64 lower-case hex digits), each once, sorted; none when absent."""
+    found = root.strings("platform_fingerprints")
+    if "platform_fingerprints" in root.data and not found:
+        raise root.fail(
+            "platform_fingerprints", "must list at least one platform fingerprint; leave it out to declare none"
+        )
+    for value in found:
+        if not _HEX64.fullmatch(value):
+            raise root.fail("platform_fingerprints", "must hold SHA-256 digests, 64 lower-case hex digits each")
+    if len(set(found)) != len(found):
+        raise root.fail("platform_fingerprints", "lists a platform fingerprint more than once")
+    return tuple(sorted(found))

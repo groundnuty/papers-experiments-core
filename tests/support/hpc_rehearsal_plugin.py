@@ -164,6 +164,7 @@ class HpcExecutor:
         slots = {"TASK": task.id, "REGION": task.attributes["region"], "HINT": HINTS[factors["tools"]]}
         user = self.template.render(slots, study_run=True)
         shelf = Shelf()
+        request.declare_secrets()  # before the sandbox and the instruments start: a diagnostic is then shown (C40)
         box = await asyncio.to_thread(self.sandboxes.start, request.run_key)
         try:
             instruments = [

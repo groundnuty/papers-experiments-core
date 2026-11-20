@@ -150,6 +150,42 @@ def test_o89_a_fact_read_back_is_the_stored_one_or_the_default():
     assert facts.get("node") == {"kernel": "k"}
 
 
+def test_o89_a_value_the_writer_still_holds_cannot_change_a_recorded_fact():
+    """O89 (Codex, 17 Nov 2026): `write` kept the caller's own object, so clearing or editing the dict a writer passed
+    changed the recorded fact with no owner check and no `FactsConflict`: the table holds a copy of what was written."""
+    facts, meta = handle()
+    window = {"verdict": "stable", "samples": [1, 2]}
+    facts.write("federation_window", {"federation_window": window})
+    window["verdict"] = "unstable"
+    window["samples"].append(3)
+    assert meta[LITERAL] == {"federation_window": {"verdict": "stable", "samples": [1, 2]}}
+    window.clear()
+    assert facts.get("federation_window") == {"verdict": "stable", "samples": [1, 2]}
+
+
+def test_o89_a_value_read_back_is_a_copy_so_editing_it_changes_no_recorded_fact():
+    """O89 (Codex, 17 Nov 2026): `get` returned the live value, so `get(key)["verdict"] = ...` rewrote a recorded fact
+    past the owner check. What it returns is the caller's own."""
+    facts, meta = handle()
+    facts.write("federation_window", {"federation_window": {"verdict": "stable", "samples": [1]}})
+    read = facts.get("federation_window")
+    read["verdict"] = "unstable"
+    read["samples"].append(2)
+    assert facts.get("federation_window") == {"verdict": "stable", "samples": [1]}
+    assert meta[LITERAL] == {"federation_window": {"verdict": "stable", "samples": [1]}}
+    assert facts.get("federation_window") is not facts.get("federation_window")
+
+
+def test_o89_the_default_of_a_read_is_returned_as_given_and_a_scalar_fact_reads_back_equal():
+    """O89: the copy changes nothing a reader saw: an absent key gives the very default asked for, and a string or a
+    number reads back equal."""
+    facts, _ = handle()
+    marker = object()
+    assert facts.get("missing", marker) is marker
+    facts.write("feature_a", {"fact": "text", "count": 3})
+    assert (facts.get("fact"), facts.get("count")) == ("text", 3)
+
+
 def test_o89_a_record_cannot_replace_the_whole_table():
     """O89: `sandbox.record(**fields)` updates the metadata: a field named for the table would replace it."""
     infrafacts.refuse_replacement({"lease": 1})

@@ -32,9 +32,9 @@ The order is fixed, and each step is decided by what a kill at that point must l
 
 An exception in the executor is the study's: `InfraError` is infrastructure, anything else is a harness defect, whose
 redacted traceback goes to the campaign's local log (`defect_log`) and nowhere else; the request carries that log, so a
-crash the loop catches inside `record_run` is logged too, redacted with the secrets the executor passed it. An
-exception in the steps around it is our own bookkeeping failing, and propagates: the scheduler stops dispatch loudly
-and leaves the 'running' row for recovery (C17).
+crash the loop catches inside `record_run` is logged too, redacted with the secrets the executor declared or passed
+it. An exception in the steps around it is our own bookkeeping failing, and propagates: the scheduler stops dispatch
+loudly and leaves the 'running' row for recovery (C17).
 """
 
 import asyncio
@@ -52,9 +52,11 @@ from typing import Any
 from expcore.campaign import liveness, prerun
 from expcore.campaign.after_loop import settle_usage
 from expcore.campaign.attempts import BegunAttempt, classify, is_charged, unverified
-from expcore.campaign.defect_log import DefectLog
+from expcore.campaign.defect_log import Chained, DefectLog
+from expcore.campaign.deployments import deployment_ids, deployments_switched
 from expcore.campaign.executor import (
     BackendFactory,
+    DeclaredSecrets,
     Endpoint,
     RunExecutor,
     RunRequest,
@@ -72,7 +74,9 @@ from expcore.campaign.markers import AttemptResult, write_marker
 from expcore.campaign.no_request import EVENT as ZERO_EVENT
 from expcore.campaign.no_request import REASON as ZERO_REASON
 from expcore.campaign.no_request import settle_unsent
+from expcore.campaign.session_bind import bind_session
 from expcore.campaign.settings import SchedulerConfig
+from expcore.campaign.start_diagnostic import WITHHELD_ERROR, snapshot_of
 from expcore.campaign.store import Store
 from expcore.campaign.topup import AttemptSpend, Ledger
 from expcore.campaign.units import UnitHealth
@@ -83,7 +87,9 @@ from expcore.loop.outcomes import Outcome
 from expcore.models import spend
 from expcore.records.build import RunIdentity, redactor_for
 from expcore.records.injections import restore_refusal
+from expcore.records.redact import Redactor
 
+NOTE_EVENT = "diagnostic_note_unwritten"  # an event of an attempt whose withheld diagnostic left no note (C40)
 LEASE_WAIT_NOTED_S = 0.5  # a wait for a lease longer than this is an event
 # A platform's run admission: given the run's treatment kinds, its treatment targets, the campaign's end and whether its
 # condition declares `exclusive = true`, a context manager that holds what the run needs from before the attempt until
@@ -126,6 +132,9 @@ class Parts:
     reply_cap_unheld: Callable[[str], bool | None] = lambda model: None
     # the key the store is registered under for the attempts' liveness (`liveness.register`); None: not registered
     campaign: str | None = None
+    # the lease this campaign's one run is taken on (C41, `run_lease`), written in every record the attempts produce
+    # so that two leases' attempts of one number are told apart; None: the campaign runs on no lease
+    lease_id: int | None = None
 
 
 class AttemptRunner:
@@ -323,6 +332,7 @@ class AttemptRunner:
         # checks more, never less.
         decided = p.reserved_capped(key)
         begun, run_dir = self._begin(row, lease, admission=admission, reserved_capped=decided)
+        bind_session(backend, p.store, key, begun.number, p.lease_id)  # B20: the opaque id of this attempt, if sent
         live = contextlib.nullcontext() if p.campaign is None else liveness.running(p.campaign, begun.id)
         with live:  # the attempt is live from its row to its result: the executor and the post-run check inside it
             guard = None
@@ -331,7 +341,7 @@ class AttemptRunner:
                 guard = AttemptSpend(p.ledger, begun.id, key, model, reserved_capped=capped, calls_logged=True)
             defects = DefectLog(p.root, key, begun.number, p.stamp, lambda: redactor_for(backend, models=p.models))
             request = RunRequest(
-                RunIdentity(key, factors, begun.number),
+                RunIdentity(key, factors, begun.number, lease_id=p.lease_id),
                 run_dir,
                 endpoint,
                 backend,
@@ -367,11 +377,14 @@ class AttemptRunner:
                     treatment_targets=targets,
                     sent_nothing=sent_no_request(error, backend),
                 )
+                result = self._with_diagnostic(result, error, defects, request.declared)
                 result, unsent = self._settle_failure(result, guard, backend, begun.id)
                 if result.outcome.defect is not None:  # the attempt keeps the class and stack hash, the log the rest
                     defects(error, result.outcome.defect)
             result, moved = self._judge(result, record, model, key, begun)
             mix = None if record is None else p.identities.deployment_mix(model, record.transcript)  # B18
+            named = None if record is None else deployment_ids(record.transcript)  # B20
+            switched = record is not None and deployments_switched(record.transcript)
 
             def bookkeeping() -> None:  # in the transaction of the result: both stand, or neither does
                 self._bookkeeping(model, endpoint, key, result, kinds, targets, moved)
@@ -379,10 +392,65 @@ class AttemptRunner:
                     p.store.event(p.stamp(), ZERO_EVENT, model, f"{key}: {ZERO_REASON}; charged 0, basis measured")
                 if mix is not None:
                     p.store.record_deployments(begun.id, mix)
+                if named is not None or switched:  # a split no header names shows in the fingerprints alone
+                    p.store.record_deployment_ids(begun.id, named, switched)
+                if (
+                    result.post_run_health is not None
+                ):  # the reading, with the result: both stand, or neither does (O90)
+                    text = json.dumps(result.post_run_health, sort_keys=True)
+                    p.store.event(p.stamp(), "post_run_health", model, f"{key}: {text}")
+                if (
+                    defects.note_unwritten is not None
+                ):  # the stub stands; the courtesy copy of its text did not get written
+                    p.store.event(
+                        p.stamp(),
+                        NOTE_EVENT,
+                        model,
+                        f"{key}: the withheld diagnostic could not be written to the local log "
+                        f"({defects.note_unwritten})",
+                    )
 
             status = self._finish(begun, run_dir, key, result, bookkeeping)
             defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
             return p.settings.retry_delay_s if status == "pending" else 0.0
+
+    def _with_diagnostic(
+        self, result: AttemptResult, error: BaseException, defects: DefectLog, declared: DeclaredSecrets
+    ) -> AttemptResult:
+        """Keep on the result the snapshot an infrastructure error carries (a failed instrument start's), redacted with
+        the attempt's redaction context as it stands (C40): the runner's own base (the process, the models, the
+        registry), the one installed after it (the secrets the executor declared with `RunRequest.declare_secrets`, or
+        the whole context `record_attempt` gave) and the declared secrets themselves, pinned, so what replaces the log's
+        redactor never takes one away.
+
+        Never a diagnostic redacted against a partial list of the run's secrets: `declared.called` says the executor
+        called `declare_secrets` (a call with no secret says it has none), which is the only way to show one, since a
+        secret only a later `record_run` names is not known to the core, and `record_run` given secrets is not a
+        declaration. Otherwise the row and the marker keep a stub, with the phase alone and the reason, and what would
+        have been shown, redacted with what the core does know, goes to the campaign's local log, which no merge or
+        package carries. One that cannot be kept is recorded as failed, not raised."""
+
+        def redactor() -> Chained | Redactor:
+            context = defects.build_redactor()
+            return Chained(context, Redactor(declared.secrets)) if declared.secrets else context
+
+        kept = snapshot_of(error, redactor, complete=declared.called)
+        if kept is not None and kept.get("error") == WITHHELD_ERROR:
+            self._keep_withheld(defects, error, redactor)
+        return result if kept is None else dataclasses.replace(result, diagnostic=kept)
+
+    @staticmethod
+    def _keep_withheld(defects: DefectLog, error: BaseException, redactor: Callable[[], Chained | Redactor]) -> None:
+        """Leave in the local log what a withheld diagnostic would have shown, as `snapshot_of` shows it (structurally
+        redacted, whole or recorded as failed, never cut), and never raise: a note that cannot be written is
+        `defects.note_unwritten`."""
+        try:
+            shown = snapshot_of(error, redactor, complete=True)
+            text = json.dumps(shown, sort_keys=True)
+        except Exception as problem:
+            defects.note_unwritten = type(problem).__name__
+            return
+        defects.keep_private("a diagnostic withheld, since the executor declared no secrets", text)
 
     def _settle_failure(
         self, result: AttemptResult, guard: AttemptSpend | None, backend: Any, attempt_id: int
@@ -413,7 +481,14 @@ class AttemptRunner:
         is told the attempt it judges (`CheckContext`): the run, the number and the id of the row `begun` made."""
         p = self.p
         if p.health is not None:
+            note = prerun.current()
+            if note is not None:
+                note.pop(prerun.HEALTH_READING, None)  # only a check made from here on leaves the post-run reading
+                note[prerun.EXECUTOR_RETURNED] = (
+                    True  # nothing of the run is in progress now: no leftover is its own work
+                )
             health, outage = p.health.after_run(key, attempt=begun.number, attempt_id=begun.id)
+            result = self._keep_reading(result, note, model, key)
             if health.deferred:  # it verified nothing: no result is scored on it, treatment included (C11)
                 result = unverified(result, health.detail)
                 text = f"{key}: {health.detail}; nothing is scored on it ({result.outcome.infra_kind or 'set aside'})"
@@ -439,11 +514,34 @@ class AttemptRunner:
         if change is None:
             return result, False
         p.store.event(p.stamp(), "served_identity_changed", model, f"{key}: {json.dumps(change, sort_keys=True)}")
-        if result.outcome.set_aside:
+        # Under a lease's declared set nothing undeclared is ever scored (C48), so a treatment fault it would score is
+        # replaced as an instrument's refusal replaces one; a hand-run campaign keeps an outcome already set aside.
+        treated = result.outcome.set_aside and p.identities.leased(model)
+        if treated and classify(result, result.treatment_kinds, result.treatment_targets).state != "done":
+            treated = False
+        if result.outcome.set_aside and not treated:
             return result, True  # already set aside: the event and the unit's failure are what is left to do
         text = "the endpoint's served identity changed during the run"
         outcome = Outcome("infrastructure", text, infra_kind=p.settings.identity_kind)
-        return dataclasses.replace(result, outcome=outcome), True
+        changes = {"recorded_treatment": False} if treated else {}  # the record flagged a treatment it no longer is
+        return dataclasses.replace(result, outcome=outcome, **changes), True
+
+    def _keep_reading(self, result: AttemptResult, note: Any, model: str, key: str) -> AttemptResult:
+        """The structured reading the post-run check noted for this try (`prerun.HEALTH_READING`), kept in the result
+        (its marker, and an event in the result's transaction); one that is no small JSON object is not kept, and an
+        event says so. A check that noted none leaves the result as it was."""
+        raw = None if note is None else note.get(prerun.HEALTH_READING)
+        if raw is None:
+            return result
+        reading = prerun.reading_of(raw)
+        if reading is None:
+            limit = prerun.READING_MAX_BYTES
+            reason = f"is not a JSON object of at most {limit} bytes of text"
+            self.p.store.event(
+                self.p.stamp(), "post_run_health_refused", model, f"{key}: the post-run reading {reason}"
+            )
+            return result
+        return dataclasses.replace(result, post_run_health=reading)
 
     def _judge_instruments(self, result: AttemptResult, record: Any, model: str, key: str) -> AttemptResult:
         """Apply the refusal an instrument's post-run check put in the record (C31): the third way a finished attempt is

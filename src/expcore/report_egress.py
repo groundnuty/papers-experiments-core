@@ -6,6 +6,8 @@ A batch is checked when one of its analysed records carries the `egress` instrum
 the report of any other batch has no such section and is the text it always was. The section shows:
 
 - per condition, the analysed runs, the flagged ones, and the flagged ones by each flag;
+- under package indexes the campaign declared (O95), how many runs installed from them or named them, a class of its
+  own that flags nothing;
 - one row per flagged run: its run key and attempt, its condition, its flags, the state of its log and why it is
   unknown, its outside destinations (address and port), and its static-scan hits (kind, what, cell), each cut to a
   few with the number left;
@@ -92,6 +94,12 @@ def egress_lines(
         f"connection, {counts['log_unknown']} with an unknown log, {counts['static_scan']} with a static-scan hit "
         "(a run may have several flags)."
     )
+    if egress.package_indexes:
+        lines.append(
+            f"{counts['package_index']} analysed run(s) installed from or named the declared package indexes "
+            f"({', '.join(egress.package_indexes)}): reported in their own class, not flagged for it, and kept by "
+            "the reruns unless another flag leaves them out."
+        )
     lines += ["", *_by_condition(egress, table), *_flagged(egress, table)]
     lines += ["### Sensitivity analysis: the flagged runs left out", "", *SENSITIVITY_NOTES, ""]
     if egress.refused is not None:

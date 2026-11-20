@@ -48,10 +48,14 @@ def digest_of(value: Any) -> str:
 def federation_roles(config: PlatformConfig) -> list[tuple[str, str]]:
     """Each value of the file that is its federation's own, paired with the role that names it in every federation:
     the zone's and each provider's URL and host, each provider's, space's and fixed user's id, the link check's space
-    id, the tool server's clone and the platform file's directory. Longest first, so a URL is replaced before its host,
-    and a host that several roles share is the plain role `host`. A host is a role only when it has a dot or a colon
-    (a domain name or an address): a single label (`read`) could be an option's own value, and two lines that differ
-    in that value must never become one, so it is left as written, which can only keep two federations apart."""
+    id, the tool server's clone, the study's own directory its `artifacts` declares (as written, since the command is
+    rendered from the same placeholder: two sites' paths of one directory, #451) and the platform file's directory.
+    With a declared artifacts directory the clone is a role by its path as written too, since a site may reach both
+    through a parent that is a link, where the resolved clone matches nothing the command says (O94). Longest first, so
+    a URL is replaced before its host, and a host that several roles share is the plain role `host`. A host is a role
+    only when it has a dot or a colon (a domain name or an address): a single label (`read`) could be an option's own
+    value, and two lines that differ in that value must never become one, so it is left as written, which can only
+    keep two federations apart."""
     from urllib.parse import urlsplit  # only here: what a word of a command line holds of the federation
 
     roles: dict[str, str] = {}
@@ -76,6 +80,9 @@ def federation_roles(config: PlatformConfig) -> list[tuple[str, str]]:
         add(None if principal is None else principal.user_id, f"principals.{plane}-id")
     if config.toolserver is not None and config.toolserver.clone is not None:
         add(str(config.toolserver.clone), "clone")
+    if config.toolserver is not None and config.toolserver.artifacts is not None:
+        add(config.toolserver.artifacts, "artifacts")
+        add(config.toolserver.clone_written, "clone")  # undeclared, the fingerprint is the one it was
     add(str(config.file.parent), "platform-dir")
     return sorted(roles.items(), key=lambda item: -len(item[0]))
 
@@ -199,12 +206,12 @@ def sandbox_record(sandbox: SandboxSettings, roles: list[tuple[str, str]]) -> di
 def toolserver_record(server: ToolServer, file: Any, roles: list[tuple[str, str]]) -> dict[str, Any]:
     """`[toolserver]`'s settings that shape a run: the pinned commit of its checkout (None when none is pinned), its
     command and arguments, which start it and can set its own options (a timeout, a limit), by the SHA-256 of their
-    federation-neutral form (`neutral_words`: the federation's addresses, ids, the clone's and the platform file's
-    directory replaced by their roles), the longest its start may take, and each condition, keyed by its name's
-    SHA-256 (a message never names a condition, O12, and the key still binds the name to its settings whatever the
-    file's order), with its allow-list, its rights and its frozen manifest's SHA-256. Not here: the clone's path, the
-    host's; the code it holds is the commit's. A manifest that cannot be read is refused naming its condition's
-    position, never its path."""
+    federation-neutral form (`neutral_words`: the federation's addresses, ids, the clone's, the declared artifacts
+    directory and the platform file's directory replaced by their roles), the longest its start may take, and each
+    condition, keyed by its name's SHA-256 (a message never names a condition, O12, and the key still binds the name to
+    its settings whatever the file's order), with its allow-list, its rights and its frozen manifest's SHA-256. Not
+    here: the clone's path and the artifacts directory's, the host's; the code it holds is the commit's. A manifest
+    that cannot be read is refused naming its condition's position, never its path."""
     conditions: dict[str, Any] = {}
     for index, (name, condition) in enumerate(server.conditions.items()):
         try:

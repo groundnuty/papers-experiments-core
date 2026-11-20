@@ -16,7 +16,9 @@ false, or null when it could not be told), `state`, `started_at`, `ended_at`, `e
 (the stops the state records for the service: `requested_utc`, `confirmed_utc` and `stopped`, nothing else),
 `unknown` (null, or why the step could not be told) and `accounting_wait_s_used` (seconds, 0 when the read did not
 wait). A command that fails, a step id missing, accounting that does not settle it: `running` is null with the reason,
-never true. The document names no node, address or path; the state's own words for them are never copied.
+never true. A service whose state records a kept stop's holder (O96, `services.<n>.holder`) also has `holder`: the id
+`squeue -s` lists the holder's own name under now, or null (none listed, or the list could not be read). The document
+names no node, address or path; the state's own words for them are never copied.
 
 **Slurm's accounting trails a stop.** The driver confirms a stop once `squeue -s` no longer lists the step, and `sacct`
 follows seconds later; a read in between finds the step neither listed nor recorded as ended. When the STATE says the
@@ -40,8 +42,12 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-import hpcslurm
-import hpcstate
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:  # python -I leaves the script's directory out of sys.path, as hpcfed.py notes
+    sys.path.insert(0, str(HERE))
+
+import hpcslurm  # noqa: E402
+import hpcstate  # noqa: E402
 
 FORMAT = "expcore-hpc-observe/1"
 KINDS = ("oz", "op")  # the services of the federation: the zone and the providers
@@ -110,11 +116,27 @@ def _seconds(value: Any) -> float:
     return float(value)
 
 
+def _holder(record: Dict[str, Any], listed: Optional[Dict[str, str]]) -> Dict[str, Any]:
+    """`{"holder": <the id squeue lists the holder's name under, or None>}` for a service whose state records a kept
+    stop's holder (O96); nothing for one that records none."""
+    holder = record.get("holder")
+    if not isinstance(holder, dict) or not isinstance(holder.get("name"), str):
+        return {}
+    return {"holder": listed.get(holder["name"]) if listed is not None else None}
+
+
 def _service(
     record: Dict[str, Any], listed: Optional[Dict[str, str]], listing_error: Optional[str], slurm: hpcslurm.Slurm
 ) -> Tuple[Dict[str, Any], bool]:
     """One service's reading: the step the state names, or the one squeue lists under its name, read by its exact id.
     And whether the answer is one that Slurm's accounting being behind explains (`hpcslurm.accounting_behind`)."""
+    doc, behind = _service_step(record, listed, listing_error, slurm)
+    return {**doc, **_holder(record, listed)}, behind
+
+
+def _service_step(
+    record: Dict[str, Any], listed: Optional[Dict[str, str]], listing_error: Optional[str], slurm: hpcslurm.Slurm
+) -> Tuple[Dict[str, Any], bool]:
     step = record.get("step") if isinstance(record.get("step"), dict) else {}
     name, recorded = step.get("name"), step.get("id")
     common = {"kind": record["kind"], "launch": _count(record.get("launch")), "stops": _stops(record.get("stops"))}
@@ -162,7 +184,8 @@ def _stopped(record: Dict[str, Any], doc: Dict[str, Any]) -> bool:
 
 def _lagged(doc: Dict[str, Any]) -> Dict[str, Any]:
     """The reading of a stopped step whose accounting did not catch up in the bound: unknown, with nothing of it."""
-    return _unknown(LAG, kind=doc["kind"], launch=doc["launch"], step=doc["step"], stops=doc["stops"])
+    lagged = _unknown(LAG, kind=doc["kind"], launch=doc["launch"], step=doc["step"], stops=doc["stops"])
+    return {**lagged, **({"holder": doc["holder"]} if "holder" in doc else {})}
 
 
 def _round(

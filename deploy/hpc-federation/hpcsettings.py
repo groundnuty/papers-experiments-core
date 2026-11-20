@@ -19,6 +19,12 @@ from hpcslurm import valid_network
 SIZE = re.compile(r"([1-9][0-9]{0,6})([mg])")
 TIME = re.compile(r"(?:([0-9]{1,2})-)?([0-9]{1,2}):([0-9]{2}):([0-9]{2})")
 SLURM_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")  # an account or a partition
+# HPC_NODE_DOMAIN: the domain suffix of a node whose `hostname -f` gives one label (`bundle/nodefacts.py`, lib.sh's
+# node_fqdn: the same rule); one or more DNS labels, which is what `<short>.<domain>` must be to stay a name the address
+# map holds. 189 is 253 less the longest label and its dot.
+_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+NODE_DOMAIN = re.compile(rf"{_LABEL}(?:\.{_LABEL})*")
+NODE_DOMAIN_MAX = 189
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}")
 HPC_KEYS = (
     "time",
@@ -43,6 +49,7 @@ STEP_END_S = 60  # the longest the driver polls for a stopped service's step to 
 SETTLE_SLACK_S = 70  # what settle_timeout_s keeps beyond the stop's bound and the launch wait: the stop verb's
 # own tail past its control step (the wait for the step to leave the list and after a cancel: 40 s) and a 30 s margin
 STEP_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin"  # HPC_STEP_PATH's default
+QUEUE_WAIT_MIN_S, QUEUE_WAIT_MAX_S = 600, 86400  # HPC_QUEUE_WAIT_S: how long up waits for a held job to start, in s
 SANDBOX_SPARE_CPUS = 2  # beside the agent's cores on its node: the gate, the dispatcher and the egress collector
 SANDBOX_OVERHEAD_MIB = 4096  # beside the agent's bytes: the gate, the dispatcher, the collector, the store, the SIF
 PLACEHOLDER = re.compile(r"@[A-Za-z0-9_.-]+@")  # a value the platform template leaves to up (fedfacts)
@@ -411,6 +418,16 @@ class Site:
     # ("Error configuring interconnect") from a point on while the same steps with `no_vni` ran; the services talk over
     # TCP and need none. Empty: no option, as before.
     step_network: str = ""
+    # Every held job is submitted `--exclusive` (HPC_EXCLUSIVE_NODES=1): Slurm packs a job that asks a few cores and
+    # some memory onto a node another job holds, and a pending job has no node for another `up` to exclude, so parallel
+    # ups shared nodes (live, 18 Nov). False: the held jobs ask what they always did. Not recorded in the state file:
+    # only `up` submits, and `down` needs none of it.
+    exclusive_nodes: bool = False
+    # The domain suffix of a node whose `hostname -f` gives one label (HPC_NODE_DOMAIN): its FQDN is then
+    # `<hostname -s>.<domain>` in every step that names the node (nodefacts.py, lib.sh's node_fqdn), and the step's
+    # environment carries it (`hpclaunch.Launcher`). Empty: a one-label name is refused. Recorded in the state file, so
+    # `down` and the service verbs launch their steps with it all the same.
+    node_domain: str = ""
 
     def to_json(self) -> dict:
         return {
@@ -425,6 +442,7 @@ class Site:
             "admin_mail": self.admin_mail,
             "billing_weight": self.billing_weight,
             "step_network": self.step_network,
+            "node_domain": self.node_domain,
             **{attribute: getattr(self, attribute) for attribute in OPTIONAL_VARIABLES.values()},
             "storage_root": self.storage_root,
         }
@@ -472,6 +490,12 @@ def checked_site(site: Site) -> Site:
             "HPC_STEP_NETWORK: must be an option of srun's --network (for example 'no_vni'): up to 128 letters, "
             "digits and _ . , = : + -, with no space"
         )
+    if not isinstance(site.node_domain, str) or (
+        site.node_domain and (len(site.node_domain) > NODE_DOMAIN_MAX or not NODE_DOMAIN.fullmatch(site.node_domain))
+    ):
+        raise SettingsError(
+            "HPC_NODE_DOMAIN: must be DNS labels (letters, digits and '-') joined by '.', 189 characters at most"
+        )
     for variable, attribute in {**AGENT_PATHS, **STUDY_PATHS}.items():
         if getattr(site, attribute):
             _absolute(getattr(site, attribute), variable)
@@ -491,6 +515,32 @@ def checked_site(site: Site) -> Site:
             "unset HPC_STORAGE_ROOT for storage on the nodes' tmpfs"
         )
     return site
+
+
+def queue_wait_from_environment(environ: Mapping[str, str]) -> Optional[float]:
+    """`HPC_QUEUE_WAIT_S`: the seconds `up` waits for a held job to start before it cancels it (README, "Site
+    configuration"), a whole number from `QUEUE_WAIT_MIN_S` to `QUEUE_WAIT_MAX_S`. None when it is unset or empty: the
+    driver's own bound (1800) stands. Anything else (a word, a fraction, a sign, a number out of range) is refused,
+    naming the key and never the value. It is not a `Site` value: only `up` waits, and `down` needs no bound."""
+    value = environ.get("HPC_QUEUE_WAIT_S")
+    if not value:
+        return None
+    if not re.fullmatch(r"[0-9]{1,9}", value) or not QUEUE_WAIT_MIN_S <= int(value) <= QUEUE_WAIT_MAX_S:
+        raise SettingsError(
+            f"HPC_QUEUE_WAIT_S: must be a whole number of seconds from {QUEUE_WAIT_MIN_S} to {QUEUE_WAIT_MAX_S}"
+        )
+    return float(int(value))
+
+
+def exclusive_nodes_from_environment(environ: Mapping[str, str]) -> bool:
+    """`HPC_EXCLUSIVE_NODES`: `1` submits every held job with `--exclusive` (whole nodes), `0` or unset (or empty) does
+    not. Anything else is refused, naming the key and never the value."""
+    value = environ.get("HPC_EXCLUSIVE_NODES")
+    if not value:
+        return False
+    if value not in ("0", "1"):
+        raise SettingsError("HPC_EXCLUSIVE_NODES: must be 0 or 1")
+    return value == "1"
 
 
 def site_from_environment(environ: Mapping[str, str]) -> Site:
@@ -519,6 +569,8 @@ def site_from_environment(environ: Mapping[str, str]) -> Site:
             admin_mail=environ.get("HPC_ADMIN_MAIL") or defaults.admin_mail,
             billing_weight=billing,
             step_network=environ.get("HPC_STEP_NETWORK") or "",
+            node_domain=environ.get("HPC_NODE_DOMAIN") or "",
+            exclusive_nodes=exclusive_nodes_from_environment(environ),
             **{attribute: environ.get(variable) or "" for variable, attribute in OPTIONAL_VARIABLES.items()},
             storage_root=environ.get("HPC_STORAGE_ROOT") or "",
             quota_cmd=environ.get("HPC_QUOTA_CMD") or "",

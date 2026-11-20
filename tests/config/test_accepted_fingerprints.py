@@ -1,5 +1,6 @@
 """A model's declared set of accepted serving fingerprints (B18): how `models.toml` declares it, the rules it is held
-to, and how it enters the campaign fingerprint, leaving a model that declares none with the digest it had (C06)."""
+to, and that it stays out of each model's digest in the campaign fingerprint (C48), so a model keeps the digest it had
+before the key existed (C06)."""
 
 import shutil
 import textwrap
@@ -79,9 +80,10 @@ def test_b18_an_anthropic_model_cannot_declare_accepted_fingerprints(tmp_path):
         )
 
 
-def test_b18_a_model_that_declares_no_set_keeps_the_digest_it_had_in_the_fingerprint():
-    """B18, C06: the digest of a model entry without `accepted_fingerprints` is byte for byte the one it had before
-    the key existed, so a campaign started before it resumes; one that declares a set has another."""
+def test_c48_a_models_digest_is_the_same_whatever_set_it_declares():
+    """C48, C06: the digest of a model entry without `accepted_fingerprints` is byte for byte the one it had before
+    the key existed, so a campaign started before it resumes, and one that declares a set has that same digest:
+    deployments of one checkpoint are interchangeable, and the set lives in the elastic ledger's declaration log."""
     spec = ModelSpec(
         key="gamma-relay",
         backend="openai_compat",
@@ -92,7 +94,7 @@ def test_b18_a_model_that_declares_no_set_keeps_the_digest_it_had_in_the_fingerp
     )  # no key location: where a key lives enters as a placeholder (K13), which gave a keyed entry a new digest
     assert model_digest(spec) == "675005d213c3f888d5e23a42967d5709cf0e0f3d5845470e6264877807031aca"
     declared = ModelSpec(**{**spec.__dict__, "accepted_fingerprints": ("deploy-kestrel",)})
-    assert model_digest(declared) != model_digest(spec)
+    assert model_digest(declared) == model_digest(spec)
 
 
 def _declared(study_dir: Path, accepted: str):
@@ -105,17 +107,19 @@ def _declared(study_dir: Path, accepted: str):
     return study, fingerprint_of(study, load_plugin(StudyContext(study, {"commit": "0" * 40})))
 
 
-def test_c06_a_resume_under_another_accepted_set_is_refused(tmp_path):
-    """C06, B18: the set is frozen into the campaign fingerprint through the model's digest, so a start that declares
-    another set is refused as a changed model, never taken as a grown plan."""
+def test_c48_another_accepted_set_leaves_the_models_digest_and_only_models_toml_s_hash_names_it(tmp_path):
+    """C06, C48: a start whose models.toml declares another set has the same digest for every model; the file's own
+    hash still differs, so a hand-run campaign resumed under an edited models.toml is refused as a changed
+    configuration (an elastic campaign changes its set with `declare`, never by editing the file)."""
     study, first = _declared(tmp_path / "one", 'accepted_fingerprints = ["deploy-kestrel", "deploy-plover"]')
     _, second = _declared(tmp_path / "two", 'accepted_fingerprints = ["deploy-kestrel", "deploy-osprey"]')
-    assert first["models"]["beta-stub"] == second["models"]["beta-stub"]
+    assert first["models"] == second["models"]
     comparison = compare_fingerprints(first, second)
-    assert any(leaf.startswith("models.alpha-stub:") for leaf in comparison.refused)
+    assert comparison.refused
+    assert all(leaf.startswith("configs.models.toml") for leaf in comparison.refused)
     assert not comparison.grown
     path = tmp_path / "state.sqlite"
     store, _ = open_campaign(path, study.schema, study.manifest, first, now=NOW, max_attempts=3)
     store.close()
-    with pytest.raises(FingerprintMismatch, match=r"models\.alpha-stub"):
+    with pytest.raises(FingerprintMismatch, match=r"configs\.models\.toml"):
         open_campaign(path, study.schema, study.manifest, second, now=NOW, max_attempts=3)

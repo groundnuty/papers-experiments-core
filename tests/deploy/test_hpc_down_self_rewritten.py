@@ -49,7 +49,7 @@ def _gated(rig):
     """The state after down's gate: down is stopped right after it (the state goes with the root at the end of a
     whole down, so it is read before)."""
 
-    def stopped():
+    def stopped(node_checked=None):
         raise RuntimeError("stopped for the test, after the gate")
 
     rig.driver.take_down = stopped
@@ -155,6 +155,7 @@ STRICT_CHANGES = {
     "the platform file": "platform.toml",
     "the render identity": "render-identity.json",
     "the pilot's wiring": "day0-wiring.toml",
+    "the ingest's evidence": "ingest-evidence.json",
 }
 
 
@@ -254,7 +255,7 @@ def test_discard_evidence_with_only_self_rewritten_files_changed_discards_nothin
     rig = _collected_rig(hpc, tmp_path, site)
     (rig.root / "link-check.json").write_bytes(LINK_LATER)
 
-    def stopped():
+    def stopped(node_checked=None):
         raise RuntimeError("stopped for the test, after the gate")
 
     rig.driver.take_down = stopped
@@ -270,7 +271,7 @@ def test_a_discard_of_a_changed_strict_file_records_both_the_discard_and_the_rew
     (rig.root / "link-check.json").write_bytes(LINK_LATER)
     (rig.root / "shard-claim.json").write_bytes(b"{}\n")
 
-    def stopped():
+    def stopped(node_checked=None):
         raise RuntimeError("stopped for the test, after the gate")
 
     rig.driver.take_down = stopped
