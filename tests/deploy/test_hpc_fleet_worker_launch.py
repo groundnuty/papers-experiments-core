@@ -23,9 +23,12 @@ def quiet(seconds: float) -> None:
 def deploy():
     with fleet_modules() as found:
         import fleetplan
+        import fleetrecord
         import fleetworker
+        import hpclaunch
 
-        yield SimpleNamespace(found=found, fleetplan=fleetplan, fleetworker=fleetworker)
+        yield SimpleNamespace(found=found, fleetplan=fleetplan, fleetrecord=fleetrecord, fleetworker=fleetworker,
+                              hpclaunch=hpclaunch)  # fmt: skip
 
 
 @pytest.fixture(scope="module")
@@ -144,3 +147,60 @@ def test_o93_a_launch_without_a_hop_watches_its_client_as_long_as_it_always_did(
     runner = StepRunner(bench, "fed-1")
     assert deploy.fleetworker.launch(arguments(bench, bench.settings()), runner, lambda: NOW, slept) == 0
     assert len(looks) == int(deploy.fleetworker.SETTLE_S)
+
+
+def test_c57_a_worker_is_launched_while_an_add_holds_the_fleets_lifecycle_lock(deploy, bench):
+    """C57: an add holds the fleet's lifecycle lock for its new members' whole ups, the queue wait included (hours on a
+    site whose ups queue); the launch of an up member's worker does not take that lock, so the join is not refused
+    behind the add while the member idles."""
+    assert bench.up(2)[0] == 0
+    runner = StepRunner(bench, "fed-1")
+    with deploy.fleetrecord.Record(bench.fleet).lifecycle("add"):
+        assert deploy.fleetworker.launch(arguments(bench, bench.settings()), runner, lambda: NOW, quiet) == 0
+    (launched,) = bench.spawned
+    assert member(bench, "fed-1")["worker"]["pid"] == launched.pid
+
+
+def test_c57_no_worker_is_launched_while_its_federations_up_or_down_runs(deploy, bench):
+    """C57: the launch holds its federation's own lifecycle lock (`<root>.lifecycle.lock`, which `hpcfed.py up` and
+    `down` hold for their whole run): while a down of that federation runs, the launch is refused with nothing started
+    or recorded."""
+    assert bench.up(2)[0] == 0
+    root = deploy.fleetrecord.root_of(bench.fleet, "fed-1")
+    runner = StepRunner(bench, "fed-1")
+    with deploy.hpclaunch.StateStore(root).lifecycle("down"):
+        assert deploy.fleetworker.launch(arguments(bench, bench.settings()), runner, lambda: NOW, quiet) == 2
+    assert bench.spawned == []
+    assert member(bench, "fed-1").get("worker") is None
+
+
+def test_c57_a_launch_makes_no_lock_file_its_federations_up_did_not(deploy, bench):
+    """C57: the launch opens only the lifecycle lock its federation's up made, never makes one: without it the launch is
+    refused, with nothing started, recorded or made."""
+    assert bench.up(2)[0] == 0
+    lock = deploy.hpclaunch.StateStore(deploy.fleetrecord.root_of(bench.fleet, "fed-1")).lifecycle_path
+    lock.unlink()
+    runner = StepRunner(bench, "fed-1")
+    assert deploy.fleetworker.launch(arguments(bench, bench.settings()), runner, lambda: NOW, quiet) == 2
+    assert not lock.exists()
+    assert bench.spawned == []
+    assert member(bench, "fed-1").get("worker") is None
+
+
+def test_c57_a_down_of_the_federation_is_refused_while_its_worker_launches(deploy, bench):
+    """C57: the other way round, `fleet.py down --member` of the federation whose worker is being launched is refused
+    by its `hpcfed.py down` (the federation's lifecycle lock) and leaves the federation up; the launch goes on."""
+    assert bench.up(2)[0] == 0
+    downs = []
+
+    def during(seconds: float) -> None:
+        if not downs:
+            downs.append(bench.run("down", "--member", "fed-1"))
+
+    runner = StepRunner(bench, "fed-1")
+    assert deploy.fleetworker.launch(arguments(bench, bench.settings()), runner, lambda: NOW, during) == 0
+    ((code, printed),) = downs
+    assert code != 0
+    assert "another up or down of this root is running" in printed
+    assert deploy.fleetrecord.root_of(bench.fleet, "fed-1").is_dir()
+    assert member(bench, "fed-1")["worker"]["pid"] == bench.spawned[0].pid

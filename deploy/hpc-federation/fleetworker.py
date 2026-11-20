@@ -33,6 +33,8 @@ but its restart count.
 """
 
 import argparse
+import contextlib
+import fcntl
 import importlib.util
 import json
 import os
@@ -43,7 +45,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterator, List, Mapping, Optional, Sequence
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
@@ -251,25 +253,57 @@ def launch(
 ) -> int:
     """`launch`: the member's worker started as a detached `srun` step of its held job, its client recorded; 0 when it
     was started or already runs, 2 (with nothing started) when the member is not one this fleet's up made and holds,
-    its job is not the one up held and running, or the shard settings cannot be read."""
+    its job is not the one up held and running, the shard settings cannot be read, or an up or down of its federation
+    (or another launch of its worker) is running.
+
+    It holds its federation's own lifecycle lock (`<root>.lifecycle.lock`, which `hpcfed.py up` and `down` hold for
+    their whole run), never the fleet's (C57): an add holds the fleet's for its new members' whole ups, their queue
+    wait included, and a join must not wait hours behind it. It opens only the lock file its federation's up made,
+    never makes one. The record's changes are under the record's own lock."""
     for path in (HERE, HERE.parents[1] / "deploy" / "compose-federation"):
         if str(path) not in sys.path:
             sys.path.insert(0, str(path))
     import fleetplan
     import fleetrecord
+    import hpclaunch
     import hpcslurm
 
     directory, shards = Path(args.fleet), fleetplan.shards
     runner = runner or hpcslurm.Runner()
     record = fleetrecord.Record(directory)
+
+    def up_member() -> Any:
+        member = fleetrecord.member_of(record.read(), args.member)
+        why, _ = fleetrecord.identity(directory, member)
+        if why is None and member["status"] != "up":
+            why = f"{args.member} is {member['status']}, not up"
+        if why is not None:
+            raise fleetrecord.FleetError(why)
+        return member
+
+    @contextlib.contextmanager
+    def federation_locked() -> Iterator[None]:
+        """The federation's lifecycle lock (`hpclaunch.StateStore.lifecycle_path`), never waited for, as up and down
+        take it; the file is the one its up made, opened and never made here (no `O_CREAT`)."""
+        path = hpclaunch.StateStore(fleetrecord.root_of(directory, args.member)).lifecycle_path
+        try:
+            descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            raise fleetrecord.FleetError(f"{args.member} has no lifecycle lock its up made: none started") from None
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise fleetrecord.FleetError("an up or down of its federation, or another launch of its worker, is "
+                                             "running; worker launch refused") from None  # fmt: skip
+            yield
+        finally:
+            os.close(descriptor)
+
     try:
-        with record.lifecycle("worker"):
-            member = fleetrecord.member_of(record.read(), args.member)
-            why, _ = fleetrecord.identity(directory, member)
-            if why is None and member["status"] != "up":
-                why = f"{args.member} is {member['status']}, not up"
-            if why is not None:
-                raise fleetrecord.FleetError(why)
+        up_member()  # first: the lock beside the root is taken only for a member this fleet made and brought up
+        with federation_locked():
+            member = up_member()  # again, under the lock: a down may have ended before it was taken
             held = member.get("worker")
             if held and runner.client_alive(hpcslurm.Client(held["pid"], held["start"])):
                 print(f"fleetworker: {args.member}: its worker already runs (client pid {held['pid']})")
