@@ -33,6 +33,7 @@ VERIFY_MB = 1024.0  # a verify-data in flight (declared: one at about 3.9 GB was
 LOGIN_RESERVE_MB = 512.0  # the rest of what the account runs there: the controller, the dispatcher's ssh sessions
 RELAY_STATES = ("none", "here", "elsewhere", "gone")  # no relay; beating here; beating on another login node; gone
 PREPARE_STATES = ("running", "ok", "failed")  # a member's prepare as its site's record shows it (no record: None)
+NODE_ROOMS = ("idle", "queue")  # `SiteSettings.node_room`: the node limit counts idle nodes, or trusts the queue (C56)
 
 
 def _positive(name: str, value: float, zero: bool = False) -> float:
@@ -59,7 +60,10 @@ class SiteSettings:
     (sites that name one share one budget: one cgroup), None for one of its own; `prepare_timeout_s` bounds the
     site's prepare command (the study's ingest and verify-data of a member that has come up: the deploy side holds the
     command), None when the site has none. A prepare in flight takes `verify_mb`: it is the verify-data in flight the
-    budget already counts for every member that is up, linked and not yet verified."""
+    budget already counts for every member that is up, linked and not yet verified. `node_room` (C56) is how the site's
+    node figures limit its room: `idle` (the default) counts the free whole nodes, as an `--exclusive` site needs;
+    `queue` is for a site whose jobs share nodes (`HPC_EXCLUSIVE_NODES` 0): Slurm starts them on mixed nodes, so no
+    node count is a capacity and none binds, and one up waiting in the queue at a time stands in its place."""
 
     label: str
     max_federations: int
@@ -80,6 +84,7 @@ class SiteSettings:
     login_reserve_mb: float = LOGIN_RESERVE_MB
     login_node: str | None = None
     prepare_timeout_s: float | None = None
+    node_room: str = "idle"
 
     def __post_init__(self) -> None:
         if not isinstance(self.label, str) or not self.label or len(self.label) > 40:
@@ -103,6 +108,8 @@ class SiteSettings:
             raise ValueError("login_node must be a non-empty operator label")
         if self.prepare_timeout_s is not None:
             _positive("prepare_timeout_s", self.prepare_timeout_s)
+        if not isinstance(self.node_room, str) or self.node_room not in NODE_ROOMS:
+            raise ValueError(f"node_room must be one of {', '.join(NODE_ROOMS)}, got {self.node_room!r}")
         if self.relay_mb + self.up_mb <= 0:
             raise ValueError("relay_mb and up_mb cannot both be 0: a federation takes some of the login node")
 

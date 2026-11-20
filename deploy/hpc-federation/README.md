@@ -1673,7 +1673,8 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
 - **The read** (`observe`, `fleetobserve.py`) asks Slurm only `sinfo -h -p <partition> -o "%T %D"` and `scontrol show
   job -o <id>` on the ids its fleet's record and state files name, and the site's quota command. A job whose id Slurm
   no longer knows, or that now names another job, is `GONE` (ours ended) and is never touched. Only an exactly `idle`
-  node is free: under `HPC_EXCLUSIVE_NODES=1` a federation takes 7 whole nodes, so a `mixed` node (logged) is not.
+  node is free: under `HPC_EXCLUSIVE_NODES=1` a federation takes 7 whole nodes, so a `mixed` node (logged) is not
+  (`node_room = "queue"` below is for a site whose jobs share nodes).
   A member that fails the fleet's own identity check (`fleetrecord.identity`: the root this fleet made, a state an up
   of that root wrote, the recorded name and jobs), a job read that fails or times out, sinfo failing, or a job state
   it does not read fails the whole read: the site is dark for that tick (no action, no proof, its federations not
@@ -1683,7 +1684,7 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   held to the grants its budget fits) less the federations free to take one (idle, or on their way up); the rest are
   added one at a time to the site with the most room, at most `parallel_ups` in one `fleet.py add`. A site's room is
   the least of `max_federations` less every member that may hold a job; its idle nodes less 7 per up whose job has
-  not started, over 7; its inodes, the 95% line less the usage less one whole estimate for every member whose data is
+  not started, over 7 (unless the site trusts the queue, below); its inodes, the 95% line less the usage less one whole estimate for every member whose data is
   not all there yet (not linked and verified), over the estimate; and the declared `allowance_units` less every member
   made at its whole `--time` times `rate_units_per_hour`, over one more whole `--time` (no code reads a grant: set it
   very high where core-hours do not bind). An up waiting past `queue_stall_s` (900 s), an add still running there, or
@@ -1697,6 +1698,21 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   that could not be read leaves none. Each tick logs every up's queue
   wait, submit to running, the memory budget beside the quota and the nodes, and prints one status line with the
   ledger's money: what is left, and the dollars locked in unsettled leases.
+- **A site that trusts the queue** (`node_room = "queue"` in its `[[site]]`, C56; the default `"idle"` is the node
+  limit above, and any other value is refused naming the key). For a site whose jobs share nodes
+  (`HPC_EXCLUSIVE_NODES` 0): Slurm starts a federation's jobs on `mixed` nodes within minutes, so no count of idle or
+  mixed nodes is a capacity (`(idle + mixed) // 7` would be an invented figure that also reads 0 on a full site, where
+  the controller should still stand in the queue), and the node limit does not bind: the tick's `limits` show
+  `node_room: queue`, `nodes: null`, and the node figures as before. In its place the site has room for ONE up at a
+  time (`queue_slot`): 0 while an up's job still waits in the queue, whoever started it (a restart, a dry run or a
+  hand-run add leave no `adding` mark), else 1, so a tick adds at most one federation there whatever `parallel_ups`
+  says. Everything else binds as before: the maximum, the allowance, the inodes, the login node's memory, an add
+  still running and `queue_stall_s` (under `queue` a waiting up already leaves no room, so the stall bound changes
+  nothing there; `stalled` is still reported). A member whose jobs are neither waiting, running nor ended (broken) is
+  not in the queue and does not hold the slot. A site that adds no federations (a Compose site's static members) never
+  gets room. **Not checked:** the controller does not read `HPC_EXCLUSIVE_NODES`, so `queue` on a site whose ups are
+  `--exclusive` is the operator's mistake and costs one queued `--exclusive` up at a time until the stall bound:
+  leave such a site on `idle`.
 - **Join, drain, retire, replace.** A member up, linked, verified and running joins the ledger as
   `<site label>-<fleet label>`, with the earlier end of its two held jobs, its queue wait logged (its fingerprint and
   environment are read for it (`fleetidentity.py`, below) when the sites file names `settings`; otherwise `fleetcontrol.py
@@ -1786,7 +1802,7 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   per result); one `[[site]]` per site with `label` (an operator's label, never a site's name), `fleet` (one site's
   only: two sites never share a fleet), `transport`
   (`local`: commands run on this host, where the login node and the ledger are one; or `ssh`, below), optionally
-  `interpreter` and `deploy` (the Python and this directory on its login node), `prepare` and `prepare_timeout_s` (above), and the settings above (`max_federations`, `allowance_units` and `rate_units_per_hour` required). With `archives` in
+  `interpreter` and `deploy` (the Python and this directory on its login node), `prepare` and `prepare_timeout_s` (above), `node_room` (`idle`, the default, or `queue`), and the settings above (`max_federations`, `allowance_units` and `rate_units_per_hour` required). With `archives` in
   `[controller]` (absolute: where the dispatcher keeps the archives it pulls) and a `channel` in every site (that site's
   channel root on its shared file system), the controller also runs the elastic dispatcher
   (`expcore.campaign.elastic.dispatch`, DESIGN.md) in its own loop: the ledger's lock admits one holder, so the loop goes

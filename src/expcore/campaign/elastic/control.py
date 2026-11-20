@@ -15,6 +15,10 @@ an ordered list of actions, each the call an operator would make by hand: a prov
   and verified), over the estimate; its declared allowance
   less the whole `--time` of every member made, over one more whole `--time`. A stalled queue (an up waiting past
   `queue_stall_s`), an add still running there, or a quota that could not be read leave no room.
+  A site that declares `node_room = "queue"` (C56; for jobs that share nodes, `HPC_EXCLUSIVE_NODES` 0) has no node
+  limit, since Slurm starts such a job on a mixed node and no node count is a capacity; in its place the site has
+  room for one up at a time, and none while an up still waits in the queue (restart, dry run or hand add included).
+  The node figures are still reported, and `limits` names the mode.
 - **Drain** comes once a joined federation's recorded end is closer than the lease bound (declared; by default the
   ledger's hard term, which fails closed), collect, KillWait and 5 minutes, and never after the end.
 - **Retire** only what is drained or proven ended and holds no lease in flight: collect its root evidence, then down.
@@ -436,8 +440,17 @@ def _room(
                 if (m.status in ("claimed", "made") and m.state is None) or m.state in WAITING or m.broken]  # fmt: skip
     unsettled = [m for m in live if not (m.linked and m.verified)]  # its files are not all on scratch yet
     per = view.nodes_per_federation
-    limits: dict = {"maximum": settings.max_federations - len(live)}
-    limits["nodes"] = max(view.idle_nodes - per * len(starting), 0) // per if per > 0 else 0
+    waiting_ups = [m for m in starting if m.waiting]  # an up whose job is in the queue (a broken member is not)
+    queued = settings.node_room == "queue"
+    limits: dict = {"maximum": settings.max_federations - len(live), "node_room": settings.node_room}
+    if per <= 0:
+        limits["nodes"] = 0  # a site with no nodes for a federation to add (a Compose site's static members): no room
+    elif queued:
+        limits["nodes"] = None  # C56: jobs share nodes and start on mixed ones, so no node count is a capacity
+    else:
+        limits["nodes"] = max(view.idle_nodes - per * len(starting), 0) // per
+    # C56: under `queue` one up waits in the queue at a time (never more behind it, one more a tick at most)
+    limits["queue_slot"] = (0 if waiting_ups else 1) if queued else None
     limits.update(idle_nodes=view.idle_nodes, mixed_nodes=view.mixed_nodes, nodes_reserved=per * len(starting))
     if view.inodes_error is not None or (view.inodes_quota is None) != (view.inodes_used is None):
         limits["inodes"] = 0  # a quota that could not be read is never room
@@ -455,11 +468,11 @@ def _room(
     left = settings.allowance_units - made * whole
     limits["allowance"] = int(left // whole) if whole > 0 and left >= whole else 0
     limits["stalled"] = any(m.submitted_at is not None and now - m.submitted_at >= settings.queue_stall_s
-                            for m in starting if m.waiting)  # fmt: skip
+                            for m in waiting_ups)  # fmt: skip
     limits["adding"] = settings.label in busy
     limits["login_memory"], limits["login_memory_mb"] = memory[1], memory[2]
-    figures = [limits["maximum"], limits["nodes"], limits["allowance"]]
-    figures += [limits[key] for key in ("inodes", "login_memory") if limits[key] is not None]
+    figures = [limits["maximum"], limits["allowance"]]
+    figures += [limits[key] for key in ("nodes", "inodes", "login_memory", "queue_slot") if limits[key] is not None]
     room = 0 if limits["stalled"] or limits["adding"] else max(min(figures), 0)
     return room, limits
 
