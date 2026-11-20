@@ -75,10 +75,16 @@ def test_c56_queue_stall_still_zeroes_the_room_once_an_up_waits_past_it():
 
 def test_c56_queue_waits_for_no_broken_member_to_leave_the_queue():
     """C56: a member whose jobs are neither waiting, running nor ended is not an up in the queue: it does not hold the
-    site's one waiting slot (the controller drains and takes it down), so the site still adds."""
+    site's one waiting slot (the controller drains and takes it down). Its retirement holds the add that tick (C62);
+    once it is down the site adds."""
     broken = member("fed-1", state="SUSPENDED")
     assert broken.broken
     decision = decide(NOW, ledger(pending={"m1": 9}), [(settings(node_room="queue"), site(members=[broken]))])
+    assert decision.targets["site-a"]["limits"]["queue_slot"] == 1
+    assert decision.targets["site-a"]["limits"]["retiring"] == ["fed-1"]
+    assert adds(decision) == {}
+    gone = member("fed-1", status="down", state=None)
+    decision = decide(NOW, ledger(pending={"m1": 9}), [(settings(node_room="queue"), site(members=[gone]))])
     assert adds(decision) == {"site-a": 1}
 
 

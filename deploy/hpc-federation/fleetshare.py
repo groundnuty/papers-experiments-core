@@ -212,15 +212,15 @@ def write_holders(path: Path, holders: Mapping[str, Mapping[str, Any]]) -> None:
         os.close(directory)
 
 
-def usage(settings: Any, view: Any, adding: int) -> Dict[str, Any]:
+def usage(settings: Any, view: Any, adding: int, federations: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """What a controller holds of a site, as `decide` counts it against the site's maximum and allowance: every member
-    that may hold a job, and every member made times one whole `--time`; with the Adds on their way."""
-    from expcore.campaign.elastic.control import HOLDS_NOTHING
+    that may hold a job, and every member made times one whole `--time` (a downed one the ledger shows ended: what it
+    billed, C60, `control.made_units`); with the Adds on their way."""
+    from expcore.campaign.elastic.control import HOLDS_NOTHING, made_units
 
     live = sum(1 for m in view.members if m.status not in HOLDS_NOTHING)
-    made = sum(1 for m in view.members if m.status != "taken")
     whole = settings.rate_units_per_hour * view.time_s / 3600.0
-    return {"members": live + adding, "units": (made + adding) * whole}
+    return {"members": live + adding, "units": made_units(settings, view, federations or {}) + adding * whole}
 
 
 def within(settings: Any, holders: Mapping[str, Mapping[str, Any]], own: str) -> Tuple[Any, Dict[str, Any]]:
@@ -336,7 +336,7 @@ def decide(now: float, views: Any, reads: Sequence[Tuple[Any, Any]], busy: froze
             holders = files.get(settings.label)
             if not write or holders is None or site_view.error is not None:
                 continue  # a dark site keeps its last entry: what it held is not known now
-            entry = usage(settings, site_view, state.adding.get(settings.label, 0))
+            entry = usage(settings, site_view, state.adding.get(settings.label, 0), view.federations)
             holders = {**holders, own: {**entry, "max_federations": settings.max_federations,
                                         "allowance_units": float(settings.allowance_units), "at": now}}  # fmt: skip
             try:
