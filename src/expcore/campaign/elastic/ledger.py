@@ -27,6 +27,8 @@ shown ended; the sweep expires what it must.
   (`declarations`, C48): each lease carries its model's set at issue, its run judges its replies against it, and a
   model whose lease's run saw a value its set does not declare is paused (no new lease; leases out run on) until every
   value seen is declared.
+- **Operator pause.** An operator pauses one model's issue at once and resumes it, two kinds of event in the log
+  (`pauses`, C55): no new lease of the model, leases out run on, and `resume` lifts only this pause, not C48's.
 - **Settling and raising.** A lost lease (`settle`) is charged the spend read from its dead federation instead of its
   grant, and the difference goes back to the budget (`settling`). A ceiling is raised mid-campaign, recorded, never
   lowered or set below what is committed, and never part of the fingerprint (`ceilings`); `status` shows the money,
@@ -40,7 +42,8 @@ from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.elastic import attempts, caps, ceilings, declarations, schema, settling
+from expcore.campaign.elastic import attempts, caps, ceilings, declarations, pauses, schema, settling
+from expcore.campaign.elastic.awareness import PauseAwareMark
 from expcore.campaign.elastic.choice import InFlight, Pending, choose
 from expcore.campaign.elastic.config import LedgerConfig, LedgerRun, check_plan, micro_up
 from expcore.campaign.elastic.records import (
@@ -54,6 +57,7 @@ from expcore.campaign.elastic.records import (
     JoinRefused,
     Lease,
     LedgerError,
+    OperatorPause,
     Return,
     Settlement,
     SettleRefused,
@@ -72,6 +76,7 @@ class Ledger(LedgerViews):
     def __init__(self, path: Path, lock: DispatchLock, clock: Callable[[], float]) -> None:
         self.path = path
         self._lock = lock
+        self._aware = PauseAwareMark(path)  # taken once the ledger is open: this core honours operator pauses
         self._clock = clock
         try:
             self.db = schema.connect(path)
@@ -83,12 +88,14 @@ class Ledger(LedgerViews):
             if pinned is None:
                 raise ValueError(f"{path} holds no ledger configuration")
             self._config = LedgerConfig.from_json(pinned)
+            # C55: an operator's `pause` is written only to a controller that says it honours it
+            self._aware.acquire()
+            self._fingerprint = self.config.fingerprint
+            self._opened_at = clock()
+            self._last_read: dict[str, float] = {}  # site -> when it was last read since this open; never persisted
         except BaseException:
             self.close()
             raise
-        self._fingerprint = self.config.fingerprint
-        self._opened_at = clock()
-        self._last_read: dict[str, float] = {}  # site -> when it was last read since this open; never persisted
 
     @property
     def config(self) -> LedgerConfig:
@@ -128,7 +135,10 @@ class Ledger(LedgerViews):
         try:
             self.db.close()
         finally:
-            self._lock.release()
+            try:
+                self._aware.release()
+            finally:
+                self._lock.release()
 
     # --- transactions -----------------------------------------------------------------------------------------
 
@@ -287,6 +297,7 @@ class Ledger(LedgerViews):
             self.ceilings(),
             self.caps(),
             declarations.paused(self.db),
+            pauses.reasons(self.db),
         )
         if isinstance(chosen, Wait):
             return chosen
@@ -570,6 +581,17 @@ class Ledger(LedgerViews):
         `actor`; the next `issue` reads it, and a model it was the last undeclared value of is no longer paused.
         `DeclareRefused` for a model with no runs here, a value already declared, or a ledger with no log."""
         return self._transact(lambda: declarations.declare(self.db, self._clock(), model, fingerprint, reason, actor))
+
+    def pause_model(self, model: str, reason: str, actor: str) -> OperatorPause:
+        """Pause a model's issue, recorded with the time, `reason` and `actor` (C55): the next `issue` leases none of
+        it, and leases already out run on. `PauseRefused` for a model with no runs here or one an operator already
+        paused."""
+        return self._transact(lambda: pauses.pause(self.db, self._clock(), model, reason, actor))
+
+    def resume_model(self, model: str, reason: str, actor: str) -> OperatorPause:
+        """Lift an operator's pause of a model, recorded with the time, `reason` and `actor`; a model C48 also pauses
+        stays paused until `declare`. `PauseRefused` for a model with no runs here or none an operator paused."""
+        return self._transact(lambda: pauses.resume(self.db, self._clock(), model, reason, actor))
 
     def raise_model_ceiling(self, model: str, new_max_micro_usd: int, reason: str, actor: str) -> Ceiling:
         """`raise_ceiling` for a model that has a ceiling of its own, never below what the model has committed."""

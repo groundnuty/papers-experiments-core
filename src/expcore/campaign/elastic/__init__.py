@@ -4,7 +4,8 @@
 Step 1 of the design note: the ledger, its lease state machine with fencing, expiry and the proof of a holder's end,
 grants at lease time, per-model caps, the declared set order and dispatch by remaining work, a lost lease's settling to
 its real spend, a ceiling that can be raised, a cap that can be changed, the declared fingerprints of each model and
-the pause on an undeclared one (C48), and the status of the money (`python -m expcore.campaign.elastic`).
+the pause on an undeclared one (C48), an operator's pause of one model (C55), and the status of the money
+(`python -m expcore.campaign.elastic`).
 Nothing here is reached from today's forms: an unsharded run, a shard, a selection and their merges are unchanged.
 """
 
@@ -25,6 +26,8 @@ from expcore.campaign.elastic.records import (
     JoinRefused,
     Lease,
     LedgerError,
+    OperatorPause,
+    PauseRefused,
     Return,
     Run,
     Settlement,
@@ -54,6 +57,8 @@ __all__ = [
     "LedgerError",
     "LedgerReader",
     "LedgerRun",
+    "OperatorPause",
+    "PauseRefused",
     "Return",
     "Run",
     "SettleRefused",

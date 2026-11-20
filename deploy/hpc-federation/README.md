@@ -352,6 +352,12 @@ Copy `site.env.example` to `site.env` beside it, fill it in on the login node, a
 | `HPC_QUEUE_WAIT_S` | optional: the seconds `up` waits for a held job to start before it cancels it, 1800 when unset (a queue that keeps a job pending for hours needs more): a whole number from 600 to 86400, else `up` and `describe` refuse, naming the key. `down` never reads it |
 | `HPC_EXCLUSIVE_NODES` | optional: `1` submits every held job `--exclusive`, so no other job shares its nodes and several ups at once are safe; it bills whole nodes. `0` or unset (the default) asks what it always did. Anything else refuses `up`, naming the key. `down` and `describe` never read it, and it is not recorded in the state file |
 
+**Run `up` with no `TZ` set or exported.** `up` records the allocation's end (Slurm's `EndTime`) as `scontrol`
+printed it, with no zone, and the fault relay's kept stop reads it in the login node's own zone, since the relay
+runs without `TZ`. An `up` under `TZ=UTC` on a login node that is not on UTC makes a kept stop's `keep-until` mark,
+and the holder step that sleeps until it (O96), end early by the zone's offset: an hour on a UTC+1 site (seen live,
+20 Nov 2026). A wrapper that exports `TZ` drops it for `up`.
+
 Node names, addresses and job ids are typed at the prompt or read from Slurm; they never go into a file of this
 repository. The optional keys of the driver, the agent's sandbox and the study's artifacts are in `site.env.example`; the four of the next
 section are the provider storage on scratch and its inode guard.
@@ -1760,6 +1766,21 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   J,J --job-end EPOCH --kill-wait S --fingerprint F --environment-file IDENTITY.json` (the ledger keeps the digest of
   the environment identity, as step 4's merge checks it), and `settle --ledger L --lease N --spend-micro S
   --source root|pulled --attempts N` (a settle always carries the store's charged attempts).
+- **An operator's pause of one model** (C55). `python -m expcore.campaign.elastic pause LEDGER --model M --reason TEXT
+  --actor NAME` stops new leases of model M at once (a provider's 429 or 5xx burst, a bad deployment, a key problem)
+  and `resume` lifts it; both run beside the controller, under the ledger file's own write lock (never the
+  controller's), and write one event each to the ledger, nothing else. Leases already out run on and settle as usual;
+  `resume` lifts only this pause, so a model paused by an undeclared fingerprint stays paused until `declare`. **Only a
+  controller at this commit or later honours a pause; an older controller opens the ledger and keeps leasing the
+  model.** So a controller of this core holds a second lock, on `<ledger file>.pause-aware` beside the ledger file, for as
+  long as it runs (the kernel drops it with the process), and `pause` reads it: it refuses, and writes nothing, while
+  a live controller does not hold it (restart that controller on this core, then pause; a controller only now starting
+  reads as older for a moment, so run the command again), writes with a warning when no controller holds the ledger
+  (whichever starts next must be at this commit or later) or the locks cannot be read, and `status` warns when a pause
+  is in force and the live controller is older. The controller still counts a paused model's pending runs as demand, as
+  for C48's pause, so its federations stay up through the pause; once the other models' runs of the current set are
+  done they idle until the model is resumed, since no federation is sent ahead to a later set. Federations, nodes and
+  workers never read the pause.
 - **The sites file** (`--sites`, TOML): `[controller]` with `evidence` (absolute: each retired member's root evidence),
   `interval_s` and `log` (the JSON log: one line per tick with the targets, limits, queue waits and actions, and one
   per result); one `[[site]]` per site with `label` (an operator's label, never a site's name), `fleet` (one site's
