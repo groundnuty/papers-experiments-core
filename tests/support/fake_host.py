@@ -247,6 +247,12 @@ class FakeHost:
         self.stuck_mounts: set[str] = set()
         self.denied: set[str] = set()  # files whose read raises PermissionError, as /proc does with hidepid
         self.mount_ids: dict[str, int] = {}  # a mount keeps its id when the directory above it is renamed
+        self._next_mount_id = 40  # an unmounted path that is mounted again is a new mount, with an id of its own
+        # the agent container's own mount table (`/proc/<pid>/mountinfo` of its init, read as root): the shares bound
+        # into it with `rslave` and the FUSE mounts on them, as mount propagation shows them there. Off by default: the
+        # tests that read it set `ns_mountinfo`, and `ns_override` gives a table (by pid) in place of that one
+        self.ns_mountinfo = False
+        self.ns_override: dict[int, str] = {}
         self.one_shots: list[FakeContainer] = []  # the `--rm` containers that were run, as they were labelled
         self.stuck_one_shots = False  # a `--rm` container that docker does not remove: it stays, running
         self.oneclient_images: set[str] = set()
@@ -335,15 +341,39 @@ class FakeHost:
     def mountinfo(self) -> str:
         lines = ["1 0 8:1 / / rw - ext4 /dev/root rw"]  # every real table has the root mount; the probe checks for it
         for path, kind in self.mounts.items():
-            mount_id = self.mount_ids.setdefault(path, 40 + len(self.mount_ids))
+            mount_id = self._mount_id(path)
             lines.append(f"{mount_id} 25 0:{60 + mount_id} / {path} rw - {kind} source rw")  # device 100 for the first
+        return "\n".join(lines) + "\n"
+
+    def _mount_id(self, path: str) -> int:
+        if path not in self.mount_ids:
+            self.mount_ids[path] = self._next_mount_id
+            self._next_mount_id += 1
+        return self.mount_ids[path]
+
+    def agent_mountinfo(self, pid: int) -> str | None:
+        """The mount table of the container whose init is `pid`, as `ns_mountinfo` makes it; None when it is off or
+        the pid is no container's."""
+        if pid in self.ns_override:
+            return self.ns_override[pid]
+        container = next((c for c in self.containers.values() if c.pid == pid), None)
+        if not self.ns_mountinfo or container is None:
+            return None
+        lines = ["1 0 8:1 / / ro - overlay overlay ro"]
+        for spec in container.mount_specs():
+            fields = dict(part.split("=", 1) for part in spec.split(",") if "=" in part)
+            src, dst = fields.get("src", ""), fields.get("dst", "")
+            if "rslave" in spec and self.mounts.get(src, "").startswith("fuse"):
+                lines.append(
+                    f"{self._mount_id(src) + 100} 25 0:{60 + self._mount_id(src)} / {dst} ro - fuse.oneclient s ro"
+                )
         return "\n".join(lines) + "\n"
 
     def relocate_mounts(self, old: str, new: str) -> None:
         """What renaming a directory does to the mounts under it: they move with it, with the same id and device."""
         for path in [p for p in self.mounts if p == old or p.startswith(old + "/")]:
             moved = new + path[len(old) :]
-            self.mount_ids[moved] = self.mount_ids.pop(path, 40 + len(self.mount_ids))
+            self.mount_ids[moved] = self.mount_ids.pop(path, None) or self._mount_id(moved)
             self.mounts[moved] = self.mounts.pop(path)
 
     def read_text(self, path: str | Path) -> str:
@@ -479,7 +509,9 @@ class FakeHost:
             case "dmesg":
                 return CmdResult(0, self.dmesg)
             case "cat":
-                text = self.files.get(argv[1])
+                named = re.fullmatch(r"/proc/(\d+)/mountinfo", argv[1])
+                text = self.agent_mountinfo(int(named[1])) if named else None
+                text = text if text is not None else self.files.get(argv[1])
                 return CmdResult(0, text) if text is not None else CmdResult(1, "", "No such file")
             case "kill":
                 for pid in argv[argv.index("-s") + 2 :] if "-s" in argv else argv[1:]:
@@ -496,6 +528,7 @@ class FakeHost:
                 if target in self.stuck_mounts:
                     return CmdResult(1, "", "busy")
                 self.mounts.pop(target, None)
+                self.mount_ids.pop(target, None)  # mounted again, it is another mount
                 return CmdResult(0)
             case "rm" if "-rf" in argv:
                 writable(argv[-1])  # root removes what is read-only; this user must make it writable first
