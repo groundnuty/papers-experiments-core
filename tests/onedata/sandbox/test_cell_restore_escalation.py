@@ -5,6 +5,7 @@ verdict is `agent`. Every other freed survivor is `mount_aborted` and ends the r
 record the rules do not know ends it too."""
 
 import dataclasses
+import threading
 
 import pytest
 from deadline_support import Clock, Processes, escalation, steps
@@ -22,17 +23,22 @@ INFRA = {"verdict": "infrastructure", "why": "space_not_held_down", "target": No
 
 
 class Diagnosing(Processes):
-    """A tracker that can say what its wedged process waits on, and keeps what it was asked and given."""
+    """A tracker that can say what its wedged process waits on, and keeps what it was asked and given. Unless
+    `covering` is False its answer holds a `reading` with an entry (`pid`, `start`) for each process it was given."""
 
-    def __init__(self, *args, found=None, raises: bool = False, **kwargs) -> None:
+    def __init__(self, *args, found=None, raises: bool = False, covering: bool = True, hang=None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.found, self.raises, self.asked = found, raises, []
+        self.found, self.raises, self.covering, self.hang, self.asked = found, raises, covering, hang, []
 
     def diagnose(self, left: list[dict], timeout_s: float):
         self.asked.append(([p["pid"] for p in left], timeout_s))
+        if self.hang is not None:
+            self.hang.wait(30)  # a read that never returns, until the test lets it go
         if self.raises:
             raise OSError("/proc could not be read")
-        return self.found
+        if self.found is None or not self.covering:
+            return self.found
+        return {**self.found, "reading": [{"pid": p["pid"], "start": p["start"]} for p in left]}
 
 
 def freed_by_the_abort(clock: Clock, procs: Processes, **fields):
@@ -83,8 +89,10 @@ def test_o97_the_attribution_and_the_diagnostics_are_read_before_the_abort_and_r
     attribute = attribute_as(AGENT)
     esc, calls = freed_by_the_abort(clock, procs, restorable=True, attribute=attribute)
     record = deadline.enforce(procs, esc)
-    assert procs.asked == [([12], pytest.approx(esc.margin_s - 3.0, abs=0.5))]
-    assert attribute.seen == [found]  # the attribution sees the whole reading
+    assert procs.asked == [([12], deadline.DIAGNOSE_S)]  # the least of its own bound and the margin left
+    assert attribute.seen == [
+        {**found, "reading": [{"pid": 12, "start": "12"}]}
+    ]  # the attribution sees the whole reading
     assert record["survivors"] == found["survivors"]
     assert record["survivors_cut"] == 0
     assert record["connection"] == {"fusectl": "writable"}
@@ -179,14 +187,15 @@ def test_o97_an_attribution_that_raises_is_infrastructure_and_the_abort_still_ru
 
 
 def test_o97_a_diagnosis_that_raises_is_recorded_and_attributed_to_nobody():
-    """O97: the tracker's `diagnose` raising is a `raised` step; the attribution then gets no reading (None) and is
-    asked for its verdict all the same, which fails closed; the abort still runs and frees the cell."""
+    """O97: the tracker's `diagnose` raising is a `raised` step; with no reading the verdict is `infrastructure` and
+    the attribution is never asked; the abort still runs and frees the cell."""
     clock = Clock()
     procs = Diagnosing({12: "reader"}, wedged=(12,), raises=True)
     attribute = attribute_as(INFRA)
     esc, calls = freed_by_the_abort(clock, procs, restorable=True, attribute=attribute)
     record = deadline.enforce(procs, esc)
-    assert attribute.seen == [None]
+    assert attribute.seen == []
+    assert record["attribution"] == {"verdict": "infrastructure", "why": deadline.UNKNOWN_BLOCK}
     assert [c[0] for c in calls] == ["abort"]
     raised = [s for s in record["steps"] if s["step"] == "raised"]
     assert [(s["during"], s["error"]) for s in raised] == [("diagnosis", "the diagnosis raised OSError")]
@@ -297,3 +306,84 @@ def test_o97_mount_restored_is_not_an_outcome_the_escalation_decides_and_is_not_
     assert deadline.MOUNT_RESTORED not in deadline.ESCALATED
     assert deadline.MOUNT_RESTORED in deadline.RECORDED
     assert deadline.MOUNT_ABORTED in deadline.ESCALATED
+
+
+# --------------------------------------------------------------------------- the diagnosis is bounded and never alone
+def test_o97_a_diagnosis_that_never_returns_is_given_up_on_and_the_abort_still_runs():
+    """O97: a read of `/proc/<pid>/mem` of a survivor in D can wait for ever on its mmap lock. The diagnosis runs in a
+    thread that is joined for its seconds and given up on: the step `diagnosis_timed_out`, no reading, so the
+    verdict is `infrastructure` and the attribution is never asked, and the abort still frees the cell."""
+    clock, release = Clock(), threading.Event()
+    procs = Diagnosing({12: "reader"}, wedged=(12,), found={"survivors": []}, hang=release)
+    attribute = attribute_as(AGENT)
+    esc, calls = freed_by_the_abort(clock, procs, restorable=True, attribute=attribute, diagnose_s=0.2)
+    try:
+        record = deadline.enforce(procs, esc)
+    finally:
+        release.set()
+    assert steps(record) == ["kill", "survived", "diagnosis_timed_out", "abort", "ended"]
+    assert record["steps"][2]["budget_s"] == pytest.approx(0.2)
+    assert attribute.seen == []
+    assert record["attribution"] == {"verdict": "infrastructure", "why": deadline.UNKNOWN_BLOCK}
+    assert [c[0] for c in calls] == ["abort"]
+    assert record["outcome"] == deadline.MOUNT_ABORTED
+    assert "restore" not in record
+
+
+def test_o97_a_diagnosis_is_never_given_the_time_the_abort_and_the_second_grace_need(monkeypatch):
+    """O97: the budget is the least of `diagnose_s` and the margin left less the grace and the abort's reserve; with
+    nothing left of it the diagnosis does not run, the step says so, and the abort still has its time."""
+    clock = Clock()
+    procs = Diagnosing({12: "reader"}, wedged=(12,), found={"survivors": []})
+    esc, calls = freed_by_the_abort(clock, procs, restorable=True, attribute=attribute_as(AGENT))
+    record = deadline.enforce(procs, esc)
+    (_, given) = procs.asked[0]
+    assert given == min(esc.diagnose_s, esc.margin_s - 3.0 - esc.grace_s - deadline.ABORT_RESERVE_S)
+    assert given <= deadline.DIAGNOSE_S
+    assert calls[0][1] >= esc.grace_s + deadline.ABORT_RESERVE_S  # the abort is given what the diagnosis left
+
+    spent = Diagnosing({12: "reader"}, wedged=(12,), found={"survivors": []})
+    esc, _ = freed_by_the_abort(clock, spent, restorable=True, attribute=attribute_as(AGENT), diagnose_s=1000.0)
+    monkeypatch.setattr(deadline, "ABORT_RESERVE_S", 1000.0)  # the abort's reserve is more than the margin has
+    record = deadline.enforce(spent, esc)
+    assert spent.asked == []
+    assert record["steps"][2]["step"] == "diagnosis_timed_out"
+    assert record["steps"][2]["why"] == "no time was left for it"
+
+
+@pytest.mark.parametrize(
+    "reading",
+    [
+        pytest.param(None, id="no reading at all"),
+        pytest.param([], id="an empty reading"),
+        pytest.param([{"pid": 99, "start": "99"}], id="a reading of another process"),
+        pytest.param([{"pid": 12}], id="an entry with no start"),
+        pytest.param([{"start": "12"}], id="an entry with no pid"),
+        pytest.param([{"pid": 12, "start": "13"}], id="an entry of the pid's reuse"),
+        pytest.param([{"pid": 12, "start": "12"}, "x"], id="an entry that is no mapping"),
+        pytest.param("x", id="a reading that is no list"),
+    ],
+)
+def test_o97_a_diagnosis_that_does_not_cover_every_survivor_is_infrastructure_and_never_attributed(reading):
+    """O97: the attribution is asked only when the reading holds an entry, with its `pid` and its `start`, for every
+    process the deadline listed. Anything less, a reading of other processes or of a reused pid included, is
+    `infrastructure` and the attribution function is never called."""
+    clock = Clock()
+    found = {"survivors": [], **({} if reading is None else {"reading": reading})}
+    procs = Diagnosing({12: "reader"}, wedged=(12,), found=found, covering=False)
+    attribute = attribute_as(AGENT)
+    esc, _ = freed_by_the_abort(clock, procs, restorable=True, attribute=attribute)
+    record = deadline.enforce(procs, esc)
+    assert attribute.seen == []
+    assert record["attribution"] == {"verdict": "infrastructure", "why": deadline.UNKNOWN_BLOCK}
+    assert "restore" not in record
+
+
+def test_o97_the_reading_is_never_recorded_beside_the_capped_survivors():
+    """O97: `reading` carries pids and start ticks for the verdict alone; the record keeps the capped `survivors`."""
+    clock = Clock()
+    procs = Diagnosing({12: "reader"}, wedged=(12,), found={"survivors": [{"comm": "reader"}], "survivors_cut": 0})
+    esc, _ = freed_by_the_abort(clock, procs, restorable=True, attribute=attribute_as(AGENT))
+    record = deadline.enforce(procs, esc)
+    assert "reading" not in record
+    assert record["survivors"] == [{"comm": "reader"}]
