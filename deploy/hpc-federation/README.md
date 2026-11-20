@@ -1687,7 +1687,11 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   not started, over 7 (unless the site trusts the queue, below); its inodes, the 95% line less the usage less one whole estimate for every member whose data is
   not all there yet (not linked and verified), over the estimate; and the declared `allowance_units` less every member
   made at its whole `--time` times `rate_units_per_hour`, over one more whole `--time` (no code reads a grant: set it
-  very high where core-hours do not bind). An up waiting past `queue_stall_s` (900 s), an add still running there, or
+  very high where core-hours do not bind). A member whose down is verified and whose end the ledger proves counts only
+  what its jobs billed, from their start (the job end recorded at its join less one whole `--time`) to that proven end
+  (C60); one that never joined, or whose end is not proven yet, keeps its whole `--time`. An up waiting past `queue_stall_s` (900 s), an add still running there, a retirement
+  planned or still running there (C62: its down takes the fleet's lifecycle lock, which an add holds through its
+  whole up, so an add beside it would starve the down), or
   a quota that cannot be read leave no room. **The login node's memory** binds too where the site declares
   `login_memory_mb` (the account's per-user cgroup there; its OOM kills are silent): each relay beating on this login
   node takes `relay_mb` (40: about 28 MB measured idle, with margin), each up in flight `up_mb` (256) and each

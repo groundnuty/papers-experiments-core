@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import control_support
 import pytest
 from control_site_support import FakeSite, Job
 from elastic_support import ENVIRONMENT, FINGERPRINT, FakeClock, config, plan
@@ -252,3 +253,14 @@ def test_c53_priority_holds_back_every_add_and_a_compose_join_and_nothing_else(d
     assert deploy.fleetshare.deferrable(join("vm"), sites)
     assert not deploy.fleetshare.deferrable(join("hpc"), sites)
     assert not deploy.fleetshare.deferrable(Drain("vm", "fed-1", "vm-fed-1", "idle"), sites)
+
+
+def test_c60_a_sharing_controllers_held_units_count_a_downed_member_at_what_it_billed(deploy):
+    """C60: what a sharing controller writes that it holds of a site counts its members as its own allowance does: a
+    downed member the ledger shows ended at what it billed (2 h here), the others and each Add on its way whole."""
+    cs = control_support
+    members = [cs.member("fed-1"), cs.member("fed-2", status="down", state=None)]
+    ended = cs.joined("fed-2", end_in_s=9 * cs.HOUR, ended_at=cs.NOW - cs.HOUR, end_proof="cancelled")
+    federations = {f.label: f for f in (cs.joined("fed-1"), ended)}
+    held = deploy.fleetshare.usage(cs.settings(), cs.site(members=members), 1, federations)
+    assert held == {"members": 2, "units": 47.0 * 12 + 47.0 * 2 + 47.0 * 12}
