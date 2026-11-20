@@ -1760,6 +1760,21 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   J,J --job-end EPOCH --kill-wait S --fingerprint F --environment-file IDENTITY.json` (the ledger keeps the digest of
   the environment identity, as step 4's merge checks it), and `settle --ledger L --lease N --spend-micro S
   --source root|pulled --attempts N` (a settle always carries the store's charged attempts).
+- **An operator's pause of one model** (C55). `python -m expcore.campaign.elastic pause LEDGER --model M --reason TEXT
+  --actor NAME` stops new leases of model M at once (a provider's 429 or 5xx burst, a bad deployment, a key problem)
+  and `resume` lifts it; both run beside the controller, under the ledger file's own write lock (never the
+  controller's), and write one event each to the ledger, nothing else. Leases already out run on and settle as usual;
+  `resume` lifts only this pause, so a model paused by an undeclared fingerprint stays paused until `declare`. **Only a
+  controller at this commit or later honours a pause; an older controller opens the ledger and keeps leasing the
+  model.** So a controller of this core holds a second lock, on `<ledger file>.pause-aware` beside the ledger file, for as
+  long as it runs (the kernel drops it with the process), and `pause` reads it: it refuses, and writes nothing, while
+  a live controller does not hold it (restart that controller on this core, then pause; a controller only now starting
+  reads as older for a moment, so run the command again), writes with a warning when no controller holds the ledger
+  (whichever starts next must be at this commit or later) or the locks cannot be read, and `status` warns when a pause
+  is in force and the live controller is older. The controller still counts a paused model's pending runs as demand, as
+  for C48's pause, so its federations stay up through the pause; once the other models' runs of the current set are
+  done they idle until the model is resumed, since no federation is sent ahead to a later set. Federations, nodes and
+  workers never read the pause.
 - **The sites file** (`--sites`, TOML): `[controller]` with `evidence` (absolute: each retired member's root evidence),
   `interval_s` and `log` (the JSON log: one line per tick with the targets, limits, queue waits and actions, and one
   per result); one `[[site]]` per site with `label` (an operator's label, never a site's name), `fleet` (one site's

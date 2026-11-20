@@ -29,15 +29,16 @@
 - `pause LEDGER --model M --reason TEXT --actor NAME`: stop new leases of model M at once (a provider's 429 or 5xx
   burst, a bad deployment, a key problem). Leases already out run on and settle as usual; M's pending runs wait, and no
   federation is sent ahead to a later set. Refused for a model with no runs in the ledger and for one an operator
-  already paused. It is an append-only event (C55); nothing already in the ledger changes.
+  already paused. It is an append-only event (C55); nothing already in the ledger changes. Only a controller of this
+  core honours it (an older one keeps leasing the model), so it is refused, writing nothing, while a live controller
+  does not say it does (`awareness`), and written with a warning when no controller holds the ledger.
 - `resume LEDGER --model M --reason TEXT --actor NAME`: lift an operator's pause of M. It lifts only that pause: a model
   that an undeclared fingerprint also pauses (C48) stays paused until `declare`, and `resume` says so. Refused for a
   model no operator paused. `status` shows each operator pause with its time, actor and reason, and the log of both.
 
 `status`, `raise-ceiling`, `set-cap`, `declare`, `pause` and `resume` work on the ledger file under its own write lock
 and not the dispatcher's, so they run while a dispatcher holds the ledger, and the dispatcher's next lease reads a
-raise, a cap, a declaration or a pause. The process that issues leases must run a core that has `pause`: an older one
-opens the ledger and leases the model as before. Exit status: 0
+raise, a cap, a declaration or a pause. Exit status: 0
 done, 1 refused by the ledger (or, for `create`, by the study: not loadable, or code that is not known), 2 a usage
 error or a file that is not a ledger.
 """
@@ -51,6 +52,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from expcore.campaign.elastic.awareness import AWARE, NONE, OLDER, controller_of
 from expcore.campaign.elastic.caps import set_in_file
 from expcore.campaign.elastic.ceilings import raise_in_file
 from expcore.campaign.elastic.config import MICRO, LedgerConfig, lease_grant_usd, ledger_runs, micro_down
@@ -222,7 +224,13 @@ def _create(args: argparse.Namespace) -> int:
 def _status(args: argparse.Namespace) -> int:
     reader = LedgerReader(args.ledger)
     try:
-        print(format_status(reader.status()))
+        status = reader.status()
+        print(format_status(status))
+        if status.operator_pauses and controller_of(args.ledger) == OLDER:
+            print(
+                "warning: the controller that holds this ledger does not say it honours operator pauses: it runs a "
+                "core older than the pause and keeps leasing the paused model(s); restart it on this commit or later"
+            )
         for platform, environment in sorted(reader.platform_environments().items()):  # C50: one pin per platform
             print(f"platform {platform}: environment {environment}")
     finally:
@@ -250,12 +258,33 @@ def _declare(args: argparse.Namespace) -> int:
     print(f"declared model {found.model}: {_value(found.fingerprint)} (declaration #{found.declaration_id})")
     if paused:
         print(f"model {found.model} stays paused: undeclared fingerprint(s) seen: {', '.join(map(_value, paused))}")
+    reader = LedgerReader(args.ledger)
+    try:
+        operator = reader.operator_pauses().get(found.model)
+    finally:
+        reader.close()
+    if operator is not None:  # C55: declaring lifts only C48's pause
+        print(f"model {found.model} stays paused by an operator: {operator.reason} (`resume` lifts it)")
     return 0
 
 
+_NO_CONTROLLER = (
+    "warning: no controller holds this ledger: the pause is written, but a controller older than this commit would "
+    "ignore it, so whichever controller starts next must run this commit or later"
+)
+_UNKNOWN_CONTROLLER = (
+    "warning: could not tell whether a controller holds this ledger: the pause is written, but a controller older "
+    "than this commit ignores it and keeps leasing the model; restart any such controller on this commit or later"
+)
+
+
 def _pause(args: argparse.Namespace) -> int:
-    entry = pause_in_file(args.ledger, args.model, args.reason, args.actor)
+    entry, controller = pause_in_file(args.ledger, args.model, args.reason, args.actor)
     print(f"paused model {entry.model}: no new lease until an operator resumes it (event #{entry.event_seq})")
+    if controller == AWARE:
+        print("the controller that holds the ledger honours it from its next lease")
+    else:
+        print(_NO_CONTROLLER if controller == NONE else _UNKNOWN_CONTROLLER, file=sys.stderr)
     return 0
 
 

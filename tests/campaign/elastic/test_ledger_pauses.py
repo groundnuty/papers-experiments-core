@@ -25,6 +25,8 @@ def _tables(ledger):
     """Every table of the file with its rows, as the file holds them."""
     db = ledger.db
     names = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name!='sqlite_sequence'")]
+    # sqlite_sequence is left out: SQLite moves the events table's autoincrement counter with every event appended
+    # (the guard's tests check it)
     return {name: [tuple(r) for r in db.execute(f"SELECT * FROM {name} ORDER BY rowid")] for name in sorted(names)}
 
 

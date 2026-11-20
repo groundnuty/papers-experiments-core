@@ -4,8 +4,9 @@
 An operator stops new leases of one model at once (a provider's 429 or 5xx burst, a bad deployment, a key problem)
 with `pause`, and lifts it with `resume`. Each is a row of the ledger's own `events` log (`operator_pause`,
 `operator_resume`) with the model, the reason and the actor in its detail and the time as the event's: no table and no
-column is added, the pinned configuration, the fingerprints and every earlier row stay as they were, and the schema
-the file declares is the one it had. An operator pause is in force for a model while its latest such event is a
+column is added, the pinned configuration, the fingerprints and every earlier row stay as they were (SQLite's own
+autoincrement counter of the events table moves, as with every event), and the schema the file declares is the one it
+had. An operator pause is in force for a model while its latest such event is a
 pause; the ledger reads that from the file at every lease, so a pause from another process (the operator's command,
 which does not take the dispatcher's lock) is seen by the next lease.
 
@@ -14,7 +15,9 @@ set); leases already out run to their end and settle as usual. The pause is inde
 the operator's, and a model that an undeclared fingerprint also pauses stays paused until `declare`.
 
 A core that does not know these events opens such a ledger without error and leases the model as before: it reads the
-events by kind and ignores the two. So the process that issues leases must run a core that does.
+events by kind and ignores the two. So the process that issues leases must run a core that does, and `pause_in_file`
+(the command) reads whether the controller that holds the ledger says it does (`awareness`) and refuses to write to
+one that does not.
 """
 
 import json
@@ -23,7 +26,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from expcore.campaign.elastic import declarations, schema
+from expcore.campaign.elastic import awareness, declarations, schema
 from expcore.campaign.elastic.ceilings import text_of
 from expcore.campaign.elastic.records import LedgerError, OperatorPause, PauseRefused
 
@@ -107,15 +110,26 @@ def _latest(db: sqlite3.Connection) -> OperatorPause:
 
 def pause_in_file(
     path: Path, model: str, reason: str, actor: str, *, clock: Callable[[], float] = time.time
-) -> OperatorPause:
+) -> tuple[OperatorPause, str]:
     """Pause a model in the ledger file at `path` without its dispatcher lock, for an operator while a dispatcher runs:
-    one transaction under the file's own write lock, which the dispatcher's next issue reads."""
+    one transaction under the file's own write lock, which the dispatcher's next issue reads. Refused
+    (`PauseRefused`, nothing written) while a live controller does not declare that it honours pauses, since it would
+    keep leasing the model. Return the entry and the controller's state (`awareness`): `aware` (it honours it),
+    `none` (no controller holds the ledger: the next one must honour pauses) or `unknown` (the locks could not be
+    read)."""
+    controller = awareness.controller_of(path)
+    if controller == awareness.OLDER:
+        raise PauseRefused(
+            f"a controller holds this ledger and does not say it honours operator pauses: it runs a core older than "
+            f"the pause and would keep leasing model {model}. Restart it on this commit or later, then pause (a "
+            "controller only now starting reads as older for a moment: run the command again)"
+        )
     db = schema.connect(path)
     try:
         if db.execute("SELECT value FROM meta WHERE key='config'").fetchone() is None:
             raise ValueError(f"{path} holds no ledger configuration")
         with schema.transaction(db):
-            return pause(db, clock(), model, reason, actor)
+            return pause(db, clock(), model, reason, actor), controller
     finally:
         db.close()
 

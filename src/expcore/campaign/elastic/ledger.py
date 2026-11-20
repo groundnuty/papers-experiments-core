@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.elastic import attempts, caps, ceilings, declarations, pauses, schema, settling
+from expcore.campaign.elastic.awareness import PauseAwareMark
 from expcore.campaign.elastic.choice import InFlight, Pending, choose
 from expcore.campaign.elastic.config import LedgerConfig, LedgerRun, check_plan, micro_up
 from expcore.campaign.elastic.records import (
@@ -75,6 +76,7 @@ class Ledger(LedgerViews):
     def __init__(self, path: Path, lock: DispatchLock, clock: Callable[[], float]) -> None:
         self.path = path
         self._lock = lock
+        self._aware = PauseAwareMark(path)  # taken once the ledger is open: this core honours operator pauses
         self._clock = clock
         try:
             self.db = schema.connect(path)
@@ -89,6 +91,7 @@ class Ledger(LedgerViews):
         except BaseException:
             self.close()
             raise
+        self._aware.acquire()  # C55: an operator's `pause` is written only to a controller that says it honours it
         self._fingerprint = self.config.fingerprint
         self._opened_at = clock()
         self._last_read: dict[str, float] = {}  # site -> when it was last read since this open; never persisted
@@ -131,6 +134,7 @@ class Ledger(LedgerViews):
         try:
             self.db.close()
         finally:
+            self._aware.release()
             self._lock.release()
 
     # --- transactions -----------------------------------------------------------------------------------------
