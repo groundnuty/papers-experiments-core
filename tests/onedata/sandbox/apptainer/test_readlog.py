@@ -26,6 +26,7 @@ from expcore_onedata.readlog import facts, files, paths
 from expcore_onedata.readlog.instrument import ReadLog
 from expcore_onedata.sandbox.api import ReadOnlyInput, SandboxError, StartRefused
 from expcore_onedata.sandbox.apptainer import argv as AV
+from expcore_onedata.sandbox.apptainer.collect import Collection
 from expcore_onedata.sandbox.hostops import CmdResult
 
 LOG = "readlog.jsonl"  # the collector's own log, in `readlog/`
@@ -319,6 +320,32 @@ def test_o91_a_log_that_holds_the_token_is_removed_and_fails_the_collection(node
         assert failed.value.kind == "output_collection"
         assert not (tmp_path / "out" / COPY).exists()
         assert box.read_log() is None
+    finally:
+        box.stop()
+
+
+def _no_scan(*_args, **_kwargs):
+    raise OSError("injected scan error")
+
+
+@pytest.mark.parametrize("how", ["token", "scan_error"])
+def test_c63_the_read_log_is_copied_and_exposed_only_after_its_scan(node, settings, tmp_path, monkeypatch, how):
+    """C63, O91, O05: a collection that fails in its scan, by the token found in the read log or by a scan that could
+    not run, has written no copy of the log and handed on none of its bytes: the copy was once written, and the bytes
+    set, before the scan, so a failure between left an unscanned log in the evidence directory."""
+    box = start(node, settings)
+    try:
+        with open(box.dir / "readlog" / LOG, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"event": "leak", "value": TOKEN}) + "\n")
+        if how == "scan_error":
+            monkeypatch.setattr(Collection, "_scan", _no_scan)
+        with pytest.raises(InfraError if how == "token" else OSError):
+            box.collect(tmp_path / "out")
+        assert not (tmp_path / "out" / COPY).exists()
+        assert box.read_log() is None
+        for path in (tmp_path / "out").rglob("*"):
+            if path.is_file():
+                assert TOKEN.encode() not in path.read_bytes(), path
     finally:
         box.stop()
 
