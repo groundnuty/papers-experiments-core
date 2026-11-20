@@ -301,6 +301,14 @@ class PlatformConfig:
         """Name a declared provider for a message by its position in the file, `providers[i]`, never by its name."""
         return f"providers[{list(self.providers).index(name)}]"
 
+    def space_holders(self) -> dict[str, str]:
+        """Each space's data provider, for the sandbox's attribution of a blocked read (O97): the space's name as the
+        mount shows it (the first component under the mount) to its holder's label, `providers[i]`, never its name. A
+        space with no holder (the one-space form declares none) is left out, so a block on it is never attributed."""
+        return {
+            entry.space.name: self.provider_label(entry.holder) for entry in self.spaces if entry.holder is not None
+        }
+
     def provider_labels(self, names: Iterable[str]) -> str:
         """Name several declared providers, in the file's order, joined for a message."""
         order = list(self.providers)

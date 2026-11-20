@@ -164,6 +164,21 @@ def test_o05_each_data_path_gets_a_read_only_token_of_its_own_interface_minted_b
     assert "token" not in json.dumps(sandbox.metadata()["data_path_token"]).lower().replace("data_path_token", "")
 
 
+def test_o97_a_mount_runs_spec_carries_the_platforms_map_of_each_spaces_data_provider(stage, monkeypatch):
+    """O97: the launch gives a mount run the space-to-holder map its attribution needs, from the platform."""
+    held = {"orchard": "providers[1]"}
+    monkeypatch.setattr(type(stage.config), "space_holders", lambda self: dict(held))
+    sandbox, _ = run_launch(stage, "mounted")
+    assert dict(sandbox.spec.space_holders) == held
+
+
+def test_o97_a_run_with_no_mount_has_no_holder_map(stage, monkeypatch):
+    """O97: a REST run has no mount to block on, so its spec carries no map."""
+    monkeypatch.setattr(type(stage.config), "space_holders", lambda self: {"orchard": "providers[1]"})
+    sandbox, _ = run_launch(stage, "via-gate")
+    assert dict(sandbox.spec.space_holders) == {}
+
+
 @pytest.mark.parametrize(("level", "listing"), [(COMPLETE_LEVEL, "complete"), ("via-gate", "paged"), ("mounted", None)])
 def test_o21_the_launch_gives_a_run_the_listing_mode_its_level_selects(stage, level, listing):
     """O21: a study selects the listing mode per condition through the level of its data path; the launch gives the
