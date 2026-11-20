@@ -6,9 +6,12 @@ attempt was done breaks it. A pending run whose streak reaches the bound becomes
 and a late completion of its latest lease is superseded.
 """
 
+import json
+
 from elastic_support import (
     HARD_TERM_S,
     SITE,
+    FakeClock,
     archive,
     assert_invariants,
     completion,
@@ -20,7 +23,7 @@ from elastic_support import (
     plan,
 )
 
-from expcore.campaign.elastic import LedgerConfig, SiteReading, Wait
+from expcore.campaign.elastic import Ledger, LedgerConfig, SiteReading, Wait
 from expcore.campaign.elastic.__main__ import format_status
 from expcore.campaign.elastic.streaks import STREAK_ENDED
 
@@ -148,15 +151,24 @@ def test_c58_unset_a_long_uncharged_loop_keeps_leasing_the_run_as_today(tmp_path
     assert_invariants(ledger)
 
 
-def test_c58_unset_the_pinned_configuration_is_the_text_it_was_before_the_field(tmp_path):
-    """C58: a ledger made without the bound pins the configuration's text of before; one made with it keeps it."""
-    unset = config().to_json()
-    assert "max_infra_streak" not in unset
-    assert LedgerConfig.from_json(unset).max_infra_streak is None
-    bound = config(max_infra_streak=3)
-    assert LedgerConfig.from_json(bound.to_json()) == bound
+def test_c58_the_configurations_text_is_the_one_of_before_and_the_bound_has_a_meta_row_of_its_own(tmp_path):
+    """C58: the bound is never in the configuration's text, so a core without the field still parses a bounded
+    ledger's (a controller reading a sibling's to defer to it, C53, would otherwise read it as unreadable and add
+    nothing); it is pinned in its own meta row, read back when the ledger is opened again, and absent when unset."""
+    unset, bound = config(), config(max_infra_streak=3)
+    assert bound.to_json() == unset.to_json()
+    assert "max_infra_streak" not in json.loads(bound.to_json())
+    assert unset.meta_rows() == {"config": unset.to_json()}
+    assert bound.meta_rows() == {"config": unset.to_json(), "max_infra_streak": "3"}
+    assert LedgerConfig.from_json(unset.to_json()).max_infra_streak is None
+    assert LedgerConfig.from_json(bound.to_json(), "3") == bound
     ledger, _ = make(tmp_path, **BOUND)
-    assert ledger.config.max_infra_streak == 3
+    path = ledger.path
+    ledger.close()
+    reopened = Ledger.open(path, clock=FakeClock())
+    assert reopened.config.max_infra_streak == 3
+    assert reopened._meta("config") == unset.to_json()
+    reopened.close()
 
 
 def test_c58_status_shows_each_run_lost_by_its_streak(tmp_path):

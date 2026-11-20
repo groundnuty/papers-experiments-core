@@ -207,6 +207,43 @@ def test_c45_a_run_exhausted_while_a_lease_of_it_is_unsettled_is_refused(base, f
     )
 
 
+def test_c58_a_run_lost_by_its_infrastructure_streak_is_merged_analysed_and_reported_as_exhausted(base, fleet):
+    """C58: the fleet's ledger with the bound pinned and its exhausted run lost by its streak instead (its event showing
+    3 at the bound): the merge lists it as exhausted with its streak, check, analysis and report pass, the export holds
+    it exhausted and never analysed with the streak as its last reason, and the balance counts no federation lost."""
+    ledger = base / "streak-ledger" / "ledger.sqlite"
+    ledger.parent.mkdir()
+    shutil.copyfile(fleet.ledger_file, ledger)
+    detail = {"streak": 3, "infra_kind": "budget_hold", "max_infra_streak": 3, "reason": "three in a row"}
+    db = sqlite3.connect(ledger)
+    try:
+        db.execute("INSERT INTO meta(key, value) VALUES('max_infra_streak', '3')")
+        db.execute("UPDATE runs SET state='infra_streak' WHERE run_key=?", (fleet.exhausted,))
+        db.execute(
+            "INSERT INTO events(at, kind, run_key, lease_id, detail) VALUES(?, 'infra_streak', ?, ?, ?)",
+            (2e9, fleet.exhausted, fleet.exhausted_leases[-1], json.dumps(detail, sort_keys=True)),
+        )
+        db.commit()
+    finally:
+        db.close()
+    campaign = Campaign(by_run_study(base, "streak"))
+    campaign.codes["merge"], errors = fleet.merge(campaign, fleet.outs(fleet.superseded, fleet.lost), ledger)
+    assert campaign.codes["merge"] == 0, errors
+    finish(fleet.env, campaign)
+    assert campaign.codes == {"merge": 0, "check": 0, "analyze": 0, "report": 0}
+    (entry,) = document_of(campaign)["exhausted"]
+    assert (entry["run_key"], entry["infra_streak"], entry["infra_kind"]) == (fleet.exhausted, 3, "budget_hold")
+    export = campaign.read("export.json")
+    (listed,) = [e for e in export["exhausted_runs"] if e["run_key"] == fleet.exhausted]
+    assert listed[LOST_KEY_FLAG] is False
+    assert listed["reasons"][-1] == (
+        "infrastructure streak: 3 consecutive infrastructure attempts, the last of kind budget_hold"
+    )
+    assert fleet.exhausted not in {e["run_key"] for e in export["analysed_attempts"]}
+    models = campaign.read("analysis.json")["balance"]["models"]
+    assert all(n == 0 for model in models for counts in model["exhausted_by_loss"].values() for n in counts.values())
+
+
 # --- the evidence ---------------------------------------------------------------------------------------------------
 
 

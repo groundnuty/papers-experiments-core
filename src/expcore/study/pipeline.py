@@ -1203,24 +1203,31 @@ def _export_of(verified: VerifiedBatch, plan: Manifest) -> dict[str, Any]:
 def _lost_runs(exhausted: Sequence[Mapping[str, Any]], plan: Manifest) -> dict[str, dict[str, Any]]:
     """The runs merge.json lists as exhausted for their lost leases, as a store's export lists an exhausted run: its
     identity from the plan, its charged attempts, a reason per lease, an admission unknown per attempt, and its last
-    lease's id, federation and site (C45)."""
+    lease's id, federation and site (C45). A run the ledger lost by its infrastructure streak (C58) is no federation
+    lost: its `lost_federation` is false, and its last reason names the streak and its last kind."""
     rows = {row.key.text: row for row in plan.rows}
     found = {}
     for entry in exhausted:
         key = rows[entry["run_key"]].key
+        streak, named = entry.get("infra_streak"), []
+        if streak is not None:
+            kind = entry.get("infra_kind")
+            named.append(
+                f"infrastructure streak: {streak} consecutive infrastructure attempts, the last of kind {kind}"
+            )
         found[key.text] = {
             "run_key": key.text,
             "digest": key.digest,
             "condition": entry["condition"],
             "factors": dict(key.factors),
             "attempts": entry["attempts"],
-            "reasons": list(entry["reasons"]),
+            "reasons": [*entry["reasons"], *named],
             "admissions": [None] * entry["attempts"],
             "lease_id": entry["lease_id"],
             FEDERATION_KEY: entry["federation"],
             SITE_KEY: entry["site"],
             **({PLATFORM_KEY: entry[PLATFORM_KEY]} if PLATFORM_KEY in entry else {}),  # C50: a declared platform
-            LOST_KEY_FLAG: True,
+            LOST_KEY_FLAG: streak is None,
         }
     return found
 

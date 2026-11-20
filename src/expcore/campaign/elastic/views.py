@@ -13,7 +13,7 @@ from typing import Any
 from expcore.campaign.elastic import caps as cap_table
 from expcore.campaign.elastic import declarations, pauses, schema
 from expcore.campaign.elastic.ceilings import effective, history
-from expcore.campaign.elastic.config import PRIOR_RUNS, LedgerConfig
+from expcore.campaign.elastic.config import PRIOR_RUNS, STREAK_META, LedgerConfig
 from expcore.campaign.elastic.records import (
     HELD,
     CapChange,
@@ -267,7 +267,7 @@ class LedgerReader(LedgerViews):
             pinned = self._meta("config")
             if pinned is None:
                 raise ValueError(f"{path} holds no ledger configuration")
-            self.config = LedgerConfig.from_json(pinned)
+            self.config = LedgerConfig.from_json(pinned, self._meta(STREAK_META))
         except BaseException:
             self.db.close()
             raise

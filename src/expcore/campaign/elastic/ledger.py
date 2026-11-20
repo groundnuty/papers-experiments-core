@@ -49,7 +49,7 @@ from typing import Any
 from expcore.campaign.elastic import attempts, caps, ceilings, declarations, pauses, schema, settling, streaks
 from expcore.campaign.elastic.awareness import PauseAwareMark
 from expcore.campaign.elastic.choice import InFlight, Pending, choose
-from expcore.campaign.elastic.config import LedgerConfig, LedgerRun, check_plan, micro_up
+from expcore.campaign.elastic.config import STREAK_META, LedgerConfig, LedgerRun, check_plan, micro_up
 from expcore.campaign.elastic.records import (
     LIVE,
     PROOFS,
@@ -91,7 +91,7 @@ class Ledger(LedgerViews):
             pinned = self._meta("config")
             if pinned is None:
                 raise ValueError(f"{path} holds no ledger configuration")
-            self._config = LedgerConfig.from_json(pinned)
+            self._config = LedgerConfig.from_json(pinned, self._meta(STREAK_META))
             # C55: an operator's `pause` is written only to a controller that says it honours it
             self._aware.acquire()
             self._fingerprint = self.config.fingerprint
@@ -122,7 +122,7 @@ class Ledger(LedgerViews):
         lock = DispatchLock(path.parent).acquire()
         try:
             rows = [(r.run_key, r.seq, r.model, r.condition, r.set_index) for r in runs]
-            schema.create_file(path, rows, {"config": config.to_json()}, first)
+            schema.create_file(path, rows, config.meta_rows(), first)
         except BaseException:
             lock.release()
             raise

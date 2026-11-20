@@ -35,6 +35,7 @@ SITE_OUT_S = 900.0  # a site unread this long is out: its live leases expire
 HARD_TERM_MARGIN_S = 600.0
 PRIOR_RUNS = 3  # the prior of a cell's expected time counts as this many runs
 _HEX64 = re.compile(r"[0-9a-f]{64}")
+STREAK_META = "max_infra_streak"  # the meta row that pins `LedgerConfig.max_infra_streak` (C58)
 
 
 def micro_down(usd: float) -> int:
@@ -105,8 +106,9 @@ class LedgerConfig:
       any lease of it counted, by default half the wall cap.
     - `max_attempts`: charged attempts a run may use across its counted leases (C03).
     - `max_infra_streak`: consecutive infrastructure attempts, charged or not, across every lease's completion read,
-      that end a run as `infra_streak` (C58, `elastic.streaks`). None: off, and the configuration's text is what it
-      was before the field.
+      that end a run as `infra_streak` (C58, `elastic.streaks`). None: off. It is pinned in a meta row of its own
+      (`STREAK_META`, `meta_rows`), never in the configuration's text, which stays what it was before the field: a
+      core without it parses that text (a controller reading a sibling ledger, C53) and would refuse a key it lacks.
     - `caps`: leases in flight or held back at once, per model; a model not listed has no cap.
     - `max_usd`, `per_model_usd`: the budget and the models' ceilings; None: no budget. `grants_usd`: each model's grant
       (`lease_grant_usd`), required for every planned model when there is a budget.
@@ -163,8 +165,7 @@ class LedgerConfig:
         values = {f.name: getattr(self, f.name) for f in fields(self)}
         if not self.platforms:  # C50: a ledger that declares none pins the text it did before the field
             del values["platforms"]
-        if self.max_infra_streak is None:  # C58: likewise a ledger with no streak bound
-            del values["max_infra_streak"]
+        del values["max_infra_streak"]  # C58: pinned in a meta row of its own (`meta_rows`), never in this text
         return json.dumps(
             {
                 k: dict(v) if isinstance(v, Mapping) else list(v) if isinstance(v, tuple) else v
@@ -173,10 +174,22 @@ class LedgerConfig:
             sort_keys=True,
         )
 
+    def meta_rows(self) -> dict[str, str]:
+        """The meta rows a ledger pins this configuration in: `config`, its text, and the streak bound's own row
+        (`STREAK_META`, C58) when there is one."""
+        bound = {} if self.max_infra_streak is None else {STREAK_META: str(self.max_infra_streak)}
+        return {"config": self.to_json(), **bound}
+
     @classmethod
-    def from_json(cls, text: str) -> "LedgerConfig":
+    def from_json(cls, text: str, streak: str | None = None) -> "LedgerConfig":
+        """The configuration a ledger pinned: its `config` text, and its `STREAK_META` row's text when it has one."""
         values = json.loads(text)
-        return cls(**{**values, "platforms": tuple(values.get("platforms", ()))})
+        bound = None
+        if streak is not None:
+            if not isinstance(streak, str) or not streak.isdigit() or str(int(streak)) != streak:
+                raise ValueError(f"the ledger's {STREAK_META} must be a whole number, got {streak!r}")
+            bound = int(streak)
+        return cls(**{**values, "platforms": tuple(values.get("platforms", ()))}, max_infra_streak=bound)
 
 
 def check_plan(runs: Sequence[LedgerRun], config: LedgerConfig) -> None:

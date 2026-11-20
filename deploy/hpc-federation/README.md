@@ -1800,7 +1800,7 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   workers never read the pause.
 - **A run that only ever fails as infrastructure** (C58). Set `max_infra_streak = 3` under `[scheduler]` in
   campaign.toml before the stamp: it is part of the campaign's fingerprint, and `elastic create` pins it in the
-  ledger's configuration. A lease store then stops its run after 3 infrastructure attempts in a row, charged or not
+  ledger (a meta row of its own, so an older core's controller still reads the ledger as a sibling). A lease store then stops its run after 3 infrastructure attempts in a row, charged or not
   (an uncharged hold would otherwise retry it for as long as the job lives), and the ledger adds every completion's
   streak, superseded ones included (a lease past its hard term is leased again, and its late completion never reaches
   the charged count). At 3 the run is `infra_streak`: never leased again, a line in `status` (`lost by its

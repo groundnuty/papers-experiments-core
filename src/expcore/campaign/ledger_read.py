@@ -34,7 +34,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from expcore.campaign.elastic.config import LedgerConfig
+from expcore.campaign.elastic.config import STREAK_META, LedgerConfig
 from expcore.campaign.elastic.records import HELD, Ceilings, Declaration, Settlement
 from expcore.campaign.elastic.schema import SCHEMA
 from expcore.campaign.elastic.streaks import STREAK_ENDED
@@ -162,7 +162,7 @@ def read_ledger(data: bytes, sha256: str, where: object = LEDGER_SNAPSHOT) -> Le
             meta = {row["key"]: row["value"] for row in db.execute("SELECT key, value FROM meta")}
             if meta.get("schema") != SCHEMA:
                 raise LedgerRefused(f"{where}: not a ledger of {SCHEMA}")
-            config = LedgerConfig.from_json(meta["config"])
+            config = LedgerConfig.from_json(meta["config"], meta.get(STREAK_META))
             runs = {row["run_key"]: _run_row(row) for row in db.execute("SELECT * FROM runs ORDER BY seq")}
             leases = {row["id"]: _lease_row(row) for row in db.execute("SELECT * FROM leases ORDER BY id")}
             joined_on = _platforms(db)
