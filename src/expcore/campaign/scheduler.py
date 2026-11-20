@@ -327,12 +327,14 @@ class Scheduler:
             specs = {m: self.models.resolve(m) for m in self.plan_models}
             # No model is shown held to R yet; an attempt whose usage is unknown is charged the bound its row records
             # it was reserved at dispatch, so the probes find the room the campaign really has (C27).
-            early = BudgetGate(store, specs, cfg.budget, self.agent_config.limits)
+            early = BudgetGate(store, specs, cfg.budget, self.agent_config.limits, single_run=lease is not None)
             early.take_releases(self.stamp())  # a release given for a stopped campaign makes room for its probes
             paying = self._ledger(early)
         held = self._admit_models(paying)  # before the gate: which models are held to the reply maximum (C27)
         if cfg.budget is not None:
-            self.budget = BudgetGate(store, specs, cfg.budget, self.agent_config.limits, reply_capped=held)
+            self.budget = BudgetGate(
+                store, specs, cfg.budget, self.agent_config.limits, reply_capped=held, single_run=lease is not None
+            )  # a lease's store holds one run: no second run to hold for (C64)
             self.ledger = self._ledger(self.budget)
         else:
             store.event(self.stamp(), "budget_gate_off", None, "no budget in this campaign: runs are not held for cost")

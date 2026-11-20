@@ -23,6 +23,12 @@ each lost attempt charged as its row would be, each lost top-up and probe charge
 campaign takes a release before its probes ask (`take_releases`), so a released campaign is not held for want of the
 room the release gave.
 
+A store that holds one run, a lease's (C41), is built with `single_run`: the question "can another run start" has no
+other run to ask about. While its run is in flight, that run is reserved once and no ceiling is asked about a next run
+(`_no_run_left_to_start`); once the run is done nothing is left to ask about either. Before the run starts, and again
+for a run set aside and pending, the run is weighed in full, so a grant below one reservation still starts nothing.
+Top-ups and probes (`refusal`) are weighed as always, against what is reserved and charged (C64).
+
 Cost that cannot be known holds like cost that is over: a model whose price is unknown (no price, not free) is held,
 and so is every model once an attempt of an unpriced model has been charged, because the total spent is then unknown.
 These holds end only when the table is fixed; a release file does not price a model.
@@ -132,12 +138,16 @@ class BudgetGate:
         budget: Budget,
         limits: Limits,
         reply_capped: Collection[str] = (),
+        *,
+        single_run: bool = False,
     ):
         """Take the store, the plan's models, the ceilings and the caps every attempt runs under; refuse a priced model
         with no context window, whose request past the token cap nothing bounds (C25).
 
         `reply_capped` are the models this start of the campaign showed held to the reply maximum (C27); the store's
-        marks take a model off it for the rest of the campaign (`expcore.campaign.reply_cap`).
+        marks take a model off it for the rest of the campaign (`expcore.campaign.reply_cap`). `single_run` is for a
+        store that holds one run, a lease's (C41): it has no second run to ask about, so once its run is in flight, or
+        done, no run is held for want of room (C64).
         """
         windowless = [key for key, spec in models.items() if spec.price is not None and spec.context_tokens is None]
         if windowless:
@@ -146,6 +156,7 @@ class BudgetGate:
                 "request a run makes past its token cap"
             )
         self.store, self.models, self.budget, self.limits = store, models, budget, limits
+        self.single_run = single_run
         self.shown_capped = frozenset(reply_capped)
         self._said: set[release.Refused] = set()  # the refused release lines said already, each once per process
 
@@ -364,6 +375,8 @@ class BudgetGate:
         later = {m: n * reserve[m] for m, n in flying.items() if n and reserve[m] is not None}
         if any(reserve[m] is None for m, n in flying.items() if n):
             return [Hold(ALL, "a run in flight is of a model without a price: the total is unknown", False)]
+        if topup is None and self._no_run_left_to_start(model, flying):
+            return []
         mine = reserve[model] if topup is None else topup
         what = "this run" if topup is None else label
         out = []
@@ -381,6 +394,14 @@ class BudgetGate:
                 Hold(ALL, _over("the campaign", figure, spent, sum(later.values()), mine, total_cap, what), True)
             )
         return out
+
+    def _no_run_left_to_start(self, model: str, flying: Mapping[str, int]) -> bool:
+        """Tell whether a store that holds one run (`single_run`, a lease's) has none left to start: its run is in
+        flight, where it is counted once as reserved, or it is done. No ceiling is asked about a run that cannot come
+        (C64): that run's reservation was weighed when it was admitted, and what it may still charge, a top-up, is
+        weighed against both ceilings by `refusal`, which this does not touch. A run pending and not in flight, a first
+        attempt or one after a costly attempt, is weighed in full."""
+        return self.single_run and (bool(flying.get(model)) or not self.store.pending())
 
     def _record_stops(self, holds: dict, over: dict[str, str], now: str, exact: str) -> dict:
         """Keep the stops in force: a ceiling found over for the first time begins one, given its serial in the
