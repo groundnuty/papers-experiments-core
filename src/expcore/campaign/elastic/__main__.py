@@ -258,11 +258,16 @@ def _declare(args: argparse.Namespace) -> int:
     print(f"declared model {found.model}: {_value(found.fingerprint)} (declaration #{found.declaration_id})")
     if paused:
         print(f"model {found.model} stays paused: undeclared fingerprint(s) seen: {', '.join(map(_value, paused))}")
-    reader = LedgerReader(args.ledger)
-    try:
-        operator = reader.operator_pauses().get(found.model)
-    finally:
-        reader.close()
+    try:  # the declaration is durable: a failed look for an operator's pause must not turn it into an error
+        reader = LedgerReader(args.ledger)
+        try:
+            operator = reader.operator_pauses().get(found.model)
+        finally:
+            reader.close()
+    except (OSError, ValueError, sqlite3.Error) as error:
+        print(f"note: the declaration is recorded; could not read whether an operator's pause also holds the model "
+              f"({type(error).__name__})", file=sys.stderr)  # fmt: skip
+        return 0
     if operator is not None:  # C55: declaring lifts only C48's pause
         print(f"model {found.model} stays paused by an operator: {operator.reason} (`resume` lifts it)")
     return 0

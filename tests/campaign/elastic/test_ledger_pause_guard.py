@@ -4,10 +4,13 @@ beside the dispatcher lock, held until it closes, dropped by the kernel with the
 locks: an older live controller is refused with nothing written, a current one is accepted, none running is written
 with a warning, and a lock that cannot be read is written with its own."""
 
+import sqlite3
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
+import pytest
 from elastic_support import FakeClock, ledger_path, make, plan
 
 from expcore.campaign.elastic import Ledger, LedgerReader
@@ -184,3 +187,73 @@ def test_c55_a_pause_moves_only_sqlites_own_counter_beyond_the_new_event_row(tmp
     assert after.pop("events") == entry.event_seq == before.pop("events", 0) + 1
     assert after == before
     ledger.close()
+
+
+def test_c55_a_controller_that_fails_to_open_or_to_close_never_strands_the_dispatcher_lock(tmp_path, monkeypatch):
+    """C55: a declaration that cannot be made (a warning turned into an error), a clock that raises while the ledger
+    opens, and a declaration whose release raises each leave the dispatcher lock free for the next controller."""
+    _closed(tmp_path)
+    file = ledger_path(tmp_path)
+    root = file.parent
+
+    def lock_is_free():
+        with DispatchLock(root):
+            return True
+
+    mark_path(file).unlink()
+    mark_path(file).mkdir()  # a directory where the declaration file goes: it cannot be made
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(UserWarning, match="operator pauses are refused"):
+            Ledger.open(file, clock=FakeClock())
+    assert lock_is_free()
+    mark_path(file).rmdir()
+
+    def broken_clock():
+        raise RuntimeError("no clock")
+
+    with pytest.raises(RuntimeError, match="no clock"):
+        Ledger.open(file, clock=broken_clock)
+    assert lock_is_free()
+    assert controller_of(file) == NONE
+
+    ledger = Ledger.open(file, clock=FakeClock())
+
+    def refuse(self):
+        raise OSError("cannot unlock")
+
+    monkeypatch.setattr("expcore.campaign.elastic.awareness.PauseAwareMark.release", refuse)
+    with pytest.raises(OSError, match="cannot unlock"):
+        ledger.close()
+    monkeypatch.undo()
+    assert lock_is_free()
+
+
+def test_c55_pause_of_a_file_that_is_not_a_ledger_is_a_usage_error_even_beside_an_older_controller(tmp_path, capsys):
+    """C55: the file is checked before the controller: a name that holds no ledger exits 2, as every command does,
+    where an older controller in the directory would have made it a refusal (1)."""
+    path, _ = _closed(tmp_path)
+    missing = str(ledger_path(tmp_path).with_name("other.sqlite"))
+    with DispatchLock(ledger_path(tmp_path).parent):
+        assert main(["pause", missing, *PAUSE]) == 2
+    assert "no ledger there" in capsys.readouterr().err
+    assert path
+
+
+def test_c55_a_declaration_stays_a_success_when_the_look_for_an_operators_pause_fails(tmp_path, capsys, monkeypatch):
+    """C55: `declare` has committed when it looks for an operator's pause; a read that fails then is reported as a
+    note and the command still exits 0, since the declaration is durable."""
+    ledger, _ = make(tmp_path, runs=plan(tasks=2, conditions=("api-none",)), declared={"m1": ["fp-a"]})
+    ledger.close()
+
+    class Failing:
+        def __init__(self, path):
+            raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr("expcore.campaign.elastic.__main__.LedgerReader", Failing)
+    path = str(ledger_path(tmp_path))
+    declare = ["declare", path, "--model", "m1", "--fingerprint", "fp-new", "--reason", "r", "--actor", "op-1"]
+    assert main(declare) == 0
+    captured = capsys.readouterr()
+    assert "declared model m1: fp-new" in captured.out
+    assert "the declaration is recorded" in captured.err

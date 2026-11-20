@@ -88,13 +88,14 @@ class Ledger(LedgerViews):
             if pinned is None:
                 raise ValueError(f"{path} holds no ledger configuration")
             self._config = LedgerConfig.from_json(pinned)
+            # C55: an operator's `pause` is written only to a controller that says it honours it
+            self._aware.acquire()
+            self._fingerprint = self.config.fingerprint
+            self._opened_at = clock()
+            self._last_read: dict[str, float] = {}  # site -> when it was last read since this open; never persisted
         except BaseException:
             self.close()
             raise
-        self._aware.acquire()  # C55: an operator's `pause` is written only to a controller that says it honours it
-        self._fingerprint = self.config.fingerprint
-        self._opened_at = clock()
-        self._last_read: dict[str, float] = {}  # site -> when it was last read since this open; never persisted
 
     @property
     def config(self) -> LedgerConfig:
@@ -134,8 +135,10 @@ class Ledger(LedgerViews):
         try:
             self.db.close()
         finally:
-            self._aware.release()
-            self._lock.release()
+            try:
+                self._aware.release()
+            finally:
+                self._lock.release()
 
     # --- transactions -----------------------------------------------------------------------------------------
 

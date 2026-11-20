@@ -117,6 +117,8 @@ def pause_in_file(
     keep leasing the model. Return the entry and the controller's state (`awareness`): `aware` (it honours it),
     `none` (no controller holds the ledger: the next one must honour pauses) or `unknown` (the locks could not be
     read)."""
+    if not path.is_file():  # a file that is not there is a usage error before it is a controller's business
+        raise FileNotFoundError(f"{path}: no ledger there")
     controller = awareness.controller_of(path)
     if controller == awareness.OLDER:
         raise PauseRefused(
