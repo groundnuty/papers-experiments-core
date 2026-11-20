@@ -1064,10 +1064,10 @@ class ApptainerSandbox:
         once the run's cells have ended; None before the watch exists."""
         return None if self._watch is None else self._watch.visibility()
 
-    def mount_watch_log(self) -> bytes | None:
+    def mount_watch_log(self) -> Sequence[bytes | None] | bytes | None:
         """The mount guard's log (`expcore.mountguard.MountWatchSource`), its window closed first (O60); None without a
-        mount helper that keeps one. Read after the run's cells have ended: the collection does, and so may the
-        instrument."""
+        mount helper that keeps one; the logs in order, one for each generation, for a mount that was restored (O97).
+        Read after the run's cells have ended: the collection does, and so may the instrument."""
         read = getattr(self._mount, "mount_watch_log", None)
         return None if read is None else read()
 
