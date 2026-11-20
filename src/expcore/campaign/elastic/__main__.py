@@ -26,9 +26,19 @@
   model's declared set at its issue, and a model whose lease's run saw a value its set did not declare is paused (no
   new lease; leases out run to their end) until every value seen is declared. The campaign fingerprint never changes.
 
-`status`, `raise-ceiling`, `set-cap` and `declare` work on the ledger file under its own write lock and not the
-dispatcher's, so they run while a dispatcher holds the ledger, and the dispatcher's next lease reads a raise, a cap or
-a declaration. Exit status: 0
+- `pause LEDGER --model M --reason TEXT --actor NAME`: stop new leases of model M at once (a provider's 429 or 5xx
+  burst, a bad deployment, a key problem). Leases already out run on and settle as usual; M's pending runs wait, and no
+  federation is sent ahead to a later set. Refused for a model with no runs in the ledger and for one an operator
+  already paused. It is an append-only event (C55); nothing already in the ledger changes. Only a controller of this
+  core honours it (an older one keeps leasing the model), so it is refused, writing nothing, while a live controller
+  does not say it does (`awareness`), and written with a warning when no controller holds the ledger.
+- `resume LEDGER --model M --reason TEXT --actor NAME`: lift an operator's pause of M. It lifts only that pause: a model
+  that an undeclared fingerprint also pauses (C48) stays paused until `declare`, and `resume` says so. Refused for a
+  model no operator paused. `status` shows each operator pause with its time, actor and reason, and the log of both.
+
+`status`, `raise-ceiling`, `set-cap`, `declare`, `pause` and `resume` work on the ledger file under its own write lock
+and not the dispatcher's, so they run while a dispatcher holds the ledger, and the dispatcher's next lease reads a
+raise, a cap, a declaration or a pause. Exit status: 0
 done, 1 refused by the ledger (or, for `create`, by the study: not loadable, or code that is not known), 2 a usage
 error or a file that is not a ledger.
 """
@@ -42,11 +52,13 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from expcore.campaign.elastic.awareness import AWARE, NONE, OLDER, controller_of
 from expcore.campaign.elastic.caps import set_in_file
 from expcore.campaign.elastic.ceilings import raise_in_file
 from expcore.campaign.elastic.config import MICRO, LedgerConfig, lease_grant_usd, ledger_runs, micro_down
 from expcore.campaign.elastic.declarations import declare_in_file
 from expcore.campaign.elastic.ledger import Ledger
+from expcore.campaign.elastic.pauses import pause_in_file, resume_in_file
 from expcore.campaign.elastic.records import LedgerError, Status
 from expcore.campaign.elastic.views import LedgerReader
 
@@ -91,7 +103,7 @@ def format_status(status: Status) -> str:
                 f"  #{changed.cap_id} {when} model {changed.model} {before} -> {changed.new}"
                 f" by {changed.actor}: {changed.reason}"
             )
-    return "\n".join(lines + _declaration_lines(status))
+    return "\n".join(lines + _declaration_lines(status) + _pause_lines(status))
 
 
 def _value(fingerprint: str | None) -> str:
@@ -119,6 +131,25 @@ def _declaration_lines(status: Status) -> list[str]:
             f"{found.reason}"
         )
     return lines
+
+
+def _pause_lines(status: Status) -> list[str]:
+    """Each operator pause in force with its time, actor and reason, and the log of pauses and resumes (C55); nothing
+    for a ledger no operator paused, so its status reads as it did."""
+    lines = []
+    for model, entry in sorted(status.operator_pauses.items()):
+        lines.append(f"model {model}: paused by an operator since {_when(entry.at)} by {entry.actor}: {entry.reason}")
+    if status.pause_log:
+        lines.append("operator pause history:")
+        lines += [
+            f"  #{entry.event_seq} {_when(entry.at)} model {entry.model} {entry.kind} by {entry.actor}: {entry.reason}"
+            for entry in status.pause_log
+        ]
+    return lines
+
+
+def _when(at: float) -> str:
+    return datetime.fromtimestamp(at, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def create_ledger(
@@ -193,7 +224,13 @@ def _create(args: argparse.Namespace) -> int:
 def _status(args: argparse.Namespace) -> int:
     reader = LedgerReader(args.ledger)
     try:
-        print(format_status(reader.status()))
+        status = reader.status()
+        print(format_status(status))
+        if status.operator_pauses and controller_of(args.ledger) == OLDER:
+            print(
+                "warning: the controller that holds this ledger does not say it honours operator pauses: it runs a "
+                "core older than the pause and keeps leasing the paused model(s); restart it on this commit or later"
+            )
         for platform, environment in sorted(reader.platform_environments().items()):  # C50: one pin per platform
             print(f"platform {platform}: environment {environment}")
     finally:
@@ -221,6 +258,49 @@ def _declare(args: argparse.Namespace) -> int:
     print(f"declared model {found.model}: {_value(found.fingerprint)} (declaration #{found.declaration_id})")
     if paused:
         print(f"model {found.model} stays paused: undeclared fingerprint(s) seen: {', '.join(map(_value, paused))}")
+    try:  # the declaration is durable: a failed look for an operator's pause must not turn it into an error
+        reader = LedgerReader(args.ledger)
+        try:
+            operator = reader.operator_pauses().get(found.model)
+        finally:
+            reader.close()
+    except (OSError, ValueError, sqlite3.Error) as error:
+        print(f"note: the declaration is recorded; could not read whether an operator's pause also holds the model "
+              f"({type(error).__name__})", file=sys.stderr)  # fmt: skip
+        return 0
+    if operator is not None:  # C55: declaring lifts only C48's pause
+        print(f"model {found.model} stays paused by an operator: {operator.reason} (`resume` lifts it)")
+    return 0
+
+
+_NO_CONTROLLER = (
+    "warning: no controller holds this ledger: the pause is written, but a controller older than this commit would "
+    "ignore it, so whichever controller starts next must run this commit or later"
+)
+_UNKNOWN_CONTROLLER = (
+    "warning: could not tell whether a controller holds this ledger: the pause is written, but a controller older "
+    "than this commit ignores it and keeps leasing the model; restart any such controller on this commit or later"
+)
+
+
+def _pause(args: argparse.Namespace) -> int:
+    entry, controller = pause_in_file(args.ledger, args.model, args.reason, args.actor)
+    print(f"paused model {entry.model}: no new lease until an operator resumes it (event #{entry.event_seq})")
+    if controller == AWARE:
+        print("the controller that holds the ledger honours it from its next lease")
+    else:
+        print(_NO_CONTROLLER if controller == NONE else _UNKNOWN_CONTROLLER, file=sys.stderr)
+    return 0
+
+
+def _resume(args: argparse.Namespace) -> int:
+    entry, undeclared = resume_in_file(args.ledger, args.model, args.reason, args.actor)
+    print(f"resumed model {entry.model} (event #{entry.event_seq})")
+    if undeclared:
+        print(
+            f"model {entry.model} stays paused: undeclared fingerprint(s) seen: {', '.join(map(_value, undeclared))}"
+            " (declare them to lift it)"
+        )
     return 0
 
 
@@ -286,6 +366,15 @@ def _parser() -> argparse.ArgumentParser:
     value.add_argument("--none", action="store_true", help="declare the model's replies that carry no fingerprint")
     declaring.add_argument("--reason", required=True, help="why it is declared, recorded")
     declaring.add_argument("--actor", required=True, help="who declares it (an operator or an agent), recorded")
+    for name, helps in (
+        ("pause", "stop new leases of a model at once; leases out run on"),
+        ("resume", "lift an operator's pause of a model (not C48's)"),
+    ):
+        pausing = commands.add_parser(name, help=helps)
+        pausing.add_argument("ledger", type=Path, help="the ledger file (out/ledger.sqlite)")
+        pausing.add_argument("--model", required=True, help="the model (it must have runs in the ledger)")
+        pausing.add_argument("--reason", required=True, help=f"why it is {name}d, recorded")
+        pausing.add_argument("--actor", required=True, help=f"who {name}s it (an operator or an agent), recorded")
     return parser
 
 
@@ -303,7 +392,15 @@ def _dollars(text: str) -> Decimal:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one command; print its result or its error, and return the exit status."""
     args = _parser().parse_args(argv)
-    commands = {"create": _create, "status": _status, "raise-ceiling": _raise, "set-cap": _set_cap, "declare": _declare}
+    commands = {
+        "create": _create,
+        "status": _status,
+        "raise-ceiling": _raise,
+        "set-cap": _set_cap,
+        "declare": _declare,
+        "pause": _pause,
+        "resume": _resume,
+    }
     try:
         return commands[args.command](args)
     except LedgerError as error:

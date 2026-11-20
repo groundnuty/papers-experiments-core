@@ -69,6 +69,11 @@ class DeclareRefused(LedgerError):
     declaration log."""
 
 
+class PauseRefused(LedgerError):
+    """An operator pause of a model the ledger has no runs of or one an operator already paused, or a resume of a model
+    no operator paused (C55)."""
+
+
 def undeclared_values(values: Any) -> tuple[str | None, ...]:
     """What a completion or a return reports its run saw undeclared (C48): each a fingerprint, or None (a reply that
     carried none), once, never several joined; ValueError for any other form."""
@@ -312,13 +317,27 @@ class Declaration:
 
 
 @dataclass(frozen=True)
+class OperatorPause:
+    """One entry of the operator pause log (C55): a `pause` or a `resume` of a model, with when, why and by whom.
+    `event_seq` is the sequence number of the ledger event that records it."""
+
+    event_seq: int
+    at: float
+    model: str
+    kind: str
+    reason: str
+    actor: str
+
+
+@dataclass(frozen=True)
 class Status:
     """The ledger's money in micro-dollars. `ceiling_micro` is None with no budget (then `remaining_micro` is too);
     `locked_*` is what unsettled leases hold as their grants (in flight, expired, reported, lost), by lease state and
     by model; `ceilings` is the history of raises, oldest first; `caps` is each model's cap in force and `cap_changes`
     the history of its changes, oldest first; `declared` is each model's declared fingerprints (None: "none") and
     `declarations` the log, oldest first, both None for a ledger made before the log; `paused` is each model paused by
-    what a lease's run saw undeclared, with those values (C48)."""
+    what a lease's run saw undeclared, with those values (C48); `operator_pauses` is each model an operator has paused
+    and not resumed, with the pause that holds it, and `pause_log` every pause and resume, oldest first (C55)."""
 
     ceiling_micro: int | None
     committed_micro: int
@@ -334,3 +353,5 @@ class Status:
     declared: Mapping[str, tuple[str | None, ...]] | None = None
     declarations: tuple[Declaration, ...] | None = None
     paused: Mapping[str, tuple[str | None, ...]] = field(default_factory=dict)
+    operator_pauses: Mapping[str, OperatorPause] = field(default_factory=dict)
+    pause_log: tuple[OperatorPause, ...] = ()

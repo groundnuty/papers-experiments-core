@@ -188,7 +188,8 @@ def declare_in_file(
 ) -> tuple[Declaration, tuple[str | None, ...]]:
     """Declare in the ledger file at `path` without its dispatcher lock, for an operator while a dispatcher runs: one
     transaction under the file's own write lock, which the dispatcher's next issue reads. Return the declaration and
-    what still pauses its model (empty: the model is not paused)."""
+    what still pauses its model by an undeclared value (empty: C48 no longer pauses it; an operator's pause is
+    separate, C55)."""
     db = schema.connect(path)
     try:
         if db.execute("SELECT value FROM meta WHERE key='config'").fetchone() is None:

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.elastic import caps as cap_table
-from expcore.campaign.elastic import declarations, schema
+from expcore.campaign.elastic import declarations, pauses, schema
 from expcore.campaign.elastic.ceilings import effective, history
 from expcore.campaign.elastic.config import PRIOR_RUNS, LedgerConfig
 from expcore.campaign.elastic.records import (
@@ -24,6 +24,7 @@ from expcore.campaign.elastic.records import (
     Federation,
     Lease,
     LedgerError,
+    OperatorPause,
     Run,
     Settlement,
     Status,
@@ -183,6 +184,14 @@ class LedgerViews:
         """Each model paused by values its leases' runs saw undeclared, with those values (C48)."""
         return declarations.paused(self.db)
 
+    def operator_pauses(self) -> dict[str, OperatorPause]:
+        """Each model an operator has paused and not resumed, with the pause that holds it (C55)."""
+        return pauses.held(self.db)
+
+    def pause_log(self) -> list[OperatorPause]:
+        """Every operator pause and resume, oldest first, with its time, reason and actor (C55)."""
+        return pauses.log(self.db)
+
     def settlements(self) -> list[Settlement]:
         """Every lost lease whose spend was settled, by lease id, with its time and source."""
         return read_settlements(self.db)
@@ -227,6 +236,8 @@ class LedgerViews:
             declared=declarations.declared_by_model(self.db),
             declarations=None if (logged := self.declaration_log()) is None else tuple(logged),
             paused=self.paused(),
+            operator_pauses=self.operator_pauses(),
+            pause_log=tuple(self.pause_log()),
         )
 
 
