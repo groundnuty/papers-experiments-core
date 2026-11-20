@@ -1709,8 +1709,9 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   says. Everything else binds as before: the maximum, the allowance, the inodes, the login node's memory, an add
   still running and `queue_stall_s` (under `queue` a waiting up already leaves no room, so the stall bound changes
   nothing there; `stalled` is still reported). A member whose jobs are neither waiting, running nor ended (broken) is
-  not in the queue and does not hold the slot. A site that adds no federations (a Compose site's static members) never
-  gets room. **Not checked:** the controller does not read `HPC_EXCLUSIVE_NODES`, so `queue` on a site whose ups are
+  not in the queue and does not hold the slot. The slot is per fleet: controllers that share a site's maximum
+  (`shared_site_file`) each hold their own, so two of them may each have one up waiting. A site that adds no
+  federations (a Compose site's static members) never gets room. **Not checked:** the controller does not read `HPC_EXCLUSIVE_NODES`, so `queue` on a site whose ups are
   `--exclusive` is the operator's mistake and costs one queued `--exclusive` up at a time until the stall bound:
   leave such a site on `idle`.
 - **Join, drain, retire, replace.** A member up, linked, verified and running joins the ledger as
