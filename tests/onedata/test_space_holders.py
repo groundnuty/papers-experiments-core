@@ -5,7 +5,7 @@ import pytest
 
 from expcore_onedata.config import PlatformConfig, load_platform
 from expcore_onedata.testing import ADMIN_ENV, write_platform
-from expcore_onedata.testing.world import SPACE_NAMES, with_spaces
+from expcore_onedata.testing.world import SPACE_NAMES, with_placement, with_spaces
 
 
 @pytest.fixture(autouse=True)
@@ -30,9 +30,32 @@ def test_o97_each_space_maps_to_the_label_of_its_data_provider(tmp_path):
     assert "beta" not in repr(holders)
 
 
-def test_o97_a_space_with_no_declared_holder_is_left_out(tmp_path):
-    """O97: the one-space form declares no holder: its map is empty, so no block on it is the agent's."""
+def test_o97_the_one_space_form_without_a_placement_table_has_no_holder_so_its_map_is_empty(tmp_path):
+    """O97: nothing names the single space's data provider: its map is empty, so no block on it is the agent's."""
     assert load(tmp_path).space_holders() == {}
+
+
+def test_o97_the_one_space_forms_data_provider_is_the_one_placement_names(tmp_path):
+    """O97: the single space's holder is `[placement]`'s data provider, by its label."""
+    config = load(tmp_path, lambda data: with_placement(data, holder="beta"))
+    assert config.space_holders() == {config.space.name: "providers[1]"}
+
+
+def test_o97_an_entry_of_spaces_never_takes_placements_holder(tmp_path):
+    """O97, O09: `[[spaces]]` entries name their own holder; `[placement]`'s is never borrowed for one."""
+
+    def edit(data):
+        with_spaces(data, 2)
+        with_placement(data, holder="beta")
+
+    holders = load(tmp_path, edit).space_holders()
+    assert holders == {SPACE_NAMES[0]: "providers[0]", SPACE_NAMES[1]: "providers[0]"}
+
+
+def test_o97_a_placement_holder_that_names_no_declared_provider_gives_no_holder(tmp_path):
+    """O97: a holder that is not a declared provider is not mapped (the table's own loading refuses it)."""
+    config = load(tmp_path, lambda data: with_placement(data, holder="nowhere"))
+    assert config.space_holders() == {}
 
 
 def test_o97_the_labels_are_those_the_fault_injector_is_given(tmp_path):

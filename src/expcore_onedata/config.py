@@ -303,11 +303,25 @@ class PlatformConfig:
 
     def space_holders(self) -> dict[str, str]:
         """Each space's data provider, for the sandbox's attribution of a blocked read (O97): the space's name as the
-        mount shows it (the first component under the mount) to its holder's label, `providers[i]`, never its name. A
-        space with no holder (the one-space form declares none) is left out, so a block on it is never attributed."""
-        return {
-            entry.space.name: self.provider_label(entry.holder) for entry in self.spaces if entry.holder is not None
-        }
+        mount shows it (the first component under the mount) to its holder's label, `providers[i]`, never its name. An
+        entry of `[[spaces]]` names its own `holder`, never `[placement]`'s (O09); the one-space form, which declares
+        none, has the data provider `[placement]` names, when it has the table. A space with no holder is left out, so
+        a block on it is never attributed to the agent."""
+        holders = {}
+        for entry in self.spaces:
+            name = entry.holder if entry.holder is not None else self._placement_holder(entry)
+            if name is not None:
+                holders[entry.space.name] = self.provider_label(name)
+        return holders
+
+    def _placement_holder(self, entry: StudySpace) -> str | None:
+        """The data provider `[placement]` declares, for the one-space form's single space; None for any other space,
+        without the table, or when it names no declared provider (that is refused where the table is loaded)."""
+        if self.spaces_table or entry is not self.spaces[0]:
+            return None
+        table = load_toml(self.file).get("placement")
+        name = table.get("holder") if isinstance(table, dict) else None
+        return name if isinstance(name, str) and name in self.providers else None
 
     def provider_labels(self, names: Iterable[str]) -> str:
         """Name several declared providers, in the file's order, joined for a message."""
