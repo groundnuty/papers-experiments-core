@@ -20,9 +20,13 @@ def obj(space="owned", path="data/file", mount="data") -> dict:
     return {"mount": mount, "space": space, "path": path}
 
 
-def task(*objects, state="D", via="fd", cut=False) -> dict:
+CALL_OF = {"fd": 0, "path": 257, "holdings": -1}  # a `read`, an `openat`, and a task blocked outside any syscall
+
+
+def task(*objects, state="D", via="fd", cut=False, nr=None) -> dict:
     blocking = {"via": via, "cut": cut, "objects": list(objects) or [obj()]}
-    return {"state": state, "wchan": "request_wait_answer", "syscall": {"nr": 0, "fd": 3}, "blocking": blocking}
+    syscall = {"nr": CALL_OF[via] if nr is None else nr, **({"fd": 3} if via == "fd" else {})}
+    return {"state": state, "wchan": "request_wait_answer", "syscall": syscall, "blocking": blocking}
 
 
 def survivor(*tasks, state="D", **fields) -> dict:
@@ -30,7 +34,9 @@ def survivor(*tasks, state="D", **fields) -> dict:
 
 
 def reading(*survivors, cut=0) -> dict:
-    return {"survivors": list(survivors) or [survivor()], "survivors_cut": cut}
+    """What `diagnose` answers: the uncapped `reading` the verdict is made on, and the capped `survivors` kept."""
+    held = list(survivors) or [survivor()]
+    return {"reading": held, "survivors": held, "survivors_cut": cut}
 
 
 def ask(diagnostics, held=HELD):
@@ -75,11 +81,13 @@ def test_o97_every_survivor_is_judged_and_all_must_be_the_agents():
     }
 
 
-def test_o97_the_reading_the_reader_gives_whole_is_judged_in_place_of_its_capped_copy():
-    """O97: the record keeps at most 8 processes (`survivors_cut`); a reader that gives its whole reading as `reading`
-    has the verdict made on it, so a cap on what is shown never makes a verdict."""
-    capped = {**reading(survivor(), cut=3), "reading": [survivor(), survivor(task(obj(path="data/b")))]}
-    assert ask(capped)["verdict"] == "agent"
+def test_o97_the_verdict_is_made_on_the_whole_reading_never_on_the_capped_survivors():
+    """O97: the record keeps at most 8 processes (`survivors_cut`); the verdict is made on the `reading`, which holds
+    them all, so a cap on what is shown never makes a verdict: a survivor the capped copy left out decides it."""
+    capped = {**reading(survivor(), cut=1), "reading": [survivor(), survivor(task(obj(space="shared")))]}
+    assert ask(capped)["why"] == AT.SPACE_NOT_HELD_DOWN
+    only_capped = {"survivors": [survivor()], "survivors_cut": 0}
+    assert ask(only_capped)["why"] == AT.UNKNOWN  # the capped copy alone is no reading
 
 
 # ---------------------------------------------------------------------------------------- everything else fails closed
@@ -135,6 +143,43 @@ def test_o97_one_object_in_another_space_among_the_holdings_makes_it_infrastruct
     assert ask(reading(survivor(holdings)))["why"] == AT.NOT_DATA_MOUNT
 
 
+@pytest.mark.parametrize("nr", [21, 89, 80, 137, 191, 59, 0, 257, None, "x", True])
+def test_o97_the_holdings_rule_is_sound_only_for_a_task_blocked_outside_any_syscall(nr):
+    """O97: a task blocked in a call the lists do not name (`access` 21, `readlink` 89, `chdir` 80, `statfs` 137,
+    `getxattr` 191, `execve` 59) may wait on a path it does not hold, in another space, by a link wedge: what the
+    process holds says nothing of it. Any `syscall` but `nr: -1` with `via: "holdings"` is `blocking_object_unknown`."""
+    holdings = task(obj(), via="holdings", nr=nr)
+    if nr is None:
+        holdings["syscall"] = "unreadable"
+    assert ask(reading(survivor(holdings)))["why"] == AT.UNKNOWN
+
+
+def test_o97_a_task_blocked_in_a_call_on_another_space_while_it_holds_a_held_down_file_is_not_the_agents():
+    """O97: the agent holds an fd on a file of the held-down space and blocks in `access` on a file of another space:
+    read by its holdings it would be the agent's, which the ruling forbids. It is infrastructure."""
+    task_in_access = task(obj(), via="holdings", nr=21)
+    assert ask(reading(survivor(task_in_access)))["verdict"] == "infrastructure"
+
+
+@pytest.mark.parametrize(
+    ("via", "nr"),
+    [("fd", 21), ("fd", 257), ("fd", -1), ("path", 0), ("path", 21), ("path", -1), ("fd", None), ("path", "x")],
+)
+def test_o97_an_object_resolved_by_fd_or_path_is_believed_only_for_a_call_of_its_list(via, nr):
+    """O97: a reader that took an fd for a call that has none, or a path for a call that has none, is not believed."""
+    blocked = task(obj(), via=via, nr=nr)
+    if nr is None:
+        blocked["syscall"] = "running"
+    assert ask(reading(survivor(blocked)))["why"] == AT.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    ("via", "nr"), [("fd", n) for n in sorted(AT.FD_CALLS)] + [("path", n) for n in sorted(AT.PATH_CALLS)]
+)
+def test_o97_every_call_of_the_lists_resolves_its_object(via, nr):
+    assert ask(reading(survivor(task(obj(), via=via, nr=nr))))["verdict"] == "agent"
+
+
 @pytest.mark.parametrize("state", ["R", "S", "Z", "T", None], ids=lambda s: f"state {s}")
 def test_o97_a_survivor_not_in_d_is_infrastructure(state):
     """O97: a survivor running, sleeping interruptibly or a pure zombie waits on no FUSE request: not an outage's."""
@@ -174,14 +219,14 @@ def test_o97_a_task_whose_blocking_object_is_not_known_is_infrastructure(mutate)
     [
         pytest.param(None, id="no reading at all"),
         pytest.param({}, id="an empty reading"),
-        pytest.param({"survivors": []}, id="no survivors"),
-        pytest.param({"survivors": "x"}, id="survivors that are no list"),
-        pytest.param({"survivors": ["x"]}, id="a survivor that is no mapping"),
-        pytest.param({**reading(), "survivors_cut": 1}, id="survivors the reader cut"),
+        pytest.param({"reading": []}, id="no survivors"),
+        pytest.param({"reading": "x"}, id="a reading that is no list"),
+        pytest.param({"reading": ["x"]}, id="a survivor that is no mapping"),
+        pytest.param({"survivors": [survivor()]}, id="only the capped copy"),
         pytest.param(reading(survivor(tasks_cut=1)), id="tasks the reader cut"),
         pytest.param(reading({"comm": "x", "state": "D"}), id="a survivor with no tasks read"),
         pytest.param(reading(survivor(tasks=[3])), id="a task that is no mapping"),
-        pytest.param([survivor()], id="a reading that is a list"),
+        pytest.param([survivor()], id="a diagnosis that is a list"),
     ],
 )
 def test_o97_no_reading_an_empty_one_or_one_cut_short_is_never_the_agents(diagnostics):
@@ -209,7 +254,9 @@ class Diagnosing(Processes):
         self.found = found
 
     def diagnose(self, left, timeout_s):
-        return self.found
+        """What a reader answers: the reading holds the `pid` and the `start` of each process it was given."""
+        held = [{**r, "pid": p["pid"], "start": p["start"]} for r, p in zip(self.found["reading"], left, strict=True)]
+        return {**self.found, "reading": held}
 
 
 @pytest.mark.parametrize(
