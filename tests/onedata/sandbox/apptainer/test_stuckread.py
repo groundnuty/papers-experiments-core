@@ -13,7 +13,8 @@ from expcore_onedata.sandbox.apptainer import stuckrecord as REC
 ROLES = S.Roles("/data", device=DATA_DEVICE, inputs=("/opt/inputs",))
 READ_FD3 = syscall_text(0, 3, 0x7F10, 0x1000)
 OPENAT_CWD = syscall_text(257, 0xFFFFFFFFFFFFFF9C, 0x7F20)
-MMAP = syscall_text(9, 0, 4096, 1, 1, 3, 0)
+MMAP = syscall_text(9, 0, 4096, 1, 1, 3, 0)  # mmap: a call no list names
+ACCESS = syscall_text(21, 0x7F20, 4)  # access(path, mode): a path call the lists do not name
 BLOCKED_OUTSIDE = "-1 0x7ffd1000 0x7f110000\n"
 
 
@@ -23,6 +24,16 @@ def survivors(*pids: int, start: str = "5000") -> list[dict]:
 
 def read(view: FakeProcReader, left: list[dict], **kwargs) -> dict:
     return R.diagnose(view, left, 5.0, ROLES, machine="x86_64", **kwargs)
+
+
+def spaces(found: dict, process: int = 0, task: int = 0):
+    """The (mount, space) of each object of one task's `blocking`; None when the task has none."""
+    blocking = found["reading"][process]["tasks"][task]["blocking"]
+    return None if blocking is None else [(o["mount"], o["space"]) for o in blocking["objects"]]
+
+
+def blocking(found: dict, process: int = 0, task: int = 0):
+    return found["reading"][process]["tasks"][task]["blocking"]
 
 
 def reader_in_d(view: FakeProcReader, pid: int = 100, *, target: str = "/data/orchard/a.bin", mnt_id: int = DATA_MOUNT):
@@ -35,11 +46,12 @@ def test_o97_a_reader_blocked_on_a_data_file_is_found_by_its_descriptor():
     view = FakeProcReader()
     reader_in_d(view)
     found = read(view, survivors(100))
-    assert found["blocks"] == [
-        {"state": "D", "tasks": [{"state": "D", "objects": [{"mount": "data", "space": "orchard"}]}]}
-    ]
+    fd_object = {"via": "fd", "cut": False, "objects": [{"mount": "data", "space": "orchard", "path": "a.bin"}]}
+    assert blocking(found) == fd_object
     survivor = found["survivors"][0]
-    assert survivor["tasks"] == [{"state": "D", "wchan": "request_wait_answer", "syscall": {"nr": 0, "fd": 3}}]
+    assert survivor["tasks"] == [
+        {"state": "D", "wchan": "request_wait_answer", "syscall": {"nr": 0, "fd": 3}, "blocking": fd_object}
+    ]
     assert survivor["waits_on"] == [
         {
             "fd": 3,
@@ -67,9 +79,9 @@ def test_o97_a_zombie_leader_with_a_thread_in_d_is_reported_by_its_thread():
     process.task(100, state="Z").task(101, syscall=READ_FD3, wchan="request_wait_answer")
     process.fd(3, "/data/orchard/a", mnt_id=DATA_MOUNT)
     found = read(view, survivors(100))
-    assert found["blocks"] == [
-        {"state": "Z", "tasks": [{"state": "D", "objects": [{"mount": "data", "space": "orchard"}]}]}
-    ]
+    assert found["reading"][0]["state"] == "Z"
+    assert [t["state"] for t in found["reading"][0]["tasks"]] == ["D"]  # the zombie leader is not listed
+    assert spaces(found) == [("data", "orchard")]
     assert [t["state"] for t in found["survivors"][0]["tasks"]] == ["D"]
 
 
@@ -77,23 +89,25 @@ def test_o97_a_task_that_is_not_in_d_has_no_object():
     """O97: only a task in D has a blocking object; a sleeping one does not, and the survivor shows it."""
     view = FakeProcReader()
     view.process(100, state="S").task(100, state="S", syscall=READ_FD3).fd(3, "/data/orchard/a", mnt_id=DATA_MOUNT)
-    assert read(view, survivors(100))["blocks"][0]["tasks"] == [{"state": "S", "objects": None}]
+    found = read(view, survivors(100))
+    assert [t["state"] for t in found["reading"][0]["tasks"]] == ["S"]
+    assert blocking(found) is None
 
 
 def test_o97_a_read_on_the_work_directory_is_not_the_data_mount():
     """O97: a D task reading a file in /work waits on the work role, with no space."""
     view = FakeProcReader()
     reader_in_d(view, target="/work/out.bin", mnt_id=WORK_MOUNT)
-    objects = read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"]
-    assert objects == [{"mount": "work", "space": None}]
+    objects = spaces(read(view, survivors(100)))
+    assert objects == [("work", None)]
 
 
 def test_o97_a_descriptor_on_a_pipe_is_on_no_known_mount_so_it_is_other():
     """O97: a pipe's link names no path; it is placed by its mount id alone, here the root mount: `other`."""
     view = FakeProcReader()
     reader_in_d(view, target="pipe:[1234]", mnt_id=ROOT_MOUNT)
-    objects = read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"]
-    assert objects == [{"mount": "other", "space": None}]
+    objects = spaces(read(view, survivors(100)))
+    assert objects == [("other", None)]
 
 
 def test_o97_a_descriptor_whose_fdinfo_is_missing_is_unknown():
@@ -101,7 +115,7 @@ def test_o97_a_descriptor_whose_fdinfo_is_missing_is_unknown():
     view = FakeProcReader()
     reader_in_d(view)
     view.processes[100].fds[3] = ("/data/orchard/a", "pos:\t0\n")
-    assert read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"] is None
+    assert spaces(read(view, survivors(100))) is None
 
 
 def test_o97_an_unreadable_syscall_is_never_guessed_from_what_the_process_holds():
@@ -110,7 +124,7 @@ def test_o97_an_unreadable_syscall_is_never_guessed_from_what_the_process_holds(
     reader_in_d(view)
     del view.processes[100].tasks[100]["syscall"]
     found = read(view, survivors(100))
-    assert found["blocks"][0]["tasks"][0]["objects"] is None
+    assert spaces(found) is None
     assert found["survivors"][0]["tasks"][0]["syscall"] == "unreadable"
 
 
@@ -120,7 +134,7 @@ def test_o97_an_openat_is_placed_by_the_path_read_from_the_tasks_memory():
     process = view.process(100).task(100, syscall=OPENAT_CWD).mem_at(100, 0x7F20, "/data/orchard/dir/../b.txt\0")
     process.fd(3, "/work/x", mnt_id=WORK_MOUNT)
     found = read(view, survivors(100))
-    assert found["blocks"][0]["tasks"][0]["objects"] == [{"mount": "data", "space": "orchard"}]
+    assert spaces(found) == [("data", "orchard")]
     assert found["survivors"][0]["waits_on"] == [
         {"mount": "data", "fstype": "fuse.oneclient", "space": "orchard", "path": "b.txt"}
     ]
@@ -130,7 +144,7 @@ def test_o97_a_relative_path_is_placed_from_the_working_directory():
     """O97: a path relative to AT_FDCWD is placed from the task's working directory."""
     view = FakeProcReader()
     view.process(100, cwd="/data/orchard").task(100, syscall=OPENAT_CWD).mem_at(100, 0x7F20, "sub/f\0")
-    assert read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"] == [{"mount": "data", "space": "orchard"}]
+    assert spaces(read(view, survivors(100))) == [("data", "orchard")]
 
 
 def test_o97_a_relative_path_is_placed_from_its_directory_descriptor():
@@ -138,21 +152,21 @@ def test_o97_a_relative_path_is_placed_from_its_directory_descriptor():
     view = FakeProcReader()
     process = view.process(100, cwd="/work").task(100, syscall=syscall_text(257, 5, 0x7F20))
     process.fd(5, "/data/meadow", mnt_id=DATA_MOUNT).mem_at(100, 0x7F20, "f\0")
-    assert read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"] == [{"mount": "data", "space": "meadow"}]
+    assert spaces(read(view, survivors(100))) == [("data", "meadow")]
 
 
 def test_o97_a_path_with_no_nul_in_its_read_is_unknown():
     """O97: a path argument with no NUL in the 4 KiB read is unknown, never a cut path."""
     view = FakeProcReader()
     view.process(100).task(100, syscall=OPENAT_CWD).mem_at(100, 0x7F20, "/data/orchard/" + "x" * 5000)
-    assert read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"] is None
+    assert spaces(read(view, survivors(100))) is None
 
 
 def test_o97_a_path_in_memory_that_cannot_be_read_is_unknown():
     """O97: a task memory that cannot be read at the pointer leaves the path call's object unknown."""
     view = FakeProcReader()
     view.process(100).task(100, syscall=OPENAT_CWD)
-    assert read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"] is None
+    assert spaces(read(view, survivors(100))) is None
 
 
 def test_o97_a_task_blocked_outside_a_syscall_is_read_by_what_the_process_holds():
@@ -161,58 +175,65 @@ def test_o97_a_task_blocked_outside_a_syscall_is_read_by_what_the_process_holds(
     process = view.process(100).task(100, syscall=BLOCKED_OUTSIDE)
     process.fd(3, "/data/orchard/a", mnt_id=DATA_MOUNT).fd(4, "/data/meadow/b", mnt_id=DATA_MOUNT)
     process.fd(5, "/work/out", mnt_id=WORK_MOUNT)
-    objects = read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"]
-    assert objects == [{"mount": "data", "space": "orchard"}, {"mount": "data", "space": "meadow"}]
+    objects = spaces(read(view, survivors(100)))
+    assert objects == [("data", "orchard"), ("data", "meadow")]
 
 
 def test_o97_a_mapped_file_on_the_data_mount_is_a_holding():
     """O97: a file the process mapped from the data mount counts, as a page fault on it can be what is blocked."""
     view = FakeProcReader()
-    process = view.process(100).task(100, syscall=MMAP).maps("/data/orchard/lib.so", "/usr/lib/x.so")
+    process = view.process(100).task(100, syscall=BLOCKED_OUTSIDE).maps("/data/orchard/lib.so", "/usr/lib/x.so")
     assert process is not None
-    assert read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"] == [{"mount": "data", "space": "orchard"}]
+    assert spaces(read(view, survivors(100))) == [("data", "orchard")]
 
 
 def test_o97_a_working_directory_on_the_data_mount_is_a_holding():
     """O97: the working directory counts too, when it is on the data mount."""
     view = FakeProcReader()
-    view.process(100, cwd="/data/meadow/run").task(100, syscall=MMAP)
-    assert read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"] == [{"mount": "data", "space": "meadow"}]
+    view.process(100, cwd="/data/meadow/run").task(100, syscall=BLOCKED_OUTSIDE)
+    assert spaces(read(view, survivors(100))) == [("data", "meadow")]
 
 
 def test_o97_a_process_that_holds_no_fuse_object_has_unknown_holdings():
     """O97: holdings rule with nothing held on a FUSE mount: unknown, since nothing says what it is blocked on."""
     view = FakeProcReader()
-    view.process(100).task(100, syscall=MMAP).fd(3, "/work/out", mnt_id=WORK_MOUNT)
-    assert read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"] is None
+    view.process(100).task(100, syscall=BLOCKED_OUTSIDE).fd(3, "/work/out", mnt_id=WORK_MOUNT)
+    assert spaces(read(view, survivors(100))) is None
 
 
 def test_o97_a_process_with_a_descriptor_that_cannot_be_read_has_unknown_holdings():
     """O97: one descriptor whose link cannot be read makes the whole holdings set unknown, never a partial one."""
     view = FakeProcReader()
     process = (
-        view.process(100).task(100, syscall=MMAP).fd(3, "/data/orchard/a", mnt_id=DATA_MOUNT).fd(4, "/x", mnt_id=1)
+        view.process(100)
+        .task(100, syscall=BLOCKED_OUTSIDE)
+        .fd(3, "/data/orchard/a", mnt_id=DATA_MOUNT)
+        .fd(4, "/x", mnt_id=1)
     )
     process.fds[4] = ("/x", "garbage")  # no mnt_id in its fdinfo
-    assert read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"] is None
+    assert spaces(read(view, survivors(100))) is None
 
 
 def test_o97_a_process_with_more_descriptors_than_are_read_has_unknown_holdings():
     """O97: past the number of descriptors read, the holdings are unknown: a partial set is never judged."""
     view = FakeProcReader()
-    process = view.process(100).task(100, syscall=MMAP)
+    process = view.process(100).task(100, syscall=BLOCKED_OUTSIDE)
     for number in range(R.FDS_READ + 1):
         process.fd(number, "/work/f", mnt_id=WORK_MOUNT)
-    assert read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"] is None
+    assert spaces(read(view, survivors(100))) is None
 
 
 def test_o97_a_non_x86_machine_never_reads_a_syscall_number_as_a_call():
-    """O97: the tables are x86_64's; on another machine every call is read by the holdings rule."""
+    """O97: the tables are x86_64's; on another machine a call's number says nothing, so no object is resolved (only a
+    task blocked outside any syscall, which reads `-1` everywhere, has its holdings)."""
     view = FakeProcReader()
     reader_in_d(view)
     found = R.diagnose(view, survivors(100), 5.0, ROLES, machine="aarch64")
     assert found["survivors"][0]["tasks"][0]["syscall"] == {"nr": 0}
-    assert found["blocks"][0]["tasks"][0]["objects"] == [{"mount": "data", "space": "orchard"}]
+    assert blocking(found) is None
+    other = FakeProcReader()
+    other.process(100).task(100, syscall=BLOCKED_OUTSIDE).fd(3, "/data/orchard/a", mnt_id=DATA_MOUNT)
+    assert spaces(R.diagnose(other, survivors(100), 5.0, ROLES, machine="aarch64")) == [("data", "orchard")]
 
 
 def test_o97_a_survivor_whose_pid_was_taken_over_is_unknown():
@@ -220,29 +241,34 @@ def test_o97_a_survivor_whose_pid_was_taken_over_is_unknown():
     view = FakeProcReader()
     reader_in_d(view)
     found = read(view, survivors(100, start="9999"))
-    assert found["blocks"] == [{"state": "D", "tasks": None}]
+    assert found["reading"][0]["tasks"] is None
+    assert (found["reading"][0]["pid"], found["reading"][0]["start"]) == (100, "9999")  # as the deadline listed it
+    assert "tasks" not in found["survivors"][0]
 
 
 def test_o97_a_survivor_that_cannot_be_read_is_unknown():
     """O97: a process `/proc` hides is unknown, not read as one that waits on nothing."""
     view = FakeProcReader()
     reader_in_d(view).hidden = True
-    assert read(view, survivors(100))["blocks"] == [{"state": "D", "tasks": None}]
+    found = read(view, survivors(100))
+    assert found["reading"][0]["tasks"] is None
+    assert "tasks" not in found["survivors"][0]
 
 
-def test_o97_the_record_keeps_eight_survivors_but_blocks_has_every_one():
-    """O97: the record's list is capped at 8 and says how many it cut; `blocks`, read by the attribution, is not cut."""
+def test_o97_the_record_keeps_eight_survivors_but_the_reading_has_every_one():
+    """O97: the record's list is capped at 8 and says how many it cut; the `reading`, which the verdict is made on, is
+    not."""
     view = FakeProcReader()
     for pid in range(100, 110):
         reader_in_d(view, pid)
     found = read(view, survivors(*range(100, 110)))
     assert len(found["survivors"]) == REC.SURVIVORS_KEPT
     assert found["survivors_cut"] == 2
-    assert len(found["blocks"]) == 10
+    assert len(found["reading"]) == 10
 
 
 def test_o97_the_record_keeps_four_tasks_with_the_blocked_ones_first():
-    """O97: each survivor shows at most 4 tasks, those in D before the others; `blocks` lists every task."""
+    """O97: each survivor shows at most 4 tasks, those in D before the others; the reading lists every task."""
     view = FakeProcReader()
     process = view.process(100)
     for tid in range(100, 106):
@@ -251,7 +277,9 @@ def test_o97_the_record_keeps_four_tasks_with_the_blocked_ones_first():
     found = read(view, survivors(100))
     assert found["survivors"][0]["tasks"][0]["state"] == "D"
     assert len(found["survivors"][0]["tasks"]) == REC.TASKS_KEPT
-    assert len(found["blocks"][0]["tasks"]) == 6
+    assert len(found["reading"][0]["tasks"]) == 6
+    assert found["reading"][0]["tasks_cut"] == 0
+    assert found["survivors"][0]["tasks_cut"] == 2
 
 
 def test_o97_a_data_file_in_a_second_space_gives_a_second_object_for_its_task():
@@ -259,15 +287,17 @@ def test_o97_a_data_file_in_a_second_space_gives_a_second_object_for_its_task():
     view = FakeProcReader()
     process = view.process(100).task(100, syscall=BLOCKED_OUTSIDE)
     process.fd(3, "/data/orchard/a", mnt_id=DATA_MOUNT).fd(4, "/data/orchard/b", mnt_id=DATA_MOUNT)
-    assert read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"] == [{"mount": "data", "space": "orchard"}]
+    assert spaces(read(view, survivors(100))) == [("data", "orchard")]
 
 
 def test_o97_a_record_has_no_pid_no_command_line_and_no_node_path():
-    """O97: what is recorded names no pid, no command line, no environment and no path of the node."""
+    """O97: what is recorded (`survivors`; the `reading` is never recorded) names no pid, no start, no command line, no
+    environment and no path of the node."""
     view = FakeProcReader()
     reader_in_d(view)
-    text = repr(read(view, survivors(100)))
+    text = repr(read(view, survivors(100))["survivors"])
     assert "100" not in text.replace("0100000", "")  # the pid
+    assert "5000" not in text  # the start
     assert "/proc" not in text
     assert "cmdline" not in text
     assert "environ" not in text
@@ -325,7 +355,7 @@ def test_o97_a_memory_read_that_blocks_leaves_its_object_unknown_within_the_marg
     found = R.diagnose(view, survivors(100), 0.3, ROLES, machine="x86_64")
     gate.set()
     assert time.monotonic() - began < 5
-    assert found["blocks"][0]["tasks"] == [{"state": "D", "objects": None}]
+    assert blocking(found) is None
 
 
 def test_o97_a_diagnosis_with_no_time_or_no_survivors_reads_nothing():
@@ -363,7 +393,7 @@ def test_o97_a_connection_that_raises_costs_only_the_key():
 
     found = read(view, survivors(100), connection=broken)
     assert "connection" not in found
-    assert found["blocks"][0]["tasks"][0]["objects"]
+    assert spaces(found)
 
 
 def test_o97_a_node_with_no_view_or_a_run_with_no_diagnosis_gives_none():
@@ -381,7 +411,7 @@ def test_o97_a_node_with_no_view_or_a_run_with_no_diagnosis_gives_none():
     diagnosis = R.Diagnosis(roles=lambda: ROLES)
     assert R.diagnose_node(Bare(), diagnosis, survivors(100), 5.0) is None
     assert R.diagnose_node(Viewing(), None, survivors(100), 5.0) is None
-    assert R.diagnose_node(Viewing(), diagnosis, survivors(100), 5.0)["blocks"][0]["state"] == "D"
+    assert R.diagnose_node(Viewing(), diagnosis, survivors(100), 5.0)["reading"][0]["state"] == "D"
 
 
 def test_o97_the_local_view_reads_a_real_directory(tmp_path):
@@ -410,7 +440,7 @@ def test_o97_a_chrooted_process_is_placed_by_its_own_view_of_the_paths():
     process.root = "/run/cell"
     process.fd(3, "/run/cell/data/orchard/a", mnt_id=DATA_MOUNT).maps("/run/cell/data/orchard/lib.so")
     found = read(view, survivors(100))
-    assert found["blocks"][0]["tasks"][0]["objects"] == [{"mount": "data", "space": "orchard"}]
+    assert spaces(found) == [("data", "orchard")]
     assert found["survivors"][0]["waits_on"][0]["path"] == "a"
     assert found["survivors"][0]["cwd_mount"] == "work"
 
@@ -421,7 +451,7 @@ def test_o97_a_descriptor_whose_path_is_not_under_the_data_mount_has_the_data_mo
     view = FakeProcReader()
     process = view.process(100).task(100, syscall=READ_FD3)
     process.fd(3, "/run/cell/data/orchard/a", mnt_id=DATA_MOUNT)
-    assert read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"] == [{"mount": "data", "space": None}]
+    assert spaces(read(view, survivors(100))) == [("data", None)]
 
 
 def test_o97_the_diagnosis_leaves_the_abort_half_of_the_margin_when_a_read_blocks():
@@ -447,4 +477,78 @@ def test_o97_a_process_with_a_root_that_cannot_be_read_is_taken_as_rooted_at_sla
     view = FakeProcReader()
     process = view.process(100).task(100, syscall=READ_FD3).fd(3, "/data/orchard/a", mnt_id=DATA_MOUNT)
     process.root = ""
-    assert read(view, survivors(100))["blocks"][0]["tasks"][0]["objects"] == [{"mount": "data", "space": "orchard"}]
+    assert spaces(read(view, survivors(100))) == [("data", "orchard")]
+
+
+def test_o97_each_resolution_says_how_it_was_made():
+    """O97: a read-family call is `via` fd, a path call `via` path, and a task outside any syscall `via` holdings."""
+    view = FakeProcReader()
+    reader_in_d(view, 100)
+    view.process(200, start="6000").task(200, syscall=OPENAT_CWD).mem_at(200, 0x7F20, "/data/orchard/x\0")
+    process = view.process(300, start="7000").task(300, syscall=BLOCKED_OUTSIDE)
+    process.fd(3, "/data/orchard/a", mnt_id=DATA_MOUNT)
+    left = [*survivors(100), *survivors(200, start="6000"), *survivors(300, start="7000")]
+    found = read(view, left)
+    assert [blocking(found, i)["via"] for i in range(3)] == ["fd", "path", "holdings"]
+
+
+def test_o97_a_call_the_lists_do_not_name_is_never_read_by_what_the_process_holds():
+    """O97: access(2), mmap(2) and the like may wait on a path the process does not hold: blocking is None, though the
+    process holds a data file."""
+    for call in (ACCESS, MMAP):
+        view = FakeProcReader()
+        process = view.process(100).task(100, syscall=call)
+        process.fd(3, "/data/orchard/a", mnt_id=DATA_MOUNT).mem_at(100, 0x7F20, "/data/meadow/x\0")
+        assert blocking(read(view, survivors(100))) is None
+
+
+def test_o97_the_holdings_name_each_space_once_and_carry_no_path():
+    """O97: many files of one space are one object, and a holding has no path of its own."""
+    view = FakeProcReader()
+    process = view.process(100).task(100, syscall=BLOCKED_OUTSIDE)
+    process.fd(3, "/data/orchard/a", mnt_id=DATA_MOUNT).fd(4, "/data/orchard/b", mnt_id=DATA_MOUNT)
+    process.maps("/data/orchard/lib.so")
+    assert blocking(read(view, survivors(100)))["objects"] == [{"mount": "data", "space": "orchard", "path": None}]
+
+
+def test_o97_holdings_past_the_cap_are_flagged_cut_so_they_are_never_believed():
+    """O97: more distinct objects than are kept make `cut` true, which the attribution reads as unknown."""
+    view = FakeProcReader()
+    process = view.process(100).task(100, syscall=BLOCKED_OUTSIDE)
+    for number in range(REC.OBJECTS_KEPT + 1):
+        process.fd(number + 3, f"/data/space-{number}/a", mnt_id=DATA_MOUNT)
+    found = read(view, survivors(100))
+    assert blocking(found)["cut"] is True
+    assert len(blocking(found)["objects"]) == REC.OBJECTS_KEPT
+
+
+def test_o97_the_reading_has_the_pid_and_start_exactly_as_the_deadline_listed_them_for_every_survivor():
+    """O97: one entry for each process listed, in order, whether or not it could be read."""
+    view = FakeProcReader()
+    reader_in_d(view, 100)
+    left = [*survivors(100), {"pid": 555, "start": "123", "comm": "gone", "state": "D"}]
+    found = read(view, left)
+    assert [(e["pid"], e["start"]) for e in found["reading"]] == [(100, "5000"), (555, "123")]
+    assert found["reading"][1]["tasks"] is None
+
+
+def test_o97_a_survivor_not_reached_before_the_diagnosis_was_given_up_is_still_listed_unknown():
+    """O97: a read that blocks leaves the survivors after it unread, and each is in the reading with no tasks."""
+    view = FakeProcReader()
+    view.process(100).task(100, syscall=OPENAT_CWD).mem_at(100, 0x7F20, "/data/orchard/x\0")
+    reader_in_d(view, 200)
+    gate = view.stall["100/task/100/mem"] = threading.Event()
+    found = R.diagnose(view, survivors(100, 200), 0.3, ROLES, machine="x86_64")
+    gate.set()
+    assert [(e["pid"], e["start"]) for e in found["reading"]] == [(100, "5000"), (200, "5000")]
+    assert found["reading"][0]["tasks"][0]["blocking"] is None
+
+
+def test_o97_the_readers_call_tables_are_the_attributions():
+    """O97: the calls the reader resolves are exactly the calls the attribution believes, so neither side can disagree
+    about a syscall number and fail every run closed."""
+    from expcore_onedata.sandbox import attribution
+
+    assert set(S.FD_CALLS) == attribution.FD_CALLS
+    assert set(S.PATH_CALLS) == attribution.PATH_CALLS
+    assert S.OUTSIDE_A_SYSCALL == attribution.OUTSIDE_A_SYSCALL

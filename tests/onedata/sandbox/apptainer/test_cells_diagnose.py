@@ -45,28 +45,31 @@ def test_o97_the_survivors_are_diagnosed_before_the_mount_is_aborted():
 
 
 def test_o97_what_was_read_reaches_the_attribution_and_the_record():
-    """O97: `attribute` is given the uncapped `blocks`, and the record keeps the survivors the tracker read."""
+    """O97: `attribute` is given the `reading` of every survivor, and the record keeps the capped survivors."""
     clock, seen = Clock(), []
     procs = tracker_over(wedged_reader(), Processes({7: "python3"}, wedged=(7,)), diagnosis=Diagnosis(lambda: ROLES))
     esc, _ = escalation(clock, abort=lambda t: (procs.release(), {"ok": True})[-1])
     esc = dataclasses.replace(esc, attribute=lambda found: (seen.append(found), VERDICT)[-1])
     record = deadline.enforce(procs, esc)
-    assert seen[0]["blocks"] == [
-        {"state": "D", "tasks": [{"state": "D", "objects": [{"mount": "data", "space": "orchard"}]}]}
-    ]
+    [entry] = seen[0]["reading"]
+    assert (entry["pid"], entry["start"]) == (7, "7")
+    assert entry["tasks"][0]["blocking"]["objects"] == [{"mount": "data", "space": "orchard", "path": "a.bin"}]
+    assert "reading" not in record  # the record keeps the capped survivors, never the reading
     assert record["survivors"][0]["waits_on"][0]["space"] == "orchard"
     assert record["survivors"][0]["tasks"][0]["wchan"] == "request_wait_answer"
     assert record["attribution"] == VERDICT
 
 
 def test_o97_a_run_given_no_diagnosis_is_not_read_so_nothing_is_attributed_to_the_agent():
-    """O97: with no targets given, the tracker reads nothing: `attribute` sees no diagnostics."""
+    """O97: with no targets given, the tracker reads nothing: `attribute` is never asked, and the verdict is
+    infrastructure."""
     clock, seen = Clock(), []
     procs = tracker_over(wedged_reader(), Processes({7: "python3"}, wedged=(7,)), diagnosis=None)
     esc, _ = escalation(clock, abort=lambda t: (procs.release(), {"ok": True})[-1])
     esc = dataclasses.replace(esc, attribute=lambda found: (seen.append(found), VERDICT)[-1])
     record = deadline.enforce(procs, esc)
-    assert seen == [None]
+    assert seen == []
+    assert record["attribution"]["verdict"] == "infrastructure"
     assert "survivors" not in record
 
 
@@ -78,8 +81,9 @@ def test_o97_a_node_with_no_proc_reader_is_not_diagnosed():
     esc, _ = escalation(clock, abort=lambda t: (procs.release(), {"ok": True})[-1])
     esc = dataclasses.replace(esc, attribute=lambda found: (seen.append(found), VERDICT)[-1])
     record = deadline.enforce(procs, esc)
-    assert seen == [None]
+    assert seen == []
     assert record["outcome"] == deadline.MOUNT_ABORTED
+    assert record["attribution"]["verdict"] == "infrastructure"
 
 
 def test_o97_the_run_asked_for_its_targets_when_the_deadline_fires():
@@ -110,4 +114,4 @@ def test_o97_the_fake_node_gives_a_settable_proc_to_read_so_a_runner_test_can_di
     process.task(7, syscall=syscall_text(0, 3, 0x7F10, 0x1000)).fd(3, "/data/orchard/a.bin", mnt_id=DATA_MOUNT)
     tracker = _RunProcesses(SimpleNamespace(node=node, diagnosis=Diagnosis(lambda: ROLES)))
     found = tracker.diagnose([{"pid": 7, "start": "7", "comm": "python3", "state": "D"}], 5.0)
-    assert found["blocks"][0]["tasks"][0]["objects"] == [{"mount": "data", "space": "orchard"}]
+    assert found["reading"][0]["tasks"][0]["blocking"]["objects"][0]["space"] == "orchard"

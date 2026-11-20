@@ -32,6 +32,7 @@ AT_FDCWD = -100  # the "directory descriptor" of an `*at` call that means the wo
 PATH_LIMIT = 4096  # the longest path argument read from a process's memory (PATH_MAX)
 REST_KEPT = 256  # the longest rest-of-path a record keeps
 RUNNING, UNREADABLE = "running", "unreadable"
+OUTSIDE_A_SYSCALL = -1  # `syscall`'s number for a task blocked outside any syscall (a page fault on a mapping)
 DATA, WORK, TMP, SHM, INPUT, OTHER = "data", "work", "tmp", "shm", "input", "other"
 ROLES = (DATA, WORK, TMP, SHM, INPUT, OTHER)
 X86_64 = ("x86_64", "AMD64")  # the machines whose syscall numbers the tables below are
@@ -274,6 +275,7 @@ __all__ = [
     "FD_CALLS",
     "INPUT",
     "OTHER",
+    "OUTSIDE_A_SYSCALL",
     "PATH_CALLS",
     "PATH_LIMIT",
     "REST_KEPT",

@@ -1,11 +1,15 @@
 # Provenance: new
-"""What the survivors' diagnostics keep of what was read (`stuckread`, O97): the capped record of each survivor and the
-uncapped `blocks` the attribution reads.
+"""What the survivors' diagnostics keep of what was read (`stuckread`, O97): the `reading` the attribution is made on
+and the capped `survivors` the record keeps.
 
-The record is the one the run's evidence keeps (at most `SURVIVORS_KEPT` survivors, each with `TASKS_KEPT` tasks and
-`WAITS_KEPT` things it waits on); `blocks` lists every survivor and every task, so that a process the record leaves out
-is still judged. Neither holds a pid, a command line, an environment or a file's content: `space` and `path` are given
-only for the data mount.
+Both are built from the same entries. A `reading` entry is one survivor read whole, with the `pid` and `start` the
+deadline listed it by (which the escalation checks cover every survivor, `deadline._Run.covers`) and every live task;
+the record's `survivors` entry is the same cut to what a record may hold (`expcore.records.cell_deadline`): no pid, at
+most `TASKS_KEPT` tasks with `tasks_cut` counting the rest, at most `WAITS_KEPT` things it waits on. A task's `blocking`
+is what it waits on, resolved (`attribution`'s contract): `via` says how (`fd`, `path`, or `holdings` for a task blocked
+outside any syscall), `objects` where the files are (`mount`, and for the data mount its `space` and the `path` below
+it), `cut` whether the list was cut. Unknown is None, never an empty list. Nothing here holds a command line, an
+environment or a file's content.
 """
 
 from __future__ import annotations
@@ -21,7 +25,8 @@ from expcore_onedata.sandbox.hostops import describe_error
 
 log = logging.getLogger(__name__)
 
-SURVIVORS_KEPT, TASKS_KEPT, WAITS_KEPT = 8, 4, 4  # what the record keeps; `blocks` is never cut
+SURVIVORS_KEPT, TASKS_KEPT, WAITS_KEPT = 8, 4, 4  # what the record keeps; the reading is never cut
+OBJECTS_KEPT = 16  # the most objects of one task's `blocking`: more is `cut`, which the attribution reads as unknown
 FUSECTL_STATES = ("writable", "absent", "not_writable")
 FSTYPE = re.compile(r"[A-Za-z0-9_.+-]{1,32}")
 
@@ -47,9 +52,15 @@ class Waits:
             entry["flags"] = self.flags
         return entry
 
-    def object(self) -> dict[str, Any]:
-        """What `blocks` keeps: the role and, for the data mount, the space."""
-        return {"mount": self.place.mount, "space": self.place.space if self.place.mount == S.DATA else None}
+    def object(self, *, path: bool = True) -> dict[str, Any]:
+        """What `blocking` keeps: the role and, for the data mount, the space and (unless `path` is False) the path
+        below it."""
+        data = self.place.mount == S.DATA
+        return {
+            "mount": self.place.mount,
+            "space": self.place.space if data else None,
+            "path": self.place.rest if data and path else None,
+        }
 
 
 @dataclass
@@ -58,12 +69,14 @@ class Task:
     state: str
     wchan: str | None = None
     syscall: Any = S.UNREADABLE  # a `stuck.Syscall`, or `running` or `unreadable`
+    via: str | None = None  # how its object is resolved: `fd`, `path` or `holdings`; None: it is not resolved at all
     objects: list[Waits] | None = None  # what it waits on; None: not known (yet)
 
 
 @dataclass
 class Survivor:
     pid: int
+    start: str  # both as the deadline's listing names the process: the reading is matched to it by these
     comm: str
     state: str
     tasks: list[Task] | None = None  # None: the process could not be read (gone, another process, hidden)
@@ -84,12 +97,34 @@ def syscall_record(call: Any, known: bool) -> Any:
     return {"nr": call.nr, **({} if fd is None else {"fd": fd[1]})}
 
 
-def survivor_record(proc: Survivor, roles: S.Roles, known: bool) -> dict[str, Any]:
-    """The capped record of one survivor, from what was read: no read is made here."""
-    tasks = proc.tasks or []
-    shown = sorted(tasks, key=lambda task: task.state != "D")[:TASKS_KEPT]
+def blocking_record(task: Task) -> dict[str, Any] | None:
+    """What a task waits on, resolved (the module's docstring); None when it is not known: it has no `via` or no object.
+    Objects are each once; the holdings carry no path (many files of one space are one object), and more than
+    `OBJECTS_KEPT` are cut and flagged."""
+    if task.via is None or not task.objects:
+        return None
+    found: list[dict[str, Any]] = []
+    for waits in task.objects:
+        entry = waits.object(path=task.via != "holdings")
+        if entry not in found:
+            found.append(entry)
+    return {"via": task.via, "cut": len(found) > OBJECTS_KEPT, "objects": found[:OBJECTS_KEPT]}
+
+
+def task_record(task: Task, known: bool) -> dict[str, Any]:
+    return {
+        "state": task.state,
+        "wchan": task.wchan,
+        "syscall": syscall_record(task.syscall, known),
+        "blocking": blocking_record(task) if task.state == "D" else None,
+    }
+
+
+def reading_entry(proc: Survivor, roles: S.Roles, known: bool) -> dict[str, Any]:
+    """One survivor, read whole: the entry of `reading` (the module's docstring). A process that could not be read has
+    `tasks` None, so the verdict on it is unknown, never that it waits on nothing."""
     waits: list[dict[str, Any]] = []
-    for task in tasks:
+    for task in proc.tasks or []:
         for found in task.objects or []:
             entry = found.record()
             if entry not in waits:
@@ -100,30 +135,29 @@ def survivor_record(proc: Survivor, roles: S.Roles, known: bool) -> dict[str, An
     if proc.cwd is not None and proc.mounts is not None and (entry := S.mount_of_path(proc.mounts, proc.cwd)):
         cwd = roles.of(entry)
     return {
+        "pid": proc.pid,
+        "start": proc.start,
         "comm": proc.comm[:32],
         "state": proc.state,
-        "tasks": [{"state": t.state, "wchan": t.wchan, "syscall": syscall_record(t.syscall, known)} for t in shown],
-        "waits_on": waits[:WAITS_KEPT],
+        "tasks": None if proc.tasks is None else [task_record(task, known) for task in proc.tasks],
+        "tasks_cut": 0,
+        "waits_on": waits,
         **({} if cwd is None else {"cwd_mount": cwd}),
     }
 
 
-def block_record(proc: Survivor) -> dict[str, Any]:
-    if proc.tasks is None:
-        return {"state": proc.state, "tasks": None}
-    return {"state": proc.state, "tasks": [{"state": t.state, "objects": objects_of(t)} for t in proc.tasks]}
-
-
-def objects_of(task: Task) -> list[dict[str, Any]] | None:
-    """A D task's objects by role and space, each once; None when it is no D task or its objects are not known."""
-    if task.state != "D" or not task.objects:
-        return None
-    found: list[dict[str, Any]] = []
-    for waits in task.objects:
-        entry = waits.object()
-        if entry not in found:
-            found.append(entry)
-    return found
+def survivor_record(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """The record's survivor from a reading entry: no pid and no start, the tasks in D first and cut to `TASKS_KEPT`
+    (`tasks_cut` says how many were left out), the things it waits on cut to `WAITS_KEPT`. A process that could not be
+    read has no `tasks`."""
+    kept: dict[str, Any] = {"comm": entry["comm"], "state": entry["state"]}
+    tasks = entry["tasks"]
+    if tasks is not None:
+        shown = sorted(tasks, key=lambda task: task["state"] != "D")[:TASKS_KEPT]
+        kept.update(tasks=shown, tasks_cut=len(tasks) - len(shown), waits_on=entry["waits_on"][:WAITS_KEPT])
+    if "cwd_mount" in entry:
+        kept["cwd_mount"] = entry["cwd_mount"]
+    return kept
 
 
 def connection_record(connection: Callable[[], Mapping[str, Any] | None] | None) -> dict[str, Any] | None:

@@ -3,33 +3,37 @@
 
 At the `survived` step of a cell's deadline (`deadline.enforce`), before the mount is aborted, the tracker reads each
 process that outlived its kill: its tasks (`task/<tid>/stat`, `wchan`, `syscall`) and what each task in uninterruptible
-sleep waits on, placed on the cell's own mounts (`stuck`). The answer holds the record's keys, which `deadline` merges,
-and `blocks`, the uncapped reading `Escalation.attribute` takes:
+sleep waits on, placed on the cell's own mounts (`stuck`). The answer holds the record's keys, which `deadline` merges
+(`survivors`, `survivors_cut`, `connection`), and `reading`, every survivor read whole, which `attribution` takes and
+the record never keeps (`stuckrecord`):
 
-    {"survivors": [{"comm": ..., "state": "D", "tasks": [{"state": "D", "wchan": "<symbol>" | None,
-                    "syscall": {"nr": 0, "fd": 3} | {"nr": 257} | "running" | "unreadable"}],
-                    "waits_on": [{"fd": 3, "mount": "data", "fstype": "fuse.<name>", "space": ..., "path": ...,
-                                  "pos": 0, "flags": "<octal>"}], "cwd_mount": "work"}],        # at most 8, 4, 4
-     "survivors_cut": 0, "connection": {"fusectl": "writable"},
-     "blocks": [{"state": "Z", "tasks": [{"state": "D", "objects": [{"mount": "data", "space": "<name>"}] | None}]
-                 | None}]}                                                                    # every survivor
+    {"survivors": [...], "survivors_cut": 0, "connection": {"fusectl": "writable"},   # what the record keeps, capped
+     "reading": [{"pid": 7, "start": "5000", "comm": "python3", "state": "D" | "Z" | ...,
+                  "tasks": [{"state": "D", "wchan": "<symbol>" | None, "syscall": {"nr": 0, "fd": 3} | "running" | ...,
+                             "blocking": {"via": "fd" | "path" | "holdings", "cut": False,
+                                          "objects": [{"mount": "data", "space": "<name>", "path": "<rest>"}]} | None}],
+                  "tasks_cut": 0, "waits_on": [...], "cwd_mount": "work"}]}              # one entry for EVERY survivor
 
-`objects` is None for a task whose blocking object is not known (an unreadable `syscall` or fd, a path that could not be
-read) and for a task not in `D`; a survivor whose tasks could not be listed has `tasks` None. A zombie leader with a
-live thread in `D` is reported by its thread: the leader's own entries are empty, so every read is under `task/<tid>/`.
-`space` and `path` are given only for the data mount. **Nothing a process wrote is read: no file content, no command
-line, no environment**, and no pid or node name is recorded.
+`pid` and `start` are exactly as the deadline listed the process, for it checks that the reading covers every
+survivor. `blocking` is None for a task whose object is not known (an unreadable `syscall` or descriptor, a path that
+could not be read, a call that is not resolved) and for a task not in `D`; `tasks` is None for a survivor that could
+not be read (gone, another process by that pid, hidden, or not reached in time). A zombie leader with a live thread in
+`D` is read by that thread (a zombie is not listed): the leader's own entries are empty, so every read is under
+`task/<tid>/`. `space` and `path` are given only for the data mount. **Nothing a process wrote is read: no file
+content, no command line, no environment**, and no node name is recorded.
 
-**The blocking object**, by the task's `syscall` (`stuck.FD_CALLS`, `stuck.PATH_CALLS`): the descriptor a read-family
-call names, placed by its link and its `fdinfo` mount; or the path a path call names, read from the task's memory at the
-call's pointer argument (at most 4 KiB up to a NUL, the agent's own argument) and placed lexically on the task's mount
-table; for any other call, or one blocked outside a syscall, **the holdings rule**: every FUSE object the process holds
-(its descriptors, its mapped files, its working directory), unknown when it holds none or when any could not be read.
-An unreadable `syscall` is never guessed from the holdings.
+**The blocking object**, by the task's `syscall` (`attribution.FD_CALLS`, `PATH_CALLS`, which `stuck`'s tables agree
+with): the descriptor a read-family call names (`via` `fd`), placed by its link and its `fdinfo` mount; the path a
+path call names (`via` `path`), read from the task's memory at the call's pointer argument (at most 4 KiB up to a NUL,
+the agent's own argument) and placed lexically on the task's mount table; and **only for a task blocked outside any
+syscall** (`-1`, a page fault on a mapping), **the holdings** (`via` `holdings`): every FUSE object the process holds
+(its descriptors, its mapped files, its working directory), unknown when it holds none or any could not be read. Any
+other call, and an unreadable `syscall`, is not resolved: its object may be a path the process does not hold
+(`access`, `readlink`, `chdir`, `statfs`, `getxattr`, `execve`), so it is never guessed from the holdings.
 
 **It never touches the target.** Reads are `listdir`, `readlink` and `/proc` text through a `ProcReader`; no `stat`,
-`open` or `read` of a file the process waits on. Every read runs in a daemon thread that is waited for at most the
-margin left: the cheap files first (`stat`, `wchan`, `syscall`, `fd`, `fdinfo`, `mountinfo`), `maps` and the task's
+`open` or `read` of a file the process waits on. Every read runs in a daemon thread that is waited for at most half the
+time given: the cheap files first (`stat`, `wchan`, `syscall`, `fd`, `fdinfo`, `mountinfo`), `maps` and the task's
 memory last, and a read that blocks (they lock the process's address space) leaves what it did not reach unknown.
 """
 
@@ -51,10 +55,11 @@ from expcore_onedata.sandbox.apptainer.stuckrecord import (
     Survivor,
     Task,
     Waits,
-    block_record,
     connection_record,
+    reading_entry,
     survivor_record,
 )
+from expcore_onedata.sandbox.deadline import READING
 from expcore_onedata.sandbox.hostops import describe_error
 
 log = logging.getLogger(__name__)
@@ -133,6 +138,7 @@ class _Reader:
     def __init__(self, view: ProcReader, roles: S.Roles, machine: str) -> None:
         self.view, self.roles = view, roles
         self.known = machine in S.X86_64
+        self.stopped = False  # set when the diagnosis is given up on: no read is begun after it
         self.pending: list[tuple[Survivor, Task]] = []  # D tasks whose object needs `maps` or the task's memory
 
     def text(self, name: str, limit: int = TEXT_LIMIT) -> str | None:
@@ -144,7 +150,9 @@ class _Reader:
         """The process as far as the cheap files go; unknown (`tasks` None) when it is gone, another process by this pid
         or hidden. A D task whose object needs more is queued for `finish`."""
         pid = proc.get("pid")
-        found = Survivor(pid if isinstance(pid, int) else -1, str(proc.get("comm")), str(proc.get("state")))
+        found = placeholder(proc)
+        if self.stopped:
+            return found
         stat = P.parse_stat(self.text(f"{pid}/stat") or "")
         if stat is None or stat[3] != proc.get("start"):
             return found
@@ -186,15 +194,25 @@ class _Reader:
         return S.within_root(S.link_path(target), proc.root)
 
     def _object(self, proc: Survivor, task: Task, base: str) -> None:
+        """Resolve what a task in D waits on, by its syscall: the descriptor of a read-family call, the path argument of
+        a path call (read last, from the task's memory), or, for a task blocked outside any syscall (`-1`: a page
+        fault), what the process holds. Any other call, and an unreadable one, is not resolved: its object may be a path
+        the process does not hold, so it is never guessed from the holdings."""
         call = task.syscall
-        if isinstance(call, str):  # unreadable or running: never guessed from what the process holds
+        if isinstance(call, str):
+            return
+        if call.nr == S.OUTSIDE_A_SYSCALL:
+            task.via = "holdings"
+            self.pending.append((proc, task))
             return
         fd = S.fd_call(call) if self.known else None
         if fd is not None:
+            task.via = "fd"
             found = self._descriptor(proc, base, fd[1])
             task.objects = None if found is None else [found]
-        else:
-            self.pending.append((proc, task))  # a path call's argument (task memory), or else the holdings rule
+        elif self.known and S.path_call(call) is not None:
+            task.via = "path"
+            self.pending.append((proc, task))
 
     def _descriptor(self, proc: Survivor, base: str, fd: int) -> Waits | None:
         """The file descriptor `fd` placed on the process's mounts; None when any read failed."""
@@ -228,9 +246,12 @@ class _Reader:
         """The objects that need the task's memory or its `maps`, after every cheap read of every survivor; then, for a
         survivor with a task in `D` and no object found, its FUSE descriptors, for the record's `waits_on`."""
         for proc, task in list(self.pending):
-            call = task.syscall
-            path = S.path_call(call) if self.known and not isinstance(call, str) else None
-            task.objects = self._holdings(proc) if path is None else self._path_object(proc, task, path)
+            if self.stopped:
+                return
+            if task.via == "holdings":
+                task.objects = self._holdings(proc)
+            else:
+                task.objects = self._path_object(proc, task, S.path_call(task.syscall))
         for proc in list(procs):
             tasks = proc.tasks or []
             if any(t.state == "D" for t in tasks) and not any(t.objects for t in tasks):
@@ -291,6 +312,12 @@ class _Reader:
                 proc.maps.append(Waits(self.roles.place(entry, path)))
 
 
+def placeholder(proc: Mapping[str, Any]) -> Survivor:
+    """A survivor not read (yet), as the deadline listed it: its `pid` and `start` exactly, and no tasks, which reads as
+    unknown, never as a process that waits on nothing."""
+    return Survivor(proc.get("pid", -1), proc.get("start", ""), str(proc.get("comm")), str(proc.get("state")))
+
+
 def diagnose(
     view: ProcReader,
     left: Sequence[Mapping[str, Any]],
@@ -306,7 +333,7 @@ def diagnose(
     if not left or not timeout_s > 0:
         return None
     reader = _Reader(view, roles, machine or platform.machine())
-    procs = [Survivor(-1, str(p.get("comm")), str(p.get("state"))) for p in left]
+    procs = [placeholder(p) for p in left]
 
     def work() -> None:
         try:
@@ -319,11 +346,12 @@ def diagnose(
     thread = threading.Thread(target=work, name="stuck-reader", daemon=True)
     thread.start()
     thread.join(min(timeout_s * DIAGNOSE_SHARE, DIAGNOSE_MAX_S))  # the abort that frees the cell keeps the rest
-    shown = [survivor_record(proc, reader.roles, reader.known) for proc in procs[:SURVIVORS_KEPT]]
+    reader.stopped = True  # a read still blocked is left behind, and starts nothing more
+    reading = [reading_entry(proc, reader.roles, reader.known) for proc in list(procs)]
     found: dict[str, Any] = {
-        "survivors": shown,
-        "survivors_cut": max(0, len(procs) - SURVIVORS_KEPT),
-        "blocks": [block_record(proc) for proc in procs],
+        "survivors": [survivor_record(entry) for entry in reading[:SURVIVORS_KEPT]],
+        "survivors_cut": max(0, len(reading) - SURVIVORS_KEPT),
+        READING: reading,  # every survivor, whole: what the verdict is made on, never recorded
     }
     if (conn := connection_record(connection)) is not None:
         found["connection"] = conn
