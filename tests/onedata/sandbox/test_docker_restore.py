@@ -356,3 +356,59 @@ def test_o97_a_restore_given_up_on_while_it_waits_for_the_mount_stops_waiting_an
         host.docker = real_run
     assert answer == {"ok": False, "why": "the restore is not wanted any more"}
     assert not sbx._token_files_left()
+
+
+def test_o97_the_restores_total_time_is_below_the_time_a_stop_waits_for_it():
+    """O97: a stop waits `RESTORE_WAIT_S` for a restore under way and then gives up on it: the restore's own bound is
+    below that, so a restore still inside its time is never one a stop has abandoned."""
+    from expcore_onedata.sandbox import cells
+
+    assert RM.RESTORE_TOTAL_S < cells.RESTORE_WAIT_S
+
+
+def slows_the_unmount(host, sandbox, seconds: float):
+    """The dead share takes `seconds` to unmount, by the sandbox's own clock (the abort's, the waits'): the restore
+    reaches its next step with that much of its time gone."""
+    real = host.run_handlers.get("fusermount")
+
+    def slow(argv):
+        sandbox._clock.now += seconds
+        return real(argv) if real else host._run_default(argv)
+
+    host.run_handlers["fusermount"] = slow
+
+
+def test_o97_a_restore_that_is_out_of_time_after_the_unmount_writes_no_token_and_starts_no_sidecar(aborted):
+    """O97: the unmount took the restore past its total time: nothing of the new generation is begun, no token file is
+    written, no sidecar is started, and the answer is in fixed words."""
+    sbx, host = aborted.sandbox, aborted.host
+    slows_the_unmount(host, sbx, RM.RESTORE_TOTAL_S + 5)
+    start = len(host.calls)
+    assert sbx.restore_mount() == {"ok": False, "why": "the restore ran out of its time"}
+    assert ("docker", "run", ()) not in calls_after(host, start)
+    assert not (sbx.dir / TOKEN_FILE).exists()
+    assert not sbx._token_files_left()
+
+
+def test_o97_a_mount_that_does_not_come_up_by_the_restores_time_ends_the_wait_and_leaves_no_token(aborted):
+    """O97: the sidecar is started with the time left (50 s of 90), the mount does not come up, and the wait ends at the
+    restore's time, not at the mount's own minute: out of time, with the token file removed whatever happened."""
+    sbx, host = aborted.sandbox, aborted.host
+    slows_the_unmount(host, sbx, RM.RESTORE_TOTAL_S - 50)
+    real_run = host.docker
+
+    def docker(*args, **kwargs):
+        done = real_run(*args, **kwargs)
+        if args[0] == "run" and sbx.names.sidecar in args:
+            host.mounts.pop(str(sbx.dir / "mount"), None)  # the mount never comes up
+        return done
+
+    host.docker = docker
+    try:
+        before = sbx._clock.now
+        answer = sbx.restore_mount()
+    finally:
+        host.docker = real_run
+    assert answer == {"ok": False, "why": "the restore ran out of its time"}
+    assert sbx._clock.now - before < RM.RESTORE_TOTAL_S + 1  # the wait ended at the bound, not a minute past it
+    assert not sbx._token_files_left()

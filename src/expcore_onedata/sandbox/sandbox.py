@@ -1371,7 +1371,7 @@ class DockerSandbox:
             return {"ok": False, "why": RM.NO_MOUNT}
         generation, began = len(self._gens) + 1, self._clock()
         try:
-            why = self._remount(generation)
+            why = self._remount(generation, began + RM.RESTORE_TOTAL_S)
         except Exception as error:  # the class only reaches the record: its text may name a path
             log.error("the mount's restore raised: %s", describe_error(error))
             why = f"the restore raised {type(error).__name__}"
@@ -1384,8 +1384,10 @@ class DockerSandbox:
             self._meta.setdefault("mount", {})["remounts"] = generation - 1
         return {"ok": True, "generation": generation, "wait_s": wait_s}
 
-    def _remount(self, generation: int) -> str | None:
-        """The steps of `_restore_host_mount`; None when the mount is back, else why not, in `remount`'s words."""
+    def _remount(self, generation: int, until: float) -> str | None:
+        """The steps of `_restore_host_mount`; None when the mount is back, else why not, in `remount`'s words. The
+        whole is bounded by `until` (`remount.RESTORE_TOTAL_S`): no token is written and no sidecar started past it, and
+        the wait for the new mount ends at it."""
         share = self.dir / "mount"
         mountpoint = TD.host_path(share)
         if not self._restore_wanted():
@@ -1407,13 +1409,15 @@ class DockerSandbox:
             return RM.NOT_WANTED
         if (why := self._clear_agent_copy()) is not None:
             return why
+        if self._clock() >= until:  # nothing of the new generation is begun past the restore's time
+            return RM.OUT_OF_TIME
         try:
             token = self._write_token_file(TOKEN_FILE, again=True)
         except (OSError, SandboxError):
             return RM.TOKEN
         why = None
         try:
-            why = self._start_next_sidecar(generation, token, mountpoint)
+            why = self._start_next_sidecar(generation, token, mountpoint, until)
         finally:
             try:
                 self._remove_token_files(token)  # oneclient read it as it started; its bind outlives this copy
@@ -1439,7 +1443,7 @@ class DockerSandbox:
         clean = TD._unmount_namespaces(self.host, [("agent", agent["pid"])], self.waits, _no_step_log)
         return None if clean else RM.STALE_IN_AGENT
 
-    def _start_next_sidecar(self, generation: int, token: Path, mountpoint: str) -> str | None:
+    def _start_next_sidecar(self, generation: int, token: Path, mountpoint: str, until: float) -> str | None:
         """Start the sidecar of the next generation, wait until its mount is in the host's table, and give the watch on
         the containers its baseline: the old sidecar's end was the harness's, the new one's is its own. None, or why not.
         The runner is asked again before the sidecar is started and at every look at the mount, since a stop that gave up
@@ -1450,6 +1454,8 @@ class DockerSandbox:
             log_dir.chmod(0o700)  # whatever the driver's umask
             if not self._restore_wanted():
                 return RM.NOT_WANTED
+            if self._clock() >= until:
+                return RM.OUT_OF_TIME
             self._register_creation()  # the name is the one the stop knows: a stop that ran meanwhile is not the last
             self.host.docker(
                 *sidecar_run_args(
@@ -1459,7 +1465,7 @@ class DockerSandbox:
             )  # fmt: skip
         except (OSError, SandboxError):
             return RM.NEW_SIDECAR
-        deadline = self._clock() + MOUNT_WAIT_S
+        deadline = min(self._clock() + MOUNT_WAIT_S, until)  # the mount's own wait, never past the restore's time
         try:
             while not hostops.is_fuse_mounted(self.host.read_text("/proc/self/mountinfo"), mountpoint):
                 if not self._restore_wanted():
@@ -1467,7 +1473,7 @@ class DockerSandbox:
                 if (hostops.inspect(self.host, self.names.sidecar) or {}).get("State", {}).get("Running") is not True:
                     return RM.NEW_SIDECAR
                 if self._clock() > deadline:
-                    return RM.NOT_MOUNTED
+                    return RM.OUT_OF_TIME if deadline == until else RM.NOT_MOUNTED
                 self._sleep(0.2)
             if not self._restore_wanted():
                 return RM.NOT_WANTED

@@ -162,8 +162,8 @@ def test_o97_the_cell_the_survivor_was_the_agents_is_restored_and_the_next_cell_
 
 
 def test_o97_the_record_carries_what_the_reader_found_and_nothing_a_record_may_not_hold(world, sandbox):
-    """O97: the record keeps the survivor by its name, its state and its thread's call and object (the data mount, the
-    space, the path below it), and the connection's state; no pid, no start, no path above the mount; and the call
+    """O97: the record keeps the survivor by its name, its state and its thread's call, and the connection's state; no
+    pid, no start (the per-task blocking object is the uncapped `reading`'s, which the record never keeps); and the call
     carries it whole: it passes the record's own check (`cell_deadline.problem`) as it is, with no fallback to the
     minimal form that drops the survivors."""
     _, record = at_the_cap(world, sandbox)
@@ -176,11 +176,6 @@ def test_o97_the_record_carries_what_the_reader_found_and_nothing_a_record_may_n
     assert task["state"] == "D"
     assert task["wchan"] == "request_wait_answer"
     assert task["syscall"] == {"nr": 0, "fd": 3}
-    assert task["blocking"] == {
-        "via": "fd",
-        "cut": False,
-        "objects": [{"mount": "data", "space": "space-a", "path": "file"}],
-    }
     assert not {"pid", "start"} & set(survivor)
     assert record["connection"] == {"fusectl": "writable"}
     carried = cell_deadline_of(record)
@@ -266,6 +261,13 @@ def test_o97_the_diagnosis_gives_the_pid_and_start_the_deadline_listed_so_the_re
     found = sandbox._cells.diagnosis(left, 5.0)
     assert {(e["pid"], e["start"]) for e in found[DL.READING]} == {(p["pid"], p["start"]) for p in left}
     assert DL._Run.covers(left, found)
+    [entry] = found[DL.READING]
+    assert entry["tasks"][0]["syscall"] == {"nr": 0, "fd": 3}
+    assert entry["tasks"][0]["blocking"] == {
+        "via": "fd",
+        "cut": False,
+        "objects": [{"mount": "data", "space": "space-a", "path": "file"}],
+    }
     verdict = attribution.attribute(found, {"providers[1]"}, HOLDERS)
     assert (verdict["verdict"], verdict["why"]) == ("agent", attribution.BLOCKED_ON_HOLDER)
 

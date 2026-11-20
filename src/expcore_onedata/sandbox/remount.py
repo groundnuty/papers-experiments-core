@@ -18,7 +18,11 @@ from collections.abc import Collection, Sequence
 
 from expcore_onedata.sandbox import hostops
 
+# the restore's own bound, in seconds, across every step: below the runner's wait for a restore under way (`cells.
+# RESTORE_WAIT_S`, 100 s), so a stop that waits for it never gives up on one that is still inside its time
+RESTORE_TOTAL_S = 90.0
 NOT_WANTED = "the restore is not wanted any more"  # the run gave up on it: nothing is made
+OUT_OF_TIME = "the restore ran out of its time"  # past `RESTORE_TOTAL_S`: no token is written and no sidecar started
 NO_MOUNT = "the run has no mount to restore"
 HOST_TABLE = "the host's mount table could not be read"
 OLD_SIDECAR = "the old sidecar could not be removed"
