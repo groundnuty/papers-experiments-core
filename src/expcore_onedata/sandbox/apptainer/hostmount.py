@@ -38,6 +38,14 @@ the mount is still in the table); oneclient shown gone; the token file shown gon
 holds the token removed; the bundle's copy removed. Each step is tried and the stop raises `SandboxError` naming those
 that failed; a second call does only what is left.
 
+**Generations (O97):** the mount of a run that is never restored is generation 1, as it always was. After a cell's
+deadline aborted the FUSE connection and the survivors were the agent's, `abort()` frees the cell and `restore()`
+makes the next generation (`mountgen`): the watch of the old one closed, its oneclient stopped, the dead mount
+unmounted, then a new oneclient and its own watcher, armed, at the same mount point. `mount_watch_logs()` is every
+generation's watcher log in order, `generation_oneclient_logs()` every generation's oneclient log, and `connection()`
+the live connection's device and fusectl state. Whatever is read of all of them (the guard's snapshot, the I/O-mode
+reading) is read of every one.
+
 **What is refused:** a direct mount (its check needs a cell before the first exists, and a provider's storage is on
 another node), a run without the token or the provider, an extra argument that sets the port (the provider's is
 passed), a platform that declares no bundle, and a bundle that is not the pinned file.
@@ -58,15 +66,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from expcore.mountguard import read_log, snapshot, verdict_of
+from expcore.mountguard import aggregate, verdict_of
 from expcore_onedata import tls as TLS
 from expcore_onedata.sandbox import directio, iomode
+from expcore_onedata.sandbox import fusectl as FC
 from expcore_onedata.sandbox import mountwatch as MW
 from expcore_onedata.sandbox.api import SandboxError, StartRefused
 from expcore_onedata.sandbox.apptainer import argv as AV
 from expcore_onedata.sandbox.apptainer import helpers
+from expcore_onedata.sandbox.apptainer import mountabort as MA
 from expcore_onedata.sandbox.apptainer import oneclient_bundle as OB
 from expcore_onedata.sandbox.apptainer.infra import process_state
+from expcore_onedata.sandbox.apptainer.mountgen import Generation, suffix
 from expcore_onedata.sandbox.apptainer.mounthook import MountHelperFactory
 from expcore_onedata.sandbox.apptainer.node import NodeOps
 from expcore_onedata.sandbox.containers import extra_args_record
@@ -110,6 +121,9 @@ NO_BUNDLE = (
     "host mount runs on the node (deploy/hpc-federation/README.md)"
 )
 NOT_COLLECTED = "not_collected"
+STOPPING = "the mount is being stopped"
+RESTORE_TOTAL_S = 90.0  # the whole restore's deadline by default: below the bound the runner waits for it (`cells`)
+OUT_OF_TIME = "the restore ran out of time"
 
 
 @dataclass(frozen=True)
@@ -148,7 +162,11 @@ class Layout:
 
     @property
     def watch_log(self) -> Path:
-        return self.watch_dir / "mountwatch.jsonl"
+        return self.watch_log_of(1)
+
+    def watch_log_of(self, generation: int) -> Path:
+        """A generation's watcher log: generation 1's is the log of a run that is never restored."""
+        return self.watch_dir / f"mountwatch{suffix(generation)}.jsonl"
 
     @property
     def mountpoint(self) -> Path:
@@ -196,9 +214,12 @@ def oneclient_argv(settings: Any, provider: Any, where: Layout, launcher: Sequen
     ]
 
 
-def watcher_argv(python: str, where: Layout, nonce: str, oneclient: Any, poll_s: float) -> list[str]:
+def watcher_argv(
+    python: str, where: Layout, nonce: str, oneclient: Any, poll_s: float, log: Path | None = None
+) -> list[str]:
+    """The watcher's command line; `log` is its generation's log (`Layout.watch_log_of`), generation 1's by default."""
     return [
-        *(python, "-I", "-B", "-m", "expcore_onedata.sandbox.mountwatch", "--log", str(where.watch_log)),
+        *(python, "-I", "-B", "-m", "expcore_onedata.sandbox.mountwatch", "--log", str(log or where.watch_log)),
         *("--nonce", nonce, "--token", str(where.token_file), "--mountpoint", str(where.mountpoint)),
         *("--oneclient", f"{oneclient.pid}:{oneclient.start}", "--poll-s", str(poll_s)),
         *(word for path in where.protected() for word in ("--protect", str(path))),
@@ -254,25 +275,40 @@ class HostMount:
         mountinfo: Callable[[], str] = _own_mountinfo,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        fusectl_root: Path = FC.FUSECTL,
     ) -> None:
         self.node, self.s, self.spec, self.where = node, settings, spec, Layout(Path(run_dir))
         self._python, self._unmount, self._poll_s = python or sys.executable, tuple(unmount), poll_s
         self._mountinfo, self._sleep, self._clock = mountinfo, sleep, clock
+        self._fusectl_root = Path(fusectl_root)
         self.nonce = secrets.token_hex(16)
         # The run's tag (the run directory is named by the sandbox's id): a reaper of a driver killed outright finds
         # oneclient and the watcher by it, as it finds the gate and the collector (`runs.reap`).
         self._tag = {AV.RUN_TAG: self.where.run_dir.name}
         self.bundle: OB.Bundle | None = None
         self._build: dict[str, Any] | None = None  # the oneclient that serves the run: version, build id, pin
-        self.oneclient: helpers.Helper | None = None
-        self.watch: helpers.Helper | None = None
-        self._closed = False
-        self._log: bytes | None = None
+        self._ca: Path | None = None  # the run's private copy of the CA bundle: the same for every generation
+        self._gens: list[Generation] = [Generation(1)]  # the live generation is the last
+        self._closing = False  # a stop began: no restore writes the token file or starts a process from then on
+        self._finalized = False  # the guard's window is closed and the run's snapshot and I/O-mode reading are taken
         self._snapshot: dict[str, Any] | None = None
         self._io_mode: dict[str, Any] | None = None
         self._meta: dict[str, Any] = {}
         self._lock = threading.RLock()
-        self._before: dict[str, dict[str, Any]] = {}  # a role's state just before the harness stopped it (O17)
+
+    @property
+    def _live(self) -> Generation:
+        return self._gens[-1]
+
+    @property
+    def oneclient(self) -> helpers.Helper | None:
+        """The live generation's oneclient."""
+        return self._live.oneclient
+
+    @property
+    def watch(self) -> helpers.Helper | None:
+        """The live generation's watcher."""
+        return self._live.watch
 
     # ------------------------------------------------------------------------------------------------ start
     def _validate(self) -> None:
@@ -300,20 +336,45 @@ class HostMount:
         self.bundle = OB.unpack(bundle_pin(self.s), where.bundle_dir)
         self._build = self._read_build(self.bundle)
         self._write_token()
-        ca = TLS.write_private_copy(self.s.tls.bundle(), where.home_dir) if self.s.tls.ca_file is not None else None
+        if self.s.tls.ca_file is not None:
+            self._ca = TLS.write_private_copy(self.s.tls.bundle(), where.home_dir)
+        self._launch(self._live)
+        return where.mountpoint
+
+    def _budget(self, own: float, deadline: float | None) -> float:
+        """The time a step may take: its own bound, or the time left until `deadline` when that is less (None: no
+        deadline, as the start has none). `SandboxError` when none is left: a step past the deadline is never begun."""
+        if deadline is None:
+            return own
+        left = deadline - self._clock()
+        if left <= 0:
+            raise SandboxError(OUT_OF_TIME)
+        return min(own, left)
+
+    def _launch(self, gen: Generation, deadline: float | None = None) -> None:
+        """The module's docstring, `start`'s steps 1 and 2, for one generation: oneclient started on the token file
+        already written, its mount awaited, then the generation's own watcher, and the token file removed once the
+        watcher is armed. The streams and the watcher's log are the generation's own (`mountgen.suffix`)."""
+        where, tail = self.where, suffix(gen.number)
+        self._budget(0.0, deadline)  # no oneclient is started once the time is gone
         t0 = self._clock()
-        argv = oneclient_argv(self.s, self.spec.provider, where, self.bundle.launcher(), ca)
-        out, err = where.guard / "oneclient.stdout", where.guard / "oneclient.stderr"
+        argv = oneclient_argv(self.s, self.spec.provider, where, self.bundle.launcher(), self._ca)
+        out, err = where.guard / f"oneclient{tail}.stdout", where.guard / f"oneclient{tail}.stderr"
         spawned = self.node.spawn(argv, stdout=out, stderr=err, env=self._tag)
-        self.oneclient = helpers.Helper("oneclient", spawned, out, err)
-        self._wait_mounted()
-        self._meta["wait_s"] = round(self._clock() - t0, 3)
-        watched = watcher_argv(self._python, where, self.nonce, self.oneclient.process, self._poll_s)
-        helpers.start(self.node, "mountwatch", watched, where.watch_dir, MW.READY, noted=self._noted, env=self._tag,
+        gen.oneclient = helpers.Helper("oneclient", spawned, out, err)
+        self._wait_mounted(gen, deadline)
+        gen.wait_s = round(self._clock() - t0, 3)
+        if gen.number == 1:
+            self._meta["wait_s"] = gen.wait_s
+        watched = watcher_argv(self._python, where, self.nonce, gen.oneclient.process, self._poll_s,
+                               log=where.watch_log_of(gen.number))  # fmt: skip
+        self._refuse_if_stopping()
+        ready_s = self._budget(helpers.READY_WAIT_S, deadline)  # and none is, once the time is gone
+        helpers.start(self.node, f"mountwatch{tail}", watched, where.watch_dir, MW.READY,
+                      noted=lambda helper: setattr(gen, "watch", helper), env=self._tag, wait_s=ready_s,
                       sleep=self._sleep, clock=self._clock)  # fmt: skip
         self._remove_token()
-        self._wait_armed()
-        return where.mountpoint
+        self._wait_armed(gen, deadline)
 
     def _read_build(self, bundle: OB.Bundle) -> dict[str, Any]:
         """What the run records of its oneclient: its own `--version`, run here, the binary's build id, and the pin.
@@ -331,9 +392,6 @@ class HostMount:
         """The token's file, which the sandbox lists in the run's record before the start writes it (O60)."""
         return [self.where.token_file]
 
-    def _noted(self, helper: helpers.Helper) -> None:
-        self.watch = helper
-
     def _write_token(self) -> None:
         handle = os.open(self.where.token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
@@ -344,20 +402,27 @@ class HostMount:
         if os.path.lexists(self.where.token_file):
             raise SandboxError("the mount's token file could not be removed")
 
-    def _wait_mounted(self) -> None:
-        """Until this uid's read-only FUSE mount is at the mount point; `SandboxError` when oneclient ends first, the
-        mount is not as it must be, or it does not appear in time."""
-        until, state = self._clock() + MOUNT_WAIT_S, "absent"
+    def _wait_mounted(self, gen: Generation, deadline: float | None = None) -> None:
+        """Until this uid's read-only FUSE mount is at the mount point, and the generation has its connection's device
+        and fusectl state (`connection`); `SandboxError` when oneclient ends first, the mount is not as it must be, it
+        does not appear in time, or a stop began."""
+        until, state, table = self._clock() + MOUNT_WAIT_S, "absent", ""
+        if deadline is not None:
+            until = min(until, deadline)
         while True:
+            self._refuse_if_stopping()
             try:
-                state = fuse_state(self._mountinfo(), str(self.where.mountpoint), os.getuid())
+                table = self._mountinfo()
+                state = fuse_state(table, str(self.where.mountpoint), os.getuid())
             except OSError:
                 state = "unread"
             if state is None:
+                gen.device = FC.fuse_device(table, str(self.where.mountpoint))
+                gen.fusectl = FC.state(self._fusectl_root, None if gen.device is None else FC.conn(gen.device))
                 return
             if state not in ("absent", "unread"):
                 raise SandboxError(f"the oneclient mount is not as the host mount makes it ({state})")
-            process = self.oneclient.process
+            process = gen.oneclient.process
             if self.node.alive(process.pid, process.start) is False:
                 status = self.node.exit_status(process)
                 raise SandboxError(f"oneclient ended before its mount appeared (exit {status})")
@@ -365,87 +430,271 @@ class HostMount:
                 raise SandboxError("the oneclient mount did not appear")
             self._sleep(POLL_S)
 
-    def _wait_armed(self) -> None:
+    def _wait_armed(self, gen: Generation, deadline: float | None = None) -> None:
         until = self._clock() + ARMED_WAIT_S
-        while MW.ARMED not in helpers.output(self.watch).splitlines():
-            if self.node.alive(self.watch.process.pid, self.watch.process.start) is False:
+        if deadline is not None:
+            until = min(until, deadline)
+        while MW.ARMED not in helpers.output(gen.watch).splitlines():
+            self._refuse_if_stopping()
+            if self.node.alive(gen.watch.process.pid, gen.watch.process.start) is False:
                 raise SandboxError("the mount watcher ended before it saw the token's removal")
             if self._clock() >= until:
                 raise SandboxError("the mount watcher did not see the token's removal in time")
             self._sleep(POLL_S)
 
     # ------------------------------------------------------------------------------------------------ the watch
-    def close_watch(self) -> None:
-        """Close the agent's window and read the watcher's log once (the module's docstring); safe to call again."""
+    def _close_generation(self, gen: Generation, deadline: float | None = None) -> None:
+        """Close one generation's watch: its watcher stopped (SIGTERM: a last poll, `disarmed`, its end line) and its
+        log read once. Its last state is noted first, so the stop is never read as a death. Safe to call again."""
         with self._lock:
-            if self._closed:
+            if gen.closed:
                 return
-            self._closed = True
+            gen.closed = True
             try:
-                watch = self.watch
+                watch = gen.watch
                 if watch is not None:  # its last state of the run: the stop that follows is the harness's own
-                    self._before.setdefault("mount_watch", process_state(self.node, watch.process))
+                    gen.before.setdefault("mount_watch", process_state(self.node, watch.process))
                 if watch is not None and self.node.alive(watch.process.pid, watch.process.start) is not False:
-                    self._meta["watch_stop"] = helpers.stop(self.node, watch, sleep=self._sleep, clock=self._clock)
+                    self._meta["watch_stop"] = self._stop_helper(watch, deadline)
             finally:
-                self._log = _read(self.where.watch_log) if self.watch is not None else None
-                self._snapshot = snapshot(read_log(self._log, self.nonce))
-                text = _read_log_link(self.where, directio.LOG_FILE)
-                declared = getattr(self.s.mount, "io_mode", None)
-                self._io_mode = iomode.judge(declared, None if text is None else text.decode("utf-8", "replace"))
+                gen.log = _read(self.where.watch_log_of(gen.number)) if gen.watch is not None else None
 
-    def mount_watch_log(self) -> bytes | None:
-        """The watcher's log (`expcore.mountguard.MountWatchSource`), its window closed first if still open: the
-        executor reads it after the run's cells have ended (a cell alive at the close is a failed proof)."""
+    def close_watch(self) -> None:
+        """Close the agent's window of the live generation (every earlier one was closed by its restore), and take what
+        is read of all of them: the guard's snapshot over every generation's log and the I/O-mode reading over every
+        generation's oneclient log (the module's docstring). Safe to call again."""
+        with self._lock:
+            if self._finalized:
+                return
+            self._finalized = True
+            try:
+                self._close_generation(self._live)
+            finally:
+                self._judge()
+
+    def _judge(self) -> None:
+        """The snapshot of the generations' logs and the I/O-mode reading of their oneclient logs, taken once. An
+        earlier generation's log is the one kept when it ended; the live one's is read now and not kept: it stays
+        readable as it always was, at each call (`oneclient_log`)."""
+        texts = [gen.oneclient_log for gen in self._gens[:-1]]
+        texts.append(None if self._live.oneclient is None else _read_log_link(self.where, directio.LOG_FILE))
+        self._snapshot = aggregate([gen.log for gen in self._gens], self.nonce)
+        declared = getattr(self.s.mount, "io_mode", None)
+        readings = [iomode.judge(declared, None if text is None else text.decode("utf-8", "replace")) for text in texts]
+        self._io_mode = iomode.worst(readings)
+
+    def mount_watch_logs(self) -> list[bytes | None]:
+        """Every generation's watcher log in order (None for one that could not be read), the live window closed first:
+        the executor reads them after the run's cells have ended (a cell alive at the close is a failed proof)."""
         self.close_watch()
-        return self._log
+        return [gen.log for gen in self._gens]
+
+    def mount_watch_log(self) -> Sequence[bytes | None] | bytes | None:
+        """The watcher's log as `expcore.mountguard.MountWatchSource` reads it: the one log of a mount with one
+        generation, as it always was (None when it could not be read), and for a mount that was restored every
+        generation's in order (`mount_watch_logs`), None for one that is missing, which the guard reads as unknown."""
+        logs = self.mount_watch_logs()
+        return logs[0] if len(logs) == 1 else logs
+
+    def generation_oneclient_logs(self) -> list[bytes | None]:
+        """oneclient's INFO log of every generation in order, None for one that could not be read: an earlier one as it
+        was when its generation ended (read before the next started: glog's link moves to the newest), the live one as
+        it is now."""
+        with self._lock:
+            earlier = [gen.oneclient_log for gen in self._gens[:-1]]
+            live = self._live.oneclient_log
+        return [*earlier, live if live is not None else _read_log_link(self.where, directio.LOG_FILE)]
+
+    def connection(self) -> dict[str, Any]:
+        """The live generation's FUSE connection: `device` (its "major:minor" in the mount table, None before the mount
+        is up) and `fusectl` (`writable`, `absent` or `not_writable`: whether the owner may abort it, None before the
+        mount is up). Read from what the generation recorded when its mount came up, never from the mount."""
+        live = self._live
+        return {"device": live.device, "fusectl": live.fusectl}
+
+    def abort(self, timeout_s: float) -> dict[str, Any]:
+        """Free what waits on the live connection, within `timeout_s` (`mountabort`): the deadline's abort. oneclient's
+        state is noted first as the harness's, so its end after the abort is never read as a death; only the freeing
+        action runs here, and the unmount and oneclient's stop are the restore's. The record is kept in the
+        generation's metadata. Never raises."""
+        gen = self._live
+        if gen.oneclient is None:
+            record = MA.not_attempted()
+        else:
+            try:
+                self._note_mount(gen)
+                record = MA.abort(
+                    self.node,
+                    gen.oneclient.process,
+                    connection=None if gen.device is None else FC.conn(gen.device),
+                    state=gen.fusectl,
+                    root=self._fusectl_root,
+                    identity_ok=lambda: self._identity_ok(gen),
+                    timeout_s=timeout_s,
+                    sleep=self._sleep,
+                    clock=self._clock,
+                )
+            except Exception as error:  # `mountabort.abort` does not raise; the note before it may
+                log.error("the abort of the mount could not be made: %s", describe_error(error))
+                record = {"ok": False, "method": None, "waiting_before": None, "waiting_after": None,
+                          "abort_s": 0.0, "why": MA.RAISED}  # fmt: skip
+        with self._lock:
+            gen.abort = dict(record)
+        return record
+
+    def restore(self, timeout_s: float = RESTORE_TOTAL_S) -> dict[str, Any]:
+        """Make the next generation of the mount after `abort` freed the cell (the module's docstring): the old
+        generation's watch closed (its log read, `disarmed`), its oneclient stopped and its log kept, the dead mount
+        unmounted until the mount table shows it gone, then the token file written again, a new oneclient with the same
+        command line mounted at the same point, and the generation's own watcher (a log of its own, the run's nonce)
+        armed on the token file's removal. `{"ok": True, "generation": n, "wait_s": ...}`.
+
+        **One total deadline**, `timeout_s` from the call: each step gets the lesser of its own bound and the time left,
+        and past it the token file is not written and no process is started. The runner gives up on a restore that
+        outlasts its own bound and goes on to the teardown, so a restore that was still running would race it: this one
+        ends by itself first. A failure, of any kind, removes the token file, and a `SandboxError` with a fixed phrase
+        (never an error's text) is raised: the run is then ended by the caller, and `stop()` ends whatever of the new
+        generation started. The caller is the sandbox's `_restore_host_mount`, under its restore lock, and a stop that
+        begins meanwhile ends it at its next step (`refuse_restores`)."""
+        deadline = self._clock() + timeout_s
+        step = "closing the old watch"
+        try:
+            with self._lock:
+                self._refuse_restore()
+                old = self._live
+            self._budget(0.0, deadline)
+            self._note_mount(old)
+            self._close_generation(old, deadline)
+            step = "stopping the old oneclient"
+            self._stop_generation(old, deadline)
+            old.oneclient_log = _read_log_link(self.where, directio.LOG_FILE)  # before glog's link moves to the new one
+            step = "unmounting the dead mount"
+            self._unmount_once(deadline)
+            self._mount_gone(deadline)
+            step = "starting the new mount"
+            new = Generation(old.number + 1)
+            with self._lock:  # the flag and the token file under one lock: none is written once a stop began
+                self._refuse_restore()
+                self._budget(0.0, deadline)  # nor once the time is gone
+                self._gens.append(new)  # live from now: a stop finds whatever of it starts
+                self._write_token()
+            self._launch(new, deadline)
+        except BaseException as error:
+            self._fail_restore(error, step)
+        return {"ok": True, "generation": new.number, "wait_s": new.wait_s}
+
+    def _refuse_restore(self) -> None:
+        """`SandboxError` when no restore may begin or go on: a stop began, the guard's window is closed (the run's
+        snapshot is taken, and a generation made after it would be missing from it), or no oneclient ever started."""
+        self._refuse_if_stopping()
+        with self._lock:
+            if self._finalized:
+                raise SandboxError("the mount's guard is closed: no restore can be watched")
+            if self._live.oneclient is None:
+                raise SandboxError("the mount never started: nothing to restore")
+
+    def _fail_restore(self, error: BaseException, step: str) -> None:
+        """The restore failed: the token file removed, then `SandboxError` naming the reason. An error that is not an
+        `Exception` (an interrupt) is raised as it is, after the token file is removed. A reason that is not already one
+        of ours is the step, never the error's text, which can carry a path."""
+        try:
+            self._remove_token()
+        except SandboxError:
+            if not isinstance(error, Exception):
+                raise error from None
+            reason = str(error) if isinstance(error, SandboxError) else f"the mount could not be restored ({step})"
+            raise SandboxError(f"{reason}, and its token file could not be removed") from error
+        if not isinstance(error, Exception) or isinstance(error, SandboxError):
+            raise error
+        raise SandboxError(f"the mount could not be restored while {step}") from error
+
+    def _identity_ok(self, gen: Generation) -> bool:
+        """Whether the mount table, read now, shows this uid's read-only FUSE mount at the mount point on the device
+        the generation's mount came up with: the connection's identity, since its number is reused after an unmount.
+        Read from the table alone: nothing is statted on a mount that may be wedged."""
+        try:
+            table = self._mountinfo()
+            mountpoint = str(self.where.mountpoint)
+            return (
+                fuse_state(table, mountpoint, os.getuid()) is None and FC.fuse_device(table, mountpoint) == gen.device
+            )
+        except (OSError, MountTableError):
+            return False
+
+    def refuse_restores(self) -> None:
+        """A stop is under way or about to be: from now on no restore writes the token file or starts a process, and one
+        that is running ends at its next step. Called by the sandbox's stop, which then waits for the restore."""
+        with self._lock:
+            self._closing = True
+
+    def _refuse_if_stopping(self) -> None:
+        with self._lock:
+            if self._closing:
+                raise SandboxError(STOPPING)
 
     # ------------------------------------------------------------------------------------------------ stop
     # ------------------------------------------------------------------------------------------------ its state
-    def _mount_state(self) -> dict[str, Any]:
-        process = self.oneclient.process
-        end = process_state(self.node, process)
+    def _mount_state(self, gen: Generation) -> dict[str, Any]:
+        end = process_state(self.node, gen.oneclient.process)
         try:
             end["mount"] = fuse_state(self._mountinfo(), str(self.where.mountpoint), os.getuid())
         except (OSError, MountTableError):
             end["mount"] = "unread"
         return end
 
+    def _note_mount(self, gen: Generation) -> None:
+        """The oneclient's state just before the harness ends it (an abort, the stop), once: so what follows is never
+        read as a death (`infra_check`, O17); its mount's state is unknown, never clean, when it cannot be read."""
+        if gen.oneclient is None:
+            return
+        with self._lock:
+            if "mount" in gen.before:
+                return
+            try:
+                gen.before["mount"] = self._mount_state(gen)
+            except Exception as error:  # unknown, never clean: and what follows runs all the same
+                gen.before["mount"] = {"running": None, "exit_status": None, "mount": "unread"}
+                log.error("oneclient's state before its end could not be read: %s", describe_error(error))
+
     def infra_state(self) -> dict[str, dict[str, Any]]:
         """oneclient with its mount (`mount`) and the guard's watcher (`mount_watch`), by role, for the sandbox's
         `infra_check` (`apptainer.infra`, O17): each one's process (`start`) and its state (`end`), now, or just before
         the harness stopped it (`stopped_by_harness`). Only what has started is listed. The live state is read before
         the note is looked for, and the note is taken before every stop, so a stop that lands meanwhile is found by its
-        note, never taken for a death."""
+        note, never taken for a death. These roles are the live generation's: an earlier generation of a restored mount
+        is listed beside them as `mount_<g>` and `mount_watch_<g>`, each as it was just before the harness ended it."""
         found: dict[str, dict[str, Any]] = {}
-        for role, helper, now in (("mount", self.oneclient, self._mount_state),
-                                  ("mount_watch", self.watch, None)):  # fmt: skip
-            if helper is None:
-                continue
-            live = now() if now is not None else process_state(self.node, helper.process)  # first, then the note
-            with self._lock:
-                before = self._before.get(role)
-            found[role] = {"start": helper.process.record(), "end": before or live}
-            if before is not None:
-                found[role]["stopped_by_harness"] = True
+        with self._lock:
+            gens = list(self._gens)
+        for gen in gens:
+            live = gen is gens[-1]
+            tail = "" if live else f"_{gen.number}"
+            for role, helper, now in (("mount", gen.oneclient, self._mount_state if live else None),
+                                      ("mount_watch", gen.watch, None)):  # fmt: skip
+                if helper is None:
+                    continue
+                state = (
+                    now(gen) if now is not None else process_state(self.node, helper.process)
+                )  # first, then the note
+                with self._lock:
+                    before = gen.before.get(role)
+                found[role + tail] = {"start": helper.process.record(), "end": before or state}
+                if before is not None:
+                    found[role + tail]["stopped_by_harness"] = True
         return found
 
     def oneclient_log(self) -> bytes | None:
-        """oneclient's INFO log, through glog's link to it in its log directory, as it is now; None when it cannot be
-        read, or when a link lies on the way to it (`_read_log_link`, #362). The read is the driver's, of a directory
-        no cell binds, which the guard's watcher does not watch (it watches the token file and its directory alone), so
-        it may be read during the run (O18, O60)."""
-        return _read_log_link(self.where, directio.LOG_FILE)
+        """oneclient's INFO log, through glog's link to it in its log directory, as it is now, with the logs of the
+        generations before it in front (each read when its generation ended); None when any of them cannot be read, or
+        when a link lies on the way to it (`_read_log_link`, #362). The read is the driver's, of a directory no cell
+        binds, which the guard's watcher does not watch (it watches the token file and its directory alone), so it may
+        be read during the run (O18, O60)."""
+        logs = self.generation_oneclient_logs()
+        return None if any(text is None for text in logs) else b"".join(logs)  # type: ignore[arg-type]
 
     def stop(self) -> None:
-        if self.oneclient is not None:  # its last state of the run, before the stop's own unmount and signals
-            with self._lock:
-                if "mount" not in self._before:
-                    try:
-                        self._before["mount"] = self._mount_state()
-                    except Exception as error:  # unknown, never clean: and the stop's steps run all the same
-                        self._before["mount"] = {"running": None, "exit_status": None, "mount": "unread"}
-                        log.error("oneclient's state before the stop could not be read: %s", describe_error(error))
+        self.refuse_restores()
+        self._note_mount(self._live)  # its last state of the run, before the stop's own unmount and signals
         errors: list[str] = []
         for what, step in (("watch", self.close_watch), ("unmount", self._unmount_once),
                            ("oneclient", self._stop_oneclient), ("mount", self._mount_gone),
@@ -464,26 +713,42 @@ class HostMount:
         except (OSError, MountTableError):
             return True  # a table that cannot be read shows nothing gone
 
-    def _unmount_once(self) -> None:
+    def _unmount_once(self, deadline: float | None = None) -> None:
         if self._mounted():
-            self.node.run([*self._unmount, str(self.where.mountpoint)], STEP_S)
+            self.node.run([*self._unmount, str(self.where.mountpoint)], self._budget(STEP_S, deadline))
 
     def _stop_oneclient(self) -> None:
-        process = None if self.oneclient is None else self.oneclient.process
-        if process is not None and self.node.alive(process.pid, process.start) is not False:
-            self._meta["oneclient_stop"] = helpers.stop(self.node, self.oneclient, sleep=self._sleep, clock=self._clock)
+        """Every generation's oneclient that still runs (an earlier one ended with its restore)."""
+        for gen in list(self._gens):
+            self._stop_generation(gen)
 
-    def _mount_gone(self) -> None:
+    def _stop_generation(self, gen: Generation, deadline: float | None = None) -> None:
+        process = None if gen.oneclient is None else gen.oneclient.process
+        if process is not None and self.node.alive(process.pid, process.start) is not False:
+            self._meta["oneclient_stop"] = self._stop_helper(gen.oneclient, deadline)
+
+    def _stop_helper(self, helper: helpers.Helper, deadline: float | None) -> dict[str, Any]:
+        """`helpers.stop`, each of its two waits the lesser of its own bound and the time left until `deadline`."""
+        term = self._budget(helpers.TERM_WAIT_S, deadline)
+        kill = (
+            helpers.KILL_WAIT_S
+            if deadline is None
+            else min(helpers.KILL_WAIT_S, max(deadline - self._clock() - term, 0.0))
+        )
+        return helpers.stop(self.node, helper, term_wait_s=term, kill_wait_s=kill, sleep=self._sleep, clock=self._clock)
+
+    def _mount_gone(self, deadline: float | None = None) -> None:
         if self._mounted():
-            self.node.run([self._unmount[0], LAZY, str(self.where.mountpoint)], STEP_S)
+            self.node.run([self._unmount[0], LAZY, str(self.where.mountpoint)], self._budget(STEP_S, deadline))
         if self._mounted():
             raise SandboxError("the oneclient mount is still in the mount table")
 
     def _remove_bundle(self) -> None:
         """The bundle's copy, once oneclient is shown gone: 100 MB of a run's directory that is no evidence."""
-        process = None if self.oneclient is None else self.oneclient.process
-        if process is not None and self.node.alive(process.pid, process.start) is not False:
-            raise SandboxError("oneclient is not shown gone, so its bundle is kept")
+        for gen in list(self._gens):
+            process = None if gen.oneclient is None else gen.oneclient.process
+            if process is not None and self.node.alive(process.pid, process.start) is not False:
+                raise SandboxError("oneclient is not shown gone, so its bundle is kept")
         if self.where.bundle_dir.is_dir():
             shutil.rmtree(self.where.bundle_dir)
 
@@ -507,6 +772,7 @@ class HostMount:
         mount = self.s.mount
         declared, extra = getattr(mount, "io_mode", None), getattr(mount, "extra_args", ())
         with self._lock:
+            generations = [gen.record() for gen in self._gens]
             taken = self._io_mode
             guard = (
                 {"nonce": self.nonce, "verdict": verdict_of(self._snapshot), "snapshot": dict(self._snapshot)}
@@ -521,6 +787,9 @@ class HostMount:
             "extra_args": extra_args_record(extra),
             "log_dir_from": "sandbox",
             "guard": guard,
+            "fusectl": self._gens[0].fusectl,  # the first generation's: whether this node let the owner abort (O97)
+            "remounts": len(generations) - 1,
+            "generations": generations,
             **{key: value for key, value in self._meta.items() if key in ("wait_s", "log_files_scrubbed")},
         }
 

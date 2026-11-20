@@ -60,6 +60,10 @@ Version 3 also carries, as the last field of a tool call, the optional `exec_che
 the exec that ran the call's program (`source_whole`, `exit_status`, `nonce_matched`, a section of its own whose keys
 are each optional), as the tool gave it. A call whose tool gives none has none, never a null; a replay serves it as
 recorded.
+Version 3 also carries, after `exec_check`, the optional `cell_deadline` of a tool call (O97): what a code tool says of
+a cell whose process outlived its kill at the cell's deadline (the deadline's outcome and steps, what each survivor was
+blocked on, whose block it was), a section whose nested shape `expcore.records.cell_deadline` checks. A call whose
+deadline did not fire with a survivor has none, never a null; a replay serves it as recorded.
 Until v0.1.0 is tagged every extension of version 3 is strictly additive: optional fields only, no existing field
 changes meaning or validation, the fields version 3 had at its first merge point keep the shape frozen in
 `tests/data/record-v3-fields.json`, and the fixtures in `tests/data/record-v3/`, one per merge point, keep validating
@@ -86,6 +90,7 @@ from expcore.loop.records import TOOL_STATUSES
 from expcore.models.fleetheaders import DEPLOYMENT_ID_MAX, deployment_id_ok
 from expcore.models.usage import USAGE_EXTRA_CAP, USAGE_EXTRA_NAME_MAX, usage_name_ok, usage_number_ok
 from expcore.plugin import WAIT_KINDS
+from expcore.records import cell_deadline
 from expcore.records.injections import injected_targets
 
 SCHEMA_PREFIX = "expcore-record/"
@@ -181,8 +186,21 @@ SECTIONS: dict[str, dict[str, tuple[type, ...]]] = {
         "rendering_verified": (bool,),
         "elapsed_s": NUM,
         "exec_check": (dict,),
+        "cell_deadline": (dict,),
     },
     "exec_check": {"source_whole": (bool, NONE), "exit_status": (int, NONE), "nonce_matched": (bool,)},
+    "cell_deadline": {
+        "outcome": (str,),
+        "utc": (str,),
+        "grace_s": NUM,
+        "margin_s": NUM,
+        "restore": (str,),
+        "steps": (list,),
+        "survivors": (list,),
+        "survivors_cut": (int,),
+        "connection": (dict,),
+        "attribution": (dict,),
+    },
     "failed_request": {
         "kind": (str,),
         "infra_kind": (str, NONE),
@@ -278,6 +296,12 @@ class SchemaVersion:
 # `golden-record-v2.json` is the same for version 2, which adds no field but the first-turn rule for treatment.
 # Version 3 is extended until v0.1.0 is tagged, each extension strictly additive (optional fields only), so it has a
 # fixture per merge point in `tests/data/record-v3/`, which must keep validating and replaying byte for byte.
+# every field of the section a tool call's `cell_deadline` is (O97): all optional as far as the flat checks go, the
+# nested check (`cell_deadline.problem`) requires the ones a deadline's record always has
+CELL_DEADLINE_FIELDS = (
+    "outcome", "utc", "grace_s", "margin_s", "restore", "steps", "survivors", "survivors_cut", "connection",
+    "attribution",
+)  # fmt: skip
 SCHEMAS: tuple[SchemaVersion, ...] = (
     SchemaVersion(f"{SCHEMA_PREFIX}1"),
     SchemaVersion(f"{SCHEMA_PREFIX}2", first_turn_rule=True),
@@ -289,8 +313,9 @@ SCHEMAS: tuple[SchemaVersion, ...] = (
             "record": ("treatment_targets", "instrument_refusal", "lease_id"),
             "outcome": ("infra_target",),
             "totals": ("reserved_capped", "reply_cap_unheld", "deployment_switched"),
-            "tool_call": ("elapsed_s", "exec_check"),
+            "tool_call": ("elapsed_s", "exec_check", "cell_deadline"),
             "exec_check": ("source_whole", "exit_status", "nonce_matched"),
+            "cell_deadline": CELL_DEADLINE_FIELDS,
         },
         optional={
             "usage": ("extra", "extra_cut"),
@@ -298,8 +323,9 @@ SCHEMAS: tuple[SchemaVersion, ...] = (
             "record": ("treatment_targets", "instrument_refusal", "lease_id"),
             "outcome": ("infra_target",),
             "totals": ("reserved_capped", "reply_cap_unheld", "deployment_switched"),
-            "tool_call": ("elapsed_s", "exec_check"),
+            "tool_call": ("elapsed_s", "exec_check", "cell_deadline"),
             "exec_check": ("source_whole", "exit_status", "nonce_matched"),
+            "cell_deadline": CELL_DEADLINE_FIELDS,
         },
         first_turn_rule=True,
         target_rule=True,
@@ -700,6 +726,11 @@ def validate(data: Any, schemas: Sequence[SchemaVersion] = SCHEMAS) -> str:
             raise RecordError(f"tool_calls[{i}].elapsed_s: {entry['elapsed_s']} is not a number of seconds")
         if "exec_check" in entry:  # optional, from version 3 (O55)
             check_section("exec_check", entry["exec_check"], version, f"tool_calls[{i}].exec_check", schemas)
+        if "cell_deadline" in entry:  # optional, from version 3 (O97)
+            where = f"tool_calls[{i}].cell_deadline"
+            check_section("cell_deadline", entry["cell_deadline"], version, where, schemas)
+            if bad := cell_deadline.problem(entry["cell_deadline"], where):
+                raise RecordError(bad)
     for i, reading in enumerate(body["clock"]):
         ok = isinstance(reading, list) and len(reading) == 2 and isinstance(reading[0], str) and _fits(reading[1], NUM)
         if not ok:

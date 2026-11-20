@@ -61,7 +61,7 @@ import threading
 import time
 import uuid
 import warnings
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +69,7 @@ from expcore.config.loading import ConfigError
 from expcore.egress import Declaration, declaration
 from expcore_onedata import tls as TLS
 from expcore_onedata.fault_drain import GATE, MOUNT
+from expcore_onedata.sandbox import attribution as AT
 from expcore_onedata.sandbox import (
     cellhost,
     cellresolv,
@@ -105,11 +106,13 @@ from expcore_onedata.sandbox.apptainer import (
     workproof,
 )
 from expcore_onedata.sandbox.apptainer import limits as LM
+from expcore_onedata.sandbox.apptainer import stuck as STUCK
 from expcore_onedata.sandbox.apptainer.cells import RUN_ENDED_FACT, AppCellRunner
 from expcore_onedata.sandbox.apptainer.collect import Collection
 from expcore_onedata.sandbox.apptainer.infra import InfraCheck
 from expcore_onedata.sandbox.apptainer.mounthook import MOUNT_REFUSED, MountHelper, MountHelperFactory
 from expcore_onedata.sandbox.apptainer.node import NodeOps
+from expcore_onedata.sandbox.apptainer.stuckread import Diagnosis
 from expcore_onedata.sandbox.apptainer.teardown import Teardown
 from expcore_onedata.sandbox.apptainer.watch import Watch, spaces_of
 from expcore_onedata.sandbox.cellhost import OwnNames
@@ -137,6 +140,10 @@ COLLECTOR_READY = "egress collector ready"
 LOG_UNREAD = "the oneclient log could not be read"
 GATE_ATTEMPTS = 3  # a free port another process took before the gate bound it: tried again with another
 PROBE_S = 60.0
+RESTORE_BUDGET_S = (
+    90.0  # a restore's own total deadline: below the 100 s the runner waits for one (`cells.RESTORE_WAIT_S`)
+)
+RESTORE_LOCK_S = 60.0  # the most a stop waits for a restore to end once told to (its step may be an unmount of 30 s)
 
 
 class ApptainerSandbox:
@@ -157,12 +164,16 @@ class ApptainerSandbox:
         config_sha256: str | None = None,
         output_cap_bytes: int = OUTPUT_CAP_BYTES,
         mount_helper: MountHelperFactory | None = None,
+        attribute: Callable[[dict[str, Any] | None], Mapping[str, Any]] | None = None,
         **docker_only: Any,  # the Docker sandbox's options a platform may pass to every backend (waits, sampling)
     ) -> None:
         self.node, self.s, self.spec, self.registry = node, settings, spec, registry
         self.app = settings.apptainer
         self.work_image = self.app is not None and self.app.work_disk == "image"  # O71: /work an ext3 image
         self._sleep, self._clock, self._output_cap, self._mount_factory = sleep, clock, output_cap_bytes, mount_helper
+        # a test's own verdict function for `deadline.Escalation.attribute`; by default the run's is built from its spec
+        # (`SandboxSpec.held_down`, `space_holders`: `attribution.attributer`, asked at the deadline's `survived` step)
+        self._attribute = attribute
         key = re.sub(r"[^A-Za-z0-9_.-]", "_", spec.lease_key or spec.run_key)[: sockets.RUN_KEY_CHARS]
         self.sid = f"{key}-{uuid.uuid4().hex[: sockets.RUN_SUFFIX_CHARS]}"  # at most `sockets.RUN_ID_MAX_BYTES`
         self.dir = settings.work_root / self.sid
@@ -190,6 +201,9 @@ class ApptainerSandbox:
         self._stopped, self._stop_lock = True, threading.Lock()
         self._abandoned = threading.Event()
         self._created, self._created_lock = 0, threading.Lock()
+        # held by a mount restore for the whole of it, and by a stop around its teardown: the teardown never runs beside
+        # a restore that may still write the token file or start a process (`_restore_host_mount`, `stop`)
+        self._restore_lock = threading.Lock()
         self._cells: AppCellRunner | None = None
         self._watch: Watch | None = None
         self._limits = LM.LimitsCheck(
@@ -627,13 +641,54 @@ class ApptainerSandbox:
             hidden_margin_bytes=self.app.hidden_memory_margin_bytes,
         )  # fmt: skip
         self._watch.start()
-        escalation = DL.Escalation(self.s.kill_grace_s, _no_mount, sleep=self._sleep, clock=self._clock)
+        escalation = self._escalation()
         self._cells = AppCellRunner(
             self.node, self._watch, self.cell_argv, python=self.app.python, settings=self.s, meta=self._meta,
             registry=self.registry, started_epoch=self._started, escalation=escalation, stop=self._stop_at_deadline,
             meta_lock=self._meta_lock, output_cap_bytes=self._output_cap, before_exec=self.image_unchanged,
             sleep=self._sleep, clock=self._clock,
         )  # fmt: skip
+        self._cells.diagnosis = self._diagnosis()
+
+    def _diagnosis(self) -> Diagnosis | None:
+        """What the deadline reads a survivor with: the cell's fixed targets (the data mount at its path on the run's
+        FUSE device, `/work`, `/tmp`, `/dev/shm`, the inputs) and the connection's fusectl state, each asked when the
+        deadline fires, so after a restore they are the new generation's. None for a run with no mount helper that
+        has a connection: every verdict is then infrastructure (`stuckread.diagnose_node`)."""
+        connection = getattr(self._mount, "connection", None) if self.spec.mode is DataPathMode.MOUNT else None
+        if not callable(connection) or self.s.mount is None:
+            return None
+        inputs = tuple(target for _, target in self._input_copies)
+
+        def roles() -> STUCK.Roles:
+            return STUCK.Roles(self.s.mount.path, device=(connection() or {}).get("device"), inputs=inputs)
+
+        def record() -> dict[str, str] | None:
+            fusectl = (connection() or {}).get("fusectl")
+            return None if fusectl is None else {"fusectl": fusectl}
+
+        return Diagnosis(roles=roles, connection=record)
+
+    def _escalation(self) -> DL.Escalation:
+        """What the deadline does past the kill: the mount's abort, and, for a mount helper that can both abort and
+        restore, the restorable escalation, whose attribution is built from the run's spec: the providers its study
+        holds down when the verdict is asked for, and the holder of each space (`attribution.attributer`). A run
+        without such a helper keeps `_no_mount`, and a survivor of its kill orders the sandbox's stop, as it always
+        did."""
+        mount = self._mount if self.spec.mode is DataPathMode.MOUNT else None
+        restorable = callable(getattr(mount, "abort", None)) and callable(getattr(mount, "restore", None))
+        return DL.Escalation(
+            self.s.kill_grace_s, self._abort_mount, sleep=self._sleep, clock=self._clock, restorable=restorable,
+            attribute=(self._attribute or AT.attributer(self.spec.held_down, self.spec.space_holders))
+            if restorable else None,
+        )  # fmt: skip
+
+    def _abort_mount(self, timeout_s: float) -> dict[str, Any]:
+        """The deadline's abort: the mount helper's, which frees what waits on the run's FUSE connection within
+        `timeout_s` (`HostMount.abort`), or `_no_mount` for a run with no mount of the harness's own. It takes no lock:
+        it runs in the timer's thread while the deadline is decided, which a stop waits for first."""
+        abort = getattr(self._mount, "abort", None)
+        return _no_mount(timeout_s) if abort is None else abort(timeout_s)
 
     def _canary(self) -> None:
         """The egress canary (`expcore.egress`): a connect from inside a cell to a listener of the harness's, the
@@ -904,10 +959,22 @@ class ApptainerSandbox:
         return self._cells.restore(self._restore_host_mount)
 
     def _restore_host_mount(self) -> dict[str, Any]:
-        """What this backend does to bring its mount back: nothing yet, so a restore that was somehow asked for fails
-        and ends the run, as an abort with no restore always did. A backend that restores replaces this body, and builds
-        its `deadline.Escalation` with `restorable=True` and an `attribute`; without those none is ever pending."""
-        return {"ok": False, "why": "this backend cannot restore its mount"}
+        """Bring the mount back as a new generation (`HostMount.restore`), under the restore lock: `{"ok": True,
+        "generation": n, ...}`, or `{"ok": False, "why": ...}` with a fixed phrase, which ends the run
+        (`cells.restore`).
+        Nothing is created once the sandbox is stopped, and a stop that begins meanwhile waits for this to end
+        (`stop`), which it does at its next step."""
+        restore = getattr(self._mount, "restore", None)
+        if restore is None:
+            return {"ok": False, "why": "this backend cannot restore its mount"}
+        with self._restore_lock:
+            if self._stopped:
+                return {"ok": False, "why": "the sandbox is stopped"}
+            self.register_creation()  # a teardown that overlaps a restore is never declared complete
+            try:
+                return dict(restore(timeout_s=RESTORE_BUDGET_S))
+            except SandboxError as error:
+                return {"ok": False, "why": str(error)}
 
     def _refuse_if_ended(self) -> None:
         if self._cells is None:
@@ -1025,12 +1092,18 @@ class ApptainerSandbox:
         once the run's cells have ended; None before the watch exists."""
         return None if self._watch is None else self._watch.visibility()
 
-    def mount_watch_log(self) -> bytes | None:
+    def mount_watch_log(self) -> Sequence[bytes | None] | bytes | None:
         """The mount guard's log (`expcore.mountguard.MountWatchSource`), its window closed first (O60); None without a
-        mount helper that keeps one. Read after the run's cells have ended: the collection does, and so may the
-        instrument."""
+        mount helper that keeps one; the logs in order, one for each generation, for a mount that was restored (O97).
+        Read after the run's cells have ended: the collection does, and so may the instrument."""
         read = getattr(self._mount, "mount_watch_log", None)
         return None if read is None else read()
+
+    def mount_watch_logs(self) -> list[bytes | None]:
+        """Every generation's mount-guard log in order (`HostMount.mount_watch_logs`): one for a mount that was never
+        restored, one more for each restore; empty without a mount helper that keeps them. The window closes first."""
+        read = getattr(self._mount, "mount_watch_logs", None)
+        return [] if read is None else read()
 
     @property
     def mount_guard_nonce(self) -> str | None:
@@ -1230,9 +1303,17 @@ class ApptainerSandbox:
         """Tear down in order and verify (`teardown.Teardown`); raise `SandboxError` when anything is not shown gone.
         Idempotent; a SIGTERM cannot cut it short; a cell's deadline under way is waited for first (O34)."""
         if self._cells is not None:
-            self._cells.wait_decided()
+            self._cells.wait_decided()  # a deadline's outcome, and a restore under way up to its bound (O34, O97)
+        refuse = getattr(self._mount, "refuse_restores", None)
+        if refuse is not None:
+            refuse()  # from here no restore writes the token file or starts a process; one running ends soon
         with TERM.sigterm_deferred(), self._stop_lock:
-            self.teardown.run(force)
+            if not self._restore_lock.acquire(timeout=RESTORE_LOCK_S):
+                raise SandboxError("a mount restore is still running: the sandbox's teardown was not run")
+            try:
+                self.teardown.run(force)
+            finally:
+                self._restore_lock.release()
 
     def teardown_left(self) -> dict[str, Any]:
         return self.teardown.left()

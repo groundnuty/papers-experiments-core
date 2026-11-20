@@ -353,10 +353,18 @@ class RecordedToolProvider:
         if status == "failed":
             self._raise_recorded_failure(j)
         checked = call.get("exec_check")  # served as recorded, so the replay's call holds it where the stored one does
+        deadline = call.get("cell_deadline")  # likewise (O97)
         if status == "ok":
-            return ToolOutput(call["raw_text"], source_truncated=call["source_truncated"], exec_check=checked)
+            return ToolOutput(
+                call["raw_text"], source_truncated=call["source_truncated"], exec_check=checked, cell_deadline=deadline
+            )
         return ToolOutput(
-            self._error_message(call), True, call["error_class"], call["source_truncated"], exec_check=checked
+            self._error_message(call),
+            True,
+            call["error_class"],
+            call["source_truncated"],
+            exec_check=checked,
+            cell_deadline=deadline,
         )
 
     def _raise_recorded_failure(self, j: int) -> None:
