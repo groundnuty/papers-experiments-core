@@ -13,7 +13,8 @@ an ordered list of actions, each the call an operator would make by hand: a prov
   only: under `--exclusive` a mixed node is not free) less 7 per up whose job has not started, over 7; its inodes, the
   95% line less the usage less one whole estimate per member whose data is not yet all there (not linked
   and verified), over the estimate; its declared allowance
-  less the whole `--time` of every member made, over one more whole `--time`. A stalled queue (an up waiting past
+  less the whole `--time` of every member made, over one more whole `--time`, but a member whose down the ledger shows
+  ended counts only what its jobs billed (C60, `made_units`). A stalled queue (an up waiting past
   `queue_stall_s`), an add still running there, or a quota that could not be read leave no room.
   A site that declares `node_room = "queue"` (C56; for jobs that share nodes, `HPC_EXCLUSIVE_NODES` 0) has no node
   limit, since Slurm starts such a job on a mixed node and no node count is a capacity; in its place the site has
@@ -34,7 +35,7 @@ an ordered list of actions, each the call an operator would make by hand: a prov
   the job gone) is proven `cancelled`. A site that cannot be read proves nothing and gets no action.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from expcore.campaign.elastic.controlinputs import (
@@ -263,7 +264,7 @@ def _site(
             state = _joined(now, ledger, settings, m, fed, decision.actions)
             free += state == "free"
             working += state == "working"
-    room, limits = _room(now, settings, view, busy, memory)
+    room, limits = _room(now, settings, view, busy, memory, ledger.federations)
     available = free + working
     decision.targets[site] = {"target": min(settings.max_federations, available + room), "available": available,
                               "room": room, "limits": limits}  # fmt: skip
@@ -430,10 +431,37 @@ def login_budgets(
     return found
 
 
+def made_units(settings: SiteSettings, view: SiteView, federations: Mapping[str, Federation]) -> float:
+    """The billing units the site's members count against its allowance (C60): one whole `--time` each (its rate times
+    the `--time`), as reserved, except a member whose down is verified (`down`) and whose end the ledger proves: it
+    counts what its jobs billed, from their start (the job end recorded at its join less one whole `--time`: the
+    start, never the submit) to the proven end (at or after the true one), never below 0 nor above one whole `--time`.
+    A downed member with no ledger row (it never joined) or no proven end yet keeps its whole `--time`: what is not
+    known is never counted as less."""
+    whole = settings.rate_units_per_hour * view.time_s / 3600.0
+    total = 0.0
+    for m in view.members:
+        if m.status == "taken":
+            continue
+        fed = federations.get(ledger_label(settings.label, m.label)) if m.status == "down" else None
+        if fed is None or fed.ended_at is None:
+            total += whole
+            continue
+        billed = min(fed.ended_at, fed.job_end_at) - (fed.job_end_at - view.time_s)
+        total += min(whole, settings.rate_units_per_hour * max(billed, 0.0) / 3600.0)
+    return total
+
+
 def _room(
-    now: float, settings: SiteSettings, view: SiteView, busy: frozenset[str], memory: tuple[str, int | None, dict]
+    now: float,
+    settings: SiteSettings,
+    view: SiteView,
+    busy: frozenset[str],
+    memory: tuple[str, int | None, dict],
+    federations: Mapping[str, Federation] | None = None,
 ) -> tuple[int, dict]:
-    """How many more federations the site can take now (before `parallel_ups`), and each limit's own figure."""
+    """How many more federations the site can take now (before `parallel_ups`), and each limit's own figure;
+    `federations` is the ledger's, by label (a downed member's billed units, C60)."""
     live = [m for m in view.members if m.status not in HOLDS_NOTHING]
     # every up whose job has not started, whatever its record says (a failed one may still hold a waiting job)
     starting = [m for m in live
@@ -464,8 +492,7 @@ def _room(
         limits["inodes"] = 0 if free_inodes < 0 else free_inodes // estimate
         limits["inodes_reserved"] = reserved
     whole = settings.rate_units_per_hour * view.time_s / 3600.0
-    made = sum(1 for m in view.members if m.status != "taken")
-    left = settings.allowance_units - made * whole
+    left = settings.allowance_units - made_units(settings, view, federations or {})
     limits["allowance"] = int(left // whole) if whole > 0 and left >= whole else 0
     limits["stalled"] = any(m.submitted_at is not None and now - m.submitted_at >= settings.queue_stall_s
                             for m in waiting_ups)  # fmt: skip
