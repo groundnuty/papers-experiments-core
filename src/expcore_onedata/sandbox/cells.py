@@ -749,7 +749,10 @@ class CellRunner:
             if record is None:
                 return False
             entry["deadline"] = record
-            if record["outcome"] in (DL.KILLED, DL.MOUNT_RESTORED):
+            if record["outcome"] == DL.KILLED:
+                return False
+            res.deadline = record  # a process outlived the kill: the code tool says so on the call (`cell_deadline`)
+            if record["outcome"] == DL.MOUNT_RESTORED:
                 return False
             if not DL.ends_run(record):
                 res.restore_pending = record.get("restore") == DL.RESTORE_PENDING

@@ -117,7 +117,8 @@ def test_R02_version_three_marks_the_fields_it_adds_optional_and_no_older_versio
     fault, the outcome's and the declared ones, the refusal of an instrument's post-run check, the lease an attempt ran
     on (C41), the deployment that served a turn's reply (B20), the two totals that
     say whether the attempt was held to the reservation R, the elapsed time of a tool call, and a code tool's check of
-    the exec that ran the call's program (O55), each fact of which is optional too."""
+    the exec that ran the call's program (O55), each fact of which is optional too, and what a code tool says of a
+    cell whose process outlived its kill at the cell's deadline (O97), each part of which is optional too."""
     from expcore.records import schema as rules
 
     assert SCHEMAS[-1].optional == {
@@ -126,8 +127,20 @@ def test_R02_version_three_marks_the_fields_it_adds_optional_and_no_older_versio
         "record": ("treatment_targets", "instrument_refusal", "lease_id"),
         "outcome": ("infra_target",),
         "totals": ("reserved_capped", "reply_cap_unheld", "deployment_switched"),
-        "tool_call": ("elapsed_s", "exec_check"),
+        "tool_call": ("elapsed_s", "exec_check", "cell_deadline"),
         "exec_check": ("source_whole", "exit_status", "nonce_matched"),
+        "cell_deadline": (
+            "outcome",
+            "utc",
+            "grace_s",
+            "margin_s",
+            "restore",
+            "steps",
+            "survivors",
+            "survivors_cut",
+            "connection",
+            "attribution",
+        ),
     }
     assert SCHEMAS[-1].optional == SCHEMAS[-1].added
     assert rules.optional_in("usage", "expcore-record/3") == {"extra", "extra_cut"}
@@ -139,7 +152,7 @@ def test_R02_version_three_marks_the_fields_it_adds_optional_and_no_older_versio
         "deployment_switched",
     }
     assert rules.optional_in("totals", "expcore-record/2") == frozenset()
-    assert rules.optional_in("tool_call", "expcore-record/3") == {"elapsed_s", "exec_check"}
+    assert rules.optional_in("tool_call", "expcore-record/3") == {"elapsed_s", "exec_check", "cell_deadline"}
     assert rules.optional_in("tool_call", "expcore-record/2") == frozenset()
     assert rules.optional_in("record", "expcore-record/2") == rules.optional_in("outcome", "expcore-record/2") == set()
     assert rules.optional_in("usage", "expcore-record/2") == frozenset()
