@@ -454,22 +454,25 @@ def test_o97_a_descriptor_whose_path_is_not_under_the_data_mount_has_the_data_mo
     assert spaces(read(view, survivors(100))) == [("data", None)]
 
 
-def test_o97_the_diagnosis_leaves_the_abort_half_of_the_margin_when_a_read_blocks():
-    """O97: a memory read that never returns costs at most half of the time given, so the abort keeps the rest."""
+def test_o97_a_read_that_blocks_returns_before_the_time_given_so_the_deadline_still_gets_what_was_read():
+    """O97: a memory read that never returns is given up on at 0.8 of the time given, short of the deadline's own join,
+    which would otherwise expire first and throw away the reading."""
     view = FakeProcReader()
     view.process(100).task(100, syscall=OPENAT_CWD).mem_at(100, 0x7F20, "/data/orchard/x\0")
     gate = view.stall["100/task/100/mem"] = threading.Event()
     began = time.monotonic()
-    R.diagnose(view, survivors(100), 2.0, ROLES, machine="x86_64")
+    found = R.diagnose(view, survivors(100), 2.0, ROLES, machine="x86_64")
     took = time.monotonic() - began
     gate.set()
-    assert took < 1.5
+    assert 1.5 < took < 2.0
+    assert found["reading"][0]["tasks"][0]["blocking"] is None
 
 
-def test_o97_the_diagnosis_never_takes_more_than_its_ceiling_whatever_the_margin():
-    """O97: even a long margin is cut to the ceiling, so one wedged read cannot spend a whole minute."""
-    assert R.DIAGNOSE_SHARE * 1000 > R.DIAGNOSE_MAX_S
-    assert min(1000 * R.DIAGNOSE_SHARE, R.DIAGNOSE_MAX_S) == R.DIAGNOSE_MAX_S
+def test_o97_the_time_the_deadline_gives_is_the_time_the_diagnosis_honours():
+    """O97: the bound is the one the deadline passes, less a margin that is a fraction of it, never a constant of this
+    module's own."""
+    assert 0 < R.DIAGNOSE_SHARE < 1
+    assert not hasattr(R, "DIAGNOSE_MAX_S")
 
 
 def test_o97_a_process_with_a_root_that_cannot_be_read_is_taken_as_rooted_at_slash():
