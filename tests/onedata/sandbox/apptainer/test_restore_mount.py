@@ -5,12 +5,14 @@ generation 2, and it then runs. Any other verdict, no attribution, an abort that
 fails end the run as they always did (infrastructure), and a stop never runs beside a restore. The real `HostMount`
 on the fake node; the diagnosis is a stub, since reading `/proc` is the diagnostics' own tests'."""
 
+import dataclasses
 import threading
 import time
 
 import pytest
 from apptainer_support import make_settings, make_spec, options, pinned_bundle
-from fake_mount_node import FUSE_DEV, FakeMountNode, fusectl_tree
+from fake_mount_node import FUSE_DEV, fusectl_tree
+from reader_node import ReaderNode
 
 from expcore.errors import InfraError
 from expcore_onedata.sandbox import cells as CELLS
@@ -20,45 +22,10 @@ from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.apptainer import cells as AC
 from expcore_onedata.sandbox.apptainer import hostmount as HM
 from expcore_onedata.sandbox.apptainer.sandbox import ApptainerSandbox
-from expcore_onedata.sandbox.hostops import CmdResult
 
 AGENT = {"verdict": "agent", "why": "blocked_on_held_down_holder", "target": "providers[1]",
          "space_holder": "providers[1]"}  # fmt: skip
 HARNESS = {"verdict": "infrastructure", "why": "space_not_held_down", "target": "providers[1]", "space_holder": None}
-
-
-class ReaderNode(FakeMountNode):
-    """The fake node whose cell has a reader in the kernel that no signal ends, until the connection ends: the abort
-    (the fusectl write, or oneclient's death) frees it, as the kernel does."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.keep_mount_on_death = True
-        self.reader = None
-        self.freed_by: list[str] = []
-
-    def stuck(self, cell) -> CmdResult:
-        self.reader = cell.procs[1]
-        self.reader.unkillable = True
-        deadline = time.monotonic() + 10.0
-        while cell.procs[0].alive and time.monotonic() < deadline:
-            time.sleep(0.01)
-        time.sleep(0.2)
-        return CmdResult(137, "", "")
-
-    def free(self, how: str) -> None:
-        with self.lock:
-            if self.reader is not None and self.reader.alive:
-                self.reader.unkillable, self.reader.alive, self.reader.exit_status = False, False, 137
-                self._end_namespace_if_empty(self.reader.pidns)
-                self.freed_by.append(how)
-
-    def signal(self, pid, start, sig):
-        proc = self._find(pid, start)
-        sent = super().signal(pid, start, sig)
-        if proc is not None and proc.role == "oneclient":
-            self.free("daemon_death")  # the kernel ends the connection when the daemon's descriptors close
-        return sent
 
 
 @pytest.fixture
@@ -99,7 +66,15 @@ def free_by_fusectl(monkeypatch, node):
 
 
 def make_box(
-    node, tmp_path, fusectl_root, *, attribute=lambda diagnostics: dict(AGENT), level="mounted", mount_wrap=None, **more
+    node,
+    tmp_path,
+    fusectl_root,
+    *,
+    attribute=lambda diagnostics: dict(AGENT),
+    level="mounted",
+    mount_wrap=None,
+    spec=None,
+    **more,
 ):
     settings = make_settings(tmp_path, oneclient_bundle=pinned_bundle(tmp_path / "files"))
     factory = HM.host_mount_factory(mountinfo=node.mountinfo, fusectl_root=fusectl_root)
@@ -110,7 +85,7 @@ def make_box(
             return mount_wrap(inner(*args))
 
     box_options = options(mount_helper=factory, attribute=attribute, **more)
-    return ApptainerSandbox.start(node, settings, make_spec(level), **box_options)
+    return ApptainerSandbox.start(node, settings, spec or make_spec(level), **box_options)
 
 
 @pytest.fixture
@@ -139,13 +114,36 @@ def test_o97_a_mount_runs_escalation_is_restorable_with_the_mounts_abort_and_the
     assert esc.abort == box._abort_mount
 
 
-def test_o97_without_an_attribution_a_mount_escalation_attributes_nothing_so_no_survivor_is_the_agents(
+def test_o97_the_escalation_s_attribution_is_built_from_the_specs_held_down_set_and_holders(
     node, tmp_path, fusectl_root
 ):
-    sandbox = make_box(node, tmp_path, fusectl_root, attribute=None)
+    """O97: with no option given, the verdict is the spec's: `held_down` is read when it is asked for, never when the
+    sandbox started, and each space's holder is the spec's."""
+    held = set()
+    spec = make_spec("mounted")
+    spec = dataclasses.replace(spec, held_down=lambda: frozenset(held), space_holders={"orchard": "providers[1]"})
+    sandbox = make_box(node, tmp_path, fusectl_root, attribute=None, spec=spec)
     try:
-        assert sandbox._cells._escalation.restorable is True
-        assert sandbox._cells._escalation.attribute is None
+        attribute = sandbox._cells._escalation.attribute
+        reading = {"reading": [{"pid": 7, "start": "7", "tasks": [{
+            "state": "D", "syscall": {"nr": 0, "fd": 3},
+            "blocking": {"via": "fd", "cut": False, "objects": [{"mount": "data", "space": "orchard", "path": "a"}]},
+        }]}]}  # fmt: skip
+        assert attribute(reading)["why"] == "no_injection_in_effect"  # nothing is held down yet
+        held.add("providers[1]")  # the study takes the holder down after the sandbox started
+        verdict = attribute(reading)
+        assert verdict["verdict"] == "agent"
+        assert verdict["target"] == "providers[1]"
+    finally:
+        sandbox.stop(force=True)
+
+
+def test_o97_an_attribute_option_given_to_the_sandbox_is_the_escalations_attribution(node, tmp_path, fusectl_root):
+    """O97: the constructor swallows unknown keyword arguments, so the name of the option is pinned here."""
+    given = lambda diagnostics: dict(HARNESS)  # noqa: E731
+    sandbox = make_box(node, tmp_path, fusectl_root, attribute=given)
+    try:
+        assert sandbox._cells._escalation.attribute is given
     finally:
         sandbox.stop(force=True)
 
@@ -238,9 +236,9 @@ def test_o97_the_restore_runs_under_the_sandboxs_restore_lock(node, box, free_by
     seen = []
     real = box._mount.restore
 
-    def restore():
+    def restore(**kwargs):
         seen.append(box._restore_lock.locked())
-        return real()
+        return real(**kwargs)
 
     stick(node, box)
     box.exec("read_a_stopped_providers_file()", 1.2)
@@ -303,7 +301,7 @@ def test_o97_a_survivor_that_is_the_harness_s_ends_the_run_as_cell_unkillable_an
         sandbox.stop(force=True)
 
 
-def test_o97_without_an_attribution_a_freed_survivor_ends_the_run_as_it_always_did(
+def test_o97_when_no_provider_is_held_down_a_freed_survivor_ends_the_run_as_it_always_did(
     node, tmp_path, fusectl_root, free_by_fusectl
 ):
     sandbox = make_box(node, tmp_path, fusectl_root, attribute=None)
@@ -431,3 +429,25 @@ def test_o97_the_same_when_oneclient_ended_with_the_kill_it_is_the_harness_s_end
     finally:
         node.free("teardown")
         sandbox.stop(force=True)
+
+
+def test_o97_the_restore_is_given_a_total_deadline_below_the_bound_the_runner_waits_for_it(
+    node, box, free_by_fusectl, monkeypatch
+):
+    """O97: past `cells.RESTORE_WAIT_S` the runner gives up on a restore and the teardown goes on, so the restore must
+    end by itself before that: it is given its own total deadline, a margin shorter."""
+    from expcore_onedata.sandbox.apptainer import sandbox as SB
+
+    given = []
+    real = box._mount.restore
+
+    def restore(**kwargs):
+        given.append(kwargs)
+        return real(**kwargs)
+
+    stick(node, box)
+    box.exec("read_a_stopped_providers_file()", 1.2)
+    monkeypatch.setattr(box._mount, "restore", restore)
+    box.restore_mount()
+    assert given == [{"timeout_s": SB.RESTORE_BUDGET_S}]
+    assert SB.RESTORE_BUDGET_S < CELLS.RESTORE_WAIT_S

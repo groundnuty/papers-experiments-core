@@ -106,6 +106,7 @@ def stop(
     helper: Helper,
     *,
     term_wait_s: float = TERM_WAIT_S,
+    kill_wait_s: float = KILL_WAIT_S,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
@@ -116,7 +117,7 @@ def stop(
     note["ended_on_term"] = gone
     if gone is False:
         note["kill"] = node.signal(helper.process.pid, helper.process.start, signal.SIGKILL)
-        gone = _wait(node, helper.process, KILL_WAIT_S, sleep, clock)
+        gone = _wait(node, helper.process, kill_wait_s, sleep, clock)
     note["exit_status"] = node.exit_status(helper.process)
     if gone is not True:
         raise SandboxError(f"the {helper.role} could not be shown gone after its stop")

@@ -69,6 +69,7 @@ from expcore.config.loading import ConfigError
 from expcore.egress import Declaration, declaration
 from expcore_onedata import tls as TLS
 from expcore_onedata.fault_drain import GATE, MOUNT
+from expcore_onedata.sandbox import attribution as AT
 from expcore_onedata.sandbox import (
     cellhost,
     cellresolv,
@@ -105,11 +106,13 @@ from expcore_onedata.sandbox.apptainer import (
     workproof,
 )
 from expcore_onedata.sandbox.apptainer import limits as LM
+from expcore_onedata.sandbox.apptainer import stuck as STUCK
 from expcore_onedata.sandbox.apptainer.cells import RUN_ENDED_FACT, AppCellRunner
 from expcore_onedata.sandbox.apptainer.collect import Collection
 from expcore_onedata.sandbox.apptainer.infra import InfraCheck
 from expcore_onedata.sandbox.apptainer.mounthook import MOUNT_REFUSED, MountHelper, MountHelperFactory
 from expcore_onedata.sandbox.apptainer.node import NodeOps
+from expcore_onedata.sandbox.apptainer.stuckread import Diagnosis
 from expcore_onedata.sandbox.apptainer.teardown import Teardown
 from expcore_onedata.sandbox.apptainer.watch import Watch, spaces_of
 from expcore_onedata.sandbox.cellhost import OwnNames
@@ -137,6 +140,9 @@ COLLECTOR_READY = "egress collector ready"
 LOG_UNREAD = "the oneclient log could not be read"
 GATE_ATTEMPTS = 3  # a free port another process took before the gate bound it: tried again with another
 PROBE_S = 60.0
+RESTORE_BUDGET_S = (
+    90.0  # a restore's own total deadline: below the 100 s the runner waits for one (`cells.RESTORE_WAIT_S`)
+)
 RESTORE_LOCK_S = 60.0  # the most a stop waits for a restore to end once told to (its step may be an unmount of 30 s)
 
 
@@ -165,8 +171,8 @@ class ApptainerSandbox:
         self.app = settings.apptainer
         self.work_image = self.app is not None and self.app.work_disk == "image"  # O71: /work an ext3 image
         self._sleep, self._clock, self._output_cap, self._mount_factory = sleep, clock, output_cap_bytes, mount_helper
-        # whose block a cell's survivors are (`deadline.Escalation.attribute`, `attribution.attributer`), asked at the
-        # deadline's `survived` step. None: no survivor is ever the agent's, so no mount is ever restored (fail closed)
+        # a test's own verdict function for `deadline.Escalation.attribute`; by default the run's is built from its spec
+        # (`SandboxSpec.held_down`, `space_holders`: `attribution.attributer`, asked at the deadline's `survived` step)
         self._attribute = attribute
         key = re.sub(r"[^A-Za-z0-9_.-]", "_", spec.lease_key or spec.run_key)[: sockets.RUN_KEY_CHARS]
         self.sid = f"{key}-{uuid.uuid4().hex[: sockets.RUN_SUFFIX_CHARS]}"  # at most `sockets.RUN_ID_MAX_BYTES`
@@ -642,17 +648,39 @@ class ApptainerSandbox:
             meta_lock=self._meta_lock, output_cap_bytes=self._output_cap, before_exec=self.image_unchanged,
             sleep=self._sleep, clock=self._clock,
         )  # fmt: skip
+        self._cells.diagnosis = self._diagnosis()
+
+    def _diagnosis(self) -> Diagnosis | None:
+        """What the deadline reads a survivor with: the cell's fixed targets (the data mount at its path on the run's
+        FUSE device, `/work`, `/tmp`, `/dev/shm`, the inputs) and the connection's fusectl state, each asked when the
+        deadline fires, so after a restore they are the new generation's. None for a run with no mount helper that
+        has a connection: every verdict is then infrastructure (`stuckread.diagnose_node`)."""
+        connection = getattr(self._mount, "connection", None) if self.spec.mode is DataPathMode.MOUNT else None
+        if not callable(connection) or self.s.mount is None:
+            return None
+        inputs = tuple(target for _, target in self._input_copies)
+
+        def roles() -> STUCK.Roles:
+            return STUCK.Roles(self.s.mount.path, device=(connection() or {}).get("device"), inputs=inputs)
+
+        def record() -> dict[str, str] | None:
+            fusectl = (connection() or {}).get("fusectl")
+            return None if fusectl is None else {"fusectl": fusectl}
+
+        return Diagnosis(roles=roles, connection=record)
 
     def _escalation(self) -> DL.Escalation:
         """What the deadline does past the kill: the mount's abort, and, for a mount helper that can both abort and
-        restore, the restorable escalation with the run's attribution (`attribute=`). A run without such a helper keeps
-        `_no_mount`, and a survivor of its kill orders the sandbox's stop, as it always did. Without an attribution no
-        survivor is the agent's, so none is ever restored."""
+        restore, the restorable escalation, whose attribution is built from the run's spec: the providers its study
+        holds down when the verdict is asked for, and the holder of each space (`attribution.attributer`). A run
+        without such a helper keeps `_no_mount`, and a survivor of its kill orders the sandbox's stop, as it always
+        did."""
         mount = self._mount if self.spec.mode is DataPathMode.MOUNT else None
         restorable = callable(getattr(mount, "abort", None)) and callable(getattr(mount, "restore", None))
         return DL.Escalation(
             self.s.kill_grace_s, self._abort_mount, sleep=self._sleep, clock=self._clock, restorable=restorable,
-            attribute=self._attribute if restorable else None,
+            attribute=(self._attribute or AT.attributer(self.spec.held_down, self.spec.space_holders))
+            if restorable else None,
         )  # fmt: skip
 
     def _abort_mount(self, timeout_s: float) -> dict[str, Any]:
@@ -944,7 +972,7 @@ class ApptainerSandbox:
                 return {"ok": False, "why": "the sandbox is stopped"}
             self.register_creation()  # a teardown that overlaps a restore is never declared complete
             try:
-                return dict(restore())
+                return dict(restore(timeout_s=RESTORE_BUDGET_S))
             except SandboxError as error:
                 return {"ok": False, "why": str(error)}
 

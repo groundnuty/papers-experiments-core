@@ -19,6 +19,7 @@ from expcore_onedata.sandbox import fusectl as FC
 from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.apptainer import hostmount as HM
 from expcore_onedata.sandbox.apptainer import infra
+from expcore_onedata.sandbox.hostops import CmdResult
 
 
 def device(n: int) -> str:
@@ -187,7 +188,7 @@ def test_o97_every_generations_watcher_log_is_given_in_order_and_each_reads_inta
     node.cell()
     logs = mount.mount_watch_logs()
     assert [read_log(log, mount.nonce).intact for log in logs] == [True, True]
-    assert mount.mount_watch_log() is None  # one log is not the whole run's: the singular form fails closed
+    assert mount.mount_watch_log() == logs  # the singular form gives the logs in order for a restored mount
 
 
 # ------------------------------------------------------------------------------------ what is kept per generation
@@ -374,3 +375,75 @@ def test_o97_a_stop_after_a_restore_ends_both_generations_and_removes_every_file
     assert not os.path.lexists(mount.where.token_file)
     assert not mount.where.bundle_dir.exists()
     assert all(not proc.alive for proc in node.procs.values() if proc.role in ("oneclient", "mountwatch"))
+
+
+# ------------------------------------------------------------------------------------------------- one total deadline
+def slow_unmounts(mount, node, monkeypatch):
+    """`fusermount3` takes all the time it is given and fails: a busy mount, on the mount's own (virtual) clock."""
+    real = node.run
+
+    def run(argv, timeout_s, **kwargs):
+        if argv and argv[0] == "fusermount3":
+            mount._clock.sleep(timeout_s)
+            return CmdResult(1, "", "fusermount3: invented busy\n")
+        return real(argv, timeout_s, **kwargs)
+
+    monkeypatch.setattr(node, "run", run)
+
+
+def test_o97_a_restore_whose_unmount_overruns_the_deadline_starts_nothing_and_leaves_no_token_file(
+    mount, node, monkeypatch
+):
+    """O97: one total deadline: each step gets the lesser of its own bound and the time left, and past it the token
+    file is not written and no oneclient is started."""
+    aborted(mount)
+    slow_unmounts(mount, node, monkeypatch)
+    began = mount._clock()
+    with pytest.raises(SandboxError, match="ran out of time"):
+        mount.restore(timeout_s=5.0)
+    monkeypatch.undo()
+    assert mount._clock() - began <= 5.5
+    assert not os.path.lexists(mount.where.token_file)
+    assert node.oneclient_tokens == [TOKEN]  # the first only: the token was never written again
+    assert len(node.watches) == 1
+
+
+def test_o97_a_restore_whose_old_oneclient_will_not_end_in_time_is_cut_at_the_deadline(mount, node, monkeypatch):
+    aborted(mount)
+    real = node.signal
+    monkeypatch.setattr(node, "signal", lambda pid, start, sig: True)  # sent, and oneclient stays: a thread in D
+    began = mount._clock()
+    with pytest.raises(SandboxError):
+        mount.restore(timeout_s=2.0)
+    monkeypatch.setattr(node, "signal", real)
+    assert mount._clock() - began <= 2.5
+    assert not os.path.lexists(mount.where.token_file)
+    assert len(node.watches) == 1
+    assert node.mount_count == 1
+
+
+def test_o97_a_restore_cut_after_the_token_file_was_written_removes_it_within_the_deadline(mount, node):
+    aborted(mount)
+    node.mount_never = True  # the new oneclient is started on the rewritten token file and its mount never appears
+    node.mounts.clear()
+    began = mount._clock()
+    with pytest.raises(SandboxError, match="did not appear"):
+        mount.restore(timeout_s=10.0)
+    assert 9.0 <= mount._clock() - began <= 10.5  # the mount wait was cut at the deadline, not at its own 60 s
+    assert node.oneclient_tokens == [TOKEN, TOKEN]  # the second was started on it
+    assert not os.path.lexists(mount.where.token_file)
+
+
+def test_o97_a_restore_given_no_time_touches_nothing(mount, node):
+    aborted(mount)
+    signals = list(node.signals)
+    with pytest.raises(SandboxError, match="ran out of time"):
+        mount.restore(timeout_s=0.0)
+    assert node.signals == signals
+    assert node.unmounts == []
+    assert not os.path.lexists(mount.where.token_file)
+
+
+def test_o97_a_restore_that_has_time_for_every_step_is_not_cut_by_the_deadline(mount, node):
+    aborted(mount)
+    assert mount.restore(timeout_s=90.0)["ok"] is True
