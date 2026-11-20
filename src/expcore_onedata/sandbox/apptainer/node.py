@@ -40,6 +40,7 @@ from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.apptainer import loopback
 from expcore_onedata.sandbox.apptainer import procs as P
+from expcore_onedata.sandbox.apptainer.stuckread import LocalProcReader
 from expcore_onedata.sandbox.cellhost import OwnNames
 from expcore_onedata.sandbox.hostops import CmdResult, DockerHost, mounts_under, run_bounded
 
@@ -606,6 +607,11 @@ class LocalNode:
         except OSError:
             return None
         return None  # a pid that exists and that /proc hides: not known to be ours
+
+    def proc_reader(self) -> LocalProcReader:
+        """This node's own `/proc`, for the diagnostics of a cell's survivors (`stuckread`, O97). Not part of `NodeOps`:
+        the deadline asks for it with `getattr`, and a node that has none is not diagnosed."""
+        return LocalProcReader()
 
     def identity(self) -> Spawned:
         start = _start_of(os.getpid())
