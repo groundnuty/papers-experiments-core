@@ -251,25 +251,38 @@ def launch(
 ) -> int:
     """`launch`: the member's worker started as a detached `srun` step of its held job, its client recorded; 0 when it
     was started or already runs, 2 (with nothing started) when the member is not one this fleet's up made and holds,
-    its job is not the one up held and running, or the shard settings cannot be read."""
+    its job is not the one up held and running, the shard settings cannot be read, or an up or down of its federation
+    (or another launch of its worker) is running.
+
+    It holds its federation's own lifecycle lock (`<root>.lifecycle.lock`, which `hpcfed.py up` and `down` hold for
+    their whole run), never the fleet's (C57): an add holds the fleet's for its new members' whole ups, their queue
+    wait included, and a join must not wait hours behind it. The record's changes are under the record's own lock."""
     for path in (HERE, HERE.parents[1] / "deploy" / "compose-federation"):
         if str(path) not in sys.path:
             sys.path.insert(0, str(path))
     import fleetplan
     import fleetrecord
+    import hpclaunch
     import hpcslurm
+    import hpcstate
 
     directory, shards = Path(args.fleet), fleetplan.shards
     runner = runner or hpcslurm.Runner()
     record = fleetrecord.Record(directory)
+
+    def up_member() -> Any:
+        member = fleetrecord.member_of(record.read(), args.member)
+        why, _ = fleetrecord.identity(directory, member)
+        if why is None and member["status"] != "up":
+            why = f"{args.member} is {member['status']}, not up"
+        if why is not None:
+            raise fleetrecord.FleetError(why)
+        return member
+
     try:
-        with record.lifecycle("worker"):
-            member = fleetrecord.member_of(record.read(), args.member)
-            why, _ = fleetrecord.identity(directory, member)
-            if why is None and member["status"] != "up":
-                why = f"{args.member} is {member['status']}, not up"
-            if why is not None:
-                raise fleetrecord.FleetError(why)
+        up_member()  # first: the lock beside the root is taken only for a member this fleet made and brought up
+        with hpclaunch.StateStore(fleetrecord.root_of(directory, args.member)).lifecycle("worker launch"):
+            member = up_member()  # again, under the lock: a down may have ended before it was taken
             held = member.get("worker")
             if held and runner.client_alive(hpcslurm.Client(held["pid"], held["start"])):
                 print(f"fleetworker: {args.member}: its worker already runs (client pid {held['pid']})")
@@ -301,7 +314,8 @@ def launch(
                 if not runner.client_alive(client):
                     record.update(lambda r: fleetrecord.member_of(r, args.member).update(worker=None))
                     raise fleetrecord.FleetError(f"its worker's step ended at once (see {log.name}): none is running")
-    except (fleetrecord.FleetError, shards.ShardsError, hpcslurm.SlurmError, OSError, ValueError) as error:
+    except (fleetrecord.FleetError, hpcstate.StateError, shards.ShardsError, hpcslurm.SlurmError, OSError,
+            ValueError) as error:  # fmt: skip
         print(f"error: launch: {error}", file=sys.stderr)
         return REFUSED
     print(f"fleetworker: {args.member}: its worker is launched (client pid {client.pid}); its log {log}")

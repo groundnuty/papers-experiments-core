@@ -1949,6 +1949,9 @@ Step 6 of #462, the Helios-only path of the elastic fleet wired end to end. Noth
   allowlist alone, the step named `<job name>-worker`; its client is recorded as the member's `worker` in `fleet.json`,
   and a recorded client that lives is not started again. It watches the client for 20 s: a step that ends at once (`node`
   refuses a start it cannot make) is no launch, nothing is recorded, and the join waits. `fleet.py`'s commands are unchanged.
+  The launch holds its federation's own lifecycle lock (`<root>.lifecycle.lock`, which `hpcfed.py up` and `down` hold
+  for their whole run), never the fleet's, so it is refused beside a down or up of that federation or another launch
+  of its worker, and never behind an add waiting in the queue for other members (C57).
 - **The settings' `pass_env`** (what the study's plugin reads from the site: the main study's artifacts directory,
   `HPC_STUDY_ARTIFACTS`) reaches the identity read and the worker as it reaches a shard step: each variable with the
   login node's value (its site.env's), by the shard step's name and value rules, as `env -i` words on the worker's line
