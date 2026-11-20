@@ -315,6 +315,16 @@ class FakeHost:
         self.alive.add(pid)
         self.files[f"/proc/{pid}/stat"] = f"{pid} ({comm}) {state} {ppid} " + " ".join(["0"] * 17) + f" {start}\n"
 
+    def add_threads(self, container: "FakeContainer", pid: int, threads: dict[int, str]) -> None:
+        """Give a process threads, `{tid: state}`: each has its own `task/<tid>/stat`, and the container's cgroup lists
+        the thread ids (`cgroup.threads`, as cgroup v2 does) beside the processes."""
+        directory = f"/sys/fs/cgroup/system.slice/docker-{container.id}.scope"
+        listed = self.files.get(f"{directory}/cgroup.threads", "")
+        for tid, state in threads.items():
+            self.files[f"/proc/{pid}/task/{tid}/stat"] = f"{tid} (python) {state} 1 " + " ".join(["0"] * 17) + " 30\n"
+            listed += f"{tid}\n"
+        self.files[f"{directory}/cgroup.threads"] = listed
+
     def containers_with(self, label: str, value: str | None = None) -> list[FakeContainer]:
         return [c for c in self.containers.values() if label in c.labels and value in (None, c.labels[label])]
 

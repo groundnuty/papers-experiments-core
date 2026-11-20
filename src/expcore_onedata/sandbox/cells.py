@@ -307,7 +307,8 @@ class CellRunner:
     # ------------------------------------------------------------------------------------------------ processes
     def agent_processes(self, timeout_s: float | None = None) -> list[dict] | None:
         """Every process of the agent's container except its init and the init's `sleep` (`init_sleep`, O34); [] when it
-        has stopped, None when that cannot be read (within `timeout_s`, when given)."""
+        has stopped, None when that cannot be read (within `timeout_s`, when given). A zombie leader that a thread of
+        still waits is one of them (`teardown._readers`, O97), as an Apptainer cell's is."""
         waits = TD.WAITS
         if timeout_s is not None:
             waits = dataclasses.replace(waits, command_s=min(waits.command_s, timeout_s))
@@ -318,7 +319,7 @@ class CellRunner:
             return None
         if self.init_sleep is not None:
             info = {**info, "sleep": self.init_sleep}
-        return TD._readers(self._host, info) if info["running"] else []
+        return TD._readers(self._host, info, zombie_threads=True) if info["running"] else []
 
     def quiesce(self, reason: str = "end of run") -> dict[str, Any]:
         """Kill everything the agent left running, before any evidence is collected: a worker started in a new session

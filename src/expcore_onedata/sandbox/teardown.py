@@ -182,10 +182,11 @@ def _gone(host: HostOps, pid: int) -> bool:
         return False
 
 
-def _stat(host: HostOps, pid: int) -> dict | str | None:
+def _stat(host: HostOps, pid: int, *, zombies: bool = False) -> dict | str | None:
     """State, parent, command name and start time of a process (/proc/<pid>/stat). None when it is gone (ENOENT) or a
     zombie (it holds no file and waits on no request); `UNKNOWN` when its entry cannot be read (a PermissionError, any
-    other OSError) or parsed: it may be alive, so it is never taken for gone (O15)."""
+    other OSError) or parsed: it may be alive, so it is never taken for gone (O15). With `zombies` a zombie (Z) is
+    returned as it is, for the caller that asks whether a thread of it still waits (`_readers`, O97)."""
     try:
         s = _stat_text(host, pid)
     except OSError:
@@ -196,7 +197,7 @@ def _stat(host: HostOps, pid: int) -> dict | str | None:
     rest = s[close + 2 :].split()
     if close < 0 or len(rest) < 20 or not rest[1].lstrip("-").isdigit():
         return UNKNOWN
-    if rest[0] in ("Z", "X", "x"):
+    if rest[0] in ("Z", "X", "x") and not (zombies and rest[0] == "Z"):
         return None
     return {
         "pid": pid,
@@ -246,6 +247,41 @@ def _cgroup_procs(host: HostOps, cid: str) -> list[int] | None:
     return None
 
 
+def _cgroup_threads(host: HostOps, cid: str) -> list[int] | None:
+    """The thread ids of a container's cgroup (`cgroup.threads`, or `tasks` on cgroup v1); None when neither can be read."""
+    for cand in (CGROUP_ROOT / "system.slice" / f"docker-{cid}.scope", CGROUP_ROOT / "docker" / cid):
+        for name in ("cgroup.threads", "tasks"):
+            try:
+                return [int(x) for x in host.read_text(cand / name).split()]
+            except (OSError, ValueError):
+                continue
+    return None
+
+
+def _live_thread(host: HostOps, pid: int, tids: list[int]) -> str | None:
+    """The state of the first thread of the zombie leader `pid` that is not itself a zombie, among the container's
+    thread ids `tids`; None when none is left; `UNKNOWN` when a thread's state cannot be read or parsed. A thread id is
+    this process's when `/proc/<pid>/task/<tid>/stat` exists: ENOENT there is another process's thread, not an unknown
+    (a leader that went meanwhile has no `task` entry at all, which is none left, as `_stat` reads ENOENT)."""
+    found = None
+    for tid in tids:
+        if tid == pid:
+            continue
+        try:
+            text = host.read_text(PROC / str(pid) / "task" / str(tid) / "stat")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return UNKNOWN
+        close = text.rfind(")")
+        rest = text[close + 2 :].split()
+        if close < 0 or not rest:
+            return UNKNOWN
+        if rest[0] not in ("Z", "X", "x") and found is None:
+            found = rest[0]
+    return found
+
+
 def init_sleep(host: HostOps, agent: dict) -> dict | None:
     """The init's `sleep infinity` of an agent container that has just started, by its pid and start time (/proc/<pid>/stat
     field 22): the one process of its cgroup besides the init, a child of the init named `sleep`. None while that is not
@@ -277,22 +313,34 @@ def _the_init_sleep(procs: list[dict], agent: dict) -> dict | None:
     return min(named, key=lambda p: _ticks(p["start"]), default=None)
 
 
-def _readers(host: HostOps, agent: dict) -> list[dict] | None:
+def _readers(host: HostOps, agent: dict, *, zombie_threads: bool = False) -> list[dict] | None:
     """The agent container's processes except its init and the init's `sleep infinity` (`_the_init_sleep`; keeping those
     keeps the container, and with it its mount namespace, alive until step 4). None when the container's cgroup cannot
     be read, or the state of one of its processes cannot: it could be a reader as well as the init's `sleep`, so the
     list is unknown (O15). Each carries the digest of its command line (`procsignal.KEY`, None when it cannot be read), so
-    that a signal sent later goes only to the process listed here (O72)."""
+    that a signal sent later goes only to the process listed here (O72).
+
+    With `zombie_threads`, a zombie leader that a thread of still waits (a reader in a thread other than the main one,
+    after its SIGKILL: the leader ends, the thread waits in the kernel) is listed too, in that thread's state and with
+    `zombie_leader` set; its pid and start are the leader's, which a signal and a reading identify it by. One whose
+    threads cannot all be read makes the list unknown, never a process taken for gone (O97). The cell's tracker asks for
+    it; the teardown's own use is as it was."""
     procs = _cgroup_procs(host, agent["id"])
     if procs is None:
         return None
-    found = []
+    found, tids = [], None
     for pid in procs:
         if pid == agent["pid"]:
             continue
-        st = _stat(host, pid)
+        st = _stat(host, pid, zombies=zombie_threads)
         if st == UNKNOWN:
             return None
+        if isinstance(st, dict) and st["state"] == "Z":  # only with `zombie_threads`: is a thread of it still waiting?
+            tids = _cgroup_threads(host, agent["id"]) if tids is None else tids
+            live = UNKNOWN if tids is None else _live_thread(host, pid, tids)
+            if live == UNKNOWN:
+                return None
+            st = None if live is None else {**st, "state": live, "zombie_leader": True}
         if isinstance(st, dict):
             found.append({**st, PS.KEY: PS.cmd_digest(host, pid)})
     spared = _the_init_sleep(found, agent)
