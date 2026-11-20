@@ -65,8 +65,10 @@ from expcore_onedata.sandbox.hostops import describe_error
 log = logging.getLogger(__name__)
 
 FDS_READ = 2048  # the most descriptors of a process read for the holdings rule: more is unknown, never a partial set
-DIAGNOSE_SHARE = 0.5  # of the margin left, at most, so that a read that blocks leaves the abort the rest of it
-DIAGNOSE_MAX_S = 10.0
+# The deadline bounds a diagnosis (`deadline._Run.diagnose`: at most `DIAGNOSE_S`, and never so long that the abort
+# lacks its time) and passes the bound as `timeout_s`. A reading is given up on a little before it, so that what was
+# read returns to the deadline before the deadline's own join expires and discards it.
+DIAGNOSE_SHARE = 0.8
 TEXT_LIMIT, MAPS_LIMIT = 1 << 18, 1 << 22
 WCHAN = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,63}")
 
@@ -345,7 +347,7 @@ def diagnose(
 
     thread = threading.Thread(target=work, name="stuck-reader", daemon=True)
     thread.start()
-    thread.join(min(timeout_s * DIAGNOSE_SHARE, DIAGNOSE_MAX_S))  # the abort that frees the cell keeps the rest
+    thread.join(timeout_s * DIAGNOSE_SHARE)
     reader.stopped = True  # a read still blocked is left behind, and starts nothing more
     reading = [reading_entry(proc, reader.roles, reader.known) for proc in list(procs)]
     found: dict[str, Any] = {
