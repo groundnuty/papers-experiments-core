@@ -555,3 +555,21 @@ def test_o97_the_readers_call_tables_are_the_attributions():
     assert set(S.FD_CALLS) == attribution.FD_CALLS
     assert set(S.PATH_CALLS) == attribution.PATH_CALLS
     assert S.OUTSIDE_A_SYSCALL == attribution.OUTSIDE_A_SYSCALL
+
+
+def test_o97_a_reader_blocked_past_the_join_returns_what_it_read_before_the_time_given():
+    """O97: one survivor is read whole and another waits on a task-memory read that never returns: the diagnosis is
+    back before `timeout_s`, so the deadline's own join (the same bound) has not discarded it, with the first
+    survivor's object resolved and the second's unknown."""
+    view = FakeProcReader()
+    reader_in_d(view, 100)
+    view.process(200, start="6000").task(200, syscall=OPENAT_CWD).mem_at(200, 0x7F20, "/data/orchard/x\0")
+    gate = view.stall["200/task/200/mem"] = threading.Event()
+    began = time.monotonic()
+    found = R.diagnose(view, [*survivors(100), *survivors(200, start="6000")], 2.0, ROLES, machine="x86_64")
+    took = time.monotonic() - began
+    gate.set()
+    assert took < 2.0
+    assert spaces(found, process=0) == [("data", "orchard")]
+    assert blocking(found, process=1) is None
+    assert [(e["pid"], e["start"]) for e in found["reading"]] == [(100, "5000"), (200, "6000")]
