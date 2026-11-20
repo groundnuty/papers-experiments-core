@@ -323,6 +323,35 @@ def test_o91_a_log_that_holds_the_token_is_removed_and_fails_the_collection(node
         box.stop()
 
 
+def test_o05_o91_a_read_log_that_holds_the_token_is_never_copied_or_handed_on_even_when_the_scan_never_runs(
+    node, settings, tmp_path, monkeypatch
+):
+    """O91, O05: the read log is scanned as it is read, before its copy is written and before its bytes are handed on,
+    so a collection that fails between the two (here, before the scan) leaves no unscanned copy on disk and no bytes;
+    the next collection fails for the token as before."""
+    box = start(node, settings)
+    try:
+        with open(box.dir / "readlog" / LOG, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"event": "leak", "value": TOKEN}) + "\n")
+
+        def interrupted(paths):
+            raise RuntimeError("interrupted before the scan")
+
+        monkeypatch.setattr(box.collection, "_scan", interrupted)
+        with pytest.raises(RuntimeError, match="before the scan"):
+            box.collect(tmp_path / "out")
+        assert not (tmp_path / "out" / COPY).exists()
+        assert box.read_log() is None
+        monkeypatch.undo()
+        with pytest.raises(InfraError) as failed:
+            box.collect(tmp_path / "again")
+        assert failed.value.kind == "output_collection"
+        assert not (tmp_path / "again" / COPY).exists()
+        assert box.read_log() is None
+    finally:
+        box.stop()
+
+
 def test_o91_the_collector_is_part_of_the_run_s_infrastructure_check(node, settings):
     """O91: `infra_check` names the `readlog` helper beside the egress collector and the gate, running throughout."""
     box = start(node, settings)

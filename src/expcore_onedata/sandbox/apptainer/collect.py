@@ -50,6 +50,7 @@ class Collection:
         self.box = box
         self.egress_bytes: bytes | None = None
         self.readlog_bytes: bytes | None = None  # O91: the read-log collector's log once read; None until then
+        self._withheld = 0  # logs read in this collection that held the token: never copied, never handed on (O05)
 
     def run(self, dest: Path, outputs: Sequence[str]) -> dict[str, Any]:
         box = self.box
@@ -62,6 +63,7 @@ class Collection:
             raise SandboxError("the agent's processes could not be shown stopped before collection")
         dest.mkdir(parents=True, exist_ok=True)
         box.note_evidence(dest)
+        self._withheld = 0
         deaths = self.deaths()
         result: dict[str, Any] = {"outputs": self._outputs(dest, outputs), "deaths": deaths}
         if "refused_output" in box._meta:
@@ -215,12 +217,17 @@ class Collection:
             except SandboxError as error:
                 box._meta["collector_stop"] = {"error": str(error)}
         try:
-            self.egress_bytes = (box.dir / "egress" / "egress.jsonl").read_bytes()
+            data = (box.dir / "egress" / "egress.jsonl").read_bytes()
         except OSError:
             self.egress_bytes = None
             return None
+        if self._holds_token(data):  # scanned before anything of it is written or handed on (O05): `_scan` fails it
+            self.egress_bytes = None
+            self._withheld += 1
+            return None
         target = dest / EGRESS_COPY
-        target.write_bytes(self.egress_bytes)
+        target.write_bytes(data)
+        self.egress_bytes = data  # exposed only once it has been scanned and written
         return target
 
     def _readlog(self, dest: Path) -> Path | None:
@@ -228,11 +235,17 @@ class Collection:
         that cannot be read is None, which the instrument reads as unknown, never as a run that read nothing."""
         channel = self.box._readlog
         channel.stop()
-        self.readlog_bytes = channel.read()
-        if self.readlog_bytes is None:
+        data = channel.read()
+        if data is None:
+            self.readlog_bytes = None
+            return None
+        if self._holds_token(data):  # scanned before anything of it is written or handed on (O05): `_scan` fails it
+            self.readlog_bytes = None
+            self._withheld += 1
             return None
         target = dest / readlogrun.COPY
-        target.write_bytes(self.readlog_bytes)
+        target.write_bytes(data)
+        self.readlog_bytes = data  # exposed only once it has been scanned and written
         return target
 
     def _mount_watch(self, dest: Path) -> Path | None:
@@ -245,8 +258,13 @@ class Collection:
         target.write_bytes(found)
         return target
 
+    def _holds_token(self, data: bytes) -> bool:
+        token = self.box.spec.token.reveal().encode() if self.box.spec.token is not None else b""
+        return bool(token) and token in data
+
     def _scan(self, paths: Sequence[Path]) -> None:
-        """A file of evidence that holds the token is removed, and the collection fails (O05)."""
+        """A file of evidence that holds the token is removed, and the collection fails (O05). A collector's log that
+        held it was withheld when it was read (`_egress`, `_readlog`): no copy of it was written, so it counts here."""
         token = self.box.spec.token.reveal().encode() if self.box.spec.token is not None else b""
         if not token:
             return
@@ -257,8 +275,10 @@ class Collection:
                 self.egress_bytes = None
             elif path.name == readlogrun.COPY:  # the log is never handed on as the instrument's source (O05)
                 self.readlog_bytes = None
-        if held:
-            raise kinds.collection_error("the run's evidence", f"{len(held)} file(s) held the data-path token")
+        if held or self._withheld:
+            raise kinds.collection_error(
+                "the run's evidence", f"{len(held) + self._withheld} file(s) held the data-path token"
+            )
 
 
 def _remove(path: Path) -> None:

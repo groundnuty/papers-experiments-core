@@ -199,6 +199,34 @@ def test_a_file_of_evidence_that_holds_the_token_is_removed_and_fails_the_collec
         box.stop()
 
 
+def test_o05_an_egress_log_that_holds_the_token_is_never_copied_or_handed_on_even_when_the_scan_never_runs(
+    node, settings, tmp_path, monkeypatch
+):
+    """O05: the egress log is scanned as it is read, before its copy is written and before its bytes are handed on, so
+    a collection that fails between the two (here, before the scan) leaves no unscanned copy on disk and no bytes."""
+    box = start(node, settings)
+    try:
+        with open(box.dir / "egress" / "egress.jsonl", "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"event": "leak", "value": TOKEN}) + "\n")
+
+        def interrupted(paths):
+            raise RuntimeError("interrupted before the scan")
+
+        monkeypatch.setattr(box.collection, "_scan", interrupted)
+        with pytest.raises(RuntimeError, match="before the scan"):
+            box.collect(tmp_path / "out")
+        assert not (tmp_path / "out" / "egress.jsonl").exists()
+        assert box.egress_log() is None
+        monkeypatch.undo()  # the scan, run again, still fails the collection for the log that holds the token
+        with pytest.raises(InfraError) as failed:
+            box.collect(tmp_path / "again")
+        assert failed.value.kind == "output_collection"
+        assert not (tmp_path / "again" / "egress.jsonl").exists()
+        assert box.egress_log() is None
+    finally:
+        box.stop()
+
+
 def test_a_run_with_no_data_path_has_no_gate_and_still_logs_its_egress(node, settings, tmp_path):
     """O56: no data path, no gate, no token; the collector and the canary all the same."""
     box = start(node, settings, make_spec("isolated"))
