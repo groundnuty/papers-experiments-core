@@ -15,7 +15,9 @@ an ordered list of actions, each the call an operator would make by hand: a prov
   and verified), over the estimate; its declared allowance
   less the whole `--time` of every member made, over one more whole `--time`, but a member whose down the ledger shows
   ended counts only what its jobs billed (C60, `made_units`). A stalled queue (an up waiting past
-  `queue_stall_s`), an add still running there, or a quota that could not be read leave no room.
+  `queue_stall_s`), an add still running there, a retirement planned or running there (C62: its down needs the fleet's
+  lifecycle lock, which an add holds through its whole up, queue wait included), or a quota that could not be read
+  leave no room.
   A site that declares `node_room = "queue"` (C56; for jobs that share nodes, `HPC_EXCLUSIVE_NODES` 0) has no node
   limit, since Slurm starts such a job on a mixed node and no node count is a capacity; in its place the site has
   room for one up at a time, and none while an up still waits in the queue (restart, dry run or hand add included).
@@ -265,7 +267,10 @@ def _site(
             state = _joined(now, ledger, settings, m, fed, decision.actions)
             free += state == "free"
             working += state == "working"
-    room, limits = _room(now, settings, view, busy, memory, ledger.federations)
+    # C62: a retirement planned this tick or still running here: its down must find the fleet's lock free of an add
+    retiring = {a.member for a in decision.actions if isinstance(a, Retire) and a.site == site}
+    retiring |= {key.split("/", 1)[1] for key in busy if key.startswith(f"{site}/")}  # never a prepare's key
+    room, limits = _room(now, settings, view, busy, memory, ledger.federations, frozenset(retiring))
     available = free + working
     decision.targets[site] = {"target": min(settings.max_federations, available + room), "available": available,
                               "room": room, "limits": limits}  # fmt: skip
@@ -463,9 +468,11 @@ def _room(
     busy: frozenset[str],
     memory: tuple[str, int | None, dict],
     federations: Mapping[str, Federation] | None = None,
+    retiring: frozenset[str] = frozenset(),
 ) -> tuple[int, dict]:
     """How many more federations the site can take now (before `parallel_ups`), and each limit's own figure;
-    `federations` is the ledger's, by label (a downed member's billed units, C60)."""
+    `federations` is the ledger's, by label (a downed member's billed units, C60); `retiring` the members whose
+    retirement is planned or running here, which hold every add (C62)."""
     live = [m for m in view.members if m.status not in HOLDS_NOTHING]
     # every up whose job has not started, whatever its record says (a failed one may still hold a waiting job)
     starting = [m for m in live
@@ -501,10 +508,11 @@ def _room(
     limits["stalled"] = any(m.submitted_at is not None and now - m.submitted_at >= settings.queue_stall_s
                             for m in waiting_ups)  # fmt: skip
     limits["adding"] = settings.label in busy
+    limits["retiring"] = sorted(retiring)
     limits["login_memory"], limits["login_memory_mb"] = memory[1], memory[2]
     figures = [limits["maximum"], limits["allowance"]]
     figures += [limits[key] for key in ("nodes", "inodes", "login_memory", "queue_slot") if limits[key] is not None]
-    room = 0 if limits["stalled"] or limits["adding"] else max(min(figures), 0)
+    room = 0 if limits["stalled"] or limits["adding"] or limits["retiring"] else max(min(figures), 0)
     return room, limits
 
 

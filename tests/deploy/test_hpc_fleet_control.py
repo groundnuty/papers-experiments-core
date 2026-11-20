@@ -322,7 +322,9 @@ def test_c43_a_federation_with_a_lease_in_flight_is_never_retired(deploy, tmp_pa
 @pytest.mark.parametrize("ended", ["NODE_FAIL", "TIMEOUT"])
 def test_c43_a_node_failure_or_walltime_end_is_proven_terminal_replaced_then_collected(deploy, tmp_path, site, ended):
     """C43: Slurm shows a joined federation's job ended: its end is proven `terminal` (its lease expires, its run goes
-    back to pending); on the next tick a replacement is added and the ended one is collected and taken down."""
+    back to pending); on the next tick the ended one is collected and taken down, and on the tick after, its down
+    done, a replacement is added (C62: no add while a retirement there is pending, so its down gets the fleet's
+    lock)."""
     up(site, "fed-1", 41)
     bench = Bench(tmp_path, deploy, [site], runs=plan(tasks=1, conditions=("api-none",)))
     bench.tick()
@@ -342,6 +344,10 @@ def test_c43_a_node_failure_or_walltime_end_is_proven_terminal_replaced_then_col
     bench.clock.advance(60)
     bench.tick()
     assert retiring(site) == ["collect", "verify-copy", "down"]
+    assert verbs(site).count("add") == 0
+    site.set_status("fed-1", "down")  # what its down did: the fleet's record says down (the fake runs no fleet.py)
+    bench.clock.advance(60)
+    bench.tick()
     assert verbs(site).count("add") == 1
 
 
