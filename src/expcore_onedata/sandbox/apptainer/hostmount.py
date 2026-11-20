@@ -358,6 +358,7 @@ class HostMount:
             self._meta["wait_s"] = gen.wait_s
         watched = watcher_argv(self._python, where, self.nonce, gen.oneclient.process, self._poll_s,
                                log=where.watch_log_of(gen.number))  # fmt: skip
+        self._refuse_if_stopping()
         helpers.start(self.node, f"mountwatch{tail}", watched, where.watch_dir, MW.READY,
                       noted=lambda helper: setattr(gen, "watch", helper), env=self._tag, sleep=self._sleep,
                       clock=self._clock)  # fmt: skip
@@ -526,6 +527,61 @@ class HostMount:
         with self._lock:
             gen.abort = dict(record)
         return record
+
+    def restore(self) -> dict[str, Any]:
+        """Make the next generation of the mount after `abort` freed the cell (the module's docstring): the old
+        generation's watch closed (its log read, `disarmed`), its oneclient stopped and its log kept, the dead mount
+        unmounted until the mount table shows it gone, then the token file written again, a new oneclient with the same
+        command line mounted at the same point, and the generation's own watcher (a log of its own, the run's nonce)
+        armed on the token file's removal. `{"ok": True, "generation": n, "wait_s": ...}`. A failure removes the token
+        file and raises `SandboxError` with a fixed phrase (never an error's text): the run is then ended by the caller,
+        and `stop()` ends whatever of the new generation started. The caller is the sandbox's `_restore_host_mount`,
+        under its restore lock, and a stop that begins meanwhile ends it at its next step (`refuse_restores`)."""
+        step = "closing the old watch"
+        try:
+            with self._lock:
+                self._refuse_restore()
+                old = self._live
+            self._note_mount(old)
+            self._close_generation(old)
+            step = "stopping the old oneclient"
+            self._stop_generation(old)
+            old.oneclient_log = _read_log_link(self.where, directio.LOG_FILE)  # before glog's link moves to the new one
+            step = "unmounting the dead mount"
+            self._unmount_once()
+            self._mount_gone()
+            step = "starting the new mount"
+            new = Generation(old.number + 1)
+            with self._lock:  # the flag and the token file under one lock: none is written once a stop began
+                self._refuse_restore()
+                self._gens.append(new)  # live from now: a stop finds whatever of it starts
+                self._write_token()
+            self._launch(new)
+        except Exception as error:
+            self._fail_restore(error, step)
+        return {"ok": True, "generation": new.number, "wait_s": new.wait_s}
+
+    def _refuse_restore(self) -> None:
+        """`SandboxError` when no restore may begin or go on: a stop began, the guard's window is closed (the run's
+        snapshot is taken, and a generation made after it would be missing from it), or no oneclient ever started."""
+        self._refuse_if_stopping()
+        with self._lock:
+            if self._finalized:
+                raise SandboxError("the mount's guard is closed: no restore can be watched")
+            if self._live.oneclient is None:
+                raise SandboxError("the mount never started: nothing to restore")
+
+    def _fail_restore(self, error: Exception, step: str) -> None:
+        """The restore failed: the token file removed, then `SandboxError` naming the reason. A reason that is not
+        already one of ours is the step, never the error's text, which can carry a path."""
+        reason = str(error) if isinstance(error, SandboxError) else f"the mount could not be restored while {step}"
+        try:
+            self._remove_token()
+        except SandboxError:
+            raise SandboxError(f"{reason}, and its token file could not be removed") from error
+        if isinstance(error, SandboxError):
+            raise error
+        raise SandboxError(reason) from error
 
     def _identity_ok(self, gen: Generation) -> bool:
         """Whether the mount table, read now, shows this uid's read-only FUSE mount at the mount point on the device
