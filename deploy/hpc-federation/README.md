@@ -127,10 +127,13 @@ is usually KiB to a few MiB). It is written in the run's work directory (`readlo
 counts against the memory of the step that runs the dispatcher (`[hpc] sandbox`) until the run's teardown. At collection
 the driver reads it whole (one 256 MiB `bytes` at the cap) and the reader parses it at about 8 times its size in memory
 (about 2 GiB at the cap, and about 0.2 s of one core per MiB; measured at 4 and 16 MiB on 280-byte records and
-extrapolated). The evidence copy (`read-log.jsonl`) and the side file are two more copies, which a study's executor
-normally writes under the shard's `out/` on the same tmpfs; the shard's archive is an uncompressed tar on the shared
-filesystem and is pulled whole, so each log at the cap adds 512 MiB to it. A layout that expects logs near the cap, or
-several such collections at once, sizes `[hpc] sandbox` memory for them.
+extrapolated). The evidence copy (`read-log.jsonl`) and the side file are two more copies; where a study's executor
+writes both under the shard's `out/` (on the same tmpfs), the shard's archive, an uncompressed tar on the shared
+filesystem that is pulled whole, holds both, 512 MiB for each log at the cap. The agent's node is sized for one cell's
+limits plus 4 GiB for the gate, the dispatcher, the collectors, the store and the image (17 GiB in the slots template);
+at collection the cell has stopped, and a log at the cap takes about 3 GiB for that moment (0.75 GiB of tmpfs and about
+2.3 GiB in the driver), so it fits for one run. Whether a dispatcher collects two runs at once is not established here:
+a layout that expects logs near the cap together, sizes `[hpc] sandbox` memory for each.
 
 - **The collector** is a second helper of the driver's uid beside the egress collector, started before any cell: it binds
   `sock` in an empty 0700 directory (`readlog-sock/` of the run's directory) and writes its log in `readlog/`, which no
