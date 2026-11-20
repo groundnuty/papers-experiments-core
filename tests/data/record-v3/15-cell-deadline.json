@@ -275,28 +275,17 @@
          "nr": 0,
          "fd": 3
         },
-        "blocking": {
-         "via": "fd",
-         "cut": false,
-         "objects": [
-          {
-           "mount": "data",
-           "space": "space-a",
-           "path": "reports/owner-only.bin"
-          }
-         ]
-        }
-       }
-      ],
-      "waits_on": [
-       {
-        "fd": 3,
-        "mount": "data",
-        "fstype": "fuse",
-        "space": "space-a",
-        "path": "reports/owner-only.bin",
-        "pos": 0,
-        "flags": "0100000"
+        "waits_on": [
+         {
+          "fd": 3,
+          "mount": "data",
+          "fstype": "fuse",
+          "space": "space-a",
+          "path": "reports/owner-only.bin",
+          "pos": 0,
+          "flags": "0100000"
+         }
+        ]
        }
       ],
       "cwd_mount": "work"

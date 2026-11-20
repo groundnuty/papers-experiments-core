@@ -572,7 +572,9 @@ def test_o97_the_fifteenth_fixture_pins_a_cell_deadline_of_a_restored_mount_and_
         "target": "providers[1]",
         "space_holder": "providers[1]",
     }
-    assert held["survivors"][0]["tasks"][0]["blocking"]["objects"][0]["mount"] == "data"
+    waits = held["survivors"][0]["tasks"][0]["waits_on"][0]
+    assert (waits["mount"], waits["fd"]) == ("data", 3)
+    assert "blocking" not in held["survivors"][0]["tasks"][0]  # what the verdict read, never what the record keeps
     assert (record.outcome["name"], record.outcome["infra_kind"]) == ("finished", None)
     assert replay_record(record).dumps().encode("utf-8") == fifteenth[0].read_bytes()
     for earlier in FIXTURES[:14]:
