@@ -352,6 +352,12 @@ Copy `site.env.example` to `site.env` beside it, fill it in on the login node, a
 | `HPC_QUEUE_WAIT_S` | optional: the seconds `up` waits for a held job to start before it cancels it, 1800 when unset (a queue that keeps a job pending for hours needs more): a whole number from 600 to 86400, else `up` and `describe` refuse, naming the key. `down` never reads it |
 | `HPC_EXCLUSIVE_NODES` | optional: `1` submits every held job `--exclusive`, so no other job shares its nodes and several ups at once are safe; it bills whole nodes. `0` or unset (the default) asks what it always did. Anything else refuses `up`, naming the key. `down` and `describe` never read it, and it is not recorded in the state file |
 
+**Run `up` with no `TZ` set or exported.** `up` records the allocation's end (Slurm's `EndTime`) as `scontrol`
+printed it, with no zone, and the fault relay's kept stop reads it in the login node's own zone, since the relay
+runs without `TZ`. An `up` under `TZ=UTC` on a login node that is not on UTC makes a kept stop's `keep-until` mark,
+and the holder step that sleeps until it (O96), end early by the zone's offset: an hour on a UTC+1 site (seen live,
+20 Nov 2026). A wrapper that exports `TZ` drops it for `up`.
+
 Node names, addresses and job ids are typed at the prompt or read from Slurm; they never go into a file of this
 repository. The optional keys of the driver, the agent's sandbox and the study's artifacts are in `site.env.example`; the four of the next
 section are the provider storage on scratch and its inode guard.
