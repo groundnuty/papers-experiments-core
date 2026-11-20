@@ -17,6 +17,13 @@ that outcome, the cell's own included, lasts at most the margin and `SETTLE_SLAC
 like an escalation that raised and whose quiesce did not show the cell gone, is `survived_kill`, never a clean kill.
 The first end published stands: an outcome decided later is kept among the cell's deadlines, never made the run's end.
 
+A deadline whose abort freed the cell, on a backend that can restore its mount and with a verdict that the survivors
+were the agent's (`deadline.Escalation.restorable`, `attribute`), does not end the run (`deadline.ends_run`): its
+record is `mount_aborted` with `restore: "pending"`, the cell's kill stays the agent's time limit, and the caller runs
+the restore (`CellRunner.restore`), which publishes `mount_restored`, or ends the run (`mount_lost`, by `restore`)
+when it fails. Nothing runs while a restore is pending (`refuse_while_restoring`); a run whose body ends first needs
+none (`settle`).
+
 **A cell's processes end with it** (O56): the code tool tells the agent that state does not carry between calls
 (`codetool.DEFAULT_DESCRIPTION`), so whatever of the agent's is left in the container once a cell's `docker exec` has
 returned, a worker it detached into a session of its own included, is killed and shown gone (`_sweep`: every process
@@ -43,7 +50,7 @@ import dataclasses
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from expcore_onedata.sandbox import bounds as BD
@@ -52,7 +59,7 @@ from expcore_onedata.sandbox import earlyoom as EO
 from expcore_onedata.sandbox import killcause as KC
 from expcore_onedata.sandbox import procsignal as PS
 from expcore_onedata.sandbox import teardown as TD
-from expcore_onedata.sandbox.api import NOT_STARTED, RAN, ExecResult
+from expcore_onedata.sandbox.api import NOT_STARTED, RAN, ExecResult, SandboxError
 from expcore_onedata.sandbox.completion import Completion, ExecIncomplete
 from expcore_onedata.sandbox.containers import Names
 from expcore_onedata.sandbox.hostops import TIMED_OUT, HostOps, describe_error
@@ -70,6 +77,7 @@ QUIESCE_ROUNDS = (
 HOST_CALL_MARGIN_S = 30.0  # what the docker client may take beyond the cell's own limit before it is given up on
 KILL_S = 20.0  # a `kill` of the agent's processes through the host's privilege
 SETTLE_SLACK_S = 30.0  # beyond a deadline's margin, what its commands' own timeouts may overrun it by
+RESTORE_WHY_CHARS = 200  # what the record keeps of why a restore failed: a sentence, never a path or a log
 OUTPUT_CAP_BYTES = (
     1 << 20
 )  # what is kept of each of a cell's stdout and stderr: the first bytes, the rest read and dropped
@@ -239,6 +247,8 @@ class CellRunner:
         self.init_sleep: dict[str, Any] | None = None
         self._deadline: dict[str, Any] | None = None  # the record of the running cell's deadline, once it fired
         self.ended: dict[str, Any] | None = None  # the deadline that ended the run: a process outlived its kill
+        # the record of the deadline whose mount restore is pending or under way (`deadline.RESTORING`), else None
+        self.pending_restore: dict[str, Any] | None = None
         self._running: CellTimer | None = None  # the timer of the cell running now, while its `run` lasts
         self.cells: list[dict[str, Any]] = []
         self._events_seen: dict[str, int] | None = None
@@ -402,18 +412,23 @@ class CellRunner:
         as `ended` unless the run's end is published already; the sandbox's stop it orders, for the timer to run once
         the outcome is decided."""
         outcome = record["outcome"]
+        ends = DL.ends_run(record)  # fails closed: an outcome it does not know ends the run
         with self.meta_lock:
-            if outcome in DL.ESCALATED:
+            if ends or outcome in DL.ESCALATED:
                 record["cell"] = cell  # the run's end says whose deadline it was: the cell ran, its result stands (O72)
             self._deadline = record
             self._meta.setdefault("cell_deadlines", []).append({"cell": cell, **record})  # shares the record's steps
             # the run is over from now, whatever the cell's record makes of it after. An end already published stands:
             # a bounded wait that gave up on this outcome ended the run as `survived_kill` (`_end`, `settle`), and the
             # cell and its attempt were classified by it, so a late outcome is kept above and never replaces it (#226)
-            if outcome in DL.ESCALATED and self.ended is None:
+            if ends and self.ended is None:
                 self.ended = record
-        if outcome in DL.ESCALATED:
+            elif record.get("restore") == DL.RESTORE_PENDING and not ends and self.ended is None:
+                self.pending_restore = record  # the run stands: the caller restores the mount (`restore`)
+        if ends:
             log.error("a process of a cell outlived its kill at the cap: the deadline ended %s", outcome)
+        elif outcome in DL.ESCALATED:
+            log.warning("a process of a cell outlived its kill at the cap: the mount was aborted and is to be restored")
         return (lambda: self._stop_after(record)) if outcome in DL.STOPS else None
 
     def _unknown(self, why: str, **facts: Any) -> dict[str, Any]:
@@ -461,7 +476,74 @@ class CellRunner:
             with self.meta_lock:
                 self.ended = self.ended or self._unknown("not decided within its margin")
         with self.meta_lock:
+            pending = self.pending_restore
+            if pending is not None and pending.get("restore") == DL.RESTORE_PENDING:
+                # the body is over, and nothing reads the mount again: the collection takes the outputs as they are. A
+                # restore already under way is left to publish its own outcome (`restore`), never marked here
+                self._amend(pending, restore=DL.RESTORE_NOT_NEEDED)
+                self.pending_restore = None
             return self.ended
+
+    # ------------------------------------------------------------------------------------------------ the restore
+    @property
+    def restoring(self) -> bool:
+        """Whether a mount restore is pending or under way: nothing may run on the mount until it is done."""
+        with self.meta_lock:
+            return self.pending_restore is not None
+
+    def refuse_while_restoring(self) -> None:
+        """Refuse an exec while a restore is pending or under way: the mount was aborted, and a cell would read a dead
+        directory. `SandboxError` (kind `sandbox`) fails closed; the code tool's own path restores before it returns, so
+        it never meets this."""
+        if self.restoring:
+            raise SandboxError("the mount was aborted at a cell's deadline and has not been restored: nothing may run")
+
+    def _amend(self, record: dict[str, Any], **changes: Any) -> None:
+        """Change a published deadline's record, and its entry under `cell_deadlines`, which is a copy of it (the steps
+        are shared, the other keys are not). Under `meta_lock`."""
+        record.update(changes)
+        for entry in self._meta.get("cell_deadlines", []):
+            if entry.get("steps") is record["steps"]:
+                entry.update(changes)
+
+    def restore(self, fn: Callable[[], Mapping[str, Any]]) -> dict[str, Any]:
+        """Run the restore of the mount a restorable abort left pending (`deadline.Escalation.restorable`), which is
+        `fn`: it answers `{"ok": True, "generation": n, ...}` when the mount is back as the start made it, and anything
+        else (`ok` not exactly True, a raise) is a failure. Called by the sandbox's `restore_mount`, in the code tool's
+        call, inside the agent's paused clock. The record's `restore` is `running` meanwhile, and `meta_lock` is not
+        held: a restore may take a minute and a half. Success makes the deadline `mount_restored`, with a `restored`
+        step, and the run goes on. Failure ends the run (`mount_lost`, by `restore`): every later exec and the
+        collection raise `sandbox` (`kinds.run_ended_error`), and the cell's own result, a timeout, stands. It never
+        raises. The answer is the restore's own: `{"ok": None, "why": ...}` when nothing was pending (a no-op)."""
+        with self.meta_lock:
+            record = self.pending_restore
+            if record is None or record.get("restore") != DL.RESTORE_PENDING:
+                return {"ok": None, "why": "no restore is pending"}
+            self._amend(record, restore=DL.RESTORE_RUNNING)
+        began = time.monotonic()
+        try:
+            note: dict[str, Any] = dict(fn())
+        except Exception as e:
+            note = {"ok": False, "why": f"the restore raised {type(e).__name__}"}
+        took = round(time.monotonic() - began, 3)
+        with self.meta_lock:
+            if note.get("ok") is True:
+                generation = note.get("generation")
+                step = {"step": "restored", "s": took}
+                if isinstance(generation, int) and not isinstance(generation, bool):
+                    step["generation"] = generation
+                record["steps"].append(step)
+                self._amend(record, outcome=DL.MOUNT_RESTORED, restore=DL.RESTORE_DONE)
+            else:
+                why = note.get("why") if isinstance(note.get("why"), str) else "the restore did not complete"
+                why = why[:RESTORE_WHY_CHARS]
+                record["steps"].append({"step": "restore_failed", "s": took, "why": why})
+                self._amend(record, restore=DL.RESTORE_FAILED)
+                if self.ended is None:  # an end already published stands (#226)
+                    self.ended = {"outcome": DL.MOUNT_LOST, "by": DL.RESTORE, "cell": record.get("cell"), "why": why}
+                log.error("the mount could not be restored after its abort at a cell's deadline: %s", why)
+            self.pending_restore = None
+        return note
 
     def wait_decided(self) -> None:
         """Wait for the outcome of a cell's deadline already under way, at most its margin and `SETTLE_SLACK_S`; never
@@ -659,14 +741,19 @@ class CellRunner:
         """The record of the cell's deadline, when its timer fired (`_end`: the timer's thread has put it under
         `cell_deadlines` already, or `_end` did, for one not decided in time); and when a process of the cell outlived
         its kill, or the outcome is not known, its kill becomes `kill_survived`, whatever else the counters said (after
-        an abort or a stop they describe the harness's doing); the run is already ended (`ended`). Whether that
-        happened."""
+        an abort or a stop they describe the harness's doing); the run is already ended (`ended`). Whether the
+        deadline escalated (a process outlived its kill and the mount was aborted or the sandbox stopped). One that
+        restores its mount ends nothing (`deadline.ends_run`): the cell's kill stays the agent's time limit, and the
+        result says that a restore is pending (`ExecResult.restore_pending`) for the code tool to run it."""
         with self.meta_lock:
             if record is None:
                 return False
             entry["deadline"] = record
-            if record["outcome"] not in DL.ESCALATED:
+            if record["outcome"] in (DL.KILLED, DL.MOUNT_RESTORED):
                 return False
+            if not DL.ends_run(record):
+                res.restore_pending = record.get("restore") == DL.RESTORE_PENDING
+                return True
             kill = {**(entry.get("kill") or {}), **KC.survived_cause(record)}
             entry["kill"] = res.kill = kill
             cell_kills = self._meta.setdefault("cell_kills", [])

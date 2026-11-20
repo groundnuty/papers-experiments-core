@@ -852,6 +852,7 @@ class ApptainerSandbox:
         self._refuse_if_ended()
         if self._cells is None or self._stopped:
             raise SandboxError("the sandbox is not running")
+        self._cells.refuse_while_restoring()  # an aborted mount not yet restored: a cell would read a dead directory
         self._enter(record)
         try:
             try:
@@ -892,6 +893,21 @@ class ApptainerSandbox:
 
     def settle_deadline(self) -> dict[str, Any] | None:
         return self._cells.settle() if self._cells is not None else None
+
+    def restore_mount(self) -> dict[str, Any]:
+        """Bring the run's mount back after a cell's deadline aborted it and the survivors were the agent's
+        (`api.MountRestoring`, `cells.CellRunner.restore`): `{"ok": None}` when nothing is pending, else the restore's
+        own answer, which ends the run when it failed. The code tool calls it, inside the agent's paused clock. It never
+        raises. The restore itself is `_restore_host_mount`."""
+        if self._cells is None:
+            return {"ok": None, "why": "the sandbox is not running"}
+        return self._cells.restore(self._restore_host_mount)
+
+    def _restore_host_mount(self) -> dict[str, Any]:
+        """What this backend does to bring its mount back: nothing yet, so a restore that was somehow asked for fails
+        and ends the run, as an abort with no restore always did. A backend that restores replaces this body, and builds
+        its `deadline.Escalation` with `restorable=True` and an `attribute`; without those none is ever pending."""
+        return {"ok": False, "why": "this backend cannot restore its mount"}
 
     def _refuse_if_ended(self) -> None:
         if self._cells is None:

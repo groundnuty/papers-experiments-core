@@ -159,6 +159,9 @@ class ExecResult:
     output_cut: dict[str, dict[str, int]] | None = None
     # what the cell's completion record showed (O55): `{"source_whole": ..., "exit_status": ..., "nonce_matched": ...}`
     exec_check: dict[str, Any] | None = None
+    # the cell's deadline aborted the run's mount and the survivors were the agent's: the mount is to be restored
+    # (`MountRestoring.restore_mount`) before anything else runs, and the kill stays the agent's time limit (O34)
+    restore_pending: bool = False
 
 
 @runtime_checkable
@@ -185,6 +188,16 @@ class Sandbox(Protocol):
     def metadata(self) -> dict[str, Any]:
         """The facts of the run for its record: images by id, limits, the data path, kills, deaths. Never a secret."""
         ...
+
+
+class MountRestoring(Protocol):
+    """A sandbox that can bring a run's mount back after a cell's deadline aborted it (O34): `restore_mount()` restores
+    it as the start made it, and answers `{"ok": True, "generation": n, ...}`, `{"ok": False, "why": ...}` when it could
+    not (the run is then ended and every later call raises `sandbox`), or `{"ok": None, "why": ...}` when nothing was
+    pending. It never raises for what the restore does. The code tool calls it, inside the agent's paused clock, when a
+    cell's result says `restore_pending`. Optional beside `Sandbox`: a sandbox that has none never reports a restore."""
+
+    def restore_mount(self) -> dict[str, Any]: ...
 
 
 @runtime_checkable

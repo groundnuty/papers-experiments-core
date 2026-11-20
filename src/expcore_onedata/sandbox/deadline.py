@@ -37,6 +37,17 @@ Every step is recorded with its seconds since the cap (`t_s`), and the record wi
 Each outcome but `killed` makes the attempt infrastructure (`kinds.CELL_UNKILLABLE`), and the run is over: after an
 abort the mount is dead for the rest of the run, so no later cell may read it as if it were an empty directory.
 
+**One exception: a mount that is restored.** A backend that can bring its mount back (`Escalation.restorable`) and says
+whose block it was (`Escalation.attribute`) may end the cell as the agent's. It reads each survivor at the `survived`
+step (`Tracker.diagnose`, before anything is aborted) and asks `attribute` whether the survivors were all blocked on
+what the study's own manipulation holds down, never on anything the harness cannot account for. Only a verdict `agent`,
+with an abort that freed every process of the cell, leaves the record `mount_aborted` with `restore: "pending"`: the run
+stands, the cell's kill stays the agent's time limit, and the caller restores the mount (`cells.CellRunner.restore`),
+which makes the outcome `mount_restored`, the one escalation's ending that is not infrastructure. Every other freed
+survivor (`infrastructure`, no verdict, a diagnosis that raised, an abort of a backend that cannot restore) stays
+`mount_aborted`, escalated, as before. `ends_run` says which records end the run; it fails closed, so a record it does
+not know ends it.
+
 The tracker, the abort and the clock are given, so the escalation is tested with a fake process tracker and a fake
 clock: a real process in uninterruptible sleep cannot be made in a test.
 """
@@ -46,15 +57,41 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import time
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from typing import Any, Protocol
 
 KILLED = "killed"  # every process of the cell ended within the grace of its kill
 SURVIVED = "survived_kill"  # a process outlived its kill and the margin ran out before anything ended it
 MOUNT_ABORTED = "mount_aborted"  # a process outlived its kill and ended once the mount's FUSE connection was aborted
 SANDBOX_STOPPED = "sandbox_stopped"  # a process outlived its kill and the abort: the sandbox's stop is ordered
+# the one ending of a deadline that is not infrastructure after a process outlived its kill: the mount was aborted, the
+# survivors were the agent's (`attribute`), and the mount was brought back, so the run goes on (`CellRunner.restore`).
+# `enforce` never decides it: it is what a pending restore becomes, so it is in `RECORDED`, not `OUTCOMES`, `SEVERITY`
+MOUNT_RESTORED = "mount_restored"
 OUTCOMES = (KILLED, SURVIVED, MOUNT_ABORTED, SANDBOX_STOPPED)
-ESCALATED = (SURVIVED, MOUNT_ABORTED, SANDBOX_STOPPED)  # each makes the attempt infrastructure
+RECORDED = (*OUTCOMES, MOUNT_RESTORED)  # every outcome the record of a cell's deadline can hold
+ESCALATED = (
+    SURVIVED,
+    MOUNT_ABORTED,
+    SANDBOX_STOPPED,
+)  # each makes the attempt infrastructure, unless `ends_run` says not
+# the record's `restore`, set only on a `mount_aborted` that a restorable escalation freed with the verdict `agent`:
+RESTORE_PENDING = "pending"  # the caller has not run the restore yet: the run stands, and nothing may exec
+RESTORE_RUNNING = "running"  # the restore is under way
+RESTORE_DONE = "restored"  # it succeeded: the outcome is then `mount_restored`
+RESTORE_NOT_NEEDED = "not_needed"  # the run's body ended before anything read the mount again: no restore was run
+RESTORE_FAILED = "failed"  # it did not succeed: the run is ended (`MOUNT_LOST`, by `RESTORE`)
+RESTORE_STATES = (RESTORE_PENDING, RESTORE_RUNNING, RESTORE_DONE, RESTORE_NOT_NEEDED, RESTORE_FAILED)
+# what leaves the run standing after a restorable abort; every other state, and one not named here, ends it
+RESTORE_KEEPS_RUN = (RESTORE_PENDING, RESTORE_RUNNING, RESTORE_NOT_NEEDED)
+MOUNT_LOST = "mount_lost"  # the `outcome` of the end `CellRunner.restore` publishes when the restore fails
+RESTORE = "restore"  # the `by` of that end, as `SWEEP` is of the sweep's
+AGENT = "agent"  # an attribution's verdict: every survivor was blocked on what the study's manipulation holds down
+INFRASTRUCTURE = "infrastructure"  # any other verdict: the survivors are the harness's, so the run is set aside
+VERDICTS = (AGENT, INFRASTRUCTURE)
+UNKNOWN_BLOCK = "blocking_object_unknown"  # the `why` of a verdict the escalation could not get at all
+DIAGNOSTIC_KEYS = ("survivors", "survivors_cut", "connection")  # what `Tracker.diagnose` may add to the record
+ATTRIBUTION_KEYS = ("verdict", "why", "target", "space_holder")  # what the record keeps of `attribute`'s answer
 # from the least severe to the most: an outcome never falls below a step already taken. The two stops are in STOPS and
 # order the same stop, so their order never changes what is done; `survived_kill`, where nothing shows the cell gone, is
 # above them all
@@ -87,20 +124,49 @@ class Tracker(Protocol):
     def kill(self, procs: list[dict[str, Any]], timeout_s: float) -> Collection[tuple[Any, ...]] | None: ...
 
 
+class Diagnosing(Protocol):
+    """A tracker that can also say what the survivors are blocked on: `diagnose(left, timeout_s)` reads each process
+    of `left` (from `/proc` alone, never the file it waits on: that would block the reader too) within `timeout_s`, and
+    answers with the record keys of `DIAGNOSTIC_KEYS` (`survivors`, `survivors_cut`, `connection`), or None when it
+    could not. It is optional: the escalation reads it with `getattr`, so a tracker that has none is unchanged."""
+
+    def diagnose(self, left: list[dict[str, Any]], timeout_s: float) -> dict[str, Any] | None: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class Escalation:
     """What the deadline does past the kill: its grace period, the mount's abort (given the seconds it may take; it
-    returns a record with `ok`: True, False, or None when it could not be attempted), and its clock."""
+    returns a record with `ok`: True, False, or None when it could not be attempted), and its clock.
+
+    `restorable` says the backend can bring the mount back after an abort; with `attribute` it is what lets a freed
+    survivor be the agent's (the module's docstring). `attribute(diagnostics)` is a pure function of what `diagnose`
+    read at the `survived` step (None when it read nothing): it answers `{"verdict": "agent" | "infrastructure", "why":
+    ..., "target": ..., "space_holder": ...}`, and reads what the study holds down *when it is called*, at that step,
+    never a value taken when the sandbox started. Both default to nothing: a `restorable` escalation with no
+    `attribute`, an answer that is not a verdict, or one that raises, is `infrastructure`: it fails closed."""
 
     grace_s: float
     abort: Callable[[float], dict[str, Any]]
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
     poll_s: float = POLL_S
+    restorable: bool = False
+    attribute: Callable[[dict[str, Any] | None], Mapping[str, Any]] | None = None
 
     @property
     def margin_s(self) -> float:
         return margin_s(self.grace_s)
+
+
+def ends_run(record: Mapping[str, Any]) -> bool:
+    """Whether a cell's deadline record ends the run: every escalation does (`ESCALATED`) but a `mount_aborted` whose
+    restore is pending, under way or not needed, and `mount_restored`; `killed` is the cell's own time limit and ends
+    nothing. It fails closed: an outcome or a restore state it does not know ends the run, so a record from a newer
+    writer never leaves a dead mount in use."""
+    outcome = record.get("outcome")
+    if outcome in (KILLED, MOUNT_RESTORED):
+        return False
+    return not (outcome == MOUNT_ABORTED and record.get("restore") in RESTORE_KEEPS_RUN)
 
 
 def key_of(proc: dict[str, Any]) -> tuple[Any, Any, Any]:
@@ -206,18 +272,63 @@ class _Run:
         states = None if left is None else [p.get("state") for p in left[:STATES_KEPT]]
         self.step("survived", left=None if left is None else len(left), states=states)
 
+    def diagnose(self, left: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+        """What the survivors are blocked on, read by the tracker (`Diagnosing`) at the `survived` step, before the
+        mount is aborted, within the margin left; its keys are merged into the record (`DIAGNOSTIC_KEYS`, nothing
+        else). None when the tracker cannot diagnose, nothing is left to read or the margin is spent, and when the
+        reading raised (a `raised` step, never an exception: the abort that follows is what frees the cell)."""
+        diagnose = getattr(self.tracker, "diagnose", None)
+        budget = self.left()
+        if diagnose is None or not left or budget <= 0:
+            return None
+        try:
+            found = diagnose(left, budget)
+        except Exception as error:
+            self.step("raised", during="diagnosis", error=f"the diagnosis raised {type(error).__name__}")
+            return None
+        if not isinstance(found, Mapping):
+            return None
+        kept = {key: found[key] for key in DIAGNOSTIC_KEYS if key in found}
+        self.record.update(kept)
+        return dict(found)
+
+    def attribution(self, left: list[dict[str, Any]] | None, diagnostics: dict[str, Any] | None) -> str | None:
+        """Whose the survivors are, asked of `Escalation.attribute` at the `survived` step and recorded as the record's
+        `attribution`; the verdict. None when the escalation has no `attribute` (nothing is recorded: a backend that
+        does not attribute keeps its record as it was). Fails closed: survivors that could not be listed (`left` None:
+        unknown is never gone, so never the agent's), an answer that raises, is no mapping or names no verdict is
+        `infrastructure` with the reason `UNKNOWN_BLOCK`, so a restore is never made pending by a guess."""
+        attribute = self.esc.attribute
+        if attribute is None:
+            return None
+        answer: Any = None
+        if left is not None:
+            try:
+                answer = attribute(diagnostics)
+            except Exception as error:
+                self.step("raised", during="attribution", error=f"the attribution raised {type(error).__name__}")
+        if not isinstance(answer, Mapping) or answer.get("verdict") not in VERDICTS:
+            answer = {"verdict": INFRASTRUCTURE, "why": UNKNOWN_BLOCK}
+        self.record["attribution"] = {key: answer[key] for key in ATTRIBUTION_KEYS if key in answer}
+        return str(answer["verdict"])
+
     def reach(self, outcome: str) -> None:
         """A step is taken that no later outcome may fall below: the mount aborted, or the sandbox's stop reached.
         Called before whatever can raise next, so that the fallback run for a raise still knows of it."""
         self.reached = max(self.reached, outcome, key=SEVERITY.index)
 
-    def done(self, outcome: str) -> dict[str, Any]:
+    def done(self, outcome: str, *, restore: bool = False) -> dict[str, Any]:
         """Record the outcome, the one place that does: never less severe than what was reached. One that orders the
-        sandbox's stop has that step recorded, if it is not yet (the caller runs the stop once this is recorded)."""
+        sandbox's stop has that step recorded, if it is not yet (the caller runs the stop once this is recorded).
+        `restore` makes a `mount_aborted` outcome one whose restore is pending, the one place that does: it is asked
+        only by the path where the abort worked, every process was shown gone, the escalation can restore and its
+        attribution is the agent's (`_escalate`); any outcome of more severity is never made restorable."""
         outcome = max(outcome, self.reached, key=SEVERITY.index)
         if outcome in STOPS and not any(s["step"] == "stop" for s in self.record["steps"]):
             self.step("stop")
         self.record["outcome"] = outcome
+        if restore and outcome == MOUNT_ABORTED:
+            self.record["restore"] = RESTORE_PENDING
         return self.record
 
 
@@ -268,6 +379,9 @@ def _escalate(run: _Run, esc: Escalation) -> dict[str, Any]:
         run.step("ended")
         return run.done(KILLED)
     run.survivors(left)
+    # read what the survivors wait on, and whose it is, before anything is aborted: the abort ends their wait. Asked
+    # once, here: the later `survivors` steps are of a mount already dead
+    verdict = run.attribution(left, run.diagnose(left))
     budget = run.left()
     abort = _attempt(lambda: esc.abort(budget), "abort") if budget > 0 else {"ok": False, "why": "no time was left"}
     run.step("abort", **abort)
@@ -278,7 +392,7 @@ def _escalate(run: _Run, esc: Escalation) -> dict[str, Any]:
         left = run.wait(left)
         if left == []:
             run.step("ended")
-            return run.done(MOUNT_ABORTED)
+            return run.done(MOUNT_ABORTED, restore=esc.restorable and verdict == AGENT)
         run.survivors(left)
     over = run.left() <= 0
     if over:  # waited no longer: whatever runs still is the stop's
@@ -287,17 +401,37 @@ def _escalate(run: _Run, esc: Escalation) -> dict[str, Any]:
 
 
 __all__ = [
+    "AGENT",
+    "ATTRIBUTION_KEYS",
     "COMMANDS_S",
+    "DIAGNOSTIC_KEYS",
     "ESCALATED",
+    "INFRASTRUCTURE",
     "KILLED",
     "MOUNT_ABORTED",
+    "MOUNT_LOST",
+    "MOUNT_RESTORED",
     "OUTCOMES",
+    "RECORDED",
+    "RESTORE",
+    "RESTORE_DONE",
+    "RESTORE_FAILED",
+    "RESTORE_KEEPS_RUN",
+    "RESTORE_NOT_NEEDED",
+    "RESTORE_PENDING",
+    "RESTORE_RUNNING",
+    "RESTORE_STATES",
     "SANDBOX_STOPPED",
     "SEVERITY",
     "STOPS",
     "SURVIVED",
+    "SWEEP",
+    "UNKNOWN_BLOCK",
+    "VERDICTS",
+    "Diagnosing",
     "Escalation",
     "Tracker",
+    "ends_run",
     "enforce",
     "margin_s",
 ]
