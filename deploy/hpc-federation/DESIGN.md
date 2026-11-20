@@ -730,7 +730,7 @@ image's test CA (section 7 of `up`); the cluster's Erlang names are the node's a
 
 **`up` and `down` each hold the root's lifecycle lock** (`<root>.lifecycle.lock`, beside the root, `flock`, never
 waited for) from start to end, so a `down` never runs between an `up`'s state and its `sbatch` (it would find no job
-and remove the root); the service verbs do not take it. **It lies outside the root and is never removed.** On the
+and remove the root); the service verbs do not take it. A worker's launch (`fleetworker.py launch`) holds it from its checks to its spawn, so it never meets a `down` of its federation (C57). **It lies outside the root and is never removed.** On the
 site's shared filesystem (NFS) a file held open while it is removed becomes a silly-rename file (`.nfsXXXX`) until its
 last close: the first live `down` held the lock inside the root it removed, which was then not empty. A lock file
 removed while held would let the next `up` or `down` lock another file of the same name, so it stays.
