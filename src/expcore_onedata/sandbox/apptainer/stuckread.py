@@ -46,16 +46,22 @@ from typing import Any, Protocol
 
 from expcore_onedata.sandbox.apptainer import procs as P
 from expcore_onedata.sandbox.apptainer import stuck as S
+from expcore_onedata.sandbox.apptainer.stuckrecord import (
+    SURVIVORS_KEPT,
+    Survivor,
+    Task,
+    Waits,
+    block_record,
+    connection_record,
+    survivor_record,
+)
 from expcore_onedata.sandbox.hostops import describe_error
 
 log = logging.getLogger(__name__)
 
-SURVIVORS_KEPT, TASKS_KEPT, WAITS_KEPT = 8, 4, 4  # what the record keeps; `blocks` is never cut
 FDS_READ = 2048  # the most descriptors of a process read for the holdings rule: more is unknown, never a partial set
 TEXT_LIMIT, MAPS_LIMIT = 1 << 18, 1 << 22
-FUSECTL_STATES = ("writable", "absent", "not_writable")
 WCHAN = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,63}")
-FSTYPE = re.compile(r"[A-Za-z0-9_.+-]{1,32}")
 
 
 class ProcReader(Protocol):
@@ -110,56 +116,6 @@ class LocalProcReader:
 
 
 @dataclass(frozen=True)
-class Waits:
-    """One thing a task waits on: where it is and, for a descriptor, which one, its offset and its flags."""
-
-    place: S.Place
-    fd: int | None = None
-    pos: int | None = None
-    flags: str | None = None
-
-    def record(self) -> dict[str, Any]:
-        entry: dict[str, Any] = {} if self.fd is None else {"fd": self.fd}
-        entry["mount"] = self.place.mount
-        entry["fstype"] = self.place.fstype if FSTYPE.fullmatch(self.place.fstype) else "unknown"
-        if self.place.mount == S.DATA:
-            entry["space"], entry["path"] = self.place.space, self.place.rest
-        if self.pos is not None:
-            entry["pos"] = self.pos
-        if self.flags is not None:
-            entry["flags"] = self.flags
-        return entry
-
-    def object(self) -> dict[str, Any]:
-        """What `blocks` keeps: the role and, for the data mount, the space."""
-        return {"mount": self.place.mount, "space": self.place.space if self.place.mount == S.DATA else None}
-
-
-@dataclass
-class _Task:
-    tid: int
-    state: str
-    wchan: str | None = None
-    syscall: Any = S.UNREADABLE  # a `stuck.Syscall`, or `running` or `unreadable`
-    objects: list[Waits] | None = None  # what it waits on; None: not known (yet)
-
-
-@dataclass
-class _Proc:
-    pid: int
-    comm: str
-    state: str
-    tasks: list[_Task] | None = None  # None: the process could not be read (gone, another process, hidden)
-    mounts: tuple[S.MountEntry, ...] | None = None
-    cwd: str | None = None  # the working directory's absolute path
-    fuse_fds: list[Waits] | None = None
-    fds_complete: bool = True
-    maps: list[Waits] | None = None
-    maps_complete: bool = True
-    base: str = ""  # the first live task's directory, through which the process's shared tables are read
-
-
-@dataclass(frozen=True)
 class Diagnosis:
     """What a backend gives its tracker to read survivors with: the cell's fixed targets (`roles`, asked when the
     deadline fires: the run's connection is a new device after a restore) and, optionally, the run's connection record
@@ -175,18 +131,18 @@ class _Reader:
     def __init__(self, view: ProcReader, roles: S.Roles, machine: str) -> None:
         self.view, self.roles = view, roles
         self.known = machine in S.X86_64
-        self.pending: list[tuple[_Proc, _Task]] = []  # D tasks whose object needs `maps` or the task's memory
+        self.pending: list[tuple[Survivor, Task]] = []  # D tasks whose object needs `maps` or the task's memory
 
     def text(self, name: str, limit: int = TEXT_LIMIT) -> str | None:
         data = self.view.read(name, limit)
         return None if data is None else data.decode("utf-8", "replace")
 
     # ------------------------------------------------------------------------------------------------ phase A
-    def look(self, proc: Mapping[str, Any]) -> _Proc:
+    def look(self, proc: Mapping[str, Any]) -> Survivor:
         """The process as far as the cheap files go; unknown (`tasks` None) when it is gone, another process by this pid
         or hidden. A D task whose object needs more is queued for `finish`."""
         pid = proc.get("pid")
-        found = _Proc(pid if isinstance(pid, int) else -1, str(proc.get("comm")), str(proc.get("state")))
+        found = Survivor(pid if isinstance(pid, int) else -1, str(proc.get("comm")), str(proc.get("state")))
         stat = P.parse_stat(self.text(f"{pid}/stat") or "")
         if stat is None or stat[3] != proc.get("start"):
             return found
@@ -202,26 +158,26 @@ class _Reader:
                 self._object(found, task, f"{pid}/task/{task.tid}")
         return found
 
-    def _task(self, proc: _Proc, tid: int) -> _Task | None:
+    def _task(self, proc: Survivor, tid: int) -> Task | None:
         base = f"{proc.pid}/task/{tid}"
         stat = P.parse_stat(self.text(f"{base}/stat") or "")
         if stat is None or stat[1] in ("Z", "X"):
             return None  # gone, or a zombie: not blocked on anything
-        task = _Task(tid, stat[1])
+        task = Task(tid, stat[1])
         wchan = (self.text(f"{base}/wchan", 128) or "").strip()
         task.wchan = wchan if WCHAN.fullmatch(wchan) else None  # `0` on some kernels, and unreadable, read as None
         reading = self.text(f"{base}/syscall", 512)
         task.syscall = S.UNREADABLE if reading is None else S.parse_syscall(reading)
         return task
 
-    def _shared(self, proc: _Proc, base: str) -> None:
+    def _shared(self, proc: Survivor, base: str) -> None:
         """The process's mount table and working directory, through one live task's directory."""
         proc.base = base
         table = self.text(f"{base}/mountinfo")
         proc.mounts = None if table is None else S.parse_mountinfo(table)
         proc.cwd = S.link_path(self.view.readlink(f"{base}/cwd"))
 
-    def _object(self, proc: _Proc, task: _Task, base: str) -> None:
+    def _object(self, proc: Survivor, task: Task, base: str) -> None:
         call = task.syscall
         if isinstance(call, str):  # unreadable or running: never guessed from what the process holds
             return
@@ -232,7 +188,7 @@ class _Reader:
         else:
             self.pending.append((proc, task))  # a path call's argument (task memory), or else the holdings rule
 
-    def _descriptor(self, proc: _Proc, base: str, fd: int) -> Waits | None:
+    def _descriptor(self, proc: Survivor, base: str, fd: int) -> Waits | None:
         """The file descriptor `fd` placed on the process's mounts; None when any read failed."""
         if fd < 0 or proc.mounts is None:
             return None
@@ -243,7 +199,7 @@ class _Reader:
             return None
         return Waits(self.roles.place(entry, S.link_path(target)), fd, info.pos, info.flags)
 
-    def _fuse_fds(self, proc: _Proc) -> None:
+    def _fuse_fds(self, proc: Survivor) -> None:
         """Every FUSE descriptor of the process (once), and whether the list is whole."""
         if proc.fuse_fds is not None or not proc.base:
             return
@@ -260,7 +216,7 @@ class _Reader:
                 proc.fuse_fds.append(found)
 
     # ------------------------------------------------------------------------------------------------ phase B
-    def finish(self, procs: Sequence[_Proc]) -> None:
+    def finish(self, procs: Sequence[Survivor]) -> None:
         """The objects that need the task's memory or its `maps`, after every cheap read of every survivor; then, for a
         survivor with a task in `D` and no object found, its FUSE descriptors, for the record's `waits_on`."""
         for proc, task in list(self.pending):
@@ -272,7 +228,7 @@ class _Reader:
             if any(t.state == "D" for t in tasks) and not any(t.objects for t in tasks):
                 self._fuse_fds(proc)
 
-    def _path_object(self, proc: _Proc, task: _Task, call: tuple[str, int | None, int]) -> list[Waits] | None:
+    def _path_object(self, proc: Survivor, task: Task, call: tuple[str, int | None, int]) -> list[Waits] | None:
         _, dirfd, pointer = call
         base = f"{proc.pid}/task/{task.tid}"
         path = S.cstring(self.view.read_at(f"{base}/mem", pointer, S.PATH_LIMIT))
@@ -291,10 +247,10 @@ class _Reader:
         entry = S.mount_of_path(proc.mounts, absolute)
         return None if entry is None else [Waits(self.roles.place(entry, absolute))]
 
-    def _directory(self, proc: _Proc, base: str, fd: int) -> str | None:
+    def _directory(self, proc: Survivor, base: str, fd: int) -> str | None:
         return S.link_path(self.view.readlink(f"{base}/fd/{fd}")) if fd >= 0 else None
 
-    def _holdings(self, proc: _Proc) -> list[Waits] | None:
+    def _holdings(self, proc: Survivor) -> list[Waits] | None:
         """The holdings rule: the FUSE objects the process holds, None when it holds none or any read failed."""
         self._fuse_fds(proc)
         self._mapped(proc)
@@ -306,7 +262,7 @@ class _Reader:
         found = [w for w in held if w.place.fuse]
         return found or None
 
-    def _mapped(self, proc: _Proc) -> None:
+    def _mapped(self, proc: Survivor) -> None:
         """The FUSE files the process has mapped, from `maps` (once)."""
         if proc.maps is not None:
             return
@@ -327,70 +283,6 @@ class _Reader:
                 proc.maps.append(Waits(self.roles.place(entry, path)))
 
 
-# ---------------------------------------------------------------------------------------------------- the answer
-def _syscall_record(call: Any, known: bool) -> Any:
-    if isinstance(call, str):
-        return call
-    fd = S.fd_call(call) if known else None
-    return {"nr": call.nr, **({} if fd is None else {"fd": fd[1]})}
-
-
-def _survivor_record(reader: _Reader, proc: _Proc) -> dict[str, Any]:
-    """The capped record of one survivor, from what was read: no read is made here."""
-    tasks = proc.tasks or []
-    shown = sorted(tasks, key=lambda task: task.state != "D")[:TASKS_KEPT]
-    waits: list[dict[str, Any]] = []
-    for task in tasks:
-        for found in task.objects or []:
-            entry = found.record()
-            if entry not in waits:
-                waits.append(entry)
-    if not waits:  # no object of a task's own: the FUSE descriptors read for it, if any
-        waits = [w.record() for w in (proc.fuse_fds or [])]
-    cwd = None
-    if proc.cwd is not None and proc.mounts is not None and (entry := S.mount_of_path(proc.mounts, proc.cwd)):
-        cwd = reader.roles.of(entry)
-    return {
-        "comm": proc.comm[:32],
-        "state": proc.state,
-        "tasks": [
-            {"state": t.state, "wchan": t.wchan, "syscall": _syscall_record(t.syscall, reader.known)} for t in shown
-        ],
-        "waits_on": waits[:WAITS_KEPT],
-        **({} if cwd is None else {"cwd_mount": cwd}),
-    }
-
-
-def _block_record(proc: _Proc) -> dict[str, Any]:
-    if proc.tasks is None:
-        return {"state": proc.state, "tasks": None}
-    return {"state": proc.state, "tasks": [{"state": t.state, "objects": _objects(t)} for t in proc.tasks]}
-
-
-def _objects(task: _Task) -> list[dict[str, Any]] | None:
-    """A D task's objects by role and space, each once; None when it is no D task or its objects are not known."""
-    if task.state != "D" or not task.objects:
-        return None
-    found: list[dict[str, Any]] = []
-    for waits in task.objects:
-        entry = waits.object()
-        if entry not in found:
-            found.append(entry)
-    return found
-
-
-def _connection(connection: Callable[[], Mapping[str, Any] | None] | None) -> dict[str, Any] | None:
-    if connection is None:
-        return None
-    try:
-        given = connection()
-    except Exception as error:
-        log.error("the run's connection could not be read for the diagnosis: %s", describe_error(error))
-        return None
-    state = given.get("fusectl") if isinstance(given, Mapping) else None
-    return {"fusectl": state} if state in FUSECTL_STATES else None
-
-
 def diagnose(
     view: ProcReader,
     left: Sequence[Mapping[str, Any]],
@@ -406,7 +298,7 @@ def diagnose(
     if not left or not timeout_s > 0:
         return None
     reader = _Reader(view, roles, machine or platform.machine())
-    procs = [_Proc(-1, str(p.get("comm")), str(p.get("state"))) for p in left]
+    procs = [Survivor(-1, str(p.get("comm")), str(p.get("state"))) for p in left]
 
     def work() -> None:
         try:
@@ -419,13 +311,13 @@ def diagnose(
     thread = threading.Thread(target=work, name="stuck-reader", daemon=True)
     thread.start()
     thread.join(timeout_s)
-    shown = [_survivor_record(reader, proc) for proc in procs[:SURVIVORS_KEPT]]
+    shown = [survivor_record(proc, reader.roles, reader.known) for proc in procs[:SURVIVORS_KEPT]]
     found: dict[str, Any] = {
         "survivors": shown,
         "survivors_cut": max(0, len(procs) - SURVIVORS_KEPT),
-        "blocks": [_block_record(proc) for proc in procs],
+        "blocks": [block_record(proc) for proc in procs],
     }
-    if (conn := _connection(connection)) is not None:
+    if (conn := connection_record(connection)) is not None:
         found["connection"] = conn
     return found
 

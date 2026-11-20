@@ -8,6 +8,7 @@ from fake_survivor_proc import DATA_DEVICE, DATA_MOUNT, ROOT_MOUNT, WORK_MOUNT, 
 
 from expcore_onedata.sandbox.apptainer import stuck as S
 from expcore_onedata.sandbox.apptainer import stuckread as R
+from expcore_onedata.sandbox.apptainer import stuckrecord as REC
 
 ROLES = S.Roles("/data", device=DATA_DEVICE, inputs=("/opt/inputs",))
 READ_FD3 = syscall_text(0, 3, 0x7F10, 0x1000)
@@ -235,7 +236,7 @@ def test_o97_the_record_keeps_eight_survivors_but_blocks_has_every_one():
     for pid in range(100, 110):
         reader_in_d(view, pid)
     found = read(view, survivors(*range(100, 110)))
-    assert len(found["survivors"]) == R.SURVIVORS_KEPT
+    assert len(found["survivors"]) == REC.SURVIVORS_KEPT
     assert found["survivors_cut"] == 2
     assert len(found["blocks"]) == 10
 
@@ -249,7 +250,7 @@ def test_o97_the_record_keeps_four_tasks_with_the_blocked_ones_first():
     process.task(105, state="D", syscall=READ_FD3).fd(3, "/data/orchard/a", mnt_id=DATA_MOUNT)
     found = read(view, survivors(100))
     assert found["survivors"][0]["tasks"][0]["state"] == "D"
-    assert len(found["survivors"][0]["tasks"]) == R.TASKS_KEPT
+    assert len(found["survivors"][0]["tasks"]) == REC.TASKS_KEPT
     assert len(found["blocks"][0]["tasks"]) == 6
 
 
