@@ -88,6 +88,19 @@ def _wait(node: NodeOps, process: Spawned, wait_s: float, sleep: Callable[[float
         sleep(POLL_S)
 
 
+def wait_gone(
+    node: NodeOps,
+    process: Spawned,
+    wait_s: float,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool | None:
+    """Whether the process is shown gone within `wait_s` (False when it is still there, None when that could not be
+    told): the wait `stop` makes after each signal, for a caller that signals by itself."""
+    return _wait(node, process, wait_s, sleep, clock)
+
+
 def stop(
     node: NodeOps,
     helper: Helper,
@@ -115,4 +128,4 @@ def output(helper: Helper) -> str:
     return _read(helper.stderr) + _read(helper.stdout)
 
 
-__all__ = ["Helper", "output", "start", "stop"]
+__all__ = ["Helper", "output", "start", "stop", "wait_gone"]

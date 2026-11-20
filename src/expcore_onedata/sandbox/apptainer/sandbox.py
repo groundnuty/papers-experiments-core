@@ -61,7 +61,7 @@ import threading
 import time
 import uuid
 import warnings
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -157,12 +157,16 @@ class ApptainerSandbox:
         config_sha256: str | None = None,
         output_cap_bytes: int = OUTPUT_CAP_BYTES,
         mount_helper: MountHelperFactory | None = None,
+        attribute: Callable[[dict[str, Any] | None], Mapping[str, Any]] | None = None,
         **docker_only: Any,  # the Docker sandbox's options a platform may pass to every backend (waits, sampling)
     ) -> None:
         self.node, self.s, self.spec, self.registry = node, settings, spec, registry
         self.app = settings.apptainer
         self.work_image = self.app is not None and self.app.work_disk == "image"  # O71: /work an ext3 image
         self._sleep, self._clock, self._output_cap, self._mount_factory = sleep, clock, output_cap_bytes, mount_helper
+        # whose block a cell's survivors are (`deadline.Escalation.attribute`, `attribution.attributer`), asked at the
+        # deadline's `survived` step. None: no survivor is ever the agent's, so no mount is ever restored (fail closed)
+        self._attribute = attribute
         key = re.sub(r"[^A-Za-z0-9_.-]", "_", spec.lease_key or spec.run_key)[: sockets.RUN_KEY_CHARS]
         self.sid = f"{key}-{uuid.uuid4().hex[: sockets.RUN_SUFFIX_CHARS]}"  # at most `sockets.RUN_ID_MAX_BYTES`
         self.dir = settings.work_root / self.sid
@@ -1031,6 +1035,12 @@ class ApptainerSandbox:
         instrument."""
         read = getattr(self._mount, "mount_watch_log", None)
         return None if read is None else read()
+
+    def mount_watch_logs(self) -> list[bytes | None]:
+        """Every generation's mount-guard log in order (`HostMount.mount_watch_logs`): one for a mount that was never
+        restored, one more for each restore; empty without a mount helper that keeps them. The window closes first."""
+        read = getattr(self._mount, "mount_watch_logs", None)
+        return [] if read is None else read()
 
     @property
     def mount_guard_nonce(self) -> str | None:

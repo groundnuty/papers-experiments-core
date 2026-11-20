@@ -27,7 +27,9 @@ from expcore_onedata.sandbox.apptainer.hostmount import SHELL_NAME
 from expcore_onedata.sandbox.apptainer.node import Spawned
 from expcore_onedata.sandbox.hostops import CmdResult
 
-FUSE_DEV = "0:99999"
+FUSE_DEV = (
+    "0:99999"  # the first mount's device; each later mount of the node has the next minor (`FakeMountNode.fuse_dev`)
+)
 BASE_TABLE = "1 0 8:1 / / rw shared:1 - ext4 /dev/invented rw\n2 1 0:20 / /proc rw shared:2 - proc proc rw\n"
 
 
@@ -65,12 +67,22 @@ class FakeMountNode(FakeNode):
         self.oneclient_fails = False
         self.mount_never = False
         self.stuck_mount = False
+        self.keep_mount_on_death = (
+            False  # the kernel leaves a dead oneclient's mount in the table until it is unmounted
+        )
+        self.mount_count = 0  # how many oneclient mounts came up: each has a device of its own (`fuse_dev`)
         self.watches: list[Watch] = []
         self.spawn_env: list[dict[str, str]] = []
         self.oneclient_version = "Oneclient: 25.0\nFUSE library: 3.2\n"  # what the bundle's `--version` prints
         self.version_runs: list[list[str]] = []
 
     # ------------------------------------------------------------------------------------------------ the mount
+    @property
+    def fuse_dev(self) -> str:
+        """The device of the mount that is up, or was last: the first is `FUSE_DEV`, each later one the next minor."""
+        major, _, minor = FUSE_DEV.partition(":")
+        return f"{major}:{int(minor) + max(self.mount_count, 1) - 1}"
+
     @property
     def mounted_at(self) -> str | None:
         return self.mountpoint if self.mountpoint in self.mounts else None
@@ -79,7 +91,7 @@ class FakeMountNode(FakeNode):
         line = ""
         if self.mounted_at is not None:
             owner = f"user_id={os.getuid()},group_id={os.getgid()}"
-            line = f"3 1 {FUSE_DEV} / {self.mounted_at} ro,nosuid shared:3 - fuse.oneclient oneclient rw,{owner}\n"
+            line = f"3 1 {self.fuse_dev} / {self.mounted_at} ro,nosuid shared:3 - fuse.oneclient oneclient rw,{owner}\n"
         return BASE_TABLE + line
 
     def spawn(self, argv: Sequence[str], *, stdout: Path, stderr: Path, env: dict[str, str] | None = None) -> Spawned:
@@ -107,6 +119,7 @@ class FakeMountNode(FakeNode):
         elif not self.mount_never:
             self.mountpoint = argv[-1]
             self.mounts.add(argv[-1])
+            self.mount_count += 1
         return Spawned(proc.pid, proc.start)
 
     def _spawn_watch(self, argv: list[str], stdout: Path, env: dict[str, str]) -> Spawned:
@@ -156,8 +169,8 @@ class FakeMountNode(FakeNode):
                 if watch.armed:
                     watch.write("disarmed")
                 watch.write("end", lines=watch.seq, samples=3, polls=5, polls_failed=0, unwritten=0)
-            if proc.role == "oneclient" and not self.stuck_mount and self.mountpoint is not None:
-                self.mounts.discard(self.mountpoint)
+            if proc.role == "oneclient" and not (self.stuck_mount or self.keep_mount_on_death):
+                self.mounts.discard(self.mountpoint or "")
             proc.alive, proc.exit_status = False, 0 if sig == signal.SIGTERM else 128 + sig
             return True
         return super().signal(pid, start, sig)
@@ -170,3 +183,15 @@ class FakeMountNode(FakeNode):
             self.unmounts.append(list(argv))
             return CmdResult(1, "", "fusermount3: failed to unmount: Device or resource busy\n")
         return super().run(argv, timeout_s, sudo=sudo, input=input)
+
+
+def fusectl_tree(root: Path, device: str, *, waiting: int = 0, abort: bool = True) -> Path:
+    """A fusectl directory for the connection of `device` ("0:N") under `root` (a test's own directory): `waiting` with
+    its count, and `abort` as an empty file this uid may write, the way fusectl gives the mount's owner. The
+    connection's directory."""
+    directory = root / device.partition(":")[2]
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "waiting").write_text(f"{waiting}\n", encoding="ascii")
+    if abort:
+        (directory / "abort").write_text("", encoding="ascii")
+    return directory
