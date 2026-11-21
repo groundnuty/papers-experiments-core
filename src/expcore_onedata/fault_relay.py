@@ -60,8 +60,9 @@ fails or delays a verb past the client's wait.
 removes it when it stops, and holds `relay.lock` while it runs, so a second relay for the same root refuses to start.
 The fault gate's pre-run check reads it and notes what it saw in the try's note (`RELAY_NOTE`), and the run admission
 refuses an outage run, as the hold `federation_busy` that uses no attempt, when that check saw no live relay or none is
-live at the admission (`relay_refusal`). A heartbeat is live while its wall clock is within `RELAY_STALE_S` of the
-reader's: the login node and the nodes keep the cluster's time.
+live at the admission (`relay_refusal`). A heartbeat is live unless the reader's clock is more than `RELAY_STALE_S`
+past its wall clock: the login node and the nodes keep the cluster's time, and a heartbeat newer than the reader's
+reading (one taken before the beat was written, or a little clock jitter) is live, never stale (C65).
 """
 
 import contextlib
@@ -218,7 +219,7 @@ def beat(root: Path, wall: Callable[[], float] = time.time, stale_s: float = REL
     if record is None or record.get("format") != FORMAT or not _ID.fullmatch(str(record.get("nonce", ""))):
         return None
     at = record.get("wall")
-    if isinstance(at, bool) or not isinstance(at, int | float) or abs(wall() - at) > stale_s:
+    if isinstance(at, bool) or not isinstance(at, int | float) or wall() - at > stale_s:  # one-sided: newer is live
         return None
     return record
 

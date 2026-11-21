@@ -423,13 +423,24 @@ def test_o58_a_relay_that_stops_beating_after_the_check_refuses_the_outage_run_a
 
 
 def test_o58_a_stale_heartbeat_is_a_relay_not_answering(tmp_path):
-    """O58: a heartbeat whose wall time is more than 30 s from the reader's is no live relay."""
+    """O58: a heartbeat whose wall time is more than 30 s older than the reader's is no live relay."""
     root = root_of(tmp_path)
     relay = relay_of(root, Verbs())
     with relay.holding():
         written = json.loads((relay_dir(root) / "heartbeat.json").read_text())["wall"]
         assert beat(root, lambda: written + 29) is not None
         assert beat(root, lambda: written + 31) is None
+
+
+def test_c65_a_heartbeat_newer_than_the_readers_clock_is_live(tmp_path):
+    """C65: staleness is one-sided: a heartbeat stamped after the reader's clock (a reading taken before the beat was
+    written, or the clocks apart) is live, however far ahead; only an older one is no live relay."""
+    root = root_of(tmp_path)
+    relay = relay_of(root, Verbs())
+    with relay.holding():
+        written = json.loads((relay_dir(root) / "heartbeat.json").read_text())["wall"]
+        assert beat(root, lambda: written - 31) is not None
+        assert beat(root, lambda: written - 600) is not None
 
 
 def test_o58_the_relay_never_holds_a_secret_in_its_environment_and_its_verbs_get_a_clean_one(tmp_path):

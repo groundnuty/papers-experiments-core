@@ -21,7 +21,9 @@ It reads, and never writes, submits or cancels:
   (`<root>/fault-relay/heartbeat.json`, on the shared filesystem) and whether the process it names (pid and start
   tick) is one of this login node's. A heartbeat older than the relay's own staleness bound, or none, is `gone`; a
   live one is `here` or `elsewhere` (relays stay on the login node their up ran on, and the controller budgets this
-  login node's memory).
+  login node's memory). The age is taken against a clock read when that member's heartbeat is read, never one taken
+  before the walk (the walk's site reads take minutes, and a heartbeat written meanwhile is newer than that reading),
+  and only an older one is stale: a heartbeat newer than the reading is live (C65).
 
 A job read that fails, or a job state that is neither waiting, running nor ended, fails the whole read: unknown is
 never taken for ended. A quota that cannot be read is reported (`inodes_error`) and leaves no room for an add.
@@ -33,7 +35,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
@@ -57,7 +59,7 @@ ENDING = ("COMPLETING",)  # ending now: not yet ended, and no longer usable
 NODE_LINE = re.compile(r"([a-z_]+[^\s]*) ([0-9]{1,9})")
 SINFO_TIMEOUT_S = 60.0
 RELAY_DIR, HEARTBEAT = "fault-relay", "heartbeat.json"  # `expcore_onedata.fault_relay.relay_dir`, its heartbeat
-RELAY_STALE_S = 30.0  # `expcore_onedata.fault_relay.RELAY_STALE_S`: older, the relay is not answering
+RELAY_STALE_S = 30.0  # `expcore_onedata.fault_relay.RELAY_STALE_S`: a heartbeat older than this, no relay answers
 
 
 class ObserveError(RuntimeError):
@@ -161,16 +163,21 @@ def heartbeat(root: Path) -> Optional[Dict[str, Any]]:
     return found if isinstance(found, dict) else None
 
 
-def relay_view(root: Path, state: Optional[Mapping[str, Any]], runner: Any, wall: float) -> Tuple[str, Optional[float]]:
+def relay_view(
+    root: Path, state: Optional[Mapping[str, Any]], runner: Any, clock: Callable[[], float]
+) -> Tuple[str, Optional[float]]:
     """The member's fault relay: `none` unless its up recorded it serving; `gone` with no live heartbeat; else `here`
     when the process the heartbeat names (pid and start tick) is this login node's, `elsewhere` when not. With the
-    last heartbeat's wall time."""
+    last heartbeat's wall time. A heartbeat is live unless the reading is more than `RELAY_STALE_S` past its wall time:
+    the reading is taken here, right after the heartbeat is read (the walk's earlier site reads are slow, and a
+    reading taken before them is older than a heartbeat written meanwhile), and a heartbeat newer than it is live."""
     if not state or hpcstate.relay_of(dict(state)) != "serving":
         return "none", None
     record = heartbeat(root) or {}
+    reading = clock()
     at = record.get("wall")
     at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None
-    if at is None or abs(wall - at) > RELAY_STALE_S:
+    if at is None or reading - at > RELAY_STALE_S:
         return "gone", at
     pid, start = record.get("pid"), record.get("start")
     start = (
@@ -199,7 +206,7 @@ def snapshot_reason(member: Mapping[str, Any], state: Optional[Mapping[str, Any]
     return None
 
 
-def member_view(directory: Path, member: Mapping[str, Any], slurm: Slurm, wall: float) -> Dict[str, Any]:
+def member_view(directory: Path, member: Mapping[str, Any], slurm: Slurm, clock: Callable[[], float]) -> Dict[str, Any]:
     """One member: its record's status, its root, its state file's phase and jobs, and each job as Slurm has it."""
     label, status = member["label"], member["status"]
     root = root_of(directory, label)
@@ -231,7 +238,7 @@ def member_view(directory: Path, member: Mapping[str, Any], slurm: Slurm, wall: 
     views = [job_view(slurm, job, names.get(key)) for key, job in sorted(jobs.items())]
     view.update(jobs=sorted(set(jobs.values())), linked=(state or {}).get("phase") == LINKED)
     view["verified"] = bool(state) and verified(state)
-    view["relay"], view["relay_beat_at"] = relay_view(root, state, slurm.runner, wall)
+    view["relay"], view["relay_beat_at"] = relay_view(root, state, slurm.runner, clock)
     if (state or {}).get("unswept"):  # C54: a down could not sweep a node of it: never taken down again by itself
         view["unswept"] = True
     return {**view, **combined(views)}
@@ -259,13 +266,14 @@ def inodes(runner: Any, site: Any, layout: Any, environ: Mapping[str, str]) -> D
     return {"inodes_used": used, "inodes_quota": quota, "inode_estimate": estimate, "inodes_error": None}
 
 
-def observe(directory: Path, environ: Mapping[str, str], runner: Any, wall: float) -> Dict[str, Any]:
-    """One read of the site: what `expcore.campaign.elastic.control.SiteView` takes, less its label, as JSON."""
+def observe(directory: Path, environ: Mapping[str, str], runner: Any, clock: Callable[[], float]) -> Dict[str, Any]:
+    """One read of the site: what `expcore.campaign.elastic.control.SiteView` takes, less its label, as JSON. `clock`
+    is the login node's wall clock, read once per member's relay check (C65)."""
     record = Record(directory).read()
     site = site_from_environment(environ)
     layout, nodes, time_s = federation_shape(directory, record)
     slurm = Slurm(runner)
-    members = [member_view(directory, member, slurm, wall) for member in record["members"]]
+    members = [member_view(directory, member, slurm, clock) for member in record["members"]]
     idle, mixed = read_nodes(runner, site.partition)
     return {"idle_nodes": idle, "mixed_nodes": mixed, "nodes_per_federation": nodes, "time_s": float(time_s),
             **inodes(runner, site, layout, environ), "members": members}  # fmt: skip
