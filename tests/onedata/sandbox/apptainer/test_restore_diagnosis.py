@@ -181,6 +181,26 @@ def test_o97_the_same_read_in_a_space_whose_holder_is_up_ends_the_run_as_infrast
     assert refused.value.kind == "cell_unkillable"
 
 
+def test_o97_a_connection_that_gives_no_device_never_makes_the_block_the_agents(
+    node, tmp_path, fusectl_root, free_by_fusectl, monkeypatch
+):
+    """O97 (design review of the final change): where the run's connection gives no device when the deadline fires
+    (the mount table could not be read), a read of a held-down provider's file is not taken for the data mount's by
+    the FUSE mount at the data path: nothing is the data mount, so the block is infrastructure and the run ends as
+    it did."""
+    monkeypatch.setattr(HM.HostMount, "connection", lambda self: {"device": None, "fusectl": "writable"})
+    sandbox = make_box(node, tmp_path, fusectl_root)
+    try:
+        result = stuck_cell(node, sandbox)
+        assert result.restore_pending is False
+        assert result.kill["reason"] == "kill_survived"
+        attribution = deadline_of(sandbox)["attribution"]
+        assert (attribution["verdict"], attribution["why"]) == ("infrastructure", "not_data_mount")
+    finally:
+        node.free("teardown")
+        sandbox.stop(force=True)
+
+
 def test_o97_the_same_read_with_no_provider_held_down_is_infrastructure(node, tmp_path, fusectl_root, free_by_fusectl):
     sandbox = make_box(node, tmp_path, fusectl_root, held=())
     try:

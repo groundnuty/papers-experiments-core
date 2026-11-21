@@ -131,8 +131,9 @@ def test_o97_a_path_is_on_the_mount_with_the_longest_point_above_it():
 
 
 def test_o97_a_mount_is_data_only_when_it_is_the_fuse_mount_at_the_data_path():
-    """O97: the FUSE mount at the data path is `data`; the same point with another file system is `other`."""
-    roles = S.Roles("/data")
+    """O97: the FUSE mount at the data path, on the run's device, is `data`; the same point with another file system is
+    `other`."""
+    roles = S.Roles("/data", device="0:99")
     fuse, ext3 = S.MountEntry(40, "0:99", "/data", "fuse.oneclient"), S.MountEntry(41, "8:1", "/data", "ext3")
     assert roles.of(fuse) == S.DATA
     assert roles.of(ext3) == S.OTHER
@@ -143,6 +144,18 @@ def test_o97_with_the_runs_device_only_that_connection_is_the_data_mount():
     entry = S.MountEntry(40, "0:99", "/data", "fuse.oneclient")
     assert S.Roles("/data", device="0:99").of(entry) == S.DATA
     assert S.Roles("/data", device="0:100").of(entry) == S.OTHER
+
+
+def test_o97_with_no_device_known_no_mount_is_the_data_mount():
+    """O97 (design review of the final change): a device that is not known is not a match for every FUSE mount. A
+    reading that is not told the run's connection (a host table that could not be read, a connection that gave none)
+    must not take whatever FUSE mount sits at the data path for the run's own: a block on it would be put down to the
+    study's manipulation. It is `other`, so the verdict on the block is infrastructure (`not_data_mount`)."""
+    fuse = S.MountEntry(40, "0:99", "/data", "fuse.oneclient")
+    for roles in (S.Roles("/data"), S.Roles("/data", device=None)):
+        assert roles.of(fuse) == S.OTHER
+        place = roles.place(fuse, "/data/orchard/f")
+        assert (place.mount, place.space, place.rest) == (S.OTHER, None, None)
 
 
 def test_o97_the_cells_fixed_targets_have_their_own_roles():
@@ -157,20 +170,20 @@ def test_o97_the_cells_fixed_targets_have_their_own_roles():
 
 def test_o97_a_file_on_the_data_mount_has_its_space_and_its_path_under_the_space():
     """O97: the first component under the mount is the space; the rest is the path under it."""
-    roles, entry = S.Roles("/data"), S.MountEntry(40, "0:99", "/data", "fuse.oneclient")
+    roles, entry = S.Roles("/data", device="0:99"), S.MountEntry(40, "0:99", "/data", "fuse.oneclient")
     place = roles.place(entry, "/data/orchard/dir/f.txt")
     assert (place.mount, place.space, place.rest) == (S.DATA, "orchard", "dir/f.txt")
 
 
 def test_o97_the_mount_point_itself_has_no_space():
     """O97: a wait on the data mount's own root names no space, so no space's holder can be blamed for it."""
-    roles, entry = S.Roles("/data"), S.MountEntry(40, "0:99", "/data", "fuse.oneclient")
+    roles, entry = S.Roles("/data", device="0:99"), S.MountEntry(40, "0:99", "/data", "fuse.oneclient")
     assert roles.place(entry, "/data").space is None
 
 
 def test_o97_a_path_that_is_not_below_the_mount_point_has_no_space():
     """O97: a link whose path is not under the data mount's point (a moved mount) leaves the space unknown."""
-    roles, entry = S.Roles("/data"), S.MountEntry(40, "0:99", "/data", "fuse.oneclient")
+    roles, entry = S.Roles("/data", device="0:99"), S.MountEntry(40, "0:99", "/data", "fuse.oneclient")
     place = roles.place(entry, "/elsewhere/x")
     assert place.mount == S.DATA
     assert place.space is None
@@ -179,7 +192,7 @@ def test_o97_a_path_that_is_not_below_the_mount_point_has_no_space():
 
 def test_o97_the_rest_of_a_path_is_capped():
     """O97: a record keeps at most 256 characters of the path under the space."""
-    roles, entry = S.Roles("/data"), S.MountEntry(40, "0:99", "/data", "fuse.oneclient")
+    roles, entry = S.Roles("/data", device="0:99"), S.MountEntry(40, "0:99", "/data", "fuse.oneclient")
     assert len(roles.place(entry, "/data/orchard/" + "x" * 900).rest) == S.REST_KEPT
 
 

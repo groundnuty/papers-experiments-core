@@ -220,8 +220,11 @@ class Place:
 
 @dataclasses.dataclass(frozen=True)
 class Roles:
-    """The cell's fixed targets, which give a mount its role. `device` is the run's connection (`major:minor`), None
-    when the host has none to give; with it, only a FUSE mount on that device at the data path is the data mount."""
+    """The cell's fixed targets, which give a mount its role. `device` is the run's connection (`major:minor`): only a
+    FUSE mount on that device at the data path is the data mount. **A device of None is unknown, and matches no mount**:
+    a reading that is not told the run's connection must not take whatever FUSE mount sits at the data path for it, or
+    a block on a stale or second mount would be put down to the study's own manipulation (`attribution`). Everything at
+    the data path is then `other`, and the verdict on a block there is infrastructure."""
 
     data: str
     device: str | None = None
@@ -232,7 +235,7 @@ class Roles:
 
     def of(self, entry: MountEntry) -> str:
         if entry.point == self.data:
-            return DATA if entry.fuse and self.device in (None, entry.device) else OTHER
+            return DATA if entry.fuse and self.device is not None and self.device == entry.device else OTHER
         for role, target in ((WORK, self.work), (TMP, self.tmp), (SHM, self.shm)):
             if entry.point == target:
                 return role
