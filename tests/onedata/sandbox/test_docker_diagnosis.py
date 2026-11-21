@@ -18,7 +18,7 @@ from fake_host import FakeHost
 from sandbox_support import make_spec, start_options
 
 from expcore.records import cell_deadline
-from expcore_onedata.sandbox import attribution, kinds
+from expcore_onedata.sandbox import attribution, hostops, kinds
 from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox.apptainer import stuckread
 from expcore_onedata.sandbox.calldeadline import cell_deadline_of
@@ -295,6 +295,36 @@ def test_o97_the_data_mount_is_the_run_s_connection_and_no_other_fuse_mount_at_t
     host.files[f"{base}/mountinfo"] = ROOT + "60 25 0:999 / /data ro - fuse.oneclient s ro\n"
     left = sandbox._cells.agent_processes()
     found = sandbox._cells.diagnosis(left, 5.0)
+    assert attribution.attribute(found, {"providers[1]"}, HOLDERS)["why"] == attribution.NOT_DATA_MOUNT
+
+
+def test_o97_a_share_listed_on_two_devices_makes_no_fuse_mount_the_data_mount(world, sandbox, monkeypatch):
+    """O97 (Codex, final review): the run's mount is one device, however many entries the host lists. With two
+    devices at the share, none is shown to be the run's connection, and a table that is not told apart from `no
+    device known` would take ANY FUSE mount at the data path for it: a survivor blocked on the second device would be
+    the agent's. Nothing is the data mount then; the block is infrastructure."""
+    pids = wedge(world, sandbox)
+    killed(world, pids)
+    host = world.host
+    real, point = host.mountinfo, next(m["mountpoint"] for m in hostops.fuse_mounts(host.mountinfo()))
+    base = f"/proc/{pids['python']}/task/{THREAD}"
+    host.files[f"{base}/mountinfo"] = ROOT + "60 25 0:999 / /data ro - fuse.oneclient s ro\n"  # blocked on the second
+    with monkeypatch.context() as listed_twice:  # the fixture's stop reads the table as it is
+        listed_twice.setattr(host, "mountinfo", lambda: real() + f"98 25 0:999 / {point} rw - fuse.oneclient s rw\n")
+        found = sandbox._cells.diagnosis(sandbox._cells.agent_processes(), 5.0)
+    assert attribution.attribute(found, {"providers[1]"}, HOLDERS)["why"] == attribution.NOT_DATA_MOUNT
+
+
+def test_o97_a_host_table_that_cannot_be_read_makes_no_fuse_mount_the_data_mount(world, sandbox):
+    """O97: unknown is never the run's device: with the host's table unreadable at the deadline, the diagnosis does not
+    take any FUSE mount at the data path for the run's own, so the block is infrastructure."""
+    pids = wedge(world, sandbox)
+    killed(world, pids)
+    world.host.denied.add("/proc/self/mountinfo")
+    try:
+        found = sandbox._cells.diagnosis(sandbox._cells.agent_processes(), 5.0)
+    finally:
+        world.host.denied.discard("/proc/self/mountinfo")  # the fixture's stop reads it
     assert attribution.attribute(found, {"providers[1]"}, HOLDERS)["why"] == attribution.NOT_DATA_MOUNT
 
 

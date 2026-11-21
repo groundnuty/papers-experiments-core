@@ -38,6 +38,9 @@ FUSECTL_STATE = (
 FUSECTL_STATE_NAME = "fusectl-state"  # the shell's $0
 
 
+NO_DEVICE = "none"  # a device no mount has ("major:minor"): the run's connection could not be shown, so no mount is it
+
+
 class DockerDiagnosis:
     """What a Docker run's tracker reads its survivors with: `diagnosis(left, timeout_s)`."""
 
@@ -79,9 +82,13 @@ class DockerDiagnosis:
         return next(iter(devices)) if len(devices) == 1 else None
 
     def roles(self) -> S.Roles:
-        """The cell's fixed targets (`stuck.Roles`): with the device, only a FUSE mount on it at the data path is the
-        data mount; with none known, any FUSE mount there is (the agent has no FUSE of its own)."""
-        return S.Roles(data=self._mount_path, device=self._device(), inputs=self._inputs)
+        """The cell's fixed targets (`stuck.Roles`): with the run's one device, only a FUSE mount on it at the data path
+        is the data mount. **With no device shown (none at the share, several, or a table that could not be read)
+        nothing is**: `Roles` reads a device of None as "any FUSE mount at the data path is the data mount", which is
+        right for a node that has no connection to name, but here would put a block on a second or a stale device down
+        as the run's own, and so as the agent's. A device no mount has (`NO_DEVICE`) makes the block infrastructure."""
+        device = self._device()
+        return S.Roles(data=self._mount_path, device=NO_DEVICE if device is None else device, inputs=self._inputs)
 
     def connection(self, budget_s: float | None = None) -> dict[str, Any] | None:
         """Whether the run's connection has an abort file the root user can write, `{"fusectl": ...}` for the record;
@@ -107,4 +114,4 @@ class DockerDiagnosis:
         return {"fusectl": state} if state in ("writable", "absent", "not_writable") else None
 
 
-__all__ = ["DockerDiagnosis"]
+__all__ = ["NO_DEVICE", "DockerDiagnosis"]
