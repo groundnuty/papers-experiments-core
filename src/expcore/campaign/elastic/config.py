@@ -194,6 +194,25 @@ def check_plan(runs: Sequence[LedgerRun], config: LedgerConfig) -> None:
             raise ValueError(f"model {model}'s grant {usd_of(grant):g} USD is above its per_model_usd {ceiling:g}")
 
 
+TOPUP_ALLOWANCES_KEY = "topup_allowances_micro_usd"  # the meta row of the allowances `create` was given (C65)
+
+
+def check_allowances(runs: Sequence[LedgerRun], config: LedgerConfig, allowances_micro: Mapping[str, int]) -> None:
+    """Refuse top-up allowances (`create --topup-allowance`, in micro-dollars) that raise nothing: a model no run
+    plans, a ledger with no budget (it grants every lease 0), and an allowance above the grant it is part of."""
+    planned = {run.model for run in runs}
+    for model, micro in sorted(allowances_micro.items()):
+        _whole(f"the top-up allowance of {model}", micro, 0)
+        if model not in planned:
+            raise ValueError(f"a top-up allowance names {model}, which no run of the ledger plans")
+        if config.max_usd is None:
+            raise ValueError("a top-up allowance needs a budget: without max_usd a lease is granted 0")
+        if micro > config.grant_micro(model):
+            raise ValueError(
+                f"model {model}'s top-up allowance is above its grant {usd_of(config.grant_micro(model)):g}"
+            )
+
+
 def lease_grant_usd(spec: ModelSpec, limits: Limits, *, topup_allowance_usd: float = 0.0) -> float:
     """The grant of one lease of the model: one run's reservation, two admission probes and the top-up allowance,
     each rounded up to a micro-dollar; 0 for a free model. A model with no price is refused."""

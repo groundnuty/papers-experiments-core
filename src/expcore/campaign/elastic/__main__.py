@@ -1,7 +1,8 @@
 # Provenance: new
 """`python -m expcore.campaign.elastic`: an operator's (or an agent's) view and lever on an elastic campaign's ledger.
 
-- `create LEDGER --study DIR --hard-term-s N [--prior-run-s N] [--max-usd N] [--cap MODEL=N]...`: make a campaign's
+- `create LEDGER --study DIR --hard-term-s N [--prior-run-s N] [--max-usd N] [--cap MODEL=N]...
+  [--topup-allowance MODEL=USD]...`: make a campaign's
   ledger from its study: one run per planned (task, model, condition) in the seeded order, the fingerprint a federation
   joins with, the study's attempt limit and one lease grant per model (`lease_grant_usd`), a lease's hard term (the
   study does not state the platform's reset and deferral bounds, so it is given: `hard_term_s`) and, with `--max-usd`,
@@ -9,8 +10,15 @@
   `DIR` is the study as a federation runs it (its `platform.toml` beside `study.toml`, where the study has one). It
   refuses a ledger that exists; the ledger is closed when it is made, so a controller can open it. Each `--cap` is a
   model's starting cap on the leases it holds at once (a whole number from 1; a model not named has none), and the
-  model must be one the study plans. Each model's `accepted_fingerprints` in models.toml are its first declared
-  fingerprints (C48), recorded with the actor `models.toml`; a model with none declares nothing yet.
+  model must be one the study plans. Each `--topup-allowance` (C65) raises one model's lease grant by USD dollars (not
+  below 0, no finer than a micro-dollar, which is what the ledger counts in) on top of its reservation and two
+  admission probes: for workers whose budget gate holds a lease that has spent anything, since it counts its run in
+  flight and again as the next one, a grant of two reservations and what was spent never does. It takes a model the
+  study plans and prices, once, and needs `--max-usd` (without a budget a lease is granted nothing); the grant may not
+  pass `--max-usd`. The allowance is recorded in a meta row of its own, nowhere in the fingerprint or the pinned
+  configuration, and workers read the raised grant from the ledger. Each model's `accepted_fingerprints` in models.toml
+  are its first declared fingerprints (C48), recorded with the actor `models.toml`; a model with none declares nothing
+  yet.
 - `status LEDGER`: the ceiling, what is committed, left and locked in the grants of unsettled leases (in flight,
   expired, lost), each model's own ceiling, and the history of raises; each model's cap in force and the history of
   its changes; each model's declared fingerprints, the models paused by an undeclared one seen, and the declaration
@@ -58,10 +66,11 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from expcore.campaign.elastic.allowances import allowances_micro, grants_usd, model_allowance
 from expcore.campaign.elastic.awareness import AWARE, NONE, OLDER, controller_of
 from expcore.campaign.elastic.caps import set_in_file
 from expcore.campaign.elastic.ceilings import raise_in_file
-from expcore.campaign.elastic.config import MICRO, LedgerConfig, lease_grant_usd, ledger_runs, micro_down
+from expcore.campaign.elastic.config import MICRO, LedgerConfig, ledger_runs, micro_down
 from expcore.campaign.elastic.declarations import declare_in_file
 from expcore.campaign.elastic.drains import drain_in_file
 from expcore.campaign.elastic.ledger import Ledger
@@ -167,11 +176,14 @@ def create_ledger(
     prior_run_s: float | None = None,
     max_usd: float | None = None,
     caps: Mapping[str, int] | None = None,
+    topup_allowances: Mapping[str, Decimal] | None = None,
 ) -> LedgerConfig:
     """Make the ledger of the study at `study` at `path` (the module's docstring); the configuration pinned in it.
-    Raises `LedgerError` for a ledger that exists or a cap on a model the study does not plan, the study layer's own
-    errors for a study that cannot be loaded, and `CoreVersionUnknown` for a core whose commit is unknown or whose
-    install is stale: the campaign fingerprint holds the core's identity, so a ledger made on it no run would serve."""
+    Raises `LedgerError` for a ledger that exists, a cap or a top-up allowance on a model the study does not plan, or an
+    allowance on a free one; the study layer's own errors for a study that cannot be loaded; and `CoreVersionUnknown`
+    for a core whose commit is unknown or whose install is stale: the campaign fingerprint holds the core's identity,
+    so a ledger made on it no run would serve. `topup_allowances` raise the named models' grants (C65; the
+    module's docstring) and need `max_usd`."""
     from expcore.campaign.manifest import fingerprint_sha256
     from expcore.provenance.core_check import require_core
     from expcore.study.config import load_study
@@ -189,6 +201,12 @@ def create_ledger(
     unplanned = sorted(set(caps or {}) - {run.model for run in runs})
     if unplanned:
         raise LedgerError(f"--cap names {', '.join(unplanned)}, which the study does not plan: a cap would never apply")
+    allowances = topup_allowances or {}
+    unplanned = sorted(set(allowances) - {run.model for run in runs})
+    if unplanned:
+        raise LedgerError(
+            f"--topup-allowance names {', '.join(unplanned)}, which the study does not plan: it would raise no grant"
+        )
     config = LedgerConfig(
         fingerprint=fingerprint_sha256(campaign_fingerprint(study)),
         hard_term_s=hard_term_s,
@@ -196,11 +214,12 @@ def create_ledger(
         max_attempts=loaded.campaign.scheduler.max_attempts,
         max_usd=max_usd,
         caps=caps or {},
-        grants_usd={model: lease_grant_usd(spec, pricing.limits) for model, spec in pricing.models.items()},
+        grants_usd=grants_usd(pricing.models, pricing.limits, allowances),
         platforms=loaded.campaign.platform_fingerprints,
     )
     declared = {model: spec.accepted_fingerprints for model, spec in pricing.models.items()}
-    Ledger.create(path, runs, config, clock=time.time, declared=declared).close()
+    recorded = allowances_micro(allowances)
+    Ledger.create(path, runs, config, clock=time.time, declared=declared, allowances_micro=recorded).close()
     return config
 
 
@@ -212,6 +231,14 @@ def _create(args: argparse.Namespace) -> int:
     caps = dict(args.cap)
     if len(caps) != len(args.cap):
         raise ValueError("--cap names a model more than once")
+    allowances = dict(args.topup_allowance)
+    if len(allowances) != len(args.topup_allowance):
+        raise ValueError("--topup-allowance names a model more than once")
+    if allowances and max_usd is None:
+        raise ValueError(
+            "--topup-allowance needs --max-usd: without a budget a lease is granted nothing, so an allowance "
+            "would never apply"
+        )
     try:
         config = create_ledger(
             args.ledger,
@@ -220,11 +247,17 @@ def _create(args: argparse.Namespace) -> int:
             prior_run_s=args.prior_run_s,
             max_usd=max_usd,
             caps=caps,
+            topup_allowances=allowances,
         )
     except (ConfigError, CodeVersionUnknown) as error:
         raise LedgerError(f"the study cannot be planned: {error}") from error
     capped = "".join(f", cap {model} {cap}" for model, cap in sorted(config.caps.items()))
-    print(f"created {args.ledger}: fingerprint {config.fingerprint}, hard term {config.hard_term_s:g} s{capped}")
+    raised = "".join(
+        f", top-up allowance {model} {usd(micro)}" for model, micro in allowances_micro(allowances).items()
+    )
+    print(
+        f"created {args.ledger}: fingerprint {config.fingerprint}, hard term {config.hard_term_s:g} s{capped}{raised}"
+    )
     return 0
 
 
@@ -364,6 +397,16 @@ def _parser() -> argparse.ArgumentParser:
         type=_model_cap,
         metavar="MODEL=N",
         help="a model's starting cap on the leases it holds at once (repeatable; default: no cap)",
+    )
+    creating.add_argument(
+        "--topup-allowance",
+        action="append",
+        default=[],
+        type=model_allowance,
+        metavar="MODEL=USD",
+        help="dollars added to one model's lease grant, on top of its reservation and two admission probes "
+        "(repeatable, one per model; needs --max-usd; at most 6 decimals, the micro-dollar the ledger counts in; "
+        "default: none)",
     )
     status = commands.add_parser("status", help="the money: ceiling, committed, remaining, locked, raises")
     status.add_argument("ledger", type=Path, help="the ledger file (out/ledger.sqlite)")
