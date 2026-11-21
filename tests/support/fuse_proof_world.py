@@ -47,13 +47,13 @@ def mount_level(config: Any) -> str:
 
 
 def pick_space(config: Any) -> tuple[Any, str]:
-    """A space whose data provider is not the agent's local one, and that provider's label: the target the outage takes
-    down. The first such space, in the file's order."""
+    """A space whose data provider is not the agent's local one for that space, and that provider's label: the target
+    the outage takes down. The first such space, in the file's order. Each entry's own support set names its local
+    provider: `config.support` is the one-space form's alone, and a file of several spaces refuses it."""
     holders = config.space_holders()
-    local = config.provider_label(config.support.local)
     for entry in config.spaces:
         label = holders.get(entry.space.name)
-        if label is not None and label != local:
+        if label is not None and label != config.provider_label(entry.support.local):
             return entry, label
     raise SystemExit("no space has a data provider other than the agent's local one: nothing to take down")
 
@@ -76,7 +76,7 @@ class LiveWorld:
         self.node = LocalNode()
         self.level = mount_level(config)
         self.entry, self.target = pick_space(config)
-        self.local_name = config.support.local
+        self.local_name = self.entry.support.local  # the picked space's own local provider
         self.space_id, self.space_name = self.entry.space.id, self.entry.space.name
         self.mount_path = str(config.sandbox.mount.path)
         self.owner_path: str | None = None

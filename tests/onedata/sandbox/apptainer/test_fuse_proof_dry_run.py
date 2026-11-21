@@ -76,3 +76,30 @@ def test_o97_a_check_whose_facts_are_missing_is_a_problem_never_a_pass():
     assert any(p.startswith(f"{FP.check(1)}: path not exercised") for p in found)
     for name in (FP.check(n) for n in (4, 5, 7, 9, 10, 12)):
         assert any(p.startswith(f"{name}:") for p in found), name
+
+
+def test_o97_the_target_is_a_space_whose_holder_is_not_its_own_local_provider_in_a_file_of_several_spaces(
+    tmp_path, monkeypatch
+):
+    """O97 (H2 on Helios, 21 Nov): the live world picks its target from each `[[spaces]]` entry's own support set; a
+    file of several spaces refuses `config.support`, so the one-space form's accessor is never used for it."""
+    from fuse_proof_world import pick_space
+
+    from expcore_onedata.config import load_platform
+    from expcore_onedata.testing import ADMIN_ENV, write_platform
+    from expcore_onedata.testing.world import SPACE_NAMES, with_placement, with_spaces
+
+    monkeypatch.setenv(ADMIN_ENV, "admin-credential-value")
+    for name in ("several", "local", "one"):
+        (tmp_path / name).mkdir()
+
+    def several(data):
+        with_spaces(data, 2)
+        data["spaces"][1].update(holder="beta")
+
+    entry, target = pick_space(load_platform(write_platform(tmp_path / "several", several)))
+    assert (entry.space.name, target) == (SPACE_NAMES[1], "providers[1]")
+    with pytest.raises(SystemExit):  # every space held by its own local provider: nothing to take down
+        pick_space(load_platform(write_platform(tmp_path / "local", lambda data: with_spaces(data, 2))))
+    one = load_platform(write_platform(tmp_path / "one", lambda data: with_placement(data, holder="beta")))
+    assert pick_space(one)[1] == "providers[1]"
