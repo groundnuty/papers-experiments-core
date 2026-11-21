@@ -273,6 +273,25 @@ def test_o97_a_generation_that_wrote_its_own_log_is_judged_by_it(mount):
     assert mount.metadata()["io_mode"]["effective"] == "proxy"
 
 
+def test_o97_a_silent_middle_generation_does_not_pass_on_the_log_of_the_first(mount):
+    """O97 (Codex, round 2): generation two logged nothing, so at the second restore glog's link still named generation
+    one's file and was kept as generation two's; with a third generation that logs its own, every reading was `proxy`.
+    A log equal to an earlier generation's is kept as unread, so generation two is `unknown` and the run is refused."""
+    log_dir = mount.where.log_dir
+    (log_dir / "oneclient.host.log.INFO.1").write_text(FORCED_PROXY)
+    (log_dir / "oneclient.INFO").symlink_to("oneclient.host.log.INFO.1")
+    aborted(mount)
+    mount.restore()  # generation two: no log of its own, the link still names generation one's
+    aborted(mount)
+    mount.restore()  # generation three
+    (log_dir / "oneclient.host.log.INFO.3").write_text("Log file created at: 10:09:00\n" + FORCED_PROXY)
+    (log_dir / "oneclient.INFO").unlink()
+    (log_dir / "oneclient.INFO").symlink_to("oneclient.host.log.INFO.3")
+    mount.close_watch()
+    assert mount.generation_oneclient_logs()[1] is None  # generation two is unread, not generation one again
+    assert mount.metadata()["io_mode"]["effective"] == "unknown"
+
+
 # --------------------------------------------------------------------------------------------------------- the infra
 def test_o97_the_earlier_generation_is_listed_as_stopped_by_the_harness_and_the_live_one_by_its_own_state(mount, node):
     aborted(mount)

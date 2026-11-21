@@ -459,6 +459,14 @@ class HostMount:
             finally:
                 gen.log = _read(self.where.watch_log_of(gen.number)) if gen.watch is not None else None
 
+    @staticmethod
+    def _not_inherited(text: bytes | None, earlier: Sequence[Generation]) -> bytes | None:
+        """`text`, a generation's oneclient log as glog's link shows it, unless an earlier generation kept the same
+        bytes: the link still names that generation's file, so this one wrote none, and its reading is unread (None),
+        never an earlier generation's lines judged again. Two oneclient processes cannot write the same bytes (every
+        line of a glog file carries its time, thread and process), so equal bytes are one file."""
+        return None if text is not None and any(gen.oneclient_log == text for gen in earlier) else text
+
     def close_watch(self) -> None:
         """Close the agent's window of the live generation (every earlier one was closed by its restore), and take what
         is read of all of them: the guard's snapshot over every generation's log and the I/O-mode reading over every
@@ -478,9 +486,7 @@ class HostMount:
         readable as it always was, at each call (`oneclient_log`)."""
         texts = [gen.oneclient_log for gen in self._gens[:-1]]
         live = None if self._live.oneclient is None else _read_log_link(self.where, directio.LOG_FILE)
-        if live is not None and live in texts:  # glog's link still names an earlier generation's file:
-            live = None  # this one logged none, so it is unread, never an earlier one's lines judged twice
-        texts.append(live)
+        texts.append(self._not_inherited(live, self._gens[:-1]))
         self._snapshot = aggregate([gen.log for gen in self._gens], self.nonce)
         declared = getattr(self.s.mount, "io_mode", None)
         readings = [iomode.judge(declared, None if text is None else text.decode("utf-8", "replace")) for text in texts]
@@ -570,7 +576,8 @@ class HostMount:
             self._close_generation(old, deadline)
             step = "stopping the old oneclient"
             self._stop_generation(old, deadline)
-            old.oneclient_log = _read_log_link(self.where, directio.LOG_FILE)  # before glog's link moves to the new one
+            # before glog's link moves to the new one; a log that is an earlier generation's again is unread
+            old.oneclient_log = self._not_inherited(_read_log_link(self.where, directio.LOG_FILE), self._gens[:-1])
             step = "unmounting the dead mount"
             self._unmount_once(deadline)
             self._mount_gone(deadline)
