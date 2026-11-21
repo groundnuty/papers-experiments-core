@@ -30,9 +30,11 @@ world and the campaign in its own process.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -154,6 +156,28 @@ def negative(world: Any, injector: Any, box: Any, owner_path: str, bound_s: floa
     return result
 
 
+def teardown(world: Any, files: Any, boxes: dict[str, Any]) -> list[str]:
+    """Stop the direct sandboxes, count the proof's FUSE mounts left and remove the seeded files; what went wrong."""
+    found: list[str] = []
+    free = getattr(world, "free", None)
+    for name, box in boxes.items():
+        if box is None:
+            continue
+        if free is not None:
+            free(f"fuse-proof-{name}")
+        try:
+            box.stop()
+        except Exception as error:
+            found.append(f"the {name} sandbox's stop raised {type(error).__name__}")
+    left = world.mounts_left()
+    if left:
+        found.append(f"{left} FUSE mount(s) of the proof are left")
+    removed = files.remove_all()
+    if removed:
+        found.append(f"{len(removed)} seeded file(s) could not be removed")
+    return found
+
+
 def run_proof(
     world: Any,
     out: Path,
@@ -192,65 +216,56 @@ def run_proof(
     facts.update(seeded=seeded, owner_rest=f"{folder}/owner-only.bin")
     facts["local_sha256"] = hashlib.sha256(LOCAL_BYTES if settings_world != "fake" else _fake_local()).hexdigest()
     mark("seeded")
-    control = world.direct("fuse-proof-control")
-    reads: list[str | None] = [sha_of(control.exec(FP.local_read(local_path, space_root), 60).stdout)]
-    mark("control_up")
+    control = unregistered = None
+    try:
+        control = world.direct("fuse-proof-control")
+        reads: list[str | None] = [sha_of(control.exec(FP.local_read(local_path, space_root), 60).stdout)]
+        mark("control_up")
 
-    unregistered = world.direct("fuse-proof-negative")
-    injector = world.injector(world.target)
-    with injector.session({"run_key": "fuse-proof-negative-outage", "attempt": 1}):
-        mark("negative_outage")
-        facts["negative"] = negative(world, injector, unregistered, owner_path, bound_s)
+        unregistered = world.direct("fuse-proof-negative")
+        injector = world.injector(world.target)
+        with injector.session({"run_key": "fuse-proof-negative-outage", "attempt": 1}):
+            mark("negative_outage")
+            facts["negative"] = negative(world, injector, unregistered, owner_path, bound_s)
+            reads.append(sha_of(control.exec(FP.local_read(local_path, space_root), 60).stdout))
+        mark("negative_restored")
+        facts["negative_problems"] = FP.negative_problems(facts["negative"])
+        facts["negative"]["deadline"] = None  # its record is checked above; the facts keep the verdict only
+        sleep(gap_s)
+        mark("gap_done")
+
+        study_settings = {
+            "support": str(SUPPORT),
+            "world": settings_world,
+            "platform": str(platform) if platform is not None else None,
+            "target": world.target,
+            "owner_path": owner_path,
+            "local_path": local_path,
+            "root_path": space_root,
+            "second_cycle": second_cycle,
+            "collected": str(out / "collected"),
+        }
+        study = write_study(
+            out, study_settings, target=world.target, bound_s=bound_s, time_cap_s=time_cap_s, platform=platform
+        )
+        facts["campaign_exit"] = run_campaign(study)
+        mark("registered_done")
+        record, text = registered_record(study)
+        facts["registered"] = FP.record_facts(record) if record is not None else {}
+        facts["record_valid"], facts["replayed"] = record_checks(text)
         reads.append(sha_of(control.exec(FP.local_read(local_path, space_root), 60).stdout))
-    mark("negative_restored")
-    facts["negative_problems"] = FP.negative_problems(facts["negative"])
-    facts["negative"]["deadline"] = None  # its record is checked above; the facts keep the verdict only
-    sleep(gap_s)
-    mark("gap_done")
-
-    study_settings = {
-        "support": str(SUPPORT),
-        "world": settings_world,
-        "platform": str(platform) if platform is not None else None,
-        "target": world.target,
-        "owner_path": owner_path,
-        "local_path": local_path,
-        "root_path": space_root,
-        "second_cycle": second_cycle,
-        "collected": str(out / "collected"),
-    }
-    study = write_study(
-        out, study_settings, target=world.target, bound_s=bound_s, time_cap_s=time_cap_s, platform=platform
-    )
-    facts["campaign_exit"] = run_campaign(study)
-    mark("registered_done")
-    record, text = registered_record(study)
-    facts["registered"] = FP.record_facts(record) if record is not None else {}
-    facts["record_valid"], facts["replayed"] = record_checks(text)
-    reads.append(sha_of(control.exec(FP.local_read(local_path, space_root), 60).stdout))
-
-    facts["control"] = {"reads": reads, **mount_facts(control)}
-    facts["control_problems"] = FP.control_problems(facts["control"])
-    teardown: list[str] = []
-    for name, box in (("control", control), ("negative", unregistered)):
-        free = getattr(world, "free", None)
-        if free is not None:
-            free(f"fuse-proof-{name}")
-        try:
-            box.stop()
-        except Exception as error:
-            teardown.append(f"the {name} sandbox's stop raised {type(error).__name__}")
-    left = world.mounts_left()
-    if left:
-        teardown.append(f"{left} FUSE mount(s) of the proof are left")
-    removed = files.remove_all()
-    if removed:
-        teardown.append(f"{len(removed)} seeded file(s) could not be removed")
-    facts["teardown_problems"] = teardown
-    facts["scans"] = "not_run"  # the facts are scanned on the host they are pulled to
-    mark("done")
-    facts["problems"] = FP.problems(facts)
-    (out / "facts.json").write_text(json.dumps(facts, indent=1, default=str), encoding="utf-8")
+        facts["control"] = {"reads": reads, **mount_facts(control)}
+        facts["control_problems"] = FP.control_problems(facts["control"])
+    except BaseException as error:  # a cut (the file-count watcher's SIGINT) or a failure: the teardown still runs
+        facts["cut"] = type(error).__name__
+        raise
+    finally:
+        facts["teardown_problems"] = teardown(world, files, {"control": control, "negative": unregistered})
+        facts["scans"] = "not_run"  # the facts are scanned on the host they are pulled to
+        mark("done")
+        cut = [f"the proof was cut ({facts['cut']}): nothing after it was shown"] if "cut" in facts else []
+        facts["problems"] = FP.problems(facts) + cut
+        (out / "facts.json").write_text(json.dumps(facts, indent=1, default=str), encoding="utf-8")
     return facts
 
 
@@ -261,8 +276,31 @@ def _fake_local() -> bytes:
 
 
 def live_campaign(study: Path) -> int:
-    """The campaign in a process of its own, on this interpreter, as a study's run is made."""
-    return subprocess.run([sys.executable, "-I", "-B", "-m", "expcore", "run", str(study)], check=False).returncode
+    """The campaign in a process of its own, on this interpreter, as a study's run is made. A SIGINT or SIGTERM to the
+    driver (the file-count watcher's cut, or the step's end) is passed on to it as SIGINT and its end is awaited: its
+    injector clears and its sandbox stops on their own way out, never killed under them. The driver then tears down
+    its own sandboxes and files (`run_proof`)."""
+    child = subprocess.Popen([sys.executable, "-I", "-B", "-m", "expcore", "run", str(study)])
+    asked: list[int] = []
+
+    def forward(signum: int, frame: Any) -> None:
+        asked.append(signum)
+        with contextlib.suppress(ProcessLookupError):
+            child.send_signal(signal.SIGINT)
+
+    previous = {sig: signal.signal(sig, forward) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        code = child.wait()
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    if asked:
+        raise KeyboardInterrupt("the campaign was cut by a signal")
+    return code
+
+
+def _interrupted(signum: int, frame: Any) -> None:
+    raise KeyboardInterrupt(f"signal {signum}")
 
 
 def main(argv: list[str]) -> int:
@@ -275,6 +313,7 @@ def main(argv: list[str]) -> int:
         return 2
     platform, out = Path(positional[0]).resolve(), Path(positional[1]).resolve()
     out.mkdir(parents=True, exist_ok=False)
+    signal.signal(signal.SIGTERM, _interrupted)  # the step's end: the same way out as a SIGINT, teardown included
     from fuse_proof_world import LiveWorld
 
     world = LiveWorld(platform)
