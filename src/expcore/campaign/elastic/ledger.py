@@ -45,7 +45,14 @@ from typing import Any
 from expcore.campaign.elastic import attempts, caps, ceilings, declarations, pauses, schema, settling
 from expcore.campaign.elastic.awareness import PauseAwareMark
 from expcore.campaign.elastic.choice import InFlight, Pending, choose
-from expcore.campaign.elastic.config import LedgerConfig, LedgerRun, check_plan, micro_up
+from expcore.campaign.elastic.config import (
+    TOPUP_ALLOWANCES_KEY,
+    LedgerConfig,
+    LedgerRun,
+    check_allowances,
+    check_plan,
+    micro_up,
+)
 from expcore.campaign.elastic.records import (
     LIVE,
     PROOFS,
@@ -110,15 +117,23 @@ class Ledger(LedgerViews):
         config: LedgerConfig,
         clock: Callable[[], float],
         declared: Mapping[str, Iterable[str]] | None = None,
+        allowances_micro: Mapping[str, int] | None = None,
     ) -> "Ledger":
         """Create a ledger for the runs and the configuration, with each model's first declared fingerprints
-        (`declared`, models.toml's `accepted_fingerprints`; a model not named starts with none), and open it."""
+        (`declared`, models.toml's `accepted_fingerprints`; a model not named starts with none), and open it.
+        `allowances_micro` are the top-up allowances the grants in `config` were raised by (C66), kept in a meta row of
+        their own that is written only when there are some: the pinned configuration keeps the keys it had, which an
+        older core reads, and a ledger made with none is the file it was."""
         check_plan(runs, config)
+        meta = {"config": config.to_json()}
+        if allowances_micro:
+            check_allowances(runs, config, allowances_micro)
+            meta[TOPUP_ALLOWANCES_KEY] = json.dumps(dict(sorted(allowances_micro.items())))
         first = declarations.first_rows(declared or {}, {r.model for r in runs}, clock())
         lock = DispatchLock(path.parent).acquire()
         try:
             rows = [(r.run_key, r.seq, r.model, r.condition, r.set_index) for r in runs]
-            schema.create_file(path, rows, {"config": config.to_json()}, first)
+            schema.create_file(path, rows, meta, first)
         except BaseException:
             lock.release()
             raise
@@ -285,6 +300,7 @@ class Ledger(LedgerViews):
             InFlight(r["model"], r["condition"], r["issued_at"])
             for r in self.db.execute("SELECT * FROM leases WHERE state IN ('issued', 'sent')")
         ]
+        grants = self.grants_micro()  # C66: read inside this transaction, at every lease: a raise is seen at the next
         chosen = choose(
             current,
             pending,
@@ -298,11 +314,12 @@ class Ledger(LedgerViews):
             self.caps(),
             declarations.paused(self.db),
             pauses.reasons(self.db),
+            grants,
         )
         if isinstance(chosen, Wait):
             return chosen
         run = self.db.execute("SELECT * FROM runs WHERE run_key=?", (chosen.run_key,)).fetchone()
-        grant = self.config.grant_micro(run["model"])
+        grant = grants.get(run["model"], 0)
         cursor = self.db.execute(
             "INSERT INTO leases(run_key, federation, site, model, condition, attempt_base, grant_micro, issued_at,"
             " renewed_at, hard_term_at, state, charge_micro) VALUES(?,?,?,?,?,?,?,?,?,?,'issued',?)",
