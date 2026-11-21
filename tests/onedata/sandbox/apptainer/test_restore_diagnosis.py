@@ -28,6 +28,17 @@ PROXY_LOG = (
 )
 
 
+def glog(box, number: int, text: str) -> None:
+    """oneclient's INFO log as glog keeps it: a file of the generation's own (its first line says when it was made),
+    and `oneclient.INFO` a relative link to the newest. A restored generation therefore has a log of its own."""
+    log_dir = box._mount.where.log_dir
+    name = f"oneclient.host.log.INFO.{number}"
+    (log_dir / name).write_text(f"Log file created at: 2026/11/16 10:0{number}:00\n{text}")
+    link = log_dir / directio.LOG_FILE
+    link.unlink(missing_ok=True)
+    link.symlink_to(name)
+
+
 @pytest.fixture
 def node() -> ReaderNode:
     node = ReaderNode()
@@ -187,13 +198,12 @@ def test_o97_a_restored_run_reads_agreeing_in_both_generations_and_clean_through
 ):
     """O97: the integrated reading: two generations, each with its own watcher log and its own oneclient log. The I/O
     mode agrees with the declared one in both, and the guard is not unknown: it is the union of the proofs."""
-    log = box._mount.where.log_dir / directio.LOG_FILE
-    log.write_text(PROXY_LOG)
+    glog(box, 1, PROXY_LOG)
     node.cell()  # generation 1 proved a cell
     stuck_cell(node, box)
     node.cell_handler = node.default_cell
     box.restore_mount()
-    log.write_text(PROXY_LOG)  # glog's link names the second generation's log now
+    glog(box, 2, PROXY_LOG)  # glog's link names the second generation's log now
     box.collect(tmp_path / "out")
     mount = box.metadata()["mount"]
     assert mount["remounts"] == 1
@@ -210,15 +220,21 @@ def test_o97_a_restored_run_reads_agreeing_in_both_generations_and_clean_through
 def test_o97_a_restored_run_whose_second_generation_contradicts_the_declared_mode_does_not_agree(
     node, box, free_by_fusectl, tmp_path
 ):
-    log = box._mount.where.log_dir / directio.LOG_FILE
-    log.write_text(PROXY_LOG)
+    glog(box, 1, PROXY_LOG)
     node.cell()
     stuck_cell(node, box)
     node.cell_handler = node.default_cell
     box.restore_mount()
-    log.write_text("I1116 10:00:00.000000  1 logging.cc:1] Forced direct IO: 1\n")
+    glog(
+        box,
+        2,
+        "I1116 10:00:00.000000  1 logging.cc:1] Forced direct IO: 1\n"
+        "I1116 10:00:00.000000  1 logging.cc:1] Forced proxy IO: 0\n",
+    )
     box.collect(tmp_path / "out")
-    assert box.mount_io_mode()["agree"] is False
+    reading = box.mount_io_mode()
+    assert reading["agree"] is False
+    assert reading["effective"] == "direct"  # read from generation two's own log, not unknown or inherited
 
 
 def test_o97_the_deadline_record_names_a_restore_and_a_generation(node, box, free_by_fusectl):

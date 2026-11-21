@@ -463,8 +463,9 @@ class HostMount:
     def _not_inherited(text: bytes | None, earlier: Sequence[Generation]) -> bytes | None:
         """`text`, a generation's oneclient log as glog's link shows it, unless an earlier generation kept the same
         bytes: the link still names that generation's file, so this one wrote none, and its reading is unread (None),
-        never an earlier generation's lines judged again. Two oneclient processes cannot write the same bytes (every
-        line of a glog file carries its time, thread and process), so equal bytes are one file."""
+        never an earlier generation's lines judged again. Equal bytes are taken as one file: a glog file starts with
+        the time it was made and every line carries a microsecond time and a thread, so two processes' logs are not
+        byte-identical in practice (a log rewritten byte for byte into the same path cannot be told from none)."""
         return None if text is not None and any(gen.oneclient_log == text for gen in earlier) else text
 
     def close_watch(self) -> None:
