@@ -43,12 +43,18 @@ infrastructure and runs it again: such a run is never scored as the declared mod
 snapshot. A study that wants the disagreement in the record without the refusal builds `MountIoMode(sandbox,
 refuse=False)`; its scorer then confirms a run's mode with `agrees(snapshot)`, which recomputes the answer from the two
 modes and reads anything that is not a matching mount snapshot as no.
+
+**A mount that was restored (O97)** has had more than one oneclient, one for each generation, each with its own log.
+`worst(readings)` takes each generation's `judge`d reading and gives the worst one unchanged, so that a second oneclient
+is never unjudged and the shape `agrees` reads is kept: a generation that disagrees beats every one that agrees, and
+among those that disagree a log that contradicts itself (`mixed`) beats one that cannot be read (`unknown`), which beats
+no forced mode (`auto`), which beats the other forced mode.
 """
 
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 
 from expcore.errors import InfraError
@@ -152,6 +158,22 @@ def judge(declared: object, log_text: str | None, *, why_unread: str = UNREAD) -
     }
 
 
+def worst(readings: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """The worst of the generations' readings (`judge`'s answers), as it is, never a merge of several: the earliest of
+    equals. None for no reading at all, which the caller treats as one never taken."""
+    if not readings:
+        return None
+    order = (MIXED, UNKNOWN, AUTO)  # the worst first; a disagreement of another kind ranks below them
+
+    def badness(reading: Mapping[str, Any]) -> int:
+        if reading.get("agree") is True:
+            return 0
+        effective = reading.get("effective")
+        return 1 + (len(order) - order.index(effective) if effective in order else 0)
+
+    return copy.deepcopy(dict(max(readings, key=badness)))  # `max` keeps the first of equals
+
+
 def agrees(snapshot: object) -> bool:
     """Whether a snapshot of this instrument confirms the mount's declared mode: a mount snapshot of version 1 whose
     declared mode is `proxy` or `direct` and whose effective mode is the same word. The `agree` flag is read too but
@@ -224,4 +246,5 @@ __all__ = [
     "ReadsIoMode",
     "agrees",
     "judge",
+    "worst",
 ]
