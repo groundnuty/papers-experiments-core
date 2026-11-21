@@ -217,6 +217,12 @@ class _CellProcesses:
         state = self._runner.quiesce("time cap")
         return None if state["killed"] is None else state["left"]
 
+    def diagnose(self, left: list[dict], timeout_s: float) -> dict[str, Any] | None:
+        """What the survivors wait on, read through the host's privilege within the time given (`deadline.Diagnosing`,
+        O97): None when the run was given no `diagnosis` (a run with no mount), so such a run is never the agent's."""
+        diagnosis = self._runner.diagnosis
+        return None if diagnosis is None else diagnosis(left, timeout_s)
+
 
 class CellRunner:
     """Runs cells in one agent container and keeps what is known about their kills."""
@@ -247,6 +253,9 @@ class CellRunner:
         # the agent's init's `sleep`, by pid and start time from the container's start (`teardown.init_sleep`): the one
         # process besides the init that a kill of the agent's processes spares; a process merely named `sleep` is killed
         self.init_sleep: dict[str, Any] | None = None
+        # what the deadline reads a survivor with: `(left, timeout_s) -> the diagnosis` (`dockerdiag.DockerDiagnosis`),
+        # set by the sandbox of a mount run; None reads nothing, so nothing is the agent's (O97)
+        self.diagnosis: Callable[[list[dict], float], dict[str, Any] | None] | None = None
         self._deadline: dict[str, Any] | None = None  # the record of the running cell's deadline, once it fired
         self.ended: dict[str, Any] | None = None  # the deadline that ended the run: a process outlived its kill
         # the record of the deadline whose mount restore is pending or under way (`deadline.RESTORING`), else None
@@ -307,7 +316,8 @@ class CellRunner:
     # ------------------------------------------------------------------------------------------------ processes
     def agent_processes(self, timeout_s: float | None = None) -> list[dict] | None:
         """Every process of the agent's container except its init and the init's `sleep` (`init_sleep`, O34); [] when it
-        has stopped, None when that cannot be read (within `timeout_s`, when given)."""
+        has stopped, None when that cannot be read (within `timeout_s`, when given). A zombie leader that a thread of
+        still waits is one of them (`teardown._readers`, O97), as an Apptainer cell's is."""
         waits = TD.WAITS
         if timeout_s is not None:
             waits = dataclasses.replace(waits, command_s=min(waits.command_s, timeout_s))
@@ -318,7 +328,7 @@ class CellRunner:
             return None
         if self.init_sleep is not None:
             info = {**info, "sleep": self.init_sleep}
-        return TD._readers(self._host, info) if info["running"] else []
+        return TD._readers(self._host, info, zombie_threads=True) if info["running"] else []
 
     def quiesce(self, reason: str = "end of run") -> dict[str, Any]:
         """Kill everything the agent left running, before any evidence is collected: a worker started in a new session

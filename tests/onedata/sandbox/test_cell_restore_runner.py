@@ -373,9 +373,11 @@ def test_o97_nothing_execs_while_a_restore_is_pending_and_the_refusal_is_a_sandb
         mounted.exec("print(1)", 5)
 
 
-def test_o97_the_default_restore_of_a_backend_that_has_none_fails_and_ends_the_run(world, mounted):
-    """O97: `restore_mount` on a sandbox whose backend gave no restore of its own answers `ok: False` and ends the
+def test_o97_a_restore_that_reports_failure_ends_the_run_and_with_nothing_pending_it_is_a_no_op(world, mounted):
+    """O97: `restore_mount` on a sandbox whose backend's restore reports failure (the Docker backend restores for real,
+    `test_docker_restore`; here the body is replaced, and the mount was never aborted) answers `ok: False` and ends the
     run, as every abort did before: the next exec raises the `sandbox` error. With nothing pending it is a no-op."""
+    mounted._restore_host_mount = lambda: {"ok": False, "why": "this backend cannot restore its mount"}
     assert mounted.restore_mount()["ok"] is None
     mounted._cells._publish(1, pending())
     assert mounted.restore_mount()["ok"] is False
