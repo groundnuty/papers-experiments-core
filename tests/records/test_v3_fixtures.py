@@ -547,3 +547,37 @@ def test_l18_the_fourteenth_fixture_pins_a_declared_code_cell_limit_and_the_thir
         assert "code_cell_bound_s" not in held.agent_config
         assert "code_cell_tools" not in held.agent_config
         assert replay_record(held).dumps().encode("utf-8") == earlier.read_bytes()
+
+
+def test_o97_the_fifteenth_fixture_pins_a_cell_deadline_of_a_restored_mount_and_the_fourteen_before_it_hold_none():
+    """O97 and R03: the fifteenth merge point adds the optional `cell_deadline` of a tool call, what a code tool says of
+    a cell whose process outlived its kill at the cell's deadline. Its fixture, written by the code of that merge on the
+    record tests' fake clock, holds a code tool's call whose cell was blocked on a file of the provider the study held
+    down, freed by the abort of its mount and restored, with the deadline as a restored mount leaves it (its steps, the
+    survivor read before the abort, the verdict that made it the agent's), and a call of another tool, which has none.
+    It validates and replays to its own bytes (the parametrized tests above); none of the fourteen before it holds the
+    field, and none is filled in with one."""
+    fifteenth = [p for p in FIXTURES if p.name.startswith("15-")]
+    assert [p.name for p in fifteenth] == ["15-cell-deadline.json"]
+    record = load_record(fifteenth[0])
+    cell, other = record.tool_calls
+    assert list(cell)[-1] == "cell_deadline"
+    assert "cell_deadline" not in other
+    held = cell["cell_deadline"]
+    assert (held["outcome"], held["restore"]) == ("mount_restored", "restored")
+    assert [s["step"] for s in held["steps"]] == ["kill", "survived", "abort", "ended", "restored"]
+    assert held["attribution"] == {
+        "verdict": "agent",
+        "why": "blocked_on_held_down_holder",
+        "target": "providers[1]",
+        "space_holder": "providers[1]",
+    }
+    waits = held["survivors"][0]["tasks"][0]["waits_on"][0]
+    assert (waits["mount"], waits["fd"]) == ("data", 3)
+    assert "blocking" not in held["survivors"][0]["tasks"][0]  # what the verdict read, never what the record keeps
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("finished", None)
+    assert replay_record(record).dumps().encode("utf-8") == fifteenth[0].read_bytes()
+    for earlier in FIXTURES[:14]:
+        held = load_record(earlier)
+        assert all("cell_deadline" not in call for call in held.tool_calls)
+        assert replay_record(held).dumps().encode("utf-8") == earlier.read_bytes()

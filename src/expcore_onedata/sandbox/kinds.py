@@ -38,7 +38,10 @@ when this module is first imported. Seven are the sandbox's and the ingest's, an
   FUSE mount, as one of a file only a stopped provider holds does), so the sandbox aborted the mount or stopped
   (`deadline.py`, O34). The harness could not bound the cell, and the run's mount or sandbox is gone: the run says
   nothing about the agent or the manipulation, so it is set aside, and no condition may declare it, an outage's
-  included. A cell killed cleanly at its deadline is the agent's own time limit, never this kind.
+  included. A cell killed cleanly at its deadline is the agent's own time limit, never this kind, and neither is one
+  whose survivors were all blocked on what the study's own manipulation holds down, once the abort freed them and the
+  mount was restored (`mount_restored`, never escalated): that is the agent's time limit too, and the run goes on. A
+  restore that fails ends the run as kind `sandbox` instead, which is charged and meets `max_infra_streak`.
 - `cell_not_isolated`: the Apptainer backend's watch ended the run because memory past a limit could not be told
   this cell's, another run's cell being charged to the same cgroup (`scope: run`, `attributed: false`, O72). The
   memory may be the other run's, so the run says nothing about the agent or the manipulation: it is set aside and
@@ -74,7 +77,7 @@ from typing import TYPE_CHECKING, Any
 
 from expcore.errors import PROVIDER_OUTAGE, InfraError, register_infra_kind
 from expcore.records.injections import INJECTOR_FAILURE  # the core names it: it sets an attempt aside as this kind
-from expcore_onedata.sandbox import deadline, infradeath, killcause
+from expcore_onedata.sandbox import calldeadline, deadline, infradeath, killcause
 
 if TYPE_CHECKING:
     from expcore.campaign.healthgate import DeferralBound
@@ -183,7 +186,8 @@ def run_ended_error(record: Mapping[str, Any]) -> InfraError:
     detail then says that cell ran, and hit its deadline: its own result stands, O72). A run the Apptainer backend's
     watch ended, because
     what passed a limit could not be told one cell's (`scope: run`, O72), is kind `cell_not_isolated` instead: set
-    aside, and counted apart from every other sandbox failure."""
+    aside, and counted apart from every other sandbox failure. A run whose mount was aborted at a cell's deadline as the
+    agent's and could not be restored (`by: "restore"`) is kind `sandbox`: charged, so it meets `max_infra_streak`."""
     if record.get("scope") == "run":
         why = record.get("why") or "what passed a limit could not be told one cell's"
         reason = record.get("reason")
@@ -195,14 +199,25 @@ def run_ended_error(record: Mapping[str, Any]) -> InfraError:
             f"the run was ended by the end-of-cell sweep after cell {record.get('cell')} ({outcome}): "
             f"{record.get('why')}; the cell's own result stands: nothing more runs",
         )
+    if record.get("by") == deadline.RESTORE:  # the mount was aborted and could not be brought back: the harness's
+        why = record.get("why") or "the restore did not complete"
+        return InfraError(
+            "sandbox",
+            f"the mount could not be restored after its abort at cell {record.get('cell')}'s deadline ({why}); "
+            "the cell's own result stands: nothing more runs",
+        )
+    # what the deadline read of its first survivor, when it read one: the only carrier for a call the loop cut, which
+    # returned no tool output to hold `cell_deadline` (O97); at most 300 characters, with no path and no cell content
+    seen = calldeadline.digest(record)
+    seen = f" [{seen}]" if seen else ""
     if record.get("cell") is not None:  # the cell ran and hit its deadline: its own result stands, a timeout (O72)
         why = record.get("why") or "a process of the cell outlived its kill"
         return InfraError(
             CELL_UNKILLABLE,
-            f"the run was ended at cell {record['cell']}'s deadline ({outcome}): {why}; "
+            f"the run was ended at cell {record['cell']}'s deadline ({outcome}): {why}{seen}; "
             "the cell's own result stands: nothing more runs",
         )
-    return InfraError(CELL_UNKILLABLE, f"the run was ended at a cell's deadline ({outcome}): nothing more runs")
+    return InfraError(CELL_UNKILLABLE, f"the run was ended at a cell's deadline ({outcome}){seen}: nothing more runs")
 
 
 def kill_error(kill: Mapping[str, Any] | None) -> InfraError | None:

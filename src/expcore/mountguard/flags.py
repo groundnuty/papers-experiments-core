@@ -34,6 +34,7 @@ from typing import Any
 
 from expcore.campaign.factors import DATA_PATH_FACTOR
 from expcore.mountguard.instrument import (
+    GENERATIONS,
     INTACT,
     MOUNT_PATH,
     NAMESPACE,
@@ -43,6 +44,7 @@ from expcore.mountguard.instrument import (
     UNKNOWN,
     UNPROVEN,
     VERSION,
+    combine,
 )
 from expcore.mountguard.log import ACCESS_KEYS
 
@@ -103,11 +105,34 @@ def _reasons(value: Any) -> bool:
 
 
 def _readable(data: Any) -> tuple[Mapping[str, Any] | None, str | None]:
-    """The snapshot when this code reads it; else why not."""
+    """The snapshot when this code reads it; else why not. A snapshot of a restored mount (`generations`) is read from
+    its generations: each must be a snapshot of its own, there must be at least two, and the top level must say exactly
+    what they say (`instrument.combine`), else it is no snapshot: a record never reads clean above a generation that
+    is not."""
     if data is None:
         return None, NOT_RECORDED
     if isinstance(data, Mapping) and data.get("ok") is False:
         return None, INSTRUMENT_FAILED
+    if isinstance(data, Mapping) and GENERATIONS in data:
+        return _readable_generations(data)
+    return _readable_one(data)
+
+
+def _readable_generations(data: Mapping[str, Any]) -> tuple[Mapping[str, Any] | None, str | None]:
+    parts = data[GENERATIONS]
+    if set(data) != SNAPSHOT_KEYS | {GENERATIONS} or not isinstance(parts, list) or len(parts) < 2:
+        return None, NOT_A_SNAPSHOT
+    readings = [_readable_one(part) for part in parts]
+    if any(why is not None for _, why in readings):
+        return None, NOT_A_SNAPSHOT
+    merged = combine([part for part, _ in readings if part is not None])
+    if any(data[key] != merged[key] for key in SNAPSHOT_KEYS):
+        return None, NOT_A_SNAPSHOT
+    return merged, None
+
+
+def _readable_one(data: Any) -> tuple[Mapping[str, Any] | None, str | None]:
+    """One log's snapshot when this code reads it; else why not."""
     if not isinstance(data, Mapping) or set(data) != SNAPSHOT_KEYS or data["version"] != VERSION:
         return None, NOT_A_SNAPSHOT
     if data["log"] not in (INTACT, UNKNOWN) or data["isolation"] not in (PROVEN, UNPROVEN):

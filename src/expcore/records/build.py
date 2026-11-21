@@ -240,12 +240,14 @@ def tool_entry(spec: ToolSpec) -> dict[str, Any]:
 def call_entry(call: Any, schema_version: str = CURRENT, schemas: Sequence[SchemaVersion] = SCHEMAS) -> dict[str, Any]:
     """Return a tool-call log entry as the record keeps it, as a record of `schema_version` keeps it.
 
-    `elapsed_s` comes after the fields of the first merge point and `exec_check` last; each is left out where there is
-    nothing to say, never written as a null: `elapsed_s` for a call that never started (L17), `exec_check` for a call
-    whose tool verified no exec (O55), and both for a version that predates them.
+    `elapsed_s` comes after the fields of the first merge point, then `exec_check` and last `cell_deadline`; each is
+    left out where there is nothing to say, never written as a null: `elapsed_s` for a call that never started (L17),
+    `exec_check` for a call whose tool verified no exec (O55), `cell_deadline` for a call whose cell's deadline did not
+    fire with a survivor (O97), and all of them for a version that predates them.
     """
     entry = plain(dataclasses.asdict(call))
     elapsed, checked = entry.pop("elapsed_s"), entry.pop("exec_check")
+    deadline = entry.pop("cell_deadline")
     entry["detail"] = stable_call_detail(entry["status"], entry["detail"])
     entry["rendering_verified"] = True  # until redaction changes what the cap or the error text is computed from
     known = fields_of("tool_call", schema_version, schemas)
@@ -253,6 +255,8 @@ def call_entry(call: Any, schema_version: str = CURRENT, schemas: Sequence[Schem
         entry["elapsed_s"] = elapsed
     if checked is not None and "exec_check" in known:
         entry["exec_check"] = checked
+    if deadline is not None and "cell_deadline" in known:
+        entry["cell_deadline"] = deadline
     return entry
 
 

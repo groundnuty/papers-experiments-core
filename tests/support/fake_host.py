@@ -21,12 +21,14 @@ docker reported an exit it never saw).
 """
 
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -68,6 +70,14 @@ class Unrecorded(CmdResult):
 def is_signal_helper(argv: Sequence[str]) -> bool:
     """The root half of a signal (`killhelper.py`), run as `PYTHON -I -c SOURCE TERM|KILL` with its request on stdin."""
     return bool(argv) and argv[0] == sys.executable and "-c" in argv and argv[-1] in ("TERM", "KILL")
+
+
+def is_snapshot_helper(argv: Sequence[str]) -> bool:
+    """The root half of the Docker diagnosis (`procsnap.py`, O97), run as `PYTHON -I -B -c SOURCE` with its request on
+    stdin: the program is the helper's own source, which is what tells it from any other `-c` command."""
+    from expcore_onedata.sandbox import sudoproc  # not before it exists: the old code never calls the helper
+
+    return bool(argv) and argv[0] == sys.executable and "-c" in argv and sudoproc.PROGRAM in argv
 
 
 def bootstrap_of(argv: Sequence[str]) -> tuple[str, int, str, str] | None:
@@ -247,6 +257,26 @@ class FakeHost:
         self.stuck_mounts: set[str] = set()
         self.denied: set[str] = set()  # files whose read raises PermissionError, as /proc does with hidepid
         self.mount_ids: dict[str, int] = {}  # a mount keeps its id when the directory above it is renamed
+        self._next_mount_id = 40  # an unmounted path that is mounted again is a new mount, with an id of its own
+        # the agent container's own mount table (`/proc/<pid>/mountinfo` of its init, read as root): the shares bound
+        # into it with `rslave` and the FUSE mounts on them, as the kernel's mount propagation shows them there (see
+        # `agent_mountinfo`). On by default, since the start reads it (`DockerSandbox._wait_agent_mount`); a test may
+        # turn it off, and `ns_override` gives a table (by pid) in place of this one
+        self.ns_mountinfo = True
+        self.ns_override: dict[int, str] = {}
+        # the real kernel lists one FUSE mount at the share twice in the host's table: the share's bind is a peer of the
+        # volume mount under it, so a mount stacked on the bind is propagated to that peer as well (measured on the
+        # study VM: two entries, one device). On by default, so no test assumes one entry; a test may turn it off
+        self.fuse_peer_entry = True
+        # the kernel hands a freed device number and mount id to the next mount, depending on how soon the dead mount is
+        # released (measured live: three restores, one on new numbers, one on the dead mount's device number, one on its
+        # mount id). With this on, a path keeps the device number and the mount id it first had across unmounts and
+        # remounts
+        self.reuse_freed_numbers = False
+        self._device_of: dict[str, int] = {}
+        # the bytes of a process's memory (`/proc/<pid>/task/<tid>/mem`), by that path, for the diagnosis's root half
+        self.proc_bytes: dict[str, bytes] = {}
+        self.fusectl_state = "writable"  # what the root half's check of the connection's abort file answers
         self.one_shots: list[FakeContainer] = []  # the `--rm` containers that were run, as they were labelled
         self.stuck_one_shots = False  # a `--rm` container that docker does not remove: it stays, running
         self.oneclient_images: set[str] = set()
@@ -315,6 +345,16 @@ class FakeHost:
         self.alive.add(pid)
         self.files[f"/proc/{pid}/stat"] = f"{pid} ({comm}) {state} {ppid} " + " ".join(["0"] * 17) + f" {start}\n"
 
+    def add_threads(self, container: "FakeContainer", pid: int, threads: dict[int, str]) -> None:
+        """Give a process threads, `{tid: state}`: each has its own `task/<tid>/stat`, and the container's cgroup lists
+        the thread ids (`cgroup.threads`, as cgroup v2 does) beside the processes."""
+        directory = f"/sys/fs/cgroup/system.slice/docker-{container.id}.scope"
+        listed = self.files.get(f"{directory}/cgroup.threads", "")
+        for tid, state in threads.items():
+            self.files[f"/proc/{pid}/task/{tid}/stat"] = f"{tid} (python) {state} 1 " + " ".join(["0"] * 17) + " 30\n"
+            listed += f"{tid}\n"
+        self.files[f"{directory}/cgroup.threads"] = listed
+
     def containers_with(self, label: str, value: str | None = None) -> list[FakeContainer]:
         return [c for c in self.containers.values() if label in c.labels and value in (None, c.labels[label])]
 
@@ -325,15 +365,56 @@ class FakeHost:
     def mountinfo(self) -> str:
         lines = ["1 0 8:1 / / rw - ext4 /dev/root rw"]  # every real table has the root mount; the probe checks for it
         for path, kind in self.mounts.items():
-            mount_id = self.mount_ids.setdefault(path, 40 + len(self.mount_ids))
-            lines.append(f"{mount_id} 25 0:{60 + mount_id} / {path} rw - {kind} source rw")  # device 100 for the first
+            mount_id = self._mount_id(path)
+            device = self._device(path, mount_id)
+            lines.append(f"{mount_id} 25 {device} / {path} rw - {kind} source rw")  # device 100 for the first
+            if self.fuse_peer_entry and kind.startswith("fuse"):  # the peer's copy: another id, the same device
+                lines.append(f"{mount_id + 5000} 24 {device} / {path} rw - {kind} source rw")
+        return "\n".join(lines) + "\n"
+
+    def _device(self, path: str, mount_id: int) -> str:
+        """The device a mount at `path` with `mount_id` shows: its own number, or the path's first when freed numbers
+        are reused (`reuse_freed_numbers`)."""
+        first = self._device_of.setdefault(path, mount_id)
+        return f"0:{60 + (first if self.reuse_freed_numbers else mount_id)}"
+
+    def _mount_id(self, path: str) -> int:
+        if path not in self.mount_ids:
+            self.mount_ids[path] = self._next_mount_id
+            self._next_mount_id += 1
+        return self.mount_ids[path]
+
+    def agent_mountinfo(self, pid: int) -> str | None:
+        """The mount table of the container whose init is `pid`, as `ns_mountinfo` makes it; None when it is off or
+        the pid is no container's."""
+        if pid in self.ns_override:
+            return self.ns_override[pid]
+        container = next((c for c in self.containers.values() if c.pid == pid), None)
+        if not self.ns_mountinfo or container is None:
+            return None
+        lines = ["1 0 8:1 / / ro - overlay overlay ro"]
+        for spec in container.mount_specs():
+            fields = dict(part.split("=", 1) for part in spec.split(",") if "=" in part)
+            src, dst = fields.get("src", ""), fields.get("dst", "")
+            if "rslave" not in spec:
+                continue
+            stacked = container.options.get("_stacked", {}).get(dst)
+            if stacked is not None:
+                # bound while a FUSE mount was stacked on the share: the bind is a clone of that mount, which no later
+                # mount or unmount of the share on the host reaches; only a detach inside the namespace removes it
+                if dst not in container.options.get("_detached", set()):
+                    lines.append(f"{stacked + 100} 25 {self._device(src, stacked)} / {dst} ro - fuse.oneclient s ro")
+            elif self.mounts.get(src, "").startswith("fuse"):
+                # bound from the bare shared share: the host's mounts on it propagate in, and its unmounts do too
+                mount_id = self._mount_id(src)
+                lines.append(f"{mount_id + 100} 25 {self._device(src, mount_id)} / {dst} ro - fuse.oneclient s ro")
         return "\n".join(lines) + "\n"
 
     def relocate_mounts(self, old: str, new: str) -> None:
         """What renaming a directory does to the mounts under it: they move with it, with the same id and device."""
         for path in [p for p in self.mounts if p == old or p.startswith(old + "/")]:
             moved = new + path[len(old) :]
-            self.mount_ids[moved] = self.mount_ids.pop(path, 40 + len(self.mount_ids))
+            self.mount_ids[moved] = self.mount_ids.pop(path, None) or self._mount_id(moved)
             self.mounts[moved] = self.mounts.pop(path)
 
     def read_text(self, path: str | Path) -> str:
@@ -404,6 +485,8 @@ class FakeHost:
             self.calls.append(("run", tuple(argv), sudo))
             if sudo:
                 self.sudo_commands.append(argv)
+            if is_snapshot_helper(argv):  # run for real, on a tree made of this fake's /proc
+                return self._snapshot_helper(input)
             if is_signal_helper(argv):  # never run for real: its pids are this fake's, and the real /proc is the host's
                 return self._signal_helper(argv, input)
             handler = self.run_handlers.get(argv[0])
@@ -412,6 +495,36 @@ class FakeHost:
             if argv[0] == sys.executable and "-c" in argv:  # the copy helper, run for real
                 return self.real(argv, input)
             return self._run_default(argv)
+
+    def _snapshot_helper(self, request: str | None) -> CmdResult:
+        """The root half of the diagnosis (`procsnap.py`, O97) played against this fake's /proc: a tree is made of the
+        files, links and memory the fake holds for its processes, and the helper's own code reads it, so what comes back
+        is what the real one would say of such a process."""
+        from expcore_onedata.sandbox import procsnap
+
+        with tempfile.TemporaryDirectory() as made:
+            root = Path(made)
+            for path, text in self.files.items():
+                if re.match(r"/proc/\d+/", path):
+                    target = root / path[len("/proc/") :]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(text, encoding="utf-8")
+            for path, data in self.proc_bytes.items():
+                target = root / path[len("/proc/") :]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            for path, destination in self.links.items():
+                if re.match(r"/proc/\d+/", path):
+                    target = root / path[len("/proc/") :]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.symlink_to(destination)
+            old, procsnap.PROC_ROOT = procsnap.PROC_ROOT, str(root)
+            try:
+                out, err = io.StringIO(), io.StringIO()
+                code = procsnap.main([], io.StringIO(request or ""), out, err)
+            finally:
+                procsnap.PROC_ROOT = old
+        return CmdResult(code, out.getvalue(), err.getvalue())
 
     def _signal_helper(self, argv: list[str], request: str | None) -> CmdResult:
         """The root half of a signal (`killhelper.py`, O72) played against this fake's /proc: each target is signalled
@@ -462,6 +575,8 @@ class FakeHost:
                 return CmdResult(0, self.routes)
             case "journalctl":
                 return CmdResult(0, self.journal)
+            case "sh" if "fusectl-state" in argv:  # the check of the connection's abort file (`dockerdiag`, O97)
+                return CmdResult(0, self.fusectl_state + "\n")
             case "chmod":
                 return self.real(argv)
             case "chown":  # this user cannot give a file to root: the command is recorded, and nothing changes
@@ -469,7 +584,9 @@ class FakeHost:
             case "dmesg":
                 return CmdResult(0, self.dmesg)
             case "cat":
-                text = self.files.get(argv[1])
+                named = re.fullmatch(r"/proc/(\d+)/mountinfo", argv[1])
+                text = self.agent_mountinfo(int(named[1])) if named else None
+                text = text if text is not None else self.files.get(argv[1])
                 return CmdResult(0, text) if text is not None else CmdResult(1, "", "No such file")
             case "kill":
                 for pid in argv[argv.index("-s") + 2 :] if "-s" in argv else argv[1:]:
@@ -486,6 +603,10 @@ class FakeHost:
                 if target in self.stuck_mounts:
                     return CmdResult(1, "", "busy")
                 self.mounts.pop(target, None)
+                if not self.reuse_freed_numbers:
+                    self.mount_ids.pop(
+                        target, None
+                    )  # mounted again, it is another mount (unless the numbers come back)
                 return CmdResult(0)
             case "rm" if "-rf" in argv:
                 writable(argv[-1])  # root removes what is read-only; this user must make it writable first
@@ -509,6 +630,11 @@ class FakeHost:
             case "mv":
                 shutil.move(argv[-2], argv[-1])
                 self.relocate_mounts(argv[-2], argv[-1])
+                return CmdResult(0)
+            case "nsenter" if "umount" in argv:  # `nsenter -t PID -m -p umount -l PATH`: a detach inside the namespace
+                owner = next((c for c in self.containers.values() if c.pid == int(argv[argv.index("-t") + 1])), None)
+                if owner is not None:
+                    owner.options.setdefault("_detached", []).append(argv[-1])
                 return CmdResult(0)
             case "mount" | "nsenter" | "sh" | "test" | "truncate":
                 return CmdResult(0)
@@ -614,6 +740,16 @@ class FakeHost:
         procs = [container.pid, *([container.init_child] if container.init_child else [])]
         self.add_cgroup(container, procs, events="low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
         container.options["_env"] = dict(env or {})
+        container.options[
+            "_stacked"
+        ] = {  # destination: the mount id of the FUSE mount the bind cloned, if there was one
+            fields["dst"]: self._mount_id(fields["src"])
+            for spec in options.get("--mount", [])
+            if "rslave" in spec
+            for fields in [dict(part.split("=", 1) for part in spec.split(",") if "=" in part)]
+            if self.mounts.get(fields.get("src", ""), "").startswith("fuse")
+        }
+        container.options["_detached"] = []  # destinations detached from inside the namespace (a list: dumped as JSON)
         container.options["_files"] = {  # what each file bound in held when the container started, by destination
             destination: Path(source).read_text(encoding="utf-8")
             for source, destination in bound_files(options)

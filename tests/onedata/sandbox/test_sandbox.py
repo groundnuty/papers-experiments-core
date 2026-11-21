@@ -701,23 +701,17 @@ def test_o14_two_sandboxes_get_two_disjoint_networks_from_the_pool(world):
 
 
 def test_a_failure_while_starting_stops_everything_that_was_started_in_order(world):
-    """O15: the teardown runs on a failed start, with the mount's order, and verifies the result."""
-    world.host.fail_run.add("never")  # nothing special: fail the agent only
-    sbx_name = {}
-
-    def fail_agent(argv):
-        return CmdResult(0)
-
-    del fail_agent, sbx_name
+    """O15: the teardown runs on a failed start, with the mount's order, and verifies the result. The agent is started
+    before the sidecar (O97), so it is the sidecar's `docker run` that fails, with the agent already made."""
     original = world.host._run_container
 
     def failing(args, env):
-        if "--init" in args:  # the agent's `docker run` is the only one with --init
-            return CmdResult(125, "", "cannot start the agent")
+        if "/dev/fuse" in args:  # the sidecar's `docker run` is the only one that is given the FUSE device
+            return CmdResult(125, "", "cannot start the sidecar")
         return original(args, env)
 
     world.host._run_container = failing
-    with pytest.raises(SandboxError, match="cannot start the agent"):
+    with pytest.raises(SandboxError, match="cannot start the sidecar"):
         start(world, "mounted")
     assert nothing_left(world)
     kinds = [c[0] for c in world.host.calls if c[0] in ("removed", "network_removed", "unmount")]
@@ -912,7 +906,10 @@ def test_o12_the_record_names_the_pool_by_position_and_the_configuration_by_its_
     assert meta["network"]["pool"] == 0  # the first of [sandbox.network] pools
     assert set(meta["mount"]) == {
         "io_mode", "options", "extra_args", "image_config", "log_dir_from", "network", "wait_s", "oneclient_build",
+        "remounts", "generations",
     }  # fmt: skip
+    assert meta["mount"]["remounts"] == 0  # every run says how many times its mount was restored (O97)
+    assert meta["mount"]["generations"] == [{"wait_s": meta["mount"]["wait_s"], "fusectl": None, "abort": None}]
     assert meta["mount"]["log_dir_from"] == "sandbox"
     assert meta["mount"]["network"] in ("default bridge", "federation")  # the kind of network, never its name
     text = json.dumps(meta, default=str)
@@ -1334,6 +1331,28 @@ def test_o15_an_abandoned_start_creates_nothing_and_a_start_abandoned_midway_rem
     world.host.docker = abandon_when_the_gate_is_up
     with pytest.raises(SandboxError, match="abandoned"):
         midway.begin()
+    assert nothing_left(world)
+    assert midway.stopped
+
+
+def test_o97_a_mount_start_abandoned_after_the_agent_started_makes_no_sidecar(world):
+    """O97 (Codex, final review): the agent is now started before the sidecar, so the abandonment checkpoint between
+    them is the one that keeps a cancelled launch from writing the token and starting the sidecar."""
+    midway = DockerSandbox(world.host, world.s, make_spec(world, "mounted"), **start_options(world))
+    original, made = world.host.docker, []
+
+    def abandon_when_the_agent_is_up(*args, **kwargs):
+        done = original(*args, **kwargs)
+        if args[0] == "run" and "/dev/fuse" in args:
+            made.append("sidecar")
+        if args[0] == "run" and "--init" in args:  # the agent's `docker run`: the sidecar is next
+            midway.abandon()
+        return done
+
+    world.host.docker = abandon_when_the_agent_is_up
+    with pytest.raises(SandboxError, match="abandoned"):
+        midway.begin()
+    assert made == []
     assert nothing_left(world)
     assert midway.stopped
 

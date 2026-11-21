@@ -1,4 +1,4 @@
-"""A cell's hard deadline against a live federation (O34, #190), skipped unless every gate below is set.
+"""A cell's hard deadline against a live federation (O34, #190, O97), skipped unless every gate below is set.
 
     EXPCORE_LIVE_DOCKER=1 EXPCORE_LIVE_MUTATE=1 EXPCORE_LIVE_FAULTS=1 EXPCORE_LIVE_PLATFORM=<root>/platform.toml \\
     EXPCORE_LIVE_SANDBOX_POOL=<a private IPv4 range the host routes nowhere> \\
@@ -21,6 +21,15 @@ that reads no byte; the target is stopped through the injector; a cell reads the
 `CELL_S`. The read waits in the kernel, the cell is killed at its cap, outlives the kill, and the sidecar aborts the
 mount's FUSE connection; the run is then over. The injector restores the target in `finally`, and the sandbox is
 stopped and shown gone. Each test asserts one fact of it.
+
+The attempt runs twice (O97), and each run is made only when a test asks for it. **Unregistered** (`attempt`): the run's
+spec holds no injection down, as a run whose study takes no provider down, so the read at the cap is a wedge the
+harness cannot account for: the abort ends it, and the run is over as `cell_unkillable` (O34). **Registered**
+(`attempt_registered`): the spec reads what the run's own injector holds down (`fault_owner.held_reader`) and names the
+target as the holder of the study space, so the same read is the agent's outcome: the survivor is attributed to it, the
+abort frees it, the cell is the agent's time limit with its restore pending, the restore brings the mount back with a
+new sidecar, the deadline is `mount_restored`, and the next cell runs. Two outages, two sandboxes: set the gates only
+on a federation nothing else uses. Written for the Docker slot on the VM, not run where it was written.
 """
 
 import json
@@ -52,7 +61,7 @@ from mount_live import (  # noqa: E402 -- only once the module is known to run
 )
 
 from expcore.errors import InfraError  # noqa: E402
-from expcore_onedata import consistency  # noqa: E402
+from expcore_onedata import consistency, fault_owner  # noqa: E402
 from expcore_onedata.client import OnezoneClient  # noqa: E402
 from expcore_onedata.config import PlatformConfig, load_platform  # noqa: E402
 from expcore_onedata.faults import FaultInjector, compose_driver, load_faults, provider_serves  # noqa: E402
@@ -137,8 +146,12 @@ def target_of(config: PlatformConfig, services: dict) -> str:
     pytest.skip("[faults.services] has no provider besides the local one to take down")
 
 
-def mount_spec(config: PlatformConfig, run_key: str) -> SandboxSpec:
-    """The spec of a mount run, its token minted for the fixed data-path user, as a live check does."""
+def mount_spec(
+    config: PlatformConfig, run_key: str, *, space_holders: dict[str, str] | None = None, held_down=None
+) -> SandboxSpec:
+    """The spec of a mount run, its token minted for the fixed data-path user, as a live check does. With `held_down`
+    (what the run's injector holds down, `fault_owner.held_reader`) and `space_holders` (each space's holder by label)
+    the run's blocked reads can be attributed to the agent (O97); without them none is."""
     client = OnezoneClient(config)
     try:
         token = TokenIssuer(client, config).mint(
@@ -153,6 +166,8 @@ def mount_spec(config: PlatformConfig, run_key: str) -> SandboxSpec:
         zone=Endpoint.from_url(config.zone.url),
         provider=Endpoint.from_url(config.local_provider.url),
         lease_key=LEASE_KEY,
+        **({"space_holders": space_holders} if space_holders is not None else {}),
+        **({"held_down": held_down} if held_down is not None else {}),
     )
 
 
@@ -165,13 +180,21 @@ def json_line(sandbox: DockerSandbox, code: str, timeout_s: float) -> dict:
 
 
 def the_read_at_its_cap(sandbox: DockerSandbox, path: str) -> dict:
-    """The reading cell during the outage, and what the deadline made of it; then whether a later cell still runs."""
+    """The reading cell during the outage, and what the deadline made of it; where the cell's survivors were the agent's
+    and the result says a restore is pending, the restore the code tool runs (O97); then whether a later cell runs."""
     began = time.monotonic()
     result = sandbox.exec(READ.format(path=path), CELL_S)
     out: dict = {"exec_s": round(time.monotonic() - began, 3), "exit_code": result.exit_code}
     kill = result.kill or {}
     out["kill"] = {"reason": kill.get("reason"), "category": kill.get("category")}
-    out["deadline"] = kill.get("deadline") or (sandbox.metadata().get("cell_deadlines") or [None])[-1]
+    out["restore_pending"] = result.restore_pending
+    if result.restore_pending:
+        restored = sandbox.restore_mount()
+        out["restore"] = {key: restored.get(key) for key in ("ok", "generation", "why")}
+    # the record the deadline kept for this call; a restore amends it in place, so it is read after one
+    out["deadline"] = (
+        result.deadline or kill.get("deadline") or (sandbox.metadata().get("cell_deadlines") or [None])[-1]
+    )
     error = kinds.kill_error(result.kill)
     out["error_kind"] = error.kind if error is not None else None
     out["mount_aborted"] = (sandbox.metadata().get("mount") or {}).get("aborted")
@@ -193,9 +216,9 @@ def left_behind(host: DockerHost, sandbox: DockerSandbox) -> dict:
     }
 
 
-@pytest.fixture(scope="module")
-def attempt(tmp_path_factory):
-    """The whole attempt, once (module docstring); the facts each test reads."""
+def run_attempt(tmp_path_factory, *, registered: bool) -> dict:
+    """The whole attempt, once (module docstring); the facts each test reads. `registered` gives the run's spec the
+    injector's own holds and names the target as the study space's holder, so the read at the cap is the agent's."""
     base = tmp_path_factory.mktemp("cell-deadline-live")
     config = load_platform(platform_with_mount(base))
     if config.principals.data_path is None:
@@ -206,7 +229,17 @@ def attempt(tmp_path_factory):
     local, target = config.support.local, target_of(source, dict(settings.services))
     host, client, files = DockerHost(sudo_command=config.sandbox.sudo), OnezoneClient(source), SpaceFiles(config)
     run = f"expcore-live-deadline-{uuid.uuid4().hex[:8]}"
-    facts: dict = {"grace_s": config.sandbox.kill_grace_s, "cap_s": CELL_S, "target": source.provider_label(target)}
+    facts: dict = {
+        "grace_s": config.sandbox.kill_grace_s,
+        "cap_s": CELL_S,
+        "target": source.provider_label(target),
+        "registered": registered,
+    }
+    attribution_spec = (
+        {"space_holders": {config.space.name: source.provider_label(target)}, "held_down": fault_owner.held_reader(run)}
+        if registered
+        else {}
+    )  # taken outside any attempt, as the injector's own hold is, so both are keyed alike (`fault_owner.attempt_key`)
     sandbox = None
     try:
         top = files.make(local, files.root(local), run, "DIR")
@@ -216,7 +249,7 @@ def attempt(tmp_path_factory):
         files.write(target, owner_only, 0, pattern(f"{run}/owner-only.bin", FILE_BYTES))
         seen = consistency.converge(lambda: files.seen(local, owner_only), bool, timeout_s=VISIBLE_S, poll_s=2.0)
         assert seen.converged, "the file did not reach the local provider"
-        sandbox = DockerSandbox.start(host, config.sandbox, mount_spec(config, run))
+        sandbox = DockerSandbox.start(host, config.sandbox, mount_spec(config, run, **attribution_spec))
         path = f"{config.sandbox.mount.path}/{config.space.name}/{run}/owner-only.bin"
         facts["visible"] = json_line(sandbox, STAT.format(path=path, size=FILE_BYTES, wait_s=VISIBLE_S), VISIBLE_S + 30)
         assert facts["visible"].get("size") == FILE_BYTES, "the file never showed at its size through the mount"
@@ -235,8 +268,22 @@ def attempt(tmp_path_factory):
         facts["files_left"] = len(files.remove_all())
         client.close()
     if os.environ.get("EXPCORE_LIVE_FACTS_OUT"):
-        Path(os.environ["EXPCORE_LIVE_FACTS_OUT"]).write_text(json.dumps(facts, indent=1, default=str), "utf-8")
+        out = Path(os.environ["EXPCORE_LIVE_FACTS_OUT"])
+        out = out.with_suffix(".registered" + out.suffix) if registered else out
+        out.write_text(json.dumps(facts, indent=1, default=str), "utf-8")
     return facts
+
+
+@pytest.fixture(scope="module")
+def attempt(tmp_path_factory):
+    """The attempt of a run whose spec holds no injection down: the wedge is the harness's (O34)."""
+    return run_attempt(tmp_path_factory, registered=False)
+
+
+@pytest.fixture(scope="module")
+def attempt_registered(tmp_path_factory):
+    """The attempt of a run whose spec reads its own injector's holds: the wedge is the agent's (O97)."""
+    return run_attempt(tmp_path_factory, registered=True)
 
 
 def test_o34_a_read_of_a_file_only_the_stopped_provider_holds_outlives_its_kill_at_the_cap(attempt):
@@ -281,3 +328,46 @@ def test_o34_the_provider_is_restored_and_nothing_of_the_sandbox_is_left(attempt
     assert attempt["restored"] is True
     assert attempt["after"] == {"stopped": True, "fuse_mounts_left": 0}
     assert attempt["files_left"] == 0
+
+
+def test_o97_a_read_blocked_on_the_held_down_providers_file_is_the_agents_and_its_deadline_is_attributed(
+    attempt_registered,
+):
+    """O97: the read waits on a file only the stopped provider holds, which the run's injector holds down and the spec
+    names as the study space's holder: the diagnosis read the survivor's thread in D on a file of the data mount, and
+    the verdict is `agent`, with the target's label, never its name."""
+    record = attempt_registered["during"]["deadline"]
+    steps = {s["step"]: s for s in record["steps"]}
+    assert "D" in steps["survived"]["states"] or steps["survived"]["left"] >= 1
+    assert record["attribution"]["verdict"] == "agent", record["attribution"]
+    assert record["attribution"]["why"] == "blocked_on_held_down_holder"
+    assert record["attribution"]["target"] == attempt_registered["target"]
+    survivor = record["survivors"][0]
+    assert any(task["state"] == "D" for task in survivor["tasks"])
+
+
+def test_o97_the_agents_cell_is_its_time_limit_and_the_mount_is_restored_and_the_next_cell_runs(attempt_registered):
+    """O97: the abort frees the cell, which stays the agent's time limit; the restore removes the sidecar the abort
+    ended, unmounts the dead share and starts a new one; the deadline is `mount_restored`, the run is not over, and the
+    next cell runs."""
+    during = attempt_registered["during"]
+    assert during["kill"] == {"reason": "time_limit", "category": "agent"}
+    assert during["restore_pending"] is True
+    assert during["restore"]["ok"] is True, during["restore"]
+    assert during["restore"]["generation"] == 2
+    record = during["deadline"]
+    assert record["outcome"] == "mount_restored"
+    assert record["restore"] == "restored"
+    assert any(step["step"] == "restored" for step in record["steps"])
+    assert during["error_kind"] is None
+    assert during["next_cell"] == "ran"
+
+
+def test_o97_the_cell_returns_within_its_hard_deadline_and_the_sandbox_leaves_nothing(attempt_registered):
+    """O97: the restore runs after the cell returned, in the code tool's paused clock, so the cell's own return
+    (`exec_s` is measured before it) is within the cap and the escalation's margin as before; and after the stop no FUSE
+    mount is left, the provider is back, and the study file is gone."""
+    assert attempt_registered["during"]["exec_s"] < HARD_BOUND_S
+    assert attempt_registered["restored"] is True
+    assert attempt_registered["after"] == {"stopped": True, "fuse_mounts_left": 0}
+    assert attempt_registered["files_left"] == 0

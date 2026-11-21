@@ -70,6 +70,7 @@ from expcore_onedata.fault_drain import GATE, MOUNT
 from expcore_onedata.readlog import facts as readlog_facts
 from expcore_onedata.readlog import reader as readlog_reader
 from expcore_onedata.sandbox import (
+    attribution,
     cellhost,
     cellresolv,
     copyout,
@@ -89,6 +90,7 @@ from expcore_onedata.sandbox import (
 from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import infradeath as ID
 from expcore_onedata.sandbox import readlog_channel as RL
+from expcore_onedata.sandbox import remount as RM
 from expcore_onedata.sandbox import teardown as TD
 from expcore_onedata.sandbox import termination as TERM
 from expcore_onedata.sandbox.api import (
@@ -122,6 +124,7 @@ from expcore_onedata.sandbox.containers import (
     sidecar_run_args,
     trust_targets,
 )
+from expcore_onedata.sandbox.dockerdiag import DockerDiagnosis
 from expcore_onedata.sandbox.hostops import HostOps, describe_error, describe_stderr, stderr_digest
 from expcore_onedata.sandbox.observe import Observer
 from expcore_onedata.sandbox.oneclient_args import DIRECT
@@ -227,6 +230,11 @@ class DockerSandbox:
         self._inputs: tuple[ReadOnlyInput, ...] = ()  # the spec's read-only inputs, their sources resolved
         self._input_copies: list[tuple[Path, str]] = []  # each input's copy in the run's directory, and its path
         self._token_files: list[Path] = []  # the run's files of the token, on the host only while their holder starts
+        # the oneclient sidecar's generations, the live one last: one at the start, one more for each restore after a cell's
+        # deadline aborted the mount (O97). Each is what the record keeps of it, as the Apptainer host mount keeps it
+        # (`wait_s`, `fusectl`, `abort`), and, once a restore has closed it, what its oneclient log showed (`io_mode`, and
+        # for a direct mount `direct_lines`), read from the run's own log directory before the next one began
+        self._gens: list[dict[str, Any]] = [{"wait_s": None, "fusectl": None, "abort": None}]
         # the read-log channel (`readlog_channel`): the nonce the collector is told, the one sender uid it accepts (the
         # declared agent uid: a cell runs as it), what the start made, and the log as the collection read it
         self._readlog_pin = settings.readlog_collector_sha256  # None: this run has no channel
@@ -419,9 +427,13 @@ class DockerSandbox:
             self._checkpoint()
         gate_ip = self._start_gate() if mode is DataPathMode.REST else None
         self._checkpoint()
-        share = self._start_mount() if mode is DataPathMode.MOUNT else None
+        share = self._prepare_share() if mode is DataPathMode.MOUNT else None
         self._checkpoint()
-        self._start_agent(work, share, gate_ip, list(hosts))
+        self._start_agent(work, share, gate_ip, list(hosts))  # binds the share before the FUSE mount is stacked on it
+        if share is not None:
+            self._checkpoint()  # an abandoned start writes no token and starts no sidecar
+            self._start_mount(share)
+            self._wait_agent_mount(share)
         self._init_sleep = self._identify_init_sleep()  # before any cell: a probe's process would be one more
         self._checkpoint()
         roles = {"agent": self.names.agent} | ({"gate": self.names.gate} if gate_ip else {})
@@ -429,12 +441,27 @@ class DockerSandbox:
             roles["readlog"] = self.names.readlog
         if share:
             roles["sidecar"] = self.names.sidecar
-        escalation = DL.Escalation(s.kill_grace_s, self._abort_mount, sleep=self._sleep, clock=self._clock)
+        escalation = DL.Escalation(
+            s.kill_grace_s, self._abort_mount, sleep=self._sleep, clock=self._clock,
+            restorable=self.spec.mode is DataPathMode.MOUNT,
+            # whose block a survivor's wait is: the providers this run's own injection holds down when the verdict is
+            # asked for, and the holder of each space, both from the spec (`SandboxSpec.held_down`, `space_holders`)
+            attribute=attribution.attributer(self.spec.held_down, self.spec.space_holders),
+        )  # fmt: skip
         self._cells = CellRunner(
             self.host, self.obs, self.names, s, self._meta, self.registry, roles, self._started, escalation,
             stop=self._stop_at_deadline, meta_lock=self._meta_lock, output_cap_bytes=self._output_cap,
         )  # fmt: skip
         self._cells.init_sleep = self._init_sleep
+        if share:  # what the deadline reads a survivor of this run with: nothing without a mount, so never the agent's
+            self._cells.diagnosis = DockerDiagnosis(
+                self.host,
+                waits=self.waits,
+                mountpoint=lambda: TD.host_path(self.dir / "mount"),
+                mount_path=str(s.mount.path),
+                inputs=tuple(path for _, path in self._input_copies),
+                clock=self._clock,
+            )
         self._verify_read_only()
         self._verify_resolv()
         if share and s.mount.io_mode == DIRECT:
@@ -634,13 +661,16 @@ class DockerSandbox:
             self._sleep(0.1)
         raise SandboxError("the gate did not become ready")
 
-    def _write_token_file(self, relative: Path, *, gate_owned: bool = False) -> Path:
+    def _write_token_file(self, relative: Path, *, gate_owned: bool = False, again: bool = False) -> Path:
         """The run's file of the data-path token, owner-only (0400), in a directory of its own (0700), for the one
         container that reads it at its start (`sidecar_run_args`, `gate_run_args`). The gate runs as root with every
-        capability dropped, so it reads only a file root owns: with `gate_owned` the file is made root's."""
+        capability dropped, so it reads only a file root owns: with `gate_owned` the file is made root's. With `again`
+        the directory is the one the start made, and the file is written a second time (a restore's new sidecar, O97):
+        the first was removed once oneclient had read it, and `O_EXCL` still refuses one that was not."""
         path = self.dir / relative
-        path.parent.mkdir(mode=0o700)
-        self._token_files.append(path)  # before it exists: every teardown removes it, whatever fails from here
+        path.parent.mkdir(mode=0o700, exist_ok=again)
+        if path not in self._token_files:
+            self._token_files.append(path)  # before it exists: every teardown removes it, whatever fails from here
         handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             stream.write(self.spec.token.reveal())
@@ -683,17 +713,20 @@ class DockerSandbox:
         """Whether any of the run's copies of the token is still on the host: looked at, never assumed from a step."""
         return any(os.path.lexists(path) for path in self._token_files)
 
-    def _start_mount(self) -> Path:
-        """Start the oneclient sidecar on a shared mount point; its token goes in a file bound into it alone, read-only,
-        never in an argument or in docker's configuration of the container (O05)."""
-        s, sp, names = self.s, self.spec, self.names
+    def _prepare_share(self) -> Path:
+        """The shared mount point of a mount run: a directory made a shared mount of itself (`mount --bind`,
+        `--make-rshared`). **The agent binds it before the FUSE mount is stacked on it** (`start`, `_wait_agent_mount`):
+        a bind taken after is a clone of the FUSE mount itself, which a later unmount on the host does not reach and
+        whose replacement never propagates in (so no restore could show the agent its new mount). Taken from the bare
+        share, the agent's bind is a slave of it: the sidecar's FUSE mount propagates in, the host's unmount of it
+        propagates in too, and so does the next generation's mount."""
+        s = self.s
         share = self.dir / "mount"
         share.mkdir()
         self._note_mount(share)
         self.host.run(["mount", "--bind", str(share), str(share)], 60, sudo=True)
         self.host.run(["mount", "--make-rshared", str(share)], 60, sudo=True)  # so the sidecar's mount propagates out
         self._note_mounted(share)
-        host_name = sp.provider.host
         self._meta["mount"] = {  # the keys that set it, never a path or a name (O12); its TLS is the run's `tls`
             "io_mode": s.mount.io_mode,  # the declared one, always: oneclient's own detection never runs (O36)
             "options": sidecar_options(s),  # what the sandbox itself passes to oneclient, in order
@@ -706,6 +739,15 @@ class DockerSandbox:
         log_dir = self.dir / LOG_DIR  # oneclient's log is bound here, owner-only, and kept with the run's evidence
         log_dir.mkdir(mode=0o700)
         log_dir.chmod(0o700)  # whatever the driver's umask
+        return share
+
+    def _start_mount(self, share: Path) -> None:
+        """Start the oneclient sidecar on the prepared share, which stacks the FUSE mount on it (the agent's bind of the
+        share, taken before, receives it); its token goes in a file bound into it alone, read-only, never in an
+        argument or in docker's configuration of the container (O05)."""
+        s, sp, names = self.s, self.spec, self.names
+        host_name = sp.provider.host
+        log_dir = self.dir / LOG_DIR
         self._register_container(names.sidecar)
         t0 = time.monotonic()
         args = sidecar_run_args(
@@ -722,6 +764,9 @@ class DockerSandbox:
                 raise SandboxError("the oneclient mount did not appear")
             self._sleep(0.2)
         self._meta["mount"]["wait_s"] = round(time.monotonic() - t0, 3)
+        self._gens[0]["wait_s"] = self._meta["mount"]["wait_s"]
+        self._meta["mount"]["remounts"] = 0  # every run says how many times its mount was restored (a covariate, O97)
+        self._meta["mount"]["generations"] = self._gens  # the live list: `metadata()` copies it as it stands
         started = self.host.docker("logs", names.sidecar, check=False, timeout=30)  # the entrypoint's one line, first
         self._meta["mount"]["image_config"] = image_config_record(started.stdout if started.returncode == 0 else None)
         self._remove_token_files(self.dir / TOKEN_FILE)  # oneclient read it as it started; its bind outlives this copy
@@ -729,7 +774,25 @@ class DockerSandbox:
         build = sidecar_build(self.host, names.sidecar, s.oneclient.id)  # O65: execs in the running sidecar, never a cp
         with self._meta_lock:  # `metadata()` may be reading it from another thread
             self._meta["mount"]["oneclient_build"] = build
-        return share
+
+    def _wait_agent_mount(self, share: Path) -> None:
+        """Until the agent container's own mount table shows the run's FUSE mount at the mount path, once and on the
+        device the host shows at the share (`remount.bar`, as the restore's bar): read from the two tables, never through
+        the mount, for at most `MOUNT_WAIT_S`. The mount propagates in as it is made, so this normally holds at the first
+        look; one that does not reach the agent (a dockerd in a private or slave mount namespace) fails the start, since
+        the agent's mount path is first a bare read-only bind, which answers a write with EROFS as the mount does: the
+        read-only probe (`_verify_read_only`, O20) would pass on it. It runs before the probe and before any cell."""
+        mountpoint, deadline = TD.host_path(share), self._clock() + MOUNT_WAIT_S
+        while True:
+            why = RM.bar(
+                self._host_table(), self._agent_table(), share=mountpoint, mount_path=str(self.s.mount.path),
+            )  # fmt: skip
+            if why is None:
+                return
+            if self._clock() > deadline:
+                log.error("the data mount did not reach the agent container: %s", why)
+                raise SandboxError(f"the data mount did not reach the agent container ({why})")
+            self._sleep(0.2)
 
     # ------------------------------------------------------------------------------------------------ the read log
     def _start_readlog(self) -> None:
@@ -1042,9 +1105,14 @@ class DockerSandbox:
 
     def direct_io_lines(self) -> list[str] | None:
         """The names of the lines of `directio.MARKERS` the sidecar's log holds now, or None when it could not be read
-        (O40): with a direct mount, any one of them means some read since the start did not go to the storage."""
+        (O40): with a direct mount, any one of them means some read since the start did not go to the storage. After a
+        restore (O97) the lines of every generation's log stand, the ones a restore closed and the live one's: a
+        generation whose log could not be read makes the whole unknown, never direct."""
         text = self._read_sidecar_log()
-        return None if text is None else directio.marker_lines(text)
+        earlier = [g["direct_lines"] for g in self._gens if "direct_lines" in g]
+        return RM.direct_lines(
+            earlier, None if text is None else directio.marker_lines(text), order=tuple(directio.MARKERS)
+        )
 
     def _direct_io_held(self) -> None:
         """At collection, show that every read of a direct run went to the storage itself, or set the run aside (O40). A
@@ -1073,6 +1141,9 @@ class DockerSandbox:
             log.error("the sidecar's oneclient log could not be read for the I/O mode: %s", describe_error(error))
             text = None
         reading = iomode.judge(self.s.mount.io_mode, text)
+        earlier = [g["io_mode"] for g in self._gens if "io_mode" in g]  # the generations a restore closed (O97)
+        if earlier:  # the worst of them stands, so a first oneclient that ran in another mode is never unjudged
+            reading = iomode.worst([*earlier, reading]) or reading
         with self._meta_lock:  # `metadata()` may be reading it from another thread
             self._meta["mount"]["effective"] = reading
 
@@ -1269,6 +1340,7 @@ class DockerSandbox:
         self._refuse_if_ended()
         if self._cells is None or self._stopped:
             raise SandboxError("the sandbox is not running")
+        self._cells.refuse_while_restoring()  # an aborted mount not yet restored: a cell would read a dead directory
         self._enter(record)
         try:
             try:
@@ -1300,6 +1372,191 @@ class DockerSandbox:
                 )
             self._steps_running += 1
 
+    def restore_mount(self) -> dict[str, Any]:
+        """Bring the run's mount back after a cell's deadline aborted it and the survivors were the agent's
+        (`api.MountRestoring`, `cells.CellRunner.restore`): `{"ok": None}` when nothing is pending, else the restore's own
+        answer, which ends the run when it failed. The code tool calls it, inside the agent's paused clock. It never
+        raises. The restore itself is `_restore_host_mount`."""
+        if self._cells is None:
+            return {"ok": None, "why": "the sandbox is not running"}
+        return self._cells.restore(self._restore_host_mount)
+
+    def _log_dir_of(self, generation: int) -> Path:
+        """The run's own directory for the oneclient log of a generation of the sidecar: the first keeps its name, each
+        later one has a directory of its own, so a restore never overwrites the log of the mount it replaces."""
+        return self.dir / (LOG_DIR if generation == 1 else f"{LOG_DIR}-{generation}")
+
+    def _restore_wanted(self) -> bool:
+        """Whether the runner still holds this restore as running: a stop that waited its bound for it, and the run's end,
+        give it up (`CellRunner._abandon_restore`), and a restore given up on makes nothing more."""
+        with self._meta_lock:
+            record = self._cells.pending_restore if self._cells is not None else None
+            return record is not None and record.get("restore") == DL.RESTORE_RUNNING and not self._stopped
+
+    def _restore_host_mount(self) -> dict[str, Any]:
+        """Bring the run's mount back after a cell's deadline aborted it and the survivors were the agent's (O97,
+        `api.MountRestoring`): remove the sidecar the abort ended, unmount the dead share, and start a new sidecar on the
+        same share, with a token file written again and a log directory of its own. The mount is shown back by the
+        host's and the agent's own mount tables, never by a read through it, and the new sidecar has its own baseline
+        for the watch on the containers. `{"ok": True, "generation": n, "wait_s": s}`, or `{"ok": False, "why": ...}` in
+        the fixed words of `remount`, which the runner ends the run on. It never raises. Every step first asks whether
+        the runner still wants the restore, so one it gave up on creates nothing the stop does not know."""
+        if self.spec.mode is not DataPathMode.MOUNT or self.names.sidecar not in self._containers:
+            return {"ok": False, "why": RM.NO_MOUNT}
+        generation, began = len(self._gens) + 1, self._clock()
+        try:
+            why = self._remount(generation, began + RM.RESTORE_TOTAL_S)
+        except Exception as error:  # the class only reaches the record: its text may name a path
+            log.error("the mount's restore raised: %s", describe_error(error))
+            why = f"the restore raised {type(error).__name__}"
+        if why is not None:
+            log.error("the mount could not be restored: %s", why)
+            return {"ok": False, "why": why}
+        wait_s = round(float(self._clock() - began), 3)
+        with self._meta_lock:
+            self._gens.append({"wait_s": wait_s, "fusectl": None, "abort": None})  # the live list `metadata()` copies
+            self._meta.setdefault("mount", {})["remounts"] = generation - 1
+        return {"ok": True, "generation": generation, "wait_s": wait_s}
+
+    def _remount(self, generation: int, until: float) -> str | None:
+        """The steps of `_restore_host_mount`; None when the mount is back, else why not, in `remount`'s words. The
+        whole is bounded by `until` (`remount.RESTORE_TOTAL_S`): no token is written and no sidecar started past it, and
+        the wait for the new mount ends at it."""
+        share = self.dir / "mount"
+        mountpoint = TD.host_path(share)
+        if not self._restore_wanted():
+            return RM.NOT_WANTED
+        found = TD._fuse_at(self.host, mountpoint, self.waits)
+        if found is None:
+            return RM.HOST_TABLE
+        self._close_generation(generation - 1)  # its log is read from the host, before anything of it is removed
+        try:
+            hostops.remove_container(self.host, self.names.sidecar)
+        except SandboxError:
+            return RM.OLD_SIDECAR
+        if not self._restore_wanted():
+            return RM.NOT_WANTED
+        if not TD._unmount_host(self.host, mountpoint, found, self.waits, _no_step_log):
+            return RM.UNMOUNT
+        # the unmount step alone also accepts a host table it could not read when its command reported success (the
+        # teardown's own use of it); a restore does not: the dead mount is gone only when the table is READ and shows no
+        # FUSE entry at the share, which is what makes a mount seen there afterwards the new one (`remount.bar`)
+        left = TD._fuse_at(self.host, mountpoint, self.waits)
+        if left is None:
+            return RM.HOST_TABLE
+        if left:
+            return RM.UNMOUNT
+        if not self._restore_wanted():
+            return RM.NOT_WANTED
+        if (why := self._clear_agent_copy()) is not None:
+            return why
+        if self._clock() >= until:  # nothing of the new generation is begun past the restore's time
+            return RM.OUT_OF_TIME
+        try:
+            token = self._write_token_file(TOKEN_FILE, again=True)
+        except (OSError, SandboxError):
+            return RM.TOKEN
+        why = None
+        try:
+            why = self._start_next_sidecar(generation, token, mountpoint, until)
+        finally:
+            try:
+                self._remove_token_files(token)  # oneclient read it as it started; its bind outlives this copy
+            except SandboxError:
+                why = why or RM.TOKEN
+        if why is not None:
+            return why
+        return RM.bar(
+            self._host_table(),
+            self._agent_table(),
+            share=mountpoint,
+            mount_path=str(self.s.mount.path),
+        )
+
+    def _clear_agent_copy(self) -> str | None:
+        """Show that no copy of the dead mount is left in the agent container's own mount namespace, and detach one that
+        the host's unmount did not reach (`teardown._unmount_namespaces`, which the teardown makes for the same reason):
+        a new mount that propagates in beside a stale one would be shown there twice. None, or why not."""
+        agent = TD._inspect(self.host, self.names.agent, self.waits)
+        if agent is None or agent.get("unknown") or not agent.get("running") or agent["pid"] <= 0:
+            return RM.AGENT_TABLE
+        clean = TD._unmount_namespaces(self.host, [("agent", agent["pid"])], self.waits, _no_step_log)
+        return None if clean else RM.STALE_IN_AGENT
+
+    def _start_next_sidecar(self, generation: int, token: Path, mountpoint: str, until: float) -> str | None:
+        """Start the sidecar of the next generation, wait until its mount is in the host's table, and give the watch on
+        the containers its baseline: the old sidecar's end was the harness's, the new one's is its own. None, or why not.
+        The runner is asked again before the sidecar is started and at every look at the mount, since a stop that gave up
+        on the restore removes by name what it knew of."""
+        log_dir = self._log_dir_of(generation)
+        try:
+            log_dir.mkdir(mode=0o700)
+            log_dir.chmod(0o700)  # whatever the driver's umask
+            if not self._restore_wanted():
+                return RM.NOT_WANTED
+            if self._clock() >= until:
+                return RM.OUT_OF_TIME
+            self._register_creation()  # the name is the one the stop knows: a stop that ran meanwhile is not the last
+            self.host.docker(
+                *sidecar_run_args(
+                    self.s, self.names, self._label_args(), self.dir / "mount", self.s.oneclient.id,
+                    self.spec.provider.host, token_file=token, log_dir=log_dir, ca_copy=self._ca_copy,
+                ),
+                timeout=max(1.0, min(hostops.DOCKER_TIMEOUT_S, until - self._clock())),  # never past the restore's time
+            )  # fmt: skip
+        except (OSError, SandboxError):
+            return RM.NEW_SIDECAR
+        deadline = min(self._clock() + MOUNT_WAIT_S, until)  # the mount's own wait, never past the restore's time
+        try:
+            while not hostops.is_fuse_mounted(self.host.read_text("/proc/self/mountinfo"), mountpoint):
+                if not self._restore_wanted():
+                    return RM.NOT_WANTED
+                if (hostops.inspect(self.host, self.names.sidecar) or {}).get("State", {}).get("Running") is not True:
+                    return RM.NEW_SIDECAR
+                if self._clock() > deadline:
+                    return RM.OUT_OF_TIME if deadline == until else RM.NOT_MOUNTED
+                self._sleep(0.2)
+            if not self._restore_wanted():
+                return RM.NOT_WANTED
+            self.watch_container("sidecar", self.names.sidecar)
+        except (OSError, SandboxError):
+            return RM.NEW_SIDECAR
+        return None
+
+    def _host_table(self) -> str | None:
+        """The host's mount table, as text; None when it cannot be read."""
+        try:
+            return self.host.read_text("/proc/self/mountinfo")
+        except OSError:
+            return None
+
+    def _agent_table(self) -> str | None:
+        """The agent container's own mount table, read as root from its init's `/proc`; None when it cannot be read."""
+        agent = TD._inspect(self.host, self.names.agent, self.waits)
+        if agent is None or agent.get("unknown") or not agent.get("running") or agent["pid"] <= 0:
+            return None
+        done = TD._sudo(self.host, "cat", str(TD.PROC / str(agent["pid"]) / "mountinfo"), timeout_s=self.waits.probe_s)
+        return done.stdout if done.returncode == 0 else None
+
+    def _close_generation(self, generation: int) -> None:
+        """What generation `generation` of the sidecar showed of its oneclient log, read as root from the run's own log
+        directory (the container that wrote it is stopped), kept with the generation before the next one begins: the I/O
+        mode it showed and, for a direct mount, which lines of detection or fallback it logged; None where the log could
+        not be read, which is unknown and never direct."""
+        text: str | None = None
+        try:
+            done = self.host.run(
+                ["cat", str(self._log_dir_of(generation) / directio.LOG_FILE)], self.waits.command_s, sudo=True
+            )
+            text = done.stdout if done.returncode == 0 else None
+        except (OSError, SandboxError):
+            text = None
+        shown: dict[str, Any] = {"io_mode": iomode.judge(self.s.mount.io_mode, text)}
+        if self.s.mount.io_mode == DIRECT:
+            shown["direct_lines"] = None if text is None else directio.marker_lines(text)
+        with self._meta_lock:  # `metadata()` may be reading the generations from another thread
+            self._gens[generation - 1].update(json.loads(json.dumps(shown, default=str)))
+
     def settle_deadline(self) -> dict[str, Any] | None:
         """Before anyone decides how the run ended (`launch`, `collect`): a cell still running has its deadline enforced
         now, and one under way is waited for (`CellRunner.settle`, O34). The record of the deadline that ended the run,
@@ -1321,7 +1578,7 @@ class DockerSandbox:
         the sidecar, which holds the mount and SYS_ADMIN (`containers.sidecar_abort_args`), nothing in the agent's
         container, within `timeout_s`, what the deadline's margin has left. The connection is the device of the run's
         mount in the host's table, read without touching the mount. `ok` is None when there is no mount to abort; once it
-        is True the mount is dead for the rest of the run."""
+        is True the mount is dead until the run restores it (`_restore_host_mount`, O97)."""
         if self.spec.mode is not DataPathMode.MOUNT or self.names.sidecar not in self._containers:
             return {"ok": None, "why": "the run has no FUSE mount"}
         until = self._clock() + timeout_s
@@ -1329,6 +1586,9 @@ class DockerSandbox:
         connections = sorted({n for m in found or [] if (n := TD._conn(m["dev"])) is not None})
         if not connections:
             return {"ok": None, "why": "the mount's FUSE connection is not in the host's mount table"}
+        # the abort ends oneclient, and with it the sidecar: that end is the harness's, noted before it is made, so that
+        # a restore that follows is not a death of infrastructure and the new sidecar has a baseline of its own (O97)
+        self._stop_on_purpose("sidecar")
         failed = []
         for n in connections:
             left = min(self.waits.command_s, until - self._clock())
@@ -1343,7 +1603,9 @@ class DockerSandbox:
             log.error("the sidecar could not abort the mount's FUSE connection: %s", describe_stderr(failed[0].stderr))
         else:
             with self._meta_lock:
-                self._meta.setdefault("mount", {})["aborted"] = True  # dead for the rest of the run
+                self._meta.setdefault("mount", {})["aborted"] = True  # it was, once at least; a restore brings it back
+        with self._meta_lock:  # what was done to this generation, as the Apptainer host mount keeps it (O97)
+            self._gens[-1]["abort"] = {k: note[k] for k in ("ok", "connections", "rc", "stderr") if k in note}
         return note
 
     def _stop_at_deadline(self) -> dict[str, Any]:
@@ -1932,6 +2194,11 @@ class DockerSandbox:
 def _linux() -> bool:
     """Whether this host passes a Unix socket through a bind (the read-log channel): Linux only."""
     return sys.platform.startswith("linux")
+
+
+def _no_step_log(step: str, **facts: Any) -> dict[str, Any]:
+    """The step log a restore passes the teardown's unmount, which records each step; a restore keeps none of them."""
+    return {}
 
 
 __all__ = ["DockerSandbox"]
