@@ -10,11 +10,12 @@ answer is the same shape, so the same verdict (`attribution`) is made of it on b
 it by.
 
 What the reading needs of a Docker run is its cell's fixed targets (`stuck.Roles`): the data mount at the path the
-agent sees it, on the device the run's mount has in the host's table now (a restore makes a new device, so it is read
-when the deadline fires, never at the start), `/work`, `/tmp`, `/dev/shm` and the read-only inputs at the paths they
-are bound at. Nothing a process wrote is read, and nothing of the target: the same uid on the same wedged connection
-would wait too (`stuckread`). The agent's processes run on this host, so the syscall tables are the ones of this
-machine, which `stuckread` checks (`stuck.X86_64`); on another one no call is resolved, and nothing is the agent's.
+agent sees it, on the device the run's mount has in the host's table now (read at each deadline, never at the start: a
+restore may change it, and the kernel may also give the new mount the number it had), `/work`, `/tmp`, `/dev/shm` and
+the read-only inputs at the paths they are bound at. Nothing a process wrote is read, and nothing of the target: the
+same uid on the same wedged connection would wait too (`stuckread`). The agent's processes run on this host, so the
+syscall tables are the ones of this machine, which `stuckread` checks (`stuck.X86_64`); on another one no call is
+resolved, and nothing is the agent's.
 """
 
 from __future__ import annotations

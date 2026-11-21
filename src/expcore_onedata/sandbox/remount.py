@@ -67,11 +67,14 @@ def bar(
 
     **It does not ask whether the mount is a new one by a number the kernel gives it**, neither its device nor its mount
     id: the kernel hands both back to the next mount once the dead one is released, and whether it does depends on how
-    soon (measured live on the study VM, three restores in a row: one came up on new numbers, one on the dead mount's
-    device number, one on the dead mount's mount id). What makes a mount in either table the new one rather than a stale
-    copy is the restore's own sequence, which the caller owns: the dead mount shown gone from the host's table (and a
-    copy detached from the agent's), then the new sidecar started, so a mount seen afterwards cannot be the dead one.
-    The device only has to agree between the two tables, where both are live at once.
+    soon (measured live on the study VM over five restores: the dead mount's device number came back in three, its mount
+    id in a fourth, and only one restore got new numbers). What makes a mount in either table the new one rather than a
+    stale copy is the restore's own sequence, which the caller owns: the dead mount shown gone from the host's table
+    (READ, and empty of FUSE entries at the share: `DockerSandbox._remount` re-reads it after the unmount and fails
+    closed on a table it could not read, or one that still lists the mount) and from the agent's (read as root, every
+    FUSE mount in it detached and the table read empty: `_clear_agent_copy`), then the new sidecar started, so a mount
+    seen afterwards cannot be the dead one. The device only has to agree between the two tables, where both are live at
+    once.
 
     The host's table lists one FUSE mount more than once: the share is bound onto itself and made shared, so the bind is
     a peer of the volume mount under it, and a mount stacked on the bind is propagated to that peer too (measured live

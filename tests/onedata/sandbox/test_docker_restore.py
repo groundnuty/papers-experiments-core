@@ -14,6 +14,7 @@ import pytest
 from deadline_support import cell_processes  # noqa: F401  (the fixtures' cell)
 from sandbox_support import make_spec, start_options
 
+from expcore.errors import InfraError
 from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import hostops
 from expcore_onedata.sandbox import remount as RM
@@ -274,6 +275,22 @@ def test_o97_the_bar_asks_for_no_number_the_kernel_would_not_give_a_new_mount_ag
     assert RM.bar(again, ns, share="/run/share", mount_path="/data") is None
 
 
+def host_table_at_the_new_sidecar(host, sandbox):
+    """Record the FUSE entries at the share that the host's table shows when the new sidecar is started (the `docker
+    run` of the sidecar's name); `.read` has one reading for each such start, `.real` is the host's own docker."""
+    share = str(sandbox.dir / "mount")
+    seen = type("Seen", (), {"read": [], "real": host.docker})()
+
+    def docker(*args, **kwargs):
+        if args[0] == "run" and sandbox.names.sidecar in args:
+            table = hostops.parse_mountinfo(host.mountinfo())
+            seen.read.append([m["id"] for m in table if m["mountpoint"] == share and m["fstype"].startswith("fuse")])
+        return seen.real(*args, **kwargs)
+
+    host.docker = docker
+    return seen
+
+
 def test_o97_the_restore_passes_when_the_kernel_hands_the_new_mount_the_dead_ones_numbers(aborted):
     """O97: the live failures, through the whole restore on the fake host: the new mount comes up with the dead
     mount's device number AND mount id. The restore passes its bar, the next cell runs, and the dead mount was shown
@@ -281,9 +298,14 @@ def test_o97_the_restore_passes_when_the_kernel_hands_the_new_mount_the_dead_one
     sbx, host = aborted.sandbox, aborted.host
     host.reuse_freed_numbers = True
     before = [(m["id"], m["dev"]) for m in hostops.parse_mountinfo(host.mountinfo()) if m["fstype"].startswith("fuse")]
+    at_the_new_sidecar = host_table_at_the_new_sidecar(host, sbx)
     start = len(host.calls)
-    answer = sbx.restore_mount()
+    try:
+        answer = sbx.restore_mount()
+    finally:
+        host.docker = at_the_new_sidecar.real
     assert (answer["ok"], answer["generation"]) == (True, 2)
+    assert at_the_new_sidecar.read == [[]]  # the host table read EMPTY of FUSE entries when the new sidecar was started
     after = [(m["id"], m["dev"]) for m in hostops.parse_mountinfo(host.mountinfo()) if m["fstype"].startswith("fuse")]
     assert after == before  # the same numbers, a new mount
     kinds = [(c[0], c[1]) for c in calls_after(host, start) if c[0] in ("docker", "run")]
@@ -637,3 +659,30 @@ def test_o97_the_start_refuses_a_share_whose_entries_are_on_two_devices(world):
     lists_the_mount_on_another_device_too(world.host)
     with pytest.raises(SandboxError, match="more than one device"):
         DockerSandbox.start(world.host, world.s, make_spec(world, "mounted"), **start_options(world))
+
+
+def test_o97_an_unmount_that_reports_success_with_the_host_table_unreadable_fails_the_restore_closed(aborted):
+    """O97: the unmount command returns 0 but the host's mount table cannot be read afterwards (the unmount step alone
+    accepts that, as the teardown's does): the restore does not take the dead mount for gone. It re-reads the table
+    before it writes a token, finds it unreadable, and fails in fixed words with no new sidecar started and no token
+    left; the runner ends the run as kind `sandbox` (`mount_lost`)."""
+    sbx, host = aborted.sandbox, aborted.host
+    real = host.run_handlers.get("fusermount")
+
+    def unmounts_then_the_table_is_unreadable(argv):
+        done = real(argv) if real else host._run_default(argv)
+        host.denied.add("/proc/self/mountinfo")  # the command said 0, and the table can no longer be read
+        return done
+
+    host.run_handlers["fusermount"] = unmounts_then_the_table_is_unreadable
+    start = len(host.calls)
+    answer = sbx.restore_mount()
+    host.denied.clear()  # the stop that follows reads the table
+    host.run_handlers.pop("fusermount", None) if real is None else host.run_handlers.update(fusermount=real)
+    assert answer == {"ok": False, "why": "the host's mount table could not be read"}
+    assert ("docker", "run", ()) not in calls_after(host, start)
+    assert not sbx._token_files_left()
+    assert sbx._cells.ended["by"] == DL.RESTORE
+    with pytest.raises(InfraError) as ended:
+        sbx.exec("print(1)", 5)
+    assert ended.value.kind == "sandbox"

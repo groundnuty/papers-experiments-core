@@ -1438,6 +1438,14 @@ class DockerSandbox:
             return RM.NOT_WANTED
         if not TD._unmount_host(self.host, mountpoint, found, self.waits, _no_step_log):
             return RM.UNMOUNT
+        # the unmount step alone also accepts a host table it could not read when its command reported success (the
+        # teardown's own use of it); a restore does not: the dead mount is gone only when the table is READ and shows no
+        # FUSE entry at the share, which is what makes a mount seen there afterwards the new one (`remount.bar`)
+        left = TD._fuse_at(self.host, mountpoint, self.waits)
+        if left is None:
+            return RM.HOST_TABLE
+        if left:
+            return RM.UNMOUNT
         if not self._restore_wanted():
             return RM.NOT_WANTED
         if (why := self._clear_agent_copy()) is not None:
