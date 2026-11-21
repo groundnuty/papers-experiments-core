@@ -235,21 +235,23 @@ def test_o97_a_restore_given_up_on_between_its_steps_starts_no_sidecar(aborted):
 
 
 def test_o97_the_restore_bar_is_what_the_mount_tables_show_not_a_read_through_the_mount():
-    """O97: `remount.bar` judges the two tables: a FUSE mount at the share on one new device on the host (however many
-    entries the kernel lists it as: the share's bind is a peer of the volume under it, so one mount shows twice), and in
-    the agent's namespace one entry at the mount path, on that device. Each failing shape has its own words."""
+    """O97: `remount.bar` judges the two tables: a FUSE mount at the share on one device on the host (however many
+    entries the kernel lists it as: the share's bind is a peer of the volume under it, so one mount shows twice) that is
+    not the dead mount, by its kernel mount id; and in the agent's namespace one entry at the mount path, on that
+    device. Each failing shape has its own words."""
     root = "1 0 8:1 / / rw - ext4 /dev/root rw\n"
     host_ok = root + "10 1 0:77 / /run/share rw - fuse.oneclient s rw\n"
     ns_ok = root + "20 1 0:77 / /data ro - fuse.oneclient s ro\n"
-    assert RM.bar(host_ok, ns_ok, share="/run/share", mount_path="/data", old_devices={"0:70"}) is None
+    mine = {"share": "/run/share", "mount_path": "/data", "old_mounts": {"3"}}
+    assert RM.bar(host_ok, ns_ok, **mine) is None
     twice = host_ok + "5010 9 0:77 / /run/share rw - fuse.oneclient s rw\n"  # the peer's copy: the same device
-    assert RM.bar(twice, ns_ok, share="/run/share", mount_path="/data", old_devices={"0:70"}) is None
+    assert RM.bar(twice, ns_ok, **mine) is None
     cases = {
         "the host's mount table shows the new mount on more than one device": (
             host_ok + "11 1 0:88 / /run/share rw - fuse.oneclient s rw\n",
             ns_ok,
         ),
-        "the new mount is the dead one's device": (twice.replace("0:77", "0:70"), ns_ok.replace("0:77", "0:70")),
+        "the mount at the share is the dead one's": (host_ok, ns_ok, {"old_mounts": {"10"}}),
         "the new mount is not on the host": (root, ns_ok),
         "the agent's mount table could not be read": (host_ok, None),
         "the new mount is not in the agent's mount table": (host_ok, root),
@@ -257,9 +259,39 @@ def test_o97_the_restore_bar_is_what_the_mount_tables_show_not_a_read_through_th
         "the agent's mount is another device": (host_ok, ns_ok.replace("0:77", "0:99")),
         "the host's mount table could not be read": ("", ns_ok),
     }
-    for why, (host_table, ns_table) in cases.items():
-        got = RM.bar(host_table, ns_table, share="/run/share", mount_path="/data", old_devices={"0:70"})
-        assert got == why
+    for why, (host_table, ns_table, *override) in cases.items():
+        assert RM.bar(host_table, ns_table, **{**mine, **(override[0] if override else {})}) == why
+
+
+def test_o97_a_new_mount_on_the_dead_ones_device_number_is_still_a_new_mount():
+    """O97: measured live: the kernel gave the next mount the freed device number of the dead one (and, in another run,
+    a new number): a device number is not the mount's identity. The mount id is, and a new one differs: the same device
+    with a new id passes; the same id on a new device is the dead mount still there."""
+    root = "1 0 8:1 / / rw - ext4 /dev/root rw\n"
+    ns = root + "20 1 0:115 / /data ro - fuse.oneclient s ro\n"
+    mine = {"share": "/run/share", "mount_path": "/data", "old_mounts": {"1374", "1375"}}
+    reused = (
+        root
+        + "1394 1 0:115 / /run/share rw - fuse.oneclient s rw\n1395 9 0:115 / /run/share rw - fuse.oneclient s rw\n"
+    )
+    assert RM.bar(reused, ns, **mine) is None
+    left = (
+        root
+        + "1374 1 0:115 / /run/share rw - fuse.oneclient s rw\n1375 9 0:115 / /run/share rw - fuse.oneclient s rw\n"
+    )
+    assert RM.bar(left, ns, **mine) == "the mount at the share is the dead one's"
+
+
+def test_o97_the_restore_passes_when_the_kernel_hands_the_new_mount_the_dead_ones_device_number(aborted):
+    """O97: the live failure, through the whole restore on the fake host: the new mount has the dead mount's device
+    number and new mount ids. The restore passes its bar, the next cell runs, and the device is the one it was."""
+    sbx, host = aborted.sandbox, aborted.host
+    host.reuse_freed_devices = True
+    before = devices(host, sbx)
+    answer = sbx.restore_mount()
+    assert (answer["ok"], answer["generation"]) == (True, 2)
+    assert devices(host, sbx) == before  # the same device number, a new mount
+    assert sbx.exec("print(1)", 30).exit_code == 0
 
 
 def test_o97_the_direct_io_lines_of_every_generation_stand_and_an_unread_one_is_unknown():

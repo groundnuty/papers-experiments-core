@@ -32,7 +32,7 @@ NEW_SIDECAR = "the new sidecar did not start"
 NOT_MOUNTED = "the new mount did not appear"
 NOT_ON_HOST = "the new mount is not on the host"
 ON_HOST_SPLIT = "the host's mount table shows the new mount on more than one device"
-OLD_DEVICE = "the new mount is the dead one's device"
+OLD_MOUNT = "the mount at the share is the dead one's"
 AGENT_TABLE = "the agent's mount table could not be read"
 STALE_IN_AGENT = "the dead mount is still in the agent's mount table"
 NOT_IN_AGENT = "the new mount is not in the agent's mount table"
@@ -41,13 +41,25 @@ AGENT_OTHER = "the agent's mount is another device"
 
 
 def _fuse_at(table: str | None, mountpoint: str) -> list[dict[str, str]] | None:
-    """The FUSE mounts at `mountpoint` in a mountinfo table; None when there is no table or it cannot be shown whole."""
+    """The FUSE mounts at `mountpoint` in a mountinfo table, each with its mount `id` and `dev`; None when there is no
+    table or it cannot be shown whole."""
     if table is None:
         return None
     try:
-        return [m for m in hostops.fuse_mounts(table) if m["mountpoint"] == mountpoint]
+        return [
+            m
+            for m in hostops.parse_mountinfo(table)
+            if m["mountpoint"] == mountpoint and m["fstype"].startswith("fuse")
+        ]
     except hostops.MountTableError:
         return None
+
+
+def mount_ids_at(table: str | None, mountpoint: str) -> frozenset[str] | None:
+    """The kernel's mount ids of the FUSE mounts at `mountpoint` in a mountinfo table (what `bar` takes as the dead
+    mount's); None when the table cannot be read."""
+    found = _fuse_at(table, mountpoint)
+    return None if found is None else frozenset(m["id"] for m in found)
 
 
 def bar(
@@ -56,12 +68,19 @@ def bar(
     *,
     share: str,
     mount_path: str,
-    old_devices: Collection[str],
+    old_mounts: Collection[str] = (),
 ) -> str | None:
     """None when the mount is shown back, else the fixed words for what is not: a FUSE mount at `share` in the host's
-    table, every entry of it on one device that is none of `old_devices` (the dead mount's), and exactly one entry at
-    `mount_path` in the agent container's own table, on that device. A table that cannot be read is unknown: a reason,
-    never a pass.
+    table, every entry of it on one device and none of them a mount in `old_mounts` (the dead mount's kernel ids), and
+    exactly one entry at `mount_path` in the agent container's own table, on that device. A table that cannot be read is
+    unknown: a reason, never a pass.
+
+    Whether a mount is the dead one is its mount id, never its device number: the kernel hands a freed device number to
+    the next mount, and whether it does depends on how soon the dead superblock is released (measured live: one restore
+    came up on the dead mount's device number, another on a new one). The mount id of a new mount is a new one. That a
+    mount in either table is the new one rather than a stale copy is the restore's own sequence (the dead mount shown
+    gone from the host's table and from the agent's, then the new sidecar started), so the device only has to agree
+    between the two tables, where both are live at once.
 
     The host's table lists one FUSE mount more than once: the share is bound onto itself and made shared, so the bind is
     a peer of the volume mount under it, and a mount stacked on the bind is propagated to that peer too (measured live
@@ -76,8 +95,8 @@ def bar(
     if len(devices) > 1:
         return ON_HOST_SPLIT
     (device,) = devices
-    if device in old_devices:
-        return OLD_DEVICE
+    if any(m["id"] in old_mounts for m in on_host):
+        return OLD_MOUNT
     in_agent = _fuse_at(ns_mountinfo, mount_path)
     if in_agent is None:
         return AGENT_TABLE
