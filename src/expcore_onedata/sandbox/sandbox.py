@@ -1461,7 +1461,8 @@ class DockerSandbox:
                 *sidecar_run_args(
                     self.s, self.names, self._label_args(), self.dir / "mount", self.s.oneclient.id,
                     self.spec.provider.host, token_file=token, log_dir=log_dir, ca_copy=self._ca_copy,
-                )
+                ),
+                timeout=max(1.0, min(hostops.DOCKER_TIMEOUT_S, until - self._clock())),  # never past the restore's time
             )  # fmt: skip
         except (OSError, SandboxError):
             return RM.NEW_SIDECAR

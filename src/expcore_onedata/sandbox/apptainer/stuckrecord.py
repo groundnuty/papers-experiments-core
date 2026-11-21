@@ -80,6 +80,7 @@ class Survivor:
     comm: str
     state: str
     tasks: list[Task] | None = None  # None: the process could not be read (gone, another process, hidden)
+    unread_tasks: int = 0  # listed tasks whose `stat` could not be read: one may be in D, so the verdict is unknown
     mounts: tuple[S.MountEntry, ...] | None = None
     cwd: str | None = None  # the working directory's absolute path
     root: str = ""  # the process's root directory when it is not `/` (a chroot): its links carry this prefix
@@ -140,7 +141,7 @@ def reading_entry(proc: Survivor, roles: S.Roles, known: bool) -> dict[str, Any]
         "comm": proc.comm[:32],
         "state": proc.state,
         "tasks": None if proc.tasks is None else [task_record(task, known) for task in proc.tasks],
-        "tasks_cut": 0,
+        "tasks_cut": proc.unread_tasks,  # a task not read is a task left out: `attribution` reads it as unknown
         "waits_on": waits,
         **({} if cwd is None else {"cwd_mount": cwd}),
     }
@@ -159,7 +160,9 @@ def survivor_record(entry: Mapping[str, Any]) -> dict[str, Any]:
             {key: value for key, value in task.items() if key != "blocking"}
             for task in sorted(tasks, key=lambda task: task["state"] != "D")[:TASKS_KEPT]
         ]
-        kept.update(tasks=shown, tasks_cut=len(tasks) - len(shown), waits_on=entry["waits_on"][:WAITS_KEPT])
+        kept.update(
+            tasks=shown, tasks_cut=len(tasks) - len(shown) + entry["tasks_cut"], waits_on=entry["waits_on"][:WAITS_KEPT]
+        )
     if "cwd_mount" in entry:
         kept["cwd_mount"] = entry["cwd_mount"]
     return kept

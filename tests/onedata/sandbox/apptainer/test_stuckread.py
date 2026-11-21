@@ -6,6 +6,7 @@ import time
 import pytest
 from fake_survivor_proc import DATA_DEVICE, DATA_MOUNT, ROOT_MOUNT, WORK_MOUNT, FakeProcReader, syscall_text
 
+from expcore_onedata.sandbox import attribution as A
 from expcore_onedata.sandbox.apptainer import stuck as S
 from expcore_onedata.sandbox.apptainer import stuckread as R
 from expcore_onedata.sandbox.apptainer import stuckrecord as REC
@@ -583,3 +584,52 @@ def test_o97_the_record_keeps_no_blocking_object_of_a_task_and_the_reading_keeps
     found = read(view, survivors(100))
     assert found["reading"][0]["tasks"][0]["blocking"] is not None
     assert all("blocking" not in task for task in found["survivors"][0]["tasks"])
+
+
+def verdict_of(found: dict) -> str:
+    """The attribution's reason for a reading, with the one space `orchard` held down."""
+    return A.attribute(found, {"providers[0]"}, {"orchard": "providers[0]"})["why"]
+
+
+def test_o97_a_task_whose_state_cannot_be_read_makes_the_verdict_unknown_not_agent():
+    """O97 (Codex, final review): a listed task whose `stat` cannot be read may be one in D, so it is never dropped
+    from the reading: the survivor says it left a task out, and the verdict is `blocking_object_unknown` even when
+    every task that was read waits on the held-down space."""
+    view = FakeProcReader()
+    process = reader_in_d(view)
+    process.tasks[101] = {"wchan": "0", "syscall": READ_FD3}  # listed, with no `stat` to read
+    found = read(view, survivors(100))
+    assert found["reading"][0]["tasks_cut"] == 1
+    assert verdict_of(found) == A.UNKNOWN
+    assert found["survivors"][0]["tasks_cut"] == 1  # the record says one task was left out
+
+
+def test_o97_a_maps_file_longer_than_the_read_limit_makes_the_holdings_unknown(monkeypatch):
+    """O97 (Codex, final review): a `maps` read that hit its limit is a partial set, never judged: a mapping past
+    the cut in another space could be the one a page fault waits on."""
+    monkeypatch.setattr(R, "MAPS_LIMIT", 400)
+    view = FakeProcReader()
+    process = view.process(100).task(100, syscall=BLOCKED_OUTSIDE).fd(3, "/data/orchard/a", mnt_id=DATA_MOUNT)
+    process.maps(*[f"/usr/lib/lib{n}.so" for n in range(12)], "/data/meadow/late.so")
+    assert spaces(read(view, survivors(100))) is None
+
+
+def test_o97_a_maps_file_that_just_fits_the_read_limit_is_read_whole(monkeypatch):
+    """O97: the limit is on what is read past it, so a file of exactly the limit is whole, not cut."""
+    view = FakeProcReader()
+    process = view.process(100).task(100, syscall=BLOCKED_OUTSIDE).fd(3, "/data/orchard/a", mnt_id=DATA_MOUNT)
+    process.maps("/data/orchard/lib.so")
+    size = len(process.maps_text())
+    monkeypatch.setattr(R, "MAPS_LIMIT", size)
+    assert spaces(read(view, survivors(100))) == [("data", "orchard")]
+
+
+def test_o97_a_working_directory_that_cannot_be_read_makes_the_holdings_unknown():
+    """O97 (Codex, final review): the working directory is one of the holdings; an unreadable one is not left out of the
+    set, it makes the set unknown: it could be in another space."""
+    view = FakeProcReader()
+    process = view.process(100).task(100, syscall=BLOCKED_OUTSIDE).fd(3, "/data/orchard/a", mnt_id=DATA_MOUNT)
+    process.cwd = None  # its link cannot be read
+    found = read(view, survivors(100))
+    assert spaces(found) is None
+    assert verdict_of(found) == A.UNKNOWN

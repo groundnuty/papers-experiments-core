@@ -69,7 +69,7 @@ FDS_READ = 2048  # the most descriptors of a process read for the holdings rule:
 # lacks its time) and passes the bound as `timeout_s`. A reading is given up on a little before it, so that what was
 # read returns to the deadline before the deadline's own join expires and discards it.
 DIAGNOSE_SHARE = 0.8
-TEXT_LIMIT, MAPS_LIMIT = 1 << 18, 1 << 22
+TEXT_LIMIT, MAPS_LIMIT = 1 << 18, 1 << 20  # a `maps` read one byte past its limit shows the file was cut
 WCHAN = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,63}")
 
 
@@ -173,8 +173,11 @@ class _Reader:
     def _task(self, proc: Survivor, tid: int) -> Task | None:
         base = f"{proc.pid}/task/{tid}"
         stat = P.parse_stat(self.text(f"{base}/stat") or "")
-        if stat is None or stat[1] in ("Z", "X"):
-            return None  # gone, or a zombie: not blocked on anything
+        if stat is None:
+            proc.unread_tasks += 1  # not shown gone: it may be one in D, so it is counted, never dropped
+            return None
+        if stat[1] in ("Z", "X"):
+            return None  # a zombie: not blocked on anything
         task = Task(tid, stat[1])
         wchan = (self.text(f"{base}/wchan", 128) or "").strip()
         task.wchan = wchan if WCHAN.fullmatch(wchan) else None  # `0` on some kernels, and unreadable, read as None
@@ -282,11 +285,12 @@ class _Reader:
         return self._path(proc, self.view.readlink(f"{base}/fd/{fd}")) if fd >= 0 else None
 
     def _holdings(self, proc: Survivor) -> list[Waits] | None:
-        """The holdings rule: the FUSE objects the process holds, None when it holds none or any read failed."""
+        """The holdings rule: the FUSE objects the process holds, None when it holds none or any read failed (a
+        descriptor, the `maps` file whole, the working directory)."""
         self._fuse_fds(proc)
         self._mapped(proc)
-        if not (proc.fds_complete and proc.maps_complete) or proc.mounts is None:
-            return None
+        if not (proc.fds_complete and proc.maps_complete) or proc.mounts is None or proc.cwd is None:
+            return None  # a working directory that could not be read is a holding left out: unknown, never partial
         held = list(proc.fuse_fds or []) + list(proc.maps or [])
         if proc.cwd is not None and (entry := S.mount_of_path(proc.mounts, proc.cwd)) is not None:
             held.append(Waits(self.roles.place(entry, proc.cwd)))
@@ -298,8 +302,8 @@ class _Reader:
         if proc.maps is not None:
             return
         proc.maps = []
-        data = self.view.read(f"{proc.base}/maps", MAPS_LIMIT) if proc.base else None
-        if data is None or proc.mounts is None:
+        data = self.view.read(f"{proc.base}/maps", MAPS_LIMIT + 1) if proc.base else None
+        if data is None or proc.mounts is None or len(data) > MAPS_LIMIT:  # unread, or cut at the limit: a partial set
             proc.maps_complete = False
             return
         seen: set[str] = set()

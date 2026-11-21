@@ -477,7 +477,10 @@ class HostMount:
         earlier generation's log is the one kept when it ended; the live one's is read now and not kept: it stays
         readable as it always was, at each call (`oneclient_log`)."""
         texts = [gen.oneclient_log for gen in self._gens[:-1]]
-        texts.append(None if self._live.oneclient is None else _read_log_link(self.where, directio.LOG_FILE))
+        live = None if self._live.oneclient is None else _read_log_link(self.where, directio.LOG_FILE)
+        if live is not None and live in texts:  # glog's link still names an earlier generation's file:
+            live = None  # this one logged none, so it is unread, never an earlier one's lines judged twice
+        texts.append(live)
         self._snapshot = aggregate([gen.log for gen in self._gens], self.nonce)
         declared = getattr(self.s.mount, "io_mode", None)
         readings = [iomode.judge(declared, None if text is None else text.decode("utf-8", "replace")) for text in texts]

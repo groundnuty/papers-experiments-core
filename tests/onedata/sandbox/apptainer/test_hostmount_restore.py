@@ -241,6 +241,38 @@ def test_o97_oneclients_log_of_each_generation_is_kept_as_it_was_before_the_next
     assert mount.oneclient_log() == b"generation one\ngeneration two\n"
 
 
+FORCED_PROXY = (
+    "I1116 10:00:00.000000  1 logging.cc:1] Forced direct IO: 0\n"
+    "I1116 10:00:00.000000  1 logging.cc:1] Forced proxy IO: 1\n"
+)
+
+
+def test_o97_a_generation_that_wrote_no_log_does_not_pass_on_the_io_mode_of_the_one_before(mount):
+    """O97 (Codex, final review): glog's link keeps naming the old file until the new oneclient logs; a second
+    generation that logged nothing read generation one's lines, so its mode was never judged. It is unknown."""
+    log_dir = mount.where.log_dir
+    (log_dir / "oneclient.host.log.INFO.1").write_text(FORCED_PROXY)
+    (log_dir / "oneclient.INFO").symlink_to("oneclient.host.log.INFO.1")
+    aborted(mount)
+    mount.restore()  # generation two logs nothing: the link still names generation one's file
+    mount.close_watch()
+    assert mount.metadata()["io_mode"]["effective"] == "unknown"
+
+
+def test_o97_a_generation_that_wrote_its_own_log_is_judged_by_it(mount):
+    """O97: the same restore, when generation two's oneclient wrote a log of its own and glog's link moved to it."""
+    log_dir = mount.where.log_dir
+    (log_dir / "oneclient.host.log.INFO.1").write_text(FORCED_PROXY)
+    (log_dir / "oneclient.INFO").symlink_to("oneclient.host.log.INFO.1")
+    aborted(mount)
+    mount.restore()
+    (log_dir / "oneclient.host.log.INFO.2").write_text("Log file created at: 10:05:00\n" + FORCED_PROXY)
+    (log_dir / "oneclient.INFO").unlink()
+    (log_dir / "oneclient.INFO").symlink_to("oneclient.host.log.INFO.2")
+    mount.close_watch()
+    assert mount.metadata()["io_mode"]["effective"] == "proxy"
+
+
 # --------------------------------------------------------------------------------------------------------- the infra
 def test_o97_the_earlier_generation_is_listed_as_stopped_by_the_harness_and_the_live_one_by_its_own_state(mount, node):
     aborted(mount)

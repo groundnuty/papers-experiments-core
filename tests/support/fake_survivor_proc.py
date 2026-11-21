@@ -135,7 +135,8 @@ class FakeProcReader:
         if tid not in process.tasks:
             return None
         if SHARED.fullmatch(tail):
-            return self._shared(process, tail)
+            shared = self._shared(process, tail)
+            return None if shared is None else shared[:limit]  # a real read stops at its limit
         text = process.tasks[tid].get(tail)
         return None if text is None else text.encode()[:limit]
 

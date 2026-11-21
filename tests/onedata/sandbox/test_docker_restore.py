@@ -412,3 +412,26 @@ def test_o97_a_mount_that_does_not_come_up_by_the_restores_time_ends_the_wait_an
     assert answer == {"ok": False, "why": "the restore ran out of its time"}
     assert sbx._clock.now - before < RM.RESTORE_TOTAL_S + 1  # the wait ended at the bound, not a minute past it
     assert not sbx._token_files_left()
+
+
+def test_o97_the_new_sidecars_creation_is_bounded_by_the_restores_time_so_none_completes_after_it(aborted):
+    """O97 (Codex, final review): `docker run` has its own 120 s default, past the restore's 90 and a stop's 100: a
+    creation that outlasts the restore's time could finish after the runner gave the restore up and the teardown
+    looked. It is given the time the restore has left, never more."""
+    sbx, host = aborted.sandbox, aborted.host
+    slows_the_unmount(host, sbx, RM.RESTORE_TOTAL_S - 50)  # 50 s of the restore are left when the sidecar starts
+    real_run, bounds = host.docker, []
+
+    def docker(*args, **kwargs):
+        if args[0] == "run" and "--name" in args and sbx.names.sidecar in args:
+            bounds.append(kwargs.get("timeout"))
+        return real_run(*args, **kwargs)
+
+    host.docker = docker
+    try:
+        assert sbx.restore_mount()["ok"] is True
+    finally:
+        host.docker = real_run
+    assert len(bounds) == 1
+    assert bounds[0] is not None
+    assert 49 <= bounds[0] <= 50  # what was left, and at most the restore's bound

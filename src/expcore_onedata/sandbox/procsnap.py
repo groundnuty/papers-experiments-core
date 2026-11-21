@@ -50,7 +50,8 @@ TASK_CAP = 64  # threads of one process whose state is read; the rest of the lis
 FD_CAP = 256  # fds of one process whose link and info are read
 TEXT_CAP = 262144  # bytes of any one file of the snapshot
 READ_CAP = 4096  # bytes of one `read_at` (a path argument is at most 4 KiB)
-MAPS_CAP = 1048576  # bytes of `maps`
+# bytes of `maps`: one past what the diagnosis accepts (`stuckread.MAPS_LIMIT`), so a longer file reads as cut
+MAPS_CAP = 1048577
 _TASK = r"task/[0-9]+"
 READ = re.compile(rf"stat|{_TASK}/(?:stat|wchan|syscall|mountinfo|maps)|{_TASK}/fdinfo/[0-9]+")
 LINK = re.compile(rf"{_TASK}/(?:root|cwd)|{_TASK}/fd/[0-9]+")
