@@ -517,7 +517,7 @@ def observe(args: argparse.Namespace, environ: Mapping[str, str], hooks: Hooks) 
 
     if not os.path.isabs(args.fleet):
         raise ConfigError("--fleet must be an absolute path")
-    read = fleetobserve.observe(Path(args.fleet), environ, hooks.runner(), hooks.clock())
+    read = fleetobserve.observe(Path(args.fleet), environ, hooks.runner(), hooks.clock)
     hooks.say(json.dumps(read, sort_keys=True))
     return 0
 
