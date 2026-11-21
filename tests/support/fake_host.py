@@ -268,11 +268,11 @@ class FakeHost:
         # volume mount under it, so a mount stacked on the bind is propagated to that peer as well (measured on the
         # study VM: two entries, one device). On by default, so no test assumes one entry; a test may turn it off
         self.fuse_peer_entry = True
-        # the kernel hands a freed device number to the next mount, depending on how soon the dead superblock is
-        # released (measured live: one restore came up on the dead mount's device number, another on a new one). With
-        # this on, a path keeps the device number it first had across unmounts and remounts, while its mount id is a new
-        # one each time, as the kernel's is
-        self.reuse_freed_devices = False
+        # the kernel hands a freed device number and mount id to the next mount, depending on how soon the dead mount is
+        # released (measured live: three restores, one on new numbers, one on the dead mount's device number, one on its
+        # mount id). With this on, a path keeps the device number and the mount id it first had across unmounts and
+        # remounts
+        self.reuse_freed_numbers = False
         self._device_of: dict[str, int] = {}
         # the bytes of a process's memory (`/proc/<pid>/task/<tid>/mem`), by that path, for the diagnosis's root half
         self.proc_bytes: dict[str, bytes] = {}
@@ -374,9 +374,9 @@ class FakeHost:
 
     def _device(self, path: str, mount_id: int) -> str:
         """The device a mount at `path` with `mount_id` shows: its own number, or the path's first when freed numbers
-        are reused (`reuse_freed_devices`)."""
+        are reused (`reuse_freed_numbers`)."""
         first = self._device_of.setdefault(path, mount_id)
-        return f"0:{60 + (first if self.reuse_freed_devices else mount_id)}"
+        return f"0:{60 + (first if self.reuse_freed_numbers else mount_id)}"
 
     def _mount_id(self, path: str) -> int:
         if path not in self.mount_ids:
@@ -603,7 +603,10 @@ class FakeHost:
                 if target in self.stuck_mounts:
                     return CmdResult(1, "", "busy")
                 self.mounts.pop(target, None)
-                self.mount_ids.pop(target, None)  # mounted again, it is another mount
+                if not self.reuse_freed_numbers:
+                    self.mount_ids.pop(
+                        target, None
+                    )  # mounted again, it is another mount (unless the numbers come back)
                 return CmdResult(0)
             case "rm" if "-rf" in argv:
                 writable(argv[-1])  # root removes what is read-only; this user must make it writable first

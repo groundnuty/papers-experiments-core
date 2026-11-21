@@ -1429,11 +1429,6 @@ class DockerSandbox:
         found = TD._fuse_at(self.host, mountpoint, self.waits)
         if found is None:
             return RM.HOST_TABLE
-        old_mounts = RM.mount_ids_at(
-            self._host_table(), mountpoint
-        )  # the dead mount's kernel ids, before it is unmounted
-        if old_mounts is None:
-            return RM.HOST_TABLE
         self._close_generation(generation - 1)  # its log is read from the host, before anything of it is removed
         try:
             hostops.remove_container(self.host, self.names.sidecar)
@@ -1468,7 +1463,6 @@ class DockerSandbox:
             self._agent_table(),
             share=mountpoint,
             mount_path=str(self.s.mount.path),
-            old_mounts=old_mounts,
         )
 
     def _clear_agent_copy(self) -> str | None:
