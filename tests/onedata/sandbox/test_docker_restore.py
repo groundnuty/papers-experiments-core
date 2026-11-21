@@ -371,6 +371,91 @@ def test_o97_a_copy_of_the_dead_mount_that_cannot_be_detached_fails_the_restore_
     host.run_handlers.pop("nsenter")
 
 
+def stale_agent_table(device: str) -> str:
+    """The agent's own table with a copy of the dead mount still in it, on `device`."""
+    return f"1 0 8:1 / / ro - overlay overlay ro\n99 25 {device} / /data ro - fuse.oneclient s ro\n"
+
+
+def test_o97_the_bar_alone_cannot_tell_a_stale_agent_entry_on_a_reused_device_from_the_new_mount():
+    """O97: why the restore must PROVE the dead mount gone from the agent's table before the new sidecar starts, and not
+    leave it to the bar: the kernel hands the new mount the dead one's device number, so a copy of the dead mount still
+    in the agent's table is on the very device the host's table shows. The bar, which only asks that the agent's entry
+    is on the host's device, passes it. The proof is `DockerSandbox._clear_agent_copy`, before the sidecar."""
+    root = "1 0 8:1 / / rw - ext4 /dev/root rw\n"
+    host_new = root + "1394 1 0:115 / /run/share rw - fuse.oneclient s rw\n"
+    stale = root + "99 25 0:115 / /data ro - fuse.oneclient s ro\n"  # the dead mount's copy, on the reused number
+    assert RM.bar(host_new, stale, share="/run/share", mount_path="/data") is None
+
+
+def test_o97_a_stale_agent_entry_on_the_reused_device_that_cannot_be_detached_fails_the_restore_before_a_sidecar(
+    aborted,
+):
+    """O97: the dead mount's copy stays in the agent's table, on the device the new mount will take again (the kernel
+    reuses it): the restore fails in fixed words before it writes the token or starts the sidecar. Without that step the
+    bar would pass the stale entry as the new mount's, and the next cell would read a dead directory."""
+    sbx, host = aborted.sandbox, aborted.host
+    host.reuse_freed_numbers = True
+    agent = host.containers[sbx.names.agent]
+    host.ns_override[agent.pid] = stale_agent_table(aborted.devices[0])
+    host.run_handlers["nsenter"] = lambda argv: CmdResult(1, "", "busy")
+    start = len(host.calls)
+    assert sbx.restore_mount() == {"ok": False, "why": "the dead mount is still in the agent's mount table"}
+    assert ("docker", "run", ()) not in calls_after(host, start)
+    assert not sbx._token_files_left()
+    host.ns_override.clear()
+    host.run_handlers.pop("nsenter")
+
+
+def test_o97_a_stale_agent_entry_on_the_reused_device_is_detached_and_the_restore_then_passes(aborted):
+    """O97: the same stale copy on the reused device, but it can be detached: it is detached from inside the agent's
+    namespace, shown gone, and only then does the new sidecar start; the next cell runs on the new mount."""
+    sbx, host = aborted.sandbox, aborted.host
+    host.reuse_freed_numbers = True
+    agent = host.containers[sbx.names.agent]
+    host.ns_override[agent.pid] = stale_agent_table(aborted.devices[0])
+    order: list[str] = []
+
+    def nsenter(argv):
+        order.append("detach")
+        host.ns_override.pop(agent.pid)
+        return CmdResult(0)
+
+    host.run_handlers["nsenter"] = nsenter
+    real_docker = host.docker
+
+    def docker(*args, **kwargs):
+        if args[0] == "run" and sbx.names.sidecar in args:
+            order.append("new sidecar")
+        return real_docker(*args, **kwargs)
+
+    host.docker = docker
+    try:
+        assert sbx.restore_mount()["ok"] is True
+    finally:
+        host.docker = real_docker
+    assert order == ["detach", "new sidecar"]
+    assert sbx.exec("print(1)", 30).exit_code == 0
+
+
+def test_o97_an_agent_table_that_cannot_be_read_is_never_taken_for_clean(aborted):
+    """O97: unknown is never gone: the agent's table cannot be read (and its namespace is not shown gone), so the
+    restore fails before a sidecar starts."""
+    sbx, host = aborted.sandbox, aborted.host
+    real = host.run_handlers.get("cat")
+
+    def refuses_the_agents_table(argv):
+        if "mountinfo" in argv[1]:
+            return CmdResult(1, "", "denied")
+        return real(argv) if real else host._run_default(argv)
+
+    host.run_handlers["cat"] = refuses_the_agents_table
+    start = len(host.calls)
+    answer = sbx.restore_mount()
+    host.run_handlers.pop("cat")
+    assert answer == {"ok": False, "why": "the dead mount is still in the agent's mount table"}
+    assert ("docker", "run", ()) not in calls_after(host, start)
+
+
 def test_o97_a_restore_given_up_on_while_it_waits_for_the_mount_stops_waiting_and_adds_nothing(aborted):
     """O97: the new sidecar is started but its mount does not come up in time for a stop that waited its bound: the
     runner gives the restore up (nothing is pending any more), and the restore leaves its wait at the next look instead
