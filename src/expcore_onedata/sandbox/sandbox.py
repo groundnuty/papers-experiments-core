@@ -431,6 +431,7 @@ class DockerSandbox:
         self._checkpoint()
         self._start_agent(work, share, gate_ip, list(hosts))  # binds the share before the FUSE mount is stacked on it
         if share is not None:
+            self._checkpoint()  # an abandoned start writes no token and starts no sidecar
             self._start_mount(share)
             self._wait_agent_mount(share)
         self._init_sleep = self._identify_init_sleep()  # before any cell: a probe's process would be one more

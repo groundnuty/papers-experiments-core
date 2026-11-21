@@ -1335,6 +1335,28 @@ def test_o15_an_abandoned_start_creates_nothing_and_a_start_abandoned_midway_rem
     assert midway.stopped
 
 
+def test_o97_a_mount_start_abandoned_after_the_agent_started_makes_no_sidecar(world):
+    """O97 (Codex, final review): the agent is now started before the sidecar, so the abandonment checkpoint between
+    them is the one that keeps a cancelled launch from writing the token and starting the sidecar."""
+    midway = DockerSandbox(world.host, world.s, make_spec(world, "mounted"), **start_options(world))
+    original, made = world.host.docker, []
+
+    def abandon_when_the_agent_is_up(*args, **kwargs):
+        done = original(*args, **kwargs)
+        if args[0] == "run" and "/dev/fuse" in args:
+            made.append("sidecar")
+        if args[0] == "run" and "--init" in args:  # the agent's `docker run`: the sidecar is next
+            midway.abandon()
+        return done
+
+    world.host.docker = abandon_when_the_agent_is_up
+    with pytest.raises(SandboxError, match="abandoned"):
+        midway.begin()
+    assert made == []
+    assert nothing_left(world)
+    assert midway.stopped
+
+
 def test_o15_a_stop_that_ran_during_the_start_is_not_the_last_word_on_the_sandbox(world):
     """O15: what the start registers after a stop began leaves the sandbox not stopped, so the next stop runs."""
     sbx = DockerSandbox(world.host, world.s, make_spec(world, "isolated"), **start_options(world))
