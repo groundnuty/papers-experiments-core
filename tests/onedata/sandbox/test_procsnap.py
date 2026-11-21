@@ -99,7 +99,7 @@ def test_o97_a_read_past_the_snapshot_is_answered_alone_and_the_memory_at_an_off
     assert base64.b64decode(answer[0]["b64"]) == b"/data/space-a/other\0"
     assert "7f00-7f10" in answer[1]["text"]
     assert answer[2]["link"] == "/data/space-a/file"
-    assert answer[3]["list"] == ["31", "32"]
+    assert sorted(answer[3]["list"]) == ["31", "32"]  # a directory's order is the file system's: not part of the answer
 
 
 @pytest.mark.parametrize(
