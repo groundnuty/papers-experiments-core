@@ -219,7 +219,9 @@ def beat(root: Path, wall: Callable[[], float] = time.time, stale_s: float = REL
     if record is None or record.get("format") != FORMAT or not _ID.fullmatch(str(record.get("nonce", ""))):
         return None
     at = record.get("wall")
-    if isinstance(at, bool) or not isinstance(at, int | float) or wall() - at > stale_s:  # one-sided: newer is live
+    if isinstance(at, bool) or not isinstance(at, int | float) or not math.isfinite(at):
+        return None  # no wall time: an infinity or a NaN is no time a relay wrote
+    if wall() - at > stale_s:  # one-sided: a heartbeat newer than the reading is live
         return None
     return record
 

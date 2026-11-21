@@ -30,6 +30,7 @@ never taken for ended. A quota that cannot be read is reported (`inodes_error`) 
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -176,7 +177,8 @@ def relay_view(
     record = heartbeat(root) or {}
     reading = clock()
     at = record.get("wall")
-    at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None
+    usable = isinstance(at, (int, float)) and not isinstance(at, bool) and math.isfinite(at)  # no infinity, no NaN
+    at = float(at) if usable else None
     if at is None or reading - at > RELAY_STALE_S:
         return "gone", at
     pid, start = record.get("pid"), record.get("start")

@@ -443,6 +443,20 @@ def test_c65_a_heartbeat_newer_than_the_readers_clock_is_live(tmp_path):
         assert beat(root, lambda: written - 600) is not None
 
 
+@pytest.mark.parametrize("wall", [float("inf"), float("nan")])
+def test_c65_a_heartbeat_whose_wall_time_is_an_infinity_or_a_nan_is_no_live_relay(tmp_path, wall):
+    """C65: with staleness one-sided, a wall time that is no time (an infinity is newer than every reading, and a NaN
+    is never older) must not read as live."""
+    root = root_of(tmp_path)
+    relay = relay_of(root, Verbs())
+    with relay.holding():
+        path = relay_dir(root) / "heartbeat.json"
+        record = json.loads(path.read_text())
+        assert beat(root) is not None
+        path.write_text(json.dumps({**record, "wall": wall}))
+        assert beat(root) is None
+
+
 def test_o58_the_relay_never_holds_a_secret_in_its_environment_and_its_verbs_get_a_clean_one(tmp_path):
     """O58: a relay started with a secret-like name in its environment refuses to start (names only in the refusal),
     and the verbs it runs get a few plain names of its environment, never anything else."""
