@@ -1,7 +1,7 @@
 """C65: the fleet's read of a member's fault relay (deploy/hpc-federation/fleetobserve.py) ages the heartbeat against a
-clock read when that member's heartbeat is read, not one taken before the walk, and a heartbeat newer than the reading
-is live. A walk over many members' slow site reads takes minutes, and with one reading taken at its start every member
-read after the first 30 s had a live heartbeat newer than that reading and read as a relay gone."""
+clock read when that member's heartbeat is read, not one taken before the walk. A walk over many members' slow site
+reads takes minutes, and with one reading taken at its start every member read after the first 30 s had a live
+heartbeat written after that reading, more than 30 s from it, and read as a relay gone."""
 
 import json
 from pathlib import Path
@@ -136,12 +136,21 @@ def test_c65_a_member_with_no_usable_heartbeat_is_gone(deploy, tmp_path, what):
     assert (view["relay"], view["relay_beat_at"]) == ("gone", None)
 
 
-@pytest.mark.parametrize("ahead_s", [5.0, 45.0])
-def test_c65_a_heartbeat_newer_than_the_reading_is_live(deploy, tmp_path, ahead_s):
-    """C65: a heartbeat stamped after the reading (the walk's clock behind it, or clock jitter) is live, however far:
-    only one older than the reading by more than the bound is gone."""
+def test_c65_a_heartbeat_5_s_newer_than_the_reading_is_live(deploy, tmp_path):
+    """C65: a heartbeat stamped 5 s after the reading (clock jitter between the relay's write and this read) is live."""
     site = FakeSite(tmp_path / "site-a", deploy)
     path = member(site)
-    beat_at(path, site.now + ahead_s)
+    beat_at(path, site.now + 5.0)
     view = observed(site)["members"][0]
-    assert (view["relay"], view["relay_beat_at"]) == ("here", site.now + ahead_s)
+    assert (view["relay"], view["relay_beat_at"]) == ("here", site.now + 5.0)
+
+
+def test_c65_a_heartbeat_60_s_newer_than_the_reading_is_gone(deploy, tmp_path):
+    """C65: the reading is taken right after the heartbeat is read, so a genuine heartbeat is at most clock jitter
+    ahead of it; one 60 s ahead (a clock stepped, a time nobody wrote) is not a relay's proof of life, and a relay that
+    died then does not read live until the reader's clock catches up."""
+    site = FakeSite(tmp_path / "site-a", deploy)
+    path = member(site)
+    beat_at(path, site.now + 60.0)
+    view = observed(site)["members"][0]
+    assert (view["relay"], view["relay_beat_at"]) == ("gone", site.now + 60.0)

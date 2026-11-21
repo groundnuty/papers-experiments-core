@@ -21,9 +21,10 @@ It reads, and never writes, submits or cancels:
   (`<root>/fault-relay/heartbeat.json`, on the shared filesystem) and whether the process it names (pid and start
   tick) is one of this login node's. A heartbeat older than the relay's own staleness bound, or none, is `gone`; a
   live one is `here` or `elsewhere` (relays stay on the login node their up ran on, and the controller budgets this
-  login node's memory). The age is taken against a clock read when that member's heartbeat is read, never one taken
-  before the walk (the walk's site reads take minutes, and a heartbeat written meanwhile is newer than that reading),
-  and only an older one is stale: a heartbeat newer than the reading is live (C65).
+  login node's memory). The heartbeat is compared with a clock read when that member's heartbeat is read, never one
+  taken before the walk (the walk's site reads take minutes, and a heartbeat written meanwhile is newer than that
+  reading); a genuine one is written before it is read, so it is at most clock jitter ahead of the reading, and one
+  more than the staleness bound from the reading on either side is `gone` (C65).
 
 A job read that fails, or a job state that is neither waiting, running nor ended, fails the whole read: unknown is
 never taken for ended. A quota that cannot be read is reported (`inodes_error`) and leaves no room for an add.
@@ -60,7 +61,7 @@ ENDING = ("COMPLETING",)  # ending now: not yet ended, and no longer usable
 NODE_LINE = re.compile(r"([a-z_]+[^\s]*) ([0-9]{1,9})")
 SINFO_TIMEOUT_S = 60.0
 RELAY_DIR, HEARTBEAT = "fault-relay", "heartbeat.json"  # `expcore_onedata.fault_relay.relay_dir`, its heartbeat
-RELAY_STALE_S = 30.0  # `expcore_onedata.fault_relay.RELAY_STALE_S`: a heartbeat older than this, no relay answers
+RELAY_STALE_S = 30.0  # `expcore_onedata.fault_relay.RELAY_STALE_S`: a heartbeat this far from the reading is no relay
 
 
 class ObserveError(RuntimeError):
@@ -169,9 +170,10 @@ def relay_view(
 ) -> Tuple[str, Optional[float]]:
     """The member's fault relay: `none` unless its up recorded it serving; `gone` with no live heartbeat; else `here`
     when the process the heartbeat names (pid and start tick) is this login node's, `elsewhere` when not. With the
-    last heartbeat's wall time. A heartbeat is live unless the reading is more than `RELAY_STALE_S` past its wall time:
-    the reading is taken here, right after the heartbeat is read (the walk's earlier site reads are slow, and a
-    reading taken before them is older than a heartbeat written meanwhile), and a heartbeat newer than it is live."""
+    last heartbeat's wall time. A heartbeat is live unless its wall time is more than `RELAY_STALE_S` from the reading
+    on either side. The reading is taken here, right after the heartbeat is read (the walk's earlier site reads are
+    slow, and a reading taken before them is far older than a heartbeat written meanwhile), so a genuine heartbeat,
+    written before it is read, is at most clock jitter ahead of it; one further ahead is no relay's proof of life."""
     if not state or hpcstate.relay_of(dict(state)) != "serving":
         return "none", None
     record = heartbeat(root) or {}
@@ -179,7 +181,7 @@ def relay_view(
     at = record.get("wall")
     usable = isinstance(at, (int, float)) and not isinstance(at, bool) and math.isfinite(at)  # no infinity, no NaN
     at = float(at) if usable else None
-    if at is None or reading - at > RELAY_STALE_S:
+    if at is None or abs(reading - at) > RELAY_STALE_S:
         return "gone", at
     pid, start = record.get("pid"), record.get("start")
     start = (
