@@ -88,11 +88,25 @@ def _wait(node: NodeOps, process: Spawned, wait_s: float, sleep: Callable[[float
         sleep(POLL_S)
 
 
+def wait_gone(
+    node: NodeOps,
+    process: Spawned,
+    wait_s: float,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool | None:
+    """Whether the process is shown gone within `wait_s` (False when it is still there, None when that could not be
+    told): the wait `stop` makes after each signal, for a caller that signals by itself."""
+    return _wait(node, process, wait_s, sleep, clock)
+
+
 def stop(
     node: NodeOps,
     helper: Helper,
     *,
     term_wait_s: float = TERM_WAIT_S,
+    kill_wait_s: float = KILL_WAIT_S,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
@@ -103,7 +117,7 @@ def stop(
     note["ended_on_term"] = gone
     if gone is False:
         note["kill"] = node.signal(helper.process.pid, helper.process.start, signal.SIGKILL)
-        gone = _wait(node, helper.process, KILL_WAIT_S, sleep, clock)
+        gone = _wait(node, helper.process, kill_wait_s, sleep, clock)
     note["exit_status"] = node.exit_status(helper.process)
     if gone is not True:
         raise SandboxError(f"the {helper.role} could not be shown gone after its stop")
@@ -115,4 +129,4 @@ def output(helper: Helper) -> str:
     return _read(helper.stderr) + _read(helper.stdout)
 
 
-__all__ = ["Helper", "output", "start", "stop"]
+__all__ = ["Helper", "output", "start", "stop", "wait_gone"]

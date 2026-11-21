@@ -12,7 +12,10 @@ processes are found and killed, and what says it was killed.
   Apptainer itself could not start (`argv.apptainer_failed`) names that cause: its program did not run.
 * **The processes** of the run are the watch's (`watch.Watch.members`): every process in a PID namespace of the
   run's. At the cap the harness's timer kills them through their pidfds (`deadline.enforce`), and one that outlives
-  the kill past the grace orders the sandbox's stop (there is no mount to abort). After every exec, whatever of the
+  the kill past the grace has the run's FUSE connection aborted when it has one (`HostMount.abort`: fusectl, else
+  oneclient's death). A survivor that ends then and was the agent's leaves the run standing with the mount to be
+  restored (`HostMount.restore`, O97); any other ends the run, and one the abort did not free, or a run with no mount of
+  the harness's own to abort, orders the sandbox's stop. After every exec, whatever of the
   cell is left is killed and shown gone: a cell's processes end with it, as on Docker, whose runner sweeps what a cell
   detached into a session of its own (`sandbox/cells.py`, `_sweep`, O72). Here the end of the cell's PID namespace
   ends them anyway, and this runner's own `_sweep` shows it. One that cannot be shown gone ends the run as

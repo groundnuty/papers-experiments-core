@@ -54,7 +54,7 @@ import re
 import time
 from pathlib import Path
 
-from expcore_onedata.sandbox import hostops
+from expcore_onedata.sandbox import fusectl, hostops
 from expcore_onedata.sandbox import procsignal as PS
 from expcore_onedata.sandbox.hostops import HostOps
 
@@ -76,7 +76,7 @@ def _read(host: HostOps, path: Path | str) -> str | None:
 
 PROC = Path("/proc")
 CGROUP_ROOT = Path("/sys/fs/cgroup")
-FUSECTL = Path("/sys/fs/fuse/connections")
+FUSECTL = fusectl.FUSECTL
 SIDECAR_SUFFIX = "-oneclient"
 SIDECAR_MOUNT = "/mnt/oneclient"  # where the sidecar mounts (Sandbox._start_mount)
 TEARDOWN_LOG_DIR = "_teardown"  # under the sandboxes' work root: <work_root>/_teardown/<sid>.jsonl
@@ -397,9 +397,9 @@ def _fuse_at(host: HostOps, mp: str, waits: Waits) -> list[dict] | None:
 
 
 def _conn(dev: str) -> str | None:
-    """The fusectl directory name of a FUSE mount's device ("0:N" -> "N")."""
-    major, _, minor = dev.partition(":")
-    return minor if major == "0" and minor.isdigit() else None
+    """The fusectl directory name of a FUSE mount's device ("0:N" -> "N"): the parse the Apptainer host mount shares
+    (`fusectl.conn`)."""
+    return fusectl.conn(dev)
 
 
 def _waiting(host: HostOps, devs: list[str], waits: Waits) -> dict:
