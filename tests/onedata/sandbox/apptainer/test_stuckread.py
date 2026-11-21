@@ -49,9 +49,8 @@ def test_o97_a_reader_blocked_on_a_data_file_is_found_by_its_descriptor():
     fd_object = {"via": "fd", "cut": False, "objects": [{"mount": "data", "space": "orchard", "path": "a.bin"}]}
     assert blocking(found) == fd_object
     survivor = found["survivors"][0]
-    assert survivor["tasks"] == [
-        {"state": "D", "wchan": "request_wait_answer", "syscall": {"nr": 0, "fd": 3}, "blocking": fd_object}
-    ]
+    # the verdict read `blocking` (in the `reading`, above); the record's closed list of task keys holds none
+    assert survivor["tasks"] == [{"state": "D", "wchan": "request_wait_answer", "syscall": {"nr": 0, "fd": 3}}]
     assert survivor["waits_on"] == [
         {
             "fd": 3,
@@ -573,3 +572,14 @@ def test_o97_a_reader_blocked_past_the_join_returns_what_it_read_before_the_time
     assert spaces(found, process=0) == [("data", "orchard")]
     assert blocking(found, process=1) is None
     assert [(e["pid"], e["start"]) for e in found["reading"]] == [(100, "5000"), (200, "6000")]
+
+
+def test_o97_the_record_keeps_no_blocking_object_of_a_task_and_the_reading_keeps_it():
+    """O97: the closed list of a recorded task's keys (`records.cell_deadline.TASK_KEYS`) has no `blocking`: it is what
+    the attribution reads, in the uncapped `reading`, and never what the record keeps, though it passes the schema's
+    check as the deadline's record."""
+    view = FakeProcReader()
+    reader_in_d(view)
+    found = read(view, survivors(100))
+    assert found["reading"][0]["tasks"][0]["blocking"] is not None
+    assert all("blocking" not in task for task in found["survivors"][0]["tasks"])

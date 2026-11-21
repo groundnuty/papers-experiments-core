@@ -153,7 +153,12 @@ def survivor_record(entry: Mapping[str, Any]) -> dict[str, Any]:
     kept: dict[str, Any] = {"comm": entry["comm"], "state": entry["state"]}
     tasks = entry["tasks"]
     if tasks is not None:
-        shown = sorted(tasks, key=lambda task: task["state"] != "D")[:TASKS_KEPT]
+        # a task's `blocking` is what the verdict read: the record's closed list of task keys (`records.cell_deadline`)
+        # holds no such key, so it is left out here, and the thing it waits on is the survivor's `waits_on`
+        shown = [
+            {key: value for key, value in task.items() if key != "blocking"}
+            for task in sorted(tasks, key=lambda task: task["state"] != "D")[:TASKS_KEPT]
+        ]
         kept.update(tasks=shown, tasks_cut=len(tasks) - len(shown), waits_on=entry["waits_on"][:WAITS_KEPT])
     if "cwd_mount" in entry:
         kept["cwd_mount"] = entry["cwd_mount"]
