@@ -197,6 +197,7 @@ def test_reaping_an_orphan_with_a_live_mount_goes_through_the_ordered_teardown(w
 def only_the_namespaces_can_prove_it(host):
     """The host's copy of the mount unmounts; neither container's own mount table can be read; the FUSE connection's
     abort is refused. Whether a container still holds a copy then rests on whether its process is gone."""
+    host.ns_mountinfo = False  # the containers' own mount tables cannot be read
     for n in range(100, 104):
         host.files[f"/sys/fs/fuse/connections/{n}"] = ""
     host.run_handlers["sh"] = lambda argv: CmdResult(1, "", "denied")

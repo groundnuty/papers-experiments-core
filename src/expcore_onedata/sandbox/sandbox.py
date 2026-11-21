@@ -427,9 +427,12 @@ class DockerSandbox:
             self._checkpoint()
         gate_ip = self._start_gate() if mode is DataPathMode.REST else None
         self._checkpoint()
-        share = self._start_mount() if mode is DataPathMode.MOUNT else None
+        share = self._prepare_share() if mode is DataPathMode.MOUNT else None
         self._checkpoint()
-        self._start_agent(work, share, gate_ip, list(hosts))
+        self._start_agent(work, share, gate_ip, list(hosts))  # binds the share before the FUSE mount is stacked on it
+        if share is not None:
+            self._start_mount(share)
+            self._wait_agent_mount(share)
         self._init_sleep = self._identify_init_sleep()  # before any cell: a probe's process would be one more
         self._checkpoint()
         roles = {"agent": self.names.agent} | ({"gate": self.names.gate} if gate_ip else {})
@@ -709,17 +712,20 @@ class DockerSandbox:
         """Whether any of the run's copies of the token is still on the host: looked at, never assumed from a step."""
         return any(os.path.lexists(path) for path in self._token_files)
 
-    def _start_mount(self) -> Path:
-        """Start the oneclient sidecar on a shared mount point; its token goes in a file bound into it alone, read-only,
-        never in an argument or in docker's configuration of the container (O05)."""
-        s, sp, names = self.s, self.spec, self.names
+    def _prepare_share(self) -> Path:
+        """The shared mount point of a mount run: a directory made a shared mount of itself (`mount --bind`,
+        `--make-rshared`). **The agent binds it before the FUSE mount is stacked on it** (`start`, `_wait_agent_mount`):
+        a bind taken after is a clone of the FUSE mount itself, which a later unmount on the host does not reach and
+        whose replacement never propagates in (so no restore could show the agent its new mount). Taken from the bare
+        share, the agent's bind is a slave of it: the sidecar's FUSE mount propagates in, the host's unmount of it
+        propagates in too, and so does the next generation's mount."""
+        s = self.s
         share = self.dir / "mount"
         share.mkdir()
         self._note_mount(share)
         self.host.run(["mount", "--bind", str(share), str(share)], 60, sudo=True)
         self.host.run(["mount", "--make-rshared", str(share)], 60, sudo=True)  # so the sidecar's mount propagates out
         self._note_mounted(share)
-        host_name = sp.provider.host
         self._meta["mount"] = {  # the keys that set it, never a path or a name (O12); its TLS is the run's `tls`
             "io_mode": s.mount.io_mode,  # the declared one, always: oneclient's own detection never runs (O36)
             "options": sidecar_options(s),  # what the sandbox itself passes to oneclient, in order
@@ -732,6 +738,15 @@ class DockerSandbox:
         log_dir = self.dir / LOG_DIR  # oneclient's log is bound here, owner-only, and kept with the run's evidence
         log_dir.mkdir(mode=0o700)
         log_dir.chmod(0o700)  # whatever the driver's umask
+        return share
+
+    def _start_mount(self, share: Path) -> None:
+        """Start the oneclient sidecar on the prepared share, which stacks the FUSE mount on it (the agent's bind of the
+        share, taken before, receives it); its token goes in a file bound into it alone, read-only, never in an
+        argument or in docker's configuration of the container (O05)."""
+        s, sp, names = self.s, self.spec, self.names
+        host_name = sp.provider.host
+        log_dir = self.dir / LOG_DIR
         self._register_container(names.sidecar)
         t0 = time.monotonic()
         args = sidecar_run_args(
@@ -758,7 +773,26 @@ class DockerSandbox:
         build = sidecar_build(self.host, names.sidecar, s.oneclient.id)  # O65: execs in the running sidecar, never a cp
         with self._meta_lock:  # `metadata()` may be reading it from another thread
             self._meta["mount"]["oneclient_build"] = build
-        return share
+
+    def _wait_agent_mount(self, share: Path) -> None:
+        """Until the agent container's own mount table shows the run's FUSE mount at the mount path, once and on the
+        device the host shows at the share (`remount.bar`, as the restore's bar): read from the two tables, never through
+        the mount, for at most `MOUNT_WAIT_S`. The mount propagates in as it is made, so this normally holds at the first
+        look; one that does not reach the agent (a dockerd in a private or slave mount namespace) fails the start, since
+        the agent's mount path is first a bare read-only bind, which answers a write with EROFS as the mount does: the
+        read-only probe (`_verify_read_only`, O20) would pass on it. It runs before the probe and before any cell."""
+        mountpoint, deadline = TD.host_path(share), self._clock() + MOUNT_WAIT_S
+        while True:
+            why = RM.bar(
+                self._host_table(), self._agent_table(), share=mountpoint, mount_path=str(self.s.mount.path),
+                old_devices=(),
+            )  # fmt: skip
+            if why is None:
+                return
+            if self._clock() > deadline:
+                log.error("the data mount did not reach the agent container: %s", why)
+                raise SandboxError(f"the data mount did not reach the agent container ({why})")
+            self._sleep(0.2)
 
     # ------------------------------------------------------------------------------------------------ the read log
     def _start_readlog(self) -> None:

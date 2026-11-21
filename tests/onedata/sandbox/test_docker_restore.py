@@ -12,12 +12,14 @@ import json
 
 import pytest
 from deadline_support import cell_processes  # noqa: F401  (the fixtures' cell)
+from sandbox_support import make_spec, start_options
 
 from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import hostops
 from expcore_onedata.sandbox import remount as RM
+from expcore_onedata.sandbox.api import SandboxError
 from expcore_onedata.sandbox.hostops import CmdResult
-from expcore_onedata.sandbox.sandbox import TOKEN_FILE
+from expcore_onedata.sandbox.sandbox import TOKEN_FILE, DockerSandbox
 
 ATTRIBUTION = {"verdict": "agent", "why": "blocked_on_held_down_holder", "target": "providers[1]", "space_holder": "x"}
 
@@ -435,3 +437,46 @@ def test_o97_the_new_sidecars_creation_is_bounded_by_the_restores_time_so_none_c
     assert len(bounds) == 1
     assert bounds[0] is not None
     assert 49 <= bounds[0] <= 50  # what was left, and at most the restore's bound
+
+
+def fuse_in_agent(host, sandbox) -> list[dict]:
+    """The FUSE mounts the agent container's own mount table shows at the mount path."""
+    table = host.agent_mountinfo(host.containers[sandbox.names.agent].pid)
+    return [m for m in hostops.fuse_mounts(table) if m["mountpoint"] == str(sandbox.s.mount.path)]
+
+
+def test_o97_the_agent_is_bound_to_the_bare_share_before_the_sidecar_stacks_the_fuse_mount_on_it(world, mounted):
+    """O97: the start binds the share into the agent (`rslave`) before the sidecar mounts on it. A bind taken after is a
+    clone of the FUSE mount (`test_mount_propagation_real`): the host's unmount would not reach it and the next
+    generation's mount would never appear. The agent still shows the mount once, as it propagated in."""
+    names = list(world.host.containers)
+    assert names.index(mounted.names.agent) < names.index(mounted.names.sidecar)
+    agent = world.host.containers[mounted.names.agent]
+    assert agent.options["_stacked"] == {}  # no FUSE mount was on the share when the agent's bind was taken
+    assert len(fuse_in_agent(world.host, mounted)) == 1
+
+
+def test_o97_a_start_whose_mount_never_reaches_the_agent_fails_before_the_read_only_probe(world, monkeypatch):
+    """O97: the agent's own table must show the mount before any cell runs. Its mount path is first a bare read-only
+    bind, which answers a write with EROFS as the mount does, so the read-only probe would pass on it (a false pass of
+    the mount check); the start fails instead, and the probe never runs."""
+    monkeypatch.setattr(world.host, "agent_mountinfo", lambda pid: "1 0 8:1 / / ro - overlay overlay ro\n")
+    probed = []
+    monkeypatch.setattr(DockerSandbox, "_verify_read_only", lambda self: probed.append(True))
+    options = start_options(world)
+    with pytest.raises(SandboxError, match="did not reach the agent container"):
+        DockerSandbox.start(world.host, world.s, make_spec(world, "mounted"), **options)
+    assert probed == []
+    assert options["clock"].now >= 60  # it waited the mount's whole bound, `MOUNT_WAIT_S`, before it gave up
+
+
+def test_o97_an_agent_bound_after_the_mount_was_stacked_fails_the_restore_closed(aborted):
+    """O97: the layout the start no longer makes. The agent's bind is a clone of the FUSE mount (the fake models it as
+    the kernel does), the restore detaches the clone, and the next generation never appears in the agent's table: the
+    restore fails in fixed words and the run ends, never a cell on a dead or bare directory."""
+    sbx, host = aborted.sandbox, aborted.host
+    agent = host.containers[sbx.names.agent]
+    agent.options["_stacked"] = {str(sbx.s.mount.path): host._mount_id(share_of(sbx))}
+    assert len(fuse_in_agent(host, sbx)) == 1  # the clone of generation one
+    assert sbx.restore_mount() == {"ok": False, "why": "the new mount is not in the agent's mount table"}
+    assert fuse_in_agent(host, sbx) == []

@@ -259,9 +259,10 @@ class FakeHost:
         self.mount_ids: dict[str, int] = {}  # a mount keeps its id when the directory above it is renamed
         self._next_mount_id = 40  # an unmounted path that is mounted again is a new mount, with an id of its own
         # the agent container's own mount table (`/proc/<pid>/mountinfo` of its init, read as root): the shares bound
-        # into it with `rslave` and the FUSE mounts on them, as mount propagation shows them there. Off by default: the
-        # tests that read it set `ns_mountinfo`, and `ns_override` gives a table (by pid) in place of that one
-        self.ns_mountinfo = False
+        # into it with `rslave` and the FUSE mounts on them, as the kernel's mount propagation shows them there (see
+        # `agent_mountinfo`). On by default, since the start reads it (`DockerSandbox._wait_agent_mount`); a test may
+        # turn it off, and `ns_override` gives a table (by pid) in place of this one
+        self.ns_mountinfo = True
         self.ns_override: dict[int, str] = {}
         # the bytes of a process's memory (`/proc/<pid>/task/<tid>/mem`), by that path, for the diagnosis's root half
         self.proc_bytes: dict[str, bytes] = {}
@@ -376,7 +377,16 @@ class FakeHost:
         for spec in container.mount_specs():
             fields = dict(part.split("=", 1) for part in spec.split(",") if "=" in part)
             src, dst = fields.get("src", ""), fields.get("dst", "")
-            if "rslave" in spec and self.mounts.get(src, "").startswith("fuse"):
+            if "rslave" not in spec:
+                continue
+            stacked = container.options.get("_stacked", {}).get(dst)
+            if stacked is not None:
+                # bound while a FUSE mount was stacked on the share: the bind is a clone of that mount, which no later
+                # mount or unmount of the share on the host reaches; only a detach inside the namespace removes it
+                if dst not in container.options.get("_detached", set()):
+                    lines.append(f"{stacked + 100} 25 0:{60 + stacked} / {dst} ro - fuse.oneclient s ro")
+            elif self.mounts.get(src, "").startswith("fuse"):
+                # bound from the bare shared share: the host's mounts on it propagate in, and its unmounts do too
                 lines.append(
                     f"{self._mount_id(src) + 100} 25 0:{60 + self._mount_id(src)} / {dst} ro - fuse.oneclient s ro"
                 )
@@ -600,6 +610,11 @@ class FakeHost:
                 shutil.move(argv[-2], argv[-1])
                 self.relocate_mounts(argv[-2], argv[-1])
                 return CmdResult(0)
+            case "nsenter" if "umount" in argv:  # `nsenter -t PID -m -p umount -l PATH`: a detach inside the namespace
+                owner = next((c for c in self.containers.values() if c.pid == int(argv[argv.index("-t") + 1])), None)
+                if owner is not None:
+                    owner.options.setdefault("_detached", []).append(argv[-1])
+                return CmdResult(0)
             case "mount" | "nsenter" | "sh" | "test" | "truncate":
                 return CmdResult(0)
         raise AssertionError(f"the fake host does not know the command {argv[0]!r}")
@@ -704,6 +719,16 @@ class FakeHost:
         procs = [container.pid, *([container.init_child] if container.init_child else [])]
         self.add_cgroup(container, procs, events="low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
         container.options["_env"] = dict(env or {})
+        container.options[
+            "_stacked"
+        ] = {  # destination: the mount id of the FUSE mount the bind cloned, if there was one
+            fields["dst"]: self._mount_id(fields["src"])
+            for spec in options.get("--mount", [])
+            if "rslave" in spec
+            for fields in [dict(part.split("=", 1) for part in spec.split(",") if "=" in part)]
+            if self.mounts.get(fields.get("src", ""), "").startswith("fuse")
+        }
+        container.options["_detached"] = []  # destinations detached from inside the namespace (a list: dumped as JSON)
         container.options["_files"] = {  # what each file bound in held when the container started, by destination
             destination: Path(source).read_text(encoding="utf-8")
             for source, destination in bound_files(options)

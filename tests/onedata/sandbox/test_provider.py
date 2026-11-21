@@ -410,6 +410,7 @@ def test_o15_an_unreadable_proc_state_at_the_teardown_keeps_the_mount_sandbox_an
 
     async def body(sandbox):
         host = stage.host
+        host.ns_mountinfo = False  # the containers' own mount tables cannot be read
         for m in fuse_mounts(host.mountinfo()):  # the connection exists, and its abort is refused
             host.files[f"/sys/fs/fuse/connections/{m['dev'].split(':')[1]}"] = ""
         host.run_handlers["sh"] = lambda argv: CmdResult(1, "", "denied")

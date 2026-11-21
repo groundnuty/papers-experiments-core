@@ -701,23 +701,17 @@ def test_o14_two_sandboxes_get_two_disjoint_networks_from_the_pool(world):
 
 
 def test_a_failure_while_starting_stops_everything_that_was_started_in_order(world):
-    """O15: the teardown runs on a failed start, with the mount's order, and verifies the result."""
-    world.host.fail_run.add("never")  # nothing special: fail the agent only
-    sbx_name = {}
-
-    def fail_agent(argv):
-        return CmdResult(0)
-
-    del fail_agent, sbx_name
+    """O15: the teardown runs on a failed start, with the mount's order, and verifies the result. The agent is started
+    before the sidecar (O97), so it is the sidecar's `docker run` that fails, with the agent already made."""
     original = world.host._run_container
 
     def failing(args, env):
-        if "--init" in args:  # the agent's `docker run` is the only one with --init
-            return CmdResult(125, "", "cannot start the agent")
+        if "/dev/fuse" in args:  # the sidecar's `docker run` is the only one that is given the FUSE device
+            return CmdResult(125, "", "cannot start the sidecar")
         return original(args, env)
 
     world.host._run_container = failing
-    with pytest.raises(SandboxError, match="cannot start the agent"):
+    with pytest.raises(SandboxError, match="cannot start the sidecar"):
         start(world, "mounted")
     assert nothing_left(world)
     kinds = [c[0] for c in world.host.calls if c[0] in ("removed", "network_removed", "unmount")]
