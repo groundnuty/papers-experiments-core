@@ -1,0 +1,1 @@
+Read the files of the {TASK} task with the python tool, then say what you read.

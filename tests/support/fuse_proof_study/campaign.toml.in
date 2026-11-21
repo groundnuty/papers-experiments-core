@@ -1,0 +1,30 @@
+# One seed and one stub model: two runs, the registered outage and its control. @BOUND_S@ is the limit on one cell
+# (30 s live; short in the offline dry run) and @TIME_CAP_S@ the agent's time cap, far above it.
+order_seed = 20261122
+seeds = [1]
+models = ["proof-stub"]
+
+[agent]
+max_tool_rounds = 6
+time_cap_s = @TIME_CAP_S@
+token_budget = 200000
+output_cap_chars = 4000
+max_output_tokens = 512
+code_cell_bound_s = @BOUND_S@
+
+[scheduler]
+max_attempts = 1
+workers = 1
+retry_delay_s = 0
+poll_interval_s = 0.2
+recheck_s = 5
+health_timeout_s = 900
+lease_timeout_s = 30
+health_kind = "sandbox"
+identity_kind = "endpoint"
+
+[scheduler.unit_caps]
+proof-stub = 1
+
+[budget]
+max_usd = 5.0
