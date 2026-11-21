@@ -56,11 +56,13 @@ def choose(
     caps: Mapping[str, int] | None = None,
     paused: Mapping[str, Sequence[str | None]] | None = None,
     operator_paused: Mapping[str, str] | None = None,
+    grants: Mapping[str, int] | None = None,
 ) -> Pending | Wait:
     """The run to lease from the current set's pending runs, or why the federation waits. `ceilings` and `caps` are the
     ones in force (raised, or changed); by default the configuration's own. `paused` gives each model paused by values
     seen undeclared, with them, and `operator_paused` each model an operator paused, with the reason given (C55); a
-    model may be both."""
+    model may be both. `grants` are the lease grants in force in micro-dollars (raised, C65); by default the
+    configuration's own."""
     ceilings = pinned(config) if ceilings is None else ceilings
     caps = config.caps if caps is None else caps
     by_model: dict[str, list[Pending]] = defaultdict(list)
@@ -76,7 +78,12 @@ def choose(
     held = []
     for model in order:
         reason = _paused_by(model, paused or {}, operator_paused or {}) or _held(
-            model, slots, committed, config, ceilings, caps
+            model,
+            slots,
+            committed,
+            ceilings,
+            caps,
+            config.grant_micro(model) if grants is None else grants.get(model, 0),
         )
         if reason is None:
             return by_model[model][0]
@@ -108,17 +115,16 @@ def _held(
     model: str,
     slots: Mapping[str, int],
     committed: tuple[int, Mapping[str, int]],
-    config: LedgerConfig,
     ceilings: Ceilings,
     caps: Mapping[str, int],
+    grant: int,
 ) -> str | None:
-    """Why the model cannot take a lease now, or None."""
+    """Why the model cannot take a lease now, or None; `grant` is what a lease of it is granted."""
     cap = caps.get(model)
     if cap is not None and slots.get(model, 0) >= cap:
         return f"model {model} is at its cap of {cap}"
     if ceilings.max_micro is None:
         return None
-    grant = config.grant_micro(model)
     total, per_model = committed
     left = ceilings.max_micro - total
     if grant > left:

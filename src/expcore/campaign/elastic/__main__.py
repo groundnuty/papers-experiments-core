@@ -23,6 +23,14 @@
   expired, lost), each model's own ceiling, and the history of raises; each model's cap in force and the history of
   its changes; each model's declared fingerprints, the models paused by an undeclared one seen, and the declaration
   log.
+- `set-grant LEDGER MODEL=USD... --reason TEXT --actor NAME` (C65): raise models' lease grants to USD dollars each,
+  on an existing ledger, for workers on a core that cannot be changed (they read the grant from the ledger). Only a
+  raise (a grant not above the one in force is refused), only before any lease of the model has ever been issued (an
+  issued lease's accounting never changes), and only if the caps still fit the budget (the sum of cap times grant over
+  the capped models may not pass the campaign's ceiling). The raise is a meta row and an event of its own: the pinned
+  configuration, the fingerprint and every earlier row stay as they were. It takes the dispatcher's lock, so it is
+  refused while a controller holds the ledger; the controller that holds it next must run a core that reads the raise
+  (this one or later). `status` shows the history.
 - `raise-ceiling LEDGER --usd N --reason TEXT --actor NAME [--model M]`: raise the campaign's dollar ceiling (or model
   M's) to N dollars, rounded down to a micro-dollar. It is never lowered or set below what is committed.
 - `set-cap LEDGER --model M --cap N --reason TEXT --actor NAME`: set model M's cap on its leases in flight or held
@@ -66,13 +74,14 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from expcore.campaign.elastic.allowances import allowances_micro, grants_usd, model_allowance
+from expcore.campaign.elastic.allowances import allowances_micro, grants_usd, micro_of, model_allowance, model_dollars
 from expcore.campaign.elastic.awareness import AWARE, NONE, OLDER, controller_of
 from expcore.campaign.elastic.caps import set_in_file
 from expcore.campaign.elastic.ceilings import raise_in_file
 from expcore.campaign.elastic.config import MICRO, LedgerConfig, ledger_runs, micro_down
 from expcore.campaign.elastic.declarations import declare_in_file
 from expcore.campaign.elastic.drains import drain_in_file
+from expcore.campaign.elastic.grants import set_in_file as set_grants_in_file
 from expcore.campaign.elastic.ledger import Ledger
 from expcore.campaign.elastic.pauses import pause_in_file, resume_in_file
 from expcore.campaign.elastic.records import LedgerError, Status
@@ -119,7 +128,7 @@ def format_status(status: Status) -> str:
                 f"  #{changed.cap_id} {when} model {changed.model} {before} -> {changed.new}"
                 f" by {changed.actor}: {changed.reason}"
             )
-    return "\n".join(lines + _declaration_lines(status) + _pause_lines(status))
+    return "\n".join(lines + _declaration_lines(status) + _pause_lines(status) + _grant_lines(status))
 
 
 def _value(fingerprint: str | None) -> str:
@@ -162,6 +171,21 @@ def _pause_lines(status: Status) -> list[str]:
             for entry in status.pause_log
         ]
     return lines
+
+
+def _grant_lines(status: Status) -> list[str]:
+    """The log of raised lease grants (C65); nothing for a ledger no grant was raised on, so its status reads as
+    it did."""
+    if not status.grant_raises:
+        return []
+    return [
+        "grant history:",
+        *(
+            f"  #{entry.event_seq} {_when(entry.at)} model {entry.model} {usd(entry.old_micro)} -> "
+            f"{usd(entry.new_micro)} by {entry.actor}: {entry.reason}"
+            for entry in status.grant_raises
+        ),
+    ]
 
 
 def _when(at: float) -> str:
@@ -285,6 +309,23 @@ def _raise(args: argparse.Namespace) -> int:
     return 0
 
 
+def _set_grant(args: argparse.Namespace) -> int:
+    models = [model for model, _ in args.grants]
+    if len(set(models)) != len(models):
+        raise ValueError("set-grant names a model more than once")
+    wanted = {model: micro_of(dollars) for model, dollars in args.grants}
+    for entry in set_grants_in_file(args.ledger, wanted, args.reason, args.actor):
+        print(
+            f"raised model {entry.model}'s grant: {usd(entry.old_micro)} -> {usd(entry.new_micro)} "
+            f"(event #{entry.event_seq})"
+        )
+    print(
+        "note: the controller that holds this ledger next must run this commit or later: a core that predates the "
+        "raise ignores it and issues at the pinned grant"
+    )
+    return 0
+
+
 def _set_cap(args: argparse.Namespace) -> int:
     changed = set_in_file(args.ledger, args.model, args.cap, args.reason, args.actor)
     before = "none" if changed.old is None else changed.old
@@ -377,6 +418,11 @@ def _model_cap(text: str) -> tuple[str, int]:
     return model, _cap_of(number)
 
 
+def _model_grant(text: str) -> tuple[str, Decimal]:
+    """`MODEL=USD` of `set-grant` as typed."""
+    return model_dollars("set-grant", text)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m expcore.campaign.elastic", description=__doc__.split("\n\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -422,6 +468,17 @@ def _parser() -> argparse.ArgumentParser:
     capping.add_argument("--cap", required=True, type=_cap_of, help="the new cap, a whole number from 1")
     capping.add_argument("--reason", required=True, help="why it is set, recorded")
     capping.add_argument("--actor", required=True, help="who sets it (an operator or an agent), recorded")
+    granting = commands.add_parser("set-grant", help="raise models' lease grants before any lease of them is issued")
+    granting.add_argument("ledger", type=Path, help="the ledger file (out/ledger.sqlite)")
+    granting.add_argument(
+        "grants",
+        nargs="+",
+        type=_model_grant,
+        metavar="MODEL=USD",
+        help="a model's new lease grant in dollars, above the one in force, at most 6 decimals (one per model)",
+    )
+    granting.add_argument("--reason", required=True, help="why it is raised, recorded")
+    granting.add_argument("--actor", required=True, help="who raises it (an operator or an agent), recorded")
     declaring = commands.add_parser("declare", help="declare a model's fingerprint, or none, in the append-only log")
     declaring.add_argument("ledger", type=Path, help="the ledger file (out/ledger.sqlite)")
     declaring.add_argument("--model", required=True, help="the model (it must have runs in the ledger)")
@@ -466,6 +523,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "status": _status,
         "raise-ceiling": _raise,
         "set-cap": _set_cap,
+        "set-grant": _set_grant,
         "declare": _declare,
         "pause": _pause,
         "resume": _resume,

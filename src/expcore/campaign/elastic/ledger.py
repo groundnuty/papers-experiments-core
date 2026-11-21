@@ -300,6 +300,7 @@ class Ledger(LedgerViews):
             InFlight(r["model"], r["condition"], r["issued_at"])
             for r in self.db.execute("SELECT * FROM leases WHERE state IN ('issued', 'sent')")
         ]
+        grants = self.grants_micro()  # C65: read inside this transaction, at every lease: a raise is seen at the next
         chosen = choose(
             current,
             pending,
@@ -313,11 +314,12 @@ class Ledger(LedgerViews):
             self.caps(),
             declarations.paused(self.db),
             pauses.reasons(self.db),
+            grants,
         )
         if isinstance(chosen, Wait):
             return chosen
         run = self.db.execute("SELECT * FROM runs WHERE run_key=?", (chosen.run_key,)).fetchone()
-        grant = self.config.grant_micro(run["model"])
+        grant = grants.get(run["model"], 0)
         cursor = self.db.execute(
             "INSERT INTO leases(run_key, federation, site, model, condition, attempt_base, grant_micro, issued_at,"
             " renewed_at, hard_term_at, state, charge_micro) VALUES(?,?,?,?,?,?,?,?,?,?,'issued',?)",

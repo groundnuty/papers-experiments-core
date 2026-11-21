@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.elastic import caps as cap_table
-from expcore.campaign.elastic import declarations, pauses, schema
+from expcore.campaign.elastic import declarations, grants, pauses, schema
 from expcore.campaign.elastic.ceilings import effective, history
 from expcore.campaign.elastic.config import PRIOR_RUNS, TOPUP_ALLOWANCES_KEY, LedgerConfig
 from expcore.campaign.elastic.records import (
@@ -64,6 +64,11 @@ class LedgerViews:
         model's grant, which `config.grants_usd` holds; empty for a ledger made without the flag."""
         text = self._meta(TOPUP_ALLOWANCES_KEY)
         return {} if text is None else {model: int(micro) for model, micro in json.loads(text).items()}
+
+    def grants_micro(self) -> dict[str, int]:
+        """Each model's lease grant in micro-dollars now: the pinned one, replaced by its raise (C65). What a lease is
+        issued at, and what a controller sizes the fleet by."""
+        return grants.in_force(self.db, self.config)
 
     def committed_micro(self) -> tuple[int, dict[str, int]]:
         """What the budget counts: every lease's charge, in micro-dollars, in total and per model."""
@@ -244,6 +249,7 @@ class LedgerViews:
             paused=self.paused(),
             operator_pauses=self.operator_pauses(),
             pause_log=tuple(self.pause_log()),
+            grant_raises=tuple(grants.log(self.db)),
         )
 
 

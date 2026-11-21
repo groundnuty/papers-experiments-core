@@ -195,14 +195,26 @@ def check_plan(runs: Sequence[LedgerRun], config: LedgerConfig) -> None:
 
 
 TOPUP_ALLOWANCES_KEY = "topup_allowances_micro_usd"  # the meta row of the allowances `create` was given (C65)
+MAX_GRANT_MICRO = 2**53  # a float of dollars holds a count of micro-dollars exactly only up to here (C65)
+
+
+def check_grant_held_exactly(model: str, micro: int) -> None:
+    """Refuse a grant that a float of dollars, which is how the pinned configuration holds it and how a worker's
+    budget takes it, cannot keep to the micro-dollar: past `MAX_GRANT_MICRO` it rounds, and a grant that rounds up
+    passes the ceiling it was checked against (C65)."""
+    if micro > MAX_GRANT_MICRO or micro_up(usd_of(micro)) != micro:
+        raise ValueError(
+            f"model {model}'s grant of {micro} micro-dollars is not one a figure of dollars holds exactly "
+            f"(at most {MAX_GRANT_MICRO} micro-dollars)"
+        )
 
 
 def check_allowances(runs: Sequence[LedgerRun], config: LedgerConfig, allowances_micro: Mapping[str, int]) -> None:
-    """Refuse top-up allowances (`create --topup-allowance`, in micro-dollars) that raise nothing: a model no run
-    plans, a ledger with no budget (it grants every lease 0), and an allowance above the grant it is part of."""
+    """Refuse top-up allowances (`create --topup-allowance`, in micro-dollars) that raise nothing: one of 0, a model no
+    run plans, a ledger with no budget (it grants every lease 0), and an allowance above the grant it is part of."""
     planned = {run.model for run in runs}
     for model, micro in sorted(allowances_micro.items()):
-        _whole(f"the top-up allowance of {model}", micro, 0)
+        _whole(f"the top-up allowance of {model}", micro, 1)
         if model not in planned:
             raise ValueError(f"a top-up allowance names {model}, which no run of the ledger plans")
         if config.max_usd is None:
@@ -213,16 +225,22 @@ def check_allowances(runs: Sequence[LedgerRun], config: LedgerConfig, allowances
             )
 
 
-def lease_grant_usd(spec: ModelSpec, limits: Limits, *, topup_allowance_usd: float = 0.0) -> float:
-    """The grant of one lease of the model: one run's reservation, two admission probes and the top-up allowance,
-    each rounded up to a micro-dollar; 0 for a free model. A model with no price is refused."""
+def lease_grant_micro(spec: ModelSpec, limits: Limits, *, topup_allowance_micro: int = 0) -> int:
+    """The grant of one lease of the model in micro-dollars: one run's reservation, two admission probes and the
+    top-up allowance, each rounded up to a micro-dollar, summed as whole numbers; 0 for a free model. A model with no
+    price is refused."""
     reservation, probe = reservation_usd(spec, limits), request_bound_usd(spec, limits)
     if reservation is None or probe is None:
         raise ValueError(f"model {spec.key} has no price and is not marked free: its leases cannot be granted")
     if reservation == 0 and probe == 0:
-        return 0.0
+        return 0
+    return micro_up(reservation) + 2 * micro_up(probe) + _whole("topup_allowance_micro", topup_allowance_micro, 0)
+
+
+def lease_grant_usd(spec: ModelSpec, limits: Limits, *, topup_allowance_usd: float = 0.0) -> float:
+    """The grant of one lease of the model in dollars (`lease_grant_micro`); 0 for a free model."""
     allowance = _dollars("topup_allowance_usd", topup_allowance_usd)
-    return usd_of(micro_up(reservation) + 2 * micro_up(probe) + micro_up(allowance))
+    return usd_of(lease_grant_micro(spec, limits, topup_allowance_micro=micro_up(allowance)))
 
 
 def hard_term_s(wall_cap_s: float, reset_bound_s: float, deferral_bound_s: float) -> float:

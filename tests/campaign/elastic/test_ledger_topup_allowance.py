@@ -5,6 +5,7 @@ pinned configuration, and nothing a worker's join compares changes."""
 import dataclasses
 import json
 import sqlite3
+from decimal import Decimal
 
 import pytest
 from elastic_support import assert_invariants, join, leased, ledger_path, make, plan
@@ -13,7 +14,7 @@ from study_support import HEAD, clean_environment, make_copy
 
 from expcore.campaign.attempt_bounds import request_bound_usd
 from expcore.campaign.elastic import LedgerConfig, LedgerReader
-from expcore.campaign.elastic.__main__ import main
+from expcore.campaign.elastic.__main__ import create_ledger, main
 from expcore.campaign.elastic.config import micro_up
 from expcore.campaign.manifest import fingerprint_sha256
 from expcore.campaign.shard_budget import reservation_usd
@@ -145,24 +146,53 @@ def test_c65_the_flag_changes_no_part_of_the_campaign_fingerprint_a_worker_joins
         ("alpha-stub=", "dollars"),
         ("=5", "MODEL=USD"),
         ("alpha-stub=abc", "dollars"),
-        ("alpha-stub=-1", "below zero"),
+        ("alpha-stub=-1", "above zero"),
+        ("alpha-stub=0", "above zero"),
         ("alpha-stub=nan", "finite"),
         ("alpha-stub=inf", "finite"),
         ("alpha-stub=1.1234567", "micro-dollar"),
-        ("alpha-stub=12345678901.123456", "more digits"),
+        ("alpha-stub=12345678901.123456", "at most"),
+        ("alpha-stub=1e1000000", "at most"),
     ],
 )
-def test_c65_an_amount_that_is_not_a_finite_number_of_dollars_from_zero_to_the_micro_dollar_is_refused(
+def test_c65_an_amount_that_is_not_a_finite_number_of_dollars_above_zero_to_the_micro_dollar_is_refused(
     tmp_path, capsys, clean_environment, typed, word
 ):
-    """C65: the form is MODEL=USD, and USD is read exactly as typed (never through a float): finite, not below zero,
-    and no finer than the micro-dollar the ledger counts in, nor with more digits than a figure of dollars holds (which
-    would round it). A usage error as argparse ends it, before the study is read, with no ledger made."""
+    """C65: the form is MODEL=USD, and USD is read exactly as typed (never through a float): finite, above zero (an
+    allowance of 0 changes nothing), no finer than the micro-dollar the ledger counts in, and no more than a grant held
+    as a float of dollars keeps exactly (a huge exponent is refused, not overflowed). A usage error as argparse ends it,
+    before the study is read, with no ledger made."""
     path = ledger_path(tmp_path)
     with pytest.raises(SystemExit) as usage:
         main(create_args(path, tmp_path / "study", *BUDGET, "--topup-allowance", typed))
     assert usage.value.code == 2
     assert word in capsys.readouterr().err
+    assert not path.exists()
+
+
+def test_c65_an_allowance_that_makes_a_grant_a_figure_of_dollars_cannot_hold_exactly_is_refused(
+    tmp_path, capsys, clean_environment
+):
+    """C65: the largest amount that can be typed, 9,007,199,254.740992 USD, on top of a grant makes more than a float of
+    dollars keeps to the micro-dollar, so it would round, and a grant that rounds up passes the ceiling it was checked
+    against (and one past 2^63 micro-dollars cannot be written to the file): refused, no ledger made."""
+    study = make_copy(tmp_path, "study")
+    path = ledger_path(tmp_path)
+    args = create_args(path, study, "--max-usd", "100000000000", "--topup-allowance", f"{ALPHA}=9007199254.740992")
+    assert main(args) == 2
+    assert "holds exactly" in capsys.readouterr().err
+    assert not path.exists()
+
+
+def test_c65_an_allowance_finer_than_a_micro_dollar_from_a_direct_caller_is_refused_not_rounded(
+    tmp_path, clean_environment
+):
+    """C65: a caller that does not come through the command line gets the same bound: 0.0000001 USD would be granted as
+    a whole micro-dollar and recorded as none."""
+    study = make_copy(tmp_path, "study")
+    path = ledger_path(tmp_path)
+    with pytest.raises(ValueError, match="micro-dollars"):
+        create_ledger(path, study, hard_term_s=5400.0, max_usd=500.0, topup_allowances={ALPHA: Decimal("0.0000001")})
     assert not path.exists()
 
 
