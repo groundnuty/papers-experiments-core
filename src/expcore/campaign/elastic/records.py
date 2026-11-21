@@ -74,6 +74,12 @@ class PauseRefused(LedgerError):
     no operator paused (C55)."""
 
 
+class GrantRefused(LedgerError):
+    """A grant raise (C66) that is not above the grant in force, is for a model with a lease ever issued, a free model,
+    a model with no run or a ledger with no budget, is above a ceiling or beyond what the caps could hold, or is asked
+    of a ledger a controller holds."""
+
+
 class DrainRefused(LedgerError):
     """An operator's drain of a federation the ledger does not hold, one already drained or proven ended, one past its
     recorded job end, or one beside a controller that does not say it honours operator writes (C59)."""
@@ -335,6 +341,20 @@ class OperatorPause:
 
 
 @dataclass(frozen=True)
+class GrantRaise:
+    """One raise of a model's lease grant before any lease of it was issued (C66), with when, why and by whom.
+    `event_seq` is the sequence number of the ledger event that records it."""
+
+    event_seq: int
+    at: float
+    model: str
+    old_micro: int
+    new_micro: int
+    reason: str
+    actor: str
+
+
+@dataclass(frozen=True)
 class Status:
     """The ledger's money in micro-dollars. `ceiling_micro` is None with no budget (then `remaining_micro` is too);
     `locked_*` is what unsettled leases hold as their grants (in flight, expired, reported, lost), by lease state and
@@ -342,7 +362,8 @@ class Status:
     the history of its changes, oldest first; `declared` is each model's declared fingerprints (None: "none") and
     `declarations` the log, oldest first, both None for a ledger made before the log; `paused` is each model paused by
     what a lease's run saw undeclared, with those values (C48); `operator_pauses` is each model an operator has paused
-    and not resumed, with the pause that holds it, and `pause_log` every pause and resume, oldest first (C55)."""
+    and not resumed, with the pause that holds it, and `pause_log` every pause and resume, oldest first (C55);
+    `grant_raises` is every raise of a lease grant, oldest first (C66)."""
 
     ceiling_micro: int | None
     committed_micro: int
@@ -360,3 +381,4 @@ class Status:
     paused: Mapping[str, tuple[str | None, ...]] = field(default_factory=dict)
     operator_pauses: Mapping[str, OperatorPause] = field(default_factory=dict)
     pause_log: tuple[OperatorPause, ...] = ()
+    grant_raises: tuple[GrantRaise, ...] = ()

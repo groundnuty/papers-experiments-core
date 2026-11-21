@@ -786,7 +786,6 @@ class DockerSandbox:
         while True:
             why = RM.bar(
                 self._host_table(), self._agent_table(), share=mountpoint, mount_path=str(self.s.mount.path),
-                old_devices=(),
             )  # fmt: skip
             if why is None:
                 return
@@ -1430,7 +1429,6 @@ class DockerSandbox:
         found = TD._fuse_at(self.host, mountpoint, self.waits)
         if found is None:
             return RM.HOST_TABLE
-        old_devices = {m["dev"] for m in found}
         self._close_generation(generation - 1)  # its log is read from the host, before anything of it is removed
         try:
             hostops.remove_container(self.host, self.names.sidecar)
@@ -1439,6 +1437,14 @@ class DockerSandbox:
         if not self._restore_wanted():
             return RM.NOT_WANTED
         if not TD._unmount_host(self.host, mountpoint, found, self.waits, _no_step_log):
+            return RM.UNMOUNT
+        # the unmount step alone also accepts a host table it could not read when its command reported success (the
+        # teardown's own use of it); a restore does not: the dead mount is gone only when the table is READ and shows no
+        # FUSE entry at the share, which is what makes a mount seen there afterwards the new one (`remount.bar`)
+        left = TD._fuse_at(self.host, mountpoint, self.waits)
+        if left is None:
+            return RM.HOST_TABLE
+        if left:
             return RM.UNMOUNT
         if not self._restore_wanted():
             return RM.NOT_WANTED
@@ -1465,7 +1471,6 @@ class DockerSandbox:
             self._agent_table(),
             share=mountpoint,
             mount_path=str(self.s.mount.path),
-            old_devices=old_devices,
         )
 
     def _clear_agent_copy(self) -> str | None:

@@ -1752,7 +1752,8 @@ uv run python -I -B deploy/hpc-federation/fleetcontrol.py control --ledger out/l
   completing, is `BROKEN`: never proven, drained and taken down, its down proving the end.
   Federations no cap lets work are drained once idle past `retire_idle_s` (765 s, an up, a down and an ingest), the
   least walltime left first, keeping `warm_pool` (0). A failed up is taken down with no collect.
-- **Relays and lost leases.** A relay its up recorded serving whose heartbeat is missing or older than 30 s is recorded
+- **Relays and lost leases.** A relay its up recorded serving whose heartbeat is missing or older than 30 s (by a clock
+  read when that member's heartbeat is read, not at the start of the walk; one that far ahead of it is gone too, C65) is recorded
   in the log as `relay gone, no exit status` with its last heartbeat, and its federation is drained (no outage can be
   injected there), or taken down if it never joined. Each lost lease (its holder proven ended with no completion, or
   its archive never verified) not yet settled is settled to the spend its dead federation's call log shows (the root

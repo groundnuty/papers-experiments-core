@@ -236,11 +236,13 @@ def environment_digest(identity: Mapping[str, str]) -> str:
 
 
 def ledger_view(views: LedgerViews) -> LedgerView:
-    """What the controller reads of a ledger: `demand`, the caps in force (`caps()`), the grants of its configuration,
-    `status()` (what the ceilings in force leave, and what unsettled leases lock), `federations`, `leases` (which lease
+    """What the controller reads of a ledger: `demand`, the caps in force (`caps()`), the grants in force (its
+    configuration's, or a raise of one, C66), `status()` (what the ceilings in force leave, and what unsettled leases
+    lock), `federations`, `leases` (which lease
     holds each federation's slot, how many are in flight, which are lost), `settlements` and `events` (since when each
     federation holds no lease: its join, or the last event that freed it)."""
     config = views.config
+    grants = views.grants_micro()  # C66: the grants in force, a raise included
     demand = views.demand()
     leases = views.leases()
     status = views.status()
@@ -268,7 +270,7 @@ def ledger_view(views: LedgerViews) -> LedgerView:
     return LedgerView(
         demand=demand,
         caps=views.caps(),
-        grants_micro={model: config.grant_micro(model) for model in demand.pending},
+        grants_micro={model: grants.get(model, 0) for model in demand.pending},
         left_micro=status.remaining_micro,
         left_per_model_micro=dict(status.model_remaining_micro),
         in_flight=sum(1 for lease in leases if lease.state in LIVE),

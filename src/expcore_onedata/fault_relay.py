@@ -61,7 +61,8 @@ removes it when it stops, and holds `relay.lock` while it runs, so a second rela
 The fault gate's pre-run check reads it and notes what it saw in the try's note (`RELAY_NOTE`), and the run admission
 refuses an outage run, as the hold `federation_busy` that uses no attempt, when that check saw no live relay or none is
 live at the admission (`relay_refusal`). A heartbeat is live while its wall clock is within `RELAY_STALE_S` of the
-reader's: the login node and the nodes keep the cluster's time.
+reader's, read right after the heartbeat is: the login node and the nodes keep the cluster's time, and a genuine
+heartbeat is written before it is read, so one further ahead than the bound is no relay's, as one that old is not (C65).
 """
 
 import contextlib
@@ -109,7 +110,7 @@ FORMAT = "expcore-fault-relay/1"
 RELAY_DIR = "fault-relay"
 STATE_FILE = "hpc-federation.json"
 BEAT_S = 5.0
-RELAY_STALE_S = 30.0  # a heartbeat older than this, by the reader's wall clock, is a relay not answering
+RELAY_STALE_S = 30.0  # a heartbeat further than this from the reader's wall clock is a relay not answering
 RELAY_MODULE = "expcore_onedata.fault_relay"  # the relay runs as `-m RELAY_MODULE serve --root <root>`: how it is told
 RELAY_NOTE = "fault_relay"  # the try's note key: what the fault gate's pre-run check saw of the relay
 POLL_S = 0.5  # between two listings that look for an answer
@@ -218,7 +219,9 @@ def beat(root: Path, wall: Callable[[], float] = time.time, stale_s: float = REL
     if record is None or record.get("format") != FORMAT or not _ID.fullmatch(str(record.get("nonce", ""))):
         return None
     at = record.get("wall")
-    if isinstance(at, bool) or not isinstance(at, int | float) or abs(wall() - at) > stale_s:
+    if isinstance(at, bool) or not isinstance(at, int | float) or not math.isfinite(at):
+        return None  # no wall time: an infinity or a NaN is no time a relay wrote
+    if abs(wall() - at) > stale_s:  # the clock is read after the heartbeat: a genuine one is never far ahead of it
         return None
     return record
 

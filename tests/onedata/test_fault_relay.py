@@ -423,13 +423,40 @@ def test_o58_a_relay_that_stops_beating_after_the_check_refuses_the_outage_run_a
 
 
 def test_o58_a_stale_heartbeat_is_a_relay_not_answering(tmp_path):
-    """O58: a heartbeat whose wall time is more than 30 s from the reader's is no live relay."""
+    """O58: a heartbeat whose wall time is more than 30 s older than the reader's is no live relay."""
     root = root_of(tmp_path)
     relay = relay_of(root, Verbs())
     with relay.holding():
         written = json.loads((relay_dir(root) / "heartbeat.json").read_text())["wall"]
         assert beat(root, lambda: written + 29) is not None
         assert beat(root, lambda: written + 31) is None
+
+
+def test_c65_a_heartbeat_far_ahead_of_the_readers_clock_is_no_live_relay(tmp_path):
+    """C65: the reader's clock is read after the heartbeat, so a genuine heartbeat is at most clock jitter ahead of it:
+    one stamped 5 s ahead is live, one more than 30 s ahead (a clock stepped, a time nobody wrote) is no live relay,
+    where a dead relay's last heartbeat would otherwise read live until the reader's clock caught up."""
+    root = root_of(tmp_path)
+    relay = relay_of(root, Verbs())
+    with relay.holding():
+        written = json.loads((relay_dir(root) / "heartbeat.json").read_text())["wall"]
+        assert beat(root, lambda: written - 5) is not None
+        assert beat(root, lambda: written - 31) is None
+        assert beat(root, lambda: written - 600) is None
+
+
+@pytest.mark.parametrize("wall", [float("inf"), float("nan")])
+def test_c65_a_heartbeat_whose_wall_time_is_an_infinity_or_a_nan_is_no_live_relay(tmp_path, wall):
+    """C65: a wall time that is no time (an infinity, or a NaN, which is never more than the bound from any reading, so
+    the age check alone would call it live) is no live relay."""
+    root = root_of(tmp_path)
+    relay = relay_of(root, Verbs())
+    with relay.holding():
+        path = relay_dir(root) / "heartbeat.json"
+        record = json.loads(path.read_text())
+        assert beat(root) is not None
+        path.write_text(json.dumps({**record, "wall": wall}))
+        assert beat(root) is None
 
 
 def test_o58_the_relay_never_holds_a_secret_in_its_environment_and_its_verbs_get_a_clean_one(tmp_path):

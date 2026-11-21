@@ -14,6 +14,7 @@ import pytest
 from deadline_support import cell_processes  # noqa: F401  (the fixtures' cell)
 from sandbox_support import make_spec, start_options
 
+from expcore.errors import InfraError
 from expcore_onedata.sandbox import deadline as DL
 from expcore_onedata.sandbox import hostops
 from expcore_onedata.sandbox import remount as RM
@@ -29,7 +30,9 @@ def share_of(mounted) -> str:
 
 
 def devices(host, mounted) -> list[str]:
-    return [m["dev"] for m in hostops.fuse_mounts(host.mountinfo()) if m["mountpoint"] == share_of(mounted)]
+    """The distinct devices of the FUSE entries at the share in the host's table: the real kernel lists one mount twice
+    (the share's bind is a peer of the volume under it), so a mount is counted by its device, never by its entries."""
+    return sorted({m["dev"] for m in hostops.fuse_mounts(host.mountinfo()) if m["mountpoint"] == share_of(mounted)})
 
 
 @pytest.fixture
@@ -233,15 +236,22 @@ def test_o97_a_restore_given_up_on_between_its_steps_starts_no_sidecar(aborted):
 
 
 def test_o97_the_restore_bar_is_what_the_mount_tables_show_not_a_read_through_the_mount():
-    """O97: `remount.bar` judges the two tables: one FUSE mount at the share on a new device on the host, and in the
-    agent's namespace one at the mount path, on that device. Each failing shape has its own words."""
+    """O97: `remount.bar` judges the two tables: a FUSE mount at the share on one device on the host (however many
+    entries the kernel lists it as: the share's bind is a peer of the volume under it, so one mount shows twice), and
+    in the agent's namespace one entry at the mount path, on that device. Each failing shape has its own words."""
     root = "1 0 8:1 / / rw - ext4 /dev/root rw\n"
     host_ok = root + "10 1 0:77 / /run/share rw - fuse.oneclient s rw\n"
     ns_ok = root + "20 1 0:77 / /data ro - fuse.oneclient s ro\n"
-    assert RM.bar(host_ok, ns_ok, share="/run/share", mount_path="/data", old_devices={"0:70"}) is None
+    mine = {"share": "/run/share", "mount_path": "/data"}
+    assert RM.bar(host_ok, ns_ok, **mine) is None
+    twice = host_ok + "5010 9 0:77 / /run/share rw - fuse.oneclient s rw\n"  # the peer's copy: the same device
+    assert RM.bar(twice, ns_ok, **mine) is None
     cases = {
+        "the host's mount table shows the new mount on more than one device": (
+            host_ok + "11 1 0:88 / /run/share rw - fuse.oneclient s rw\n",
+            ns_ok,
+        ),
         "the new mount is not on the host": (root, ns_ok),
-        "the new mount is the dead one's device": (host_ok.replace("0:77", "0:70"), ns_ok.replace("0:77", "0:70")),
         "the agent's mount table could not be read": (host_ok, None),
         "the new mount is not in the agent's mount table": (host_ok, root),
         "the agent's mount table shows the mount more than once": (host_ok, ns_ok + ns_ok.splitlines()[1] + "\n"),
@@ -249,8 +259,59 @@ def test_o97_the_restore_bar_is_what_the_mount_tables_show_not_a_read_through_th
         "the host's mount table could not be read": ("", ns_ok),
     }
     for why, (host_table, ns_table) in cases.items():
-        got = RM.bar(host_table, ns_table, share="/run/share", mount_path="/data", old_devices={"0:70"})
-        assert got == why
+        assert RM.bar(host_table, ns_table, **mine) == why
+
+
+def test_o97_the_bar_asks_for_no_number_the_kernel_would_not_give_a_new_mount_again():
+    """O97: measured live: the kernel gave a new mount the dead one's device number in one restore and its mount id in
+    another, so neither says whether a mount is new. The bar takes the dead mount's very numbers (device and ids)
+    without objection; that the mount is the new one is the restore's sequence, not a number."""
+    root = "1 0 8:1 / / rw - ext4 /dev/root rw\n"
+    ns = root + "20 1 0:115 / /data ro - fuse.oneclient s ro\n"
+    again = (
+        root
+        + "1374 1 0:115 / /run/share rw - fuse.oneclient s rw\n1375 9 0:115 / /run/share rw - fuse.oneclient s rw\n"
+    )
+    assert RM.bar(again, ns, share="/run/share", mount_path="/data") is None
+
+
+def host_table_at_the_new_sidecar(host, sandbox):
+    """Record the FUSE entries at the share that the host's table shows when the new sidecar is started (the `docker
+    run` of the sidecar's name); `.read` has one reading for each such start, `.real` is the host's own docker."""
+    share = str(sandbox.dir / "mount")
+    seen = type("Seen", (), {"read": [], "real": host.docker})()
+
+    def docker(*args, **kwargs):
+        if args[0] == "run" and sandbox.names.sidecar in args:
+            table = hostops.parse_mountinfo(host.mountinfo())
+            seen.read.append([m["id"] for m in table if m["mountpoint"] == share and m["fstype"].startswith("fuse")])
+        return seen.real(*args, **kwargs)
+
+    host.docker = docker
+    return seen
+
+
+def test_o97_the_restore_passes_when_the_kernel_hands_the_new_mount_the_dead_ones_numbers(aborted):
+    """O97: the live failures, through the whole restore on the fake host: the new mount comes up with the dead
+    mount's device number AND mount id. The restore passes its bar, the next cell runs, and the dead mount was shown
+    gone from the host's table before the new sidecar started (the sequence that makes the mount in it the new one)."""
+    sbx, host = aborted.sandbox, aborted.host
+    host.reuse_freed_numbers = True
+    before = [(m["id"], m["dev"]) for m in hostops.parse_mountinfo(host.mountinfo()) if m["fstype"].startswith("fuse")]
+    at_the_new_sidecar = host_table_at_the_new_sidecar(host, sbx)
+    start = len(host.calls)
+    try:
+        answer = sbx.restore_mount()
+    finally:
+        host.docker = at_the_new_sidecar.real
+    assert (answer["ok"], answer["generation"]) == (True, 2)
+    assert at_the_new_sidecar.read == [[]]  # the host table read EMPTY of FUSE entries when the new sidecar was started
+    after = [(m["id"], m["dev"]) for m in hostops.parse_mountinfo(host.mountinfo()) if m["fstype"].startswith("fuse")]
+    assert after == before  # the same numbers, a new mount
+    kinds = [(c[0], c[1]) for c in calls_after(host, start) if c[0] in ("docker", "run")]
+    unmounted = next(i for i, c in enumerate(kinds) if c[0] == "run" and c[1][0] == "fusermount")
+    assert unmounted < kinds.index(("docker", "run"))
+    assert sbx.exec("print(1)", 30).exit_code == 0
 
 
 def test_o97_the_direct_io_lines_of_every_generation_stand_and_an_unread_one_is_unknown():
@@ -330,6 +391,91 @@ def test_o97_a_copy_of_the_dead_mount_that_cannot_be_detached_fails_the_restore_
     assert ("docker", "run", ()) not in calls_after(host, start)
     host.ns_override.clear()
     host.run_handlers.pop("nsenter")
+
+
+def stale_agent_table(device: str) -> str:
+    """The agent's own table with a copy of the dead mount still in it, on `device`."""
+    return f"1 0 8:1 / / ro - overlay overlay ro\n99 25 {device} / /data ro - fuse.oneclient s ro\n"
+
+
+def test_o97_the_bar_alone_cannot_tell_a_stale_agent_entry_on_a_reused_device_from_the_new_mount():
+    """O97: why the restore must PROVE the dead mount gone from the agent's table before the new sidecar starts, and not
+    leave it to the bar: the kernel hands the new mount the dead one's device number, so a copy of the dead mount still
+    in the agent's table is on the very device the host's table shows. The bar, which only asks that the agent's entry
+    is on the host's device, passes it. The proof is `DockerSandbox._clear_agent_copy`, before the sidecar."""
+    root = "1 0 8:1 / / rw - ext4 /dev/root rw\n"
+    host_new = root + "1394 1 0:115 / /run/share rw - fuse.oneclient s rw\n"
+    stale = root + "99 25 0:115 / /data ro - fuse.oneclient s ro\n"  # the dead mount's copy, on the reused number
+    assert RM.bar(host_new, stale, share="/run/share", mount_path="/data") is None
+
+
+def test_o97_a_stale_agent_entry_on_the_reused_device_that_cannot_be_detached_fails_the_restore_before_a_sidecar(
+    aborted,
+):
+    """O97: the dead mount's copy stays in the agent's table, on the device the new mount will take again (the kernel
+    reuses it): the restore fails in fixed words before it writes the token or starts the sidecar. Without that step the
+    bar would pass the stale entry as the new mount's, and the next cell would read a dead directory."""
+    sbx, host = aborted.sandbox, aborted.host
+    host.reuse_freed_numbers = True
+    agent = host.containers[sbx.names.agent]
+    host.ns_override[agent.pid] = stale_agent_table(aborted.devices[0])
+    host.run_handlers["nsenter"] = lambda argv: CmdResult(1, "", "busy")
+    start = len(host.calls)
+    assert sbx.restore_mount() == {"ok": False, "why": "the dead mount is still in the agent's mount table"}
+    assert ("docker", "run", ()) not in calls_after(host, start)
+    assert not sbx._token_files_left()
+    host.ns_override.clear()
+    host.run_handlers.pop("nsenter")
+
+
+def test_o97_a_stale_agent_entry_on_the_reused_device_is_detached_and_the_restore_then_passes(aborted):
+    """O97: the same stale copy on the reused device, but it can be detached: it is detached from inside the agent's
+    namespace, shown gone, and only then does the new sidecar start; the next cell runs on the new mount."""
+    sbx, host = aborted.sandbox, aborted.host
+    host.reuse_freed_numbers = True
+    agent = host.containers[sbx.names.agent]
+    host.ns_override[agent.pid] = stale_agent_table(aborted.devices[0])
+    order: list[str] = []
+
+    def nsenter(argv):
+        order.append("detach")
+        host.ns_override.pop(agent.pid)
+        return CmdResult(0)
+
+    host.run_handlers["nsenter"] = nsenter
+    real_docker = host.docker
+
+    def docker(*args, **kwargs):
+        if args[0] == "run" and sbx.names.sidecar in args:
+            order.append("new sidecar")
+        return real_docker(*args, **kwargs)
+
+    host.docker = docker
+    try:
+        assert sbx.restore_mount()["ok"] is True
+    finally:
+        host.docker = real_docker
+    assert order == ["detach", "new sidecar"]
+    assert sbx.exec("print(1)", 30).exit_code == 0
+
+
+def test_o97_an_agent_table_that_cannot_be_read_is_never_taken_for_clean(aborted):
+    """O97: unknown is never gone: the agent's table cannot be read (and its namespace is not shown gone), so the
+    restore fails before a sidecar starts."""
+    sbx, host = aborted.sandbox, aborted.host
+    real = host.run_handlers.get("cat")
+
+    def refuses_the_agents_table(argv):
+        if "mountinfo" in argv[1]:
+            return CmdResult(1, "", "denied")
+        return real(argv) if real else host._run_default(argv)
+
+    host.run_handlers["cat"] = refuses_the_agents_table
+    start = len(host.calls)
+    answer = sbx.restore_mount()
+    host.run_handlers.pop("cat")
+    assert answer == {"ok": False, "why": "the dead mount is still in the agent's mount table"}
+    assert ("docker", "run", ()) not in calls_after(host, start)
 
 
 def test_o97_a_restore_given_up_on_while_it_waits_for_the_mount_stops_waiting_and_adds_nothing(aborted):
@@ -480,3 +626,63 @@ def test_o97_an_agent_bound_after_the_mount_was_stacked_fails_the_restore_closed
     assert len(fuse_in_agent(host, sbx)) == 1  # the clone of generation one
     assert sbx.restore_mount() == {"ok": False, "why": "the new mount is not in the agent's mount table"}
     assert fuse_in_agent(host, sbx) == []
+
+
+def lists_the_mount_on_another_device_too(host):
+    """The host's table, with each FUSE entry copied on a second device: two mounts at the share that are not one."""
+    real = host.mountinfo
+
+    def table() -> str:
+        text = real()
+        extra = [line.replace(" 0:", " 0:9", 1) for line in text.splitlines() if "fuse.oneclient" in line]
+        return text + "".join(line + "\n" for line in extra)  # nothing before the sidecar has made its mount
+
+    host.mountinfo = table
+
+
+def test_o97_the_start_accepts_a_mount_the_host_lists_twice_on_one_device(world):
+    """O97: measured live: one FUSE mount at the share is two entries of the host's table, on one device. The start's
+    wait for the agent's mount judges the table by its device, so it passes, and the agent's table shows it once."""
+    assert world.host.fuse_peer_entry is True
+    sbx = DockerSandbox.start(world.host, world.s, make_spec(world, "mounted"), **start_options(world))
+    try:
+        entries = [m for m in hostops.fuse_mounts(world.host.mountinfo()) if m["mountpoint"] == share_of(sbx)]
+        assert len(entries) == 2
+        assert len({m["dev"] for m in entries}) == 1
+        assert sbx.exec("print(1)", 30).exit_code == 0
+    finally:
+        sbx.stop()
+
+
+def test_o97_the_start_refuses_a_share_whose_entries_are_on_two_devices(world):
+    """O97: a second device at the share is not the run's mount: the start fails in fixed words, never goes on."""
+    lists_the_mount_on_another_device_too(world.host)
+    with pytest.raises(SandboxError, match="more than one device"):
+        DockerSandbox.start(world.host, world.s, make_spec(world, "mounted"), **start_options(world))
+
+
+def test_o97_an_unmount_that_reports_success_with_the_host_table_unreadable_fails_the_restore_closed(aborted):
+    """O97: the unmount command returns 0 but the host's mount table cannot be read afterwards (the unmount step alone
+    accepts that, as the teardown's does): the restore does not take the dead mount for gone. It re-reads the table
+    before it writes a token, finds it unreadable, and fails in fixed words with no new sidecar started and no token
+    left; the runner ends the run as kind `sandbox` (`mount_lost`)."""
+    sbx, host = aborted.sandbox, aborted.host
+    real = host.run_handlers.get("fusermount")
+
+    def unmounts_then_the_table_is_unreadable(argv):
+        done = real(argv) if real else host._run_default(argv)
+        host.denied.add("/proc/self/mountinfo")  # the command said 0, and the table can no longer be read
+        return done
+
+    host.run_handlers["fusermount"] = unmounts_then_the_table_is_unreadable
+    start = len(host.calls)
+    answer = sbx.restore_mount()
+    host.denied.clear()  # the stop that follows reads the table
+    host.run_handlers.pop("fusermount", None) if real is None else host.run_handlers.update(fusermount=real)
+    assert answer == {"ok": False, "why": "the host's mount table could not be read"}
+    assert ("docker", "run", ()) not in calls_after(host, start)
+    assert not sbx._token_files_left()
+    assert sbx._cells.ended["by"] == DL.RESTORE
+    with pytest.raises(InfraError) as ended:
+        sbx.exec("print(1)", 5)
+    assert ended.value.kind == "sandbox"

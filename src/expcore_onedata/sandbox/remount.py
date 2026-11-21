@@ -14,7 +14,7 @@ reads went to the storage itself only if no generation's oneclient log shows a l
 
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+from collections.abc import Sequence
 
 from expcore_onedata.sandbox import hostops
 
@@ -31,8 +31,7 @@ TOKEN = "the token file could not be written"
 NEW_SIDECAR = "the new sidecar did not start"
 NOT_MOUNTED = "the new mount did not appear"
 NOT_ON_HOST = "the new mount is not on the host"
-ON_HOST_TWICE = "the host's mount table shows the new mount more than once"
-OLD_DEVICE = "the new mount is the dead one's device"
+ON_HOST_SPLIT = "the host's mount table shows the new mount on more than one device"
 AGENT_TABLE = "the agent's mount table could not be read"
 STALE_IN_AGENT = "the dead mount is still in the agent's mount table"
 NOT_IN_AGENT = "the new mount is not in the agent's mount table"
@@ -41,11 +40,16 @@ AGENT_OTHER = "the agent's mount is another device"
 
 
 def _fuse_at(table: str | None, mountpoint: str) -> list[dict[str, str]] | None:
-    """The FUSE mounts at `mountpoint` in a mountinfo table; None when there is no table or it cannot be shown whole."""
+    """The FUSE mounts at `mountpoint` in a mountinfo table, each with its mount `id` and `dev`; None when there is no
+    table or it cannot be shown whole."""
     if table is None:
         return None
     try:
-        return [m for m in hostops.fuse_mounts(table) if m["mountpoint"] == mountpoint]
+        return [
+            m
+            for m in hostops.parse_mountinfo(table)
+            if m["mountpoint"] == mountpoint and m["fstype"].startswith("fuse")
+        ]
     except hostops.MountTableError:
         return None
 
@@ -56,21 +60,35 @@ def bar(
     *,
     share: str,
     mount_path: str,
-    old_devices: Collection[str],
 ) -> str | None:
-    """None when the mount is shown back, else the fixed words for what is not: exactly one FUSE mount at `share` in the
-    host's table, on a device that is none of `old_devices` (the dead mount's), and exactly one at `mount_path` in the
-    agent container's own table, on that device. A table that cannot be read is unknown: a reason, never a pass."""
+    """None when the mount is shown back, else the fixed words for what is not: a FUSE mount at `share` in the host's
+    table, every entry of it on one device, and exactly one entry at `mount_path` in the agent container's own table,
+    on that device. A table that cannot be read is unknown: a reason, never a pass.
+
+    **It does not ask whether the mount is a new one by a number the kernel gives it**, neither its device nor its mount
+    id: the kernel hands both back to the next mount once the dead one is released, and whether it does depends on how
+    soon (measured live on the study VM over five restores: the dead mount's device number came back in three, its mount
+    id in a fourth, and only one restore got new numbers). What makes a mount in either table the new one rather than a
+    stale copy is the restore's own sequence, which the caller owns: the dead mount shown gone from the host's table
+    (READ, and empty of FUSE entries at the share: `DockerSandbox._remount` re-reads it after the unmount and fails
+    closed on a table it could not read, or one that still lists the mount) and from the agent's (read as root, every
+    FUSE mount in it detached and the table read empty: `_clear_agent_copy`), then the new sidecar started, so a mount
+    seen afterwards cannot be the dead one. The device only has to agree between the two tables, where both are live at
+    once.
+
+    The host's table lists one FUSE mount more than once: the share is bound onto itself and made shared, so the bind is
+    a peer of the volume mount under it, and a mount stacked on the bind is propagated to that peer too (measured live
+    on a Linux 7.0 host: two entries at the share, one device). Counting entries there would refuse every start; the
+    device is what says it is one mount, and a second device at the share is not the run's mount."""
     on_host = _fuse_at(host_mountinfo, share)
     if on_host is None:
         return HOST_TABLE
     if not on_host:
         return NOT_ON_HOST
-    if len(on_host) > 1:
-        return ON_HOST_TWICE
-    device = on_host[0]["dev"]
-    if device in old_devices:
-        return OLD_DEVICE
+    devices = {m["dev"] for m in on_host}
+    if len(devices) > 1:
+        return ON_HOST_SPLIT
+    (device,) = devices
     in_agent = _fuse_at(ns_mountinfo, mount_path)
     if in_agent is None:
         return AGENT_TABLE
