@@ -264,6 +264,10 @@ class FakeHost:
         # turn it off, and `ns_override` gives a table (by pid) in place of this one
         self.ns_mountinfo = True
         self.ns_override: dict[int, str] = {}
+        # the real kernel lists one FUSE mount at the share twice in the host's table: the share's bind is a peer of the
+        # volume mount under it, so a mount stacked on the bind is propagated to that peer as well (measured on the
+        # study VM: two entries, one device). On by default, so no test assumes one entry; a test may turn it off
+        self.fuse_peer_entry = True
         # the bytes of a process's memory (`/proc/<pid>/task/<tid>/mem`), by that path, for the diagnosis's root half
         self.proc_bytes: dict[str, bytes] = {}
         self.fusectl_state = "writable"  # what the root half's check of the connection's abort file answers
@@ -357,6 +361,8 @@ class FakeHost:
         for path, kind in self.mounts.items():
             mount_id = self._mount_id(path)
             lines.append(f"{mount_id} 25 0:{60 + mount_id} / {path} rw - {kind} source rw")  # device 100 for the first
+            if self.fuse_peer_entry and kind.startswith("fuse"):  # the peer's copy: another id, the same device
+                lines.append(f"{mount_id + 5000} 24 0:{60 + mount_id} / {path} rw - {kind} source rw")
         return "\n".join(lines) + "\n"
 
     def _mount_id(self, path: str) -> int:

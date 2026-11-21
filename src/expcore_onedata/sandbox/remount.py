@@ -31,7 +31,7 @@ TOKEN = "the token file could not be written"
 NEW_SIDECAR = "the new sidecar did not start"
 NOT_MOUNTED = "the new mount did not appear"
 NOT_ON_HOST = "the new mount is not on the host"
-ON_HOST_TWICE = "the host's mount table shows the new mount more than once"
+ON_HOST_SPLIT = "the host's mount table shows the new mount on more than one device"
 OLD_DEVICE = "the new mount is the dead one's device"
 AGENT_TABLE = "the agent's mount table could not be read"
 STALE_IN_AGENT = "the dead mount is still in the agent's mount table"
@@ -58,17 +58,24 @@ def bar(
     mount_path: str,
     old_devices: Collection[str],
 ) -> str | None:
-    """None when the mount is shown back, else the fixed words for what is not: exactly one FUSE mount at `share` in the
-    host's table, on a device that is none of `old_devices` (the dead mount's), and exactly one at `mount_path` in the
-    agent container's own table, on that device. A table that cannot be read is unknown: a reason, never a pass."""
+    """None when the mount is shown back, else the fixed words for what is not: a FUSE mount at `share` in the host's
+    table, every entry of it on one device that is none of `old_devices` (the dead mount's), and exactly one entry at
+    `mount_path` in the agent container's own table, on that device. A table that cannot be read is unknown: a reason,
+    never a pass.
+
+    The host's table lists one FUSE mount more than once: the share is bound onto itself and made shared, so the bind is
+    a peer of the volume mount under it, and a mount stacked on the bind is propagated to that peer too (measured live
+    on a Linux 7.0 host: two entries at the share, one device). Counting entries there would refuse every start; the
+    device is what says it is one mount, and a second device at the share is not the run's mount."""
     on_host = _fuse_at(host_mountinfo, share)
     if on_host is None:
         return HOST_TABLE
     if not on_host:
         return NOT_ON_HOST
-    if len(on_host) > 1:
-        return ON_HOST_TWICE
-    device = on_host[0]["dev"]
+    devices = {m["dev"] for m in on_host}
+    if len(devices) > 1:
+        return ON_HOST_SPLIT
+    (device,) = devices
     if device in old_devices:
         return OLD_DEVICE
     in_agent = _fuse_at(ns_mountinfo, mount_path)

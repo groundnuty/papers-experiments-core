@@ -70,10 +70,12 @@ class DockerDiagnosis:
         )
 
     def _device(self) -> str | None:
-        """The device of the run's mount in the host's table now; None when it is not exactly one FUSE mount there, or
-        the table cannot be read."""
+        """The device of the run's mount in the host's table now; None when there is no FUSE mount at the share, or its
+        entries are on more than one device, or the table cannot be read. The table lists one mount more than once (the
+        share's bind is a peer of the volume under it), so it is the device that must be one, not the entry."""
         found = TD._fuse_at(self._host, self._mountpoint(), self._waits)
-        return found[0]["dev"] if found is not None and len(found) == 1 else None
+        devices = {m["dev"] for m in found or []}
+        return next(iter(devices)) if len(devices) == 1 else None
 
     def roles(self) -> S.Roles:
         """The cell's fixed targets (`stuck.Roles`): with the device, only a FUSE mount on it at the data path is the

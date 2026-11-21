@@ -29,7 +29,9 @@ def share_of(mounted) -> str:
 
 
 def devices(host, mounted) -> list[str]:
-    return [m["dev"] for m in hostops.fuse_mounts(host.mountinfo()) if m["mountpoint"] == share_of(mounted)]
+    """The distinct devices of the FUSE entries at the share in the host's table: the real kernel lists one mount twice
+    (the share's bind is a peer of the volume under it), so a mount is counted by its device, never by its entries."""
+    return sorted({m["dev"] for m in hostops.fuse_mounts(host.mountinfo()) if m["mountpoint"] == share_of(mounted)})
 
 
 @pytest.fixture
@@ -233,15 +235,22 @@ def test_o97_a_restore_given_up_on_between_its_steps_starts_no_sidecar(aborted):
 
 
 def test_o97_the_restore_bar_is_what_the_mount_tables_show_not_a_read_through_the_mount():
-    """O97: `remount.bar` judges the two tables: one FUSE mount at the share on a new device on the host, and in the
-    agent's namespace one at the mount path, on that device. Each failing shape has its own words."""
+    """O97: `remount.bar` judges the two tables: a FUSE mount at the share on one new device on the host (however many
+    entries the kernel lists it as: the share's bind is a peer of the volume under it, so one mount shows twice), and in
+    the agent's namespace one entry at the mount path, on that device. Each failing shape has its own words."""
     root = "1 0 8:1 / / rw - ext4 /dev/root rw\n"
     host_ok = root + "10 1 0:77 / /run/share rw - fuse.oneclient s rw\n"
     ns_ok = root + "20 1 0:77 / /data ro - fuse.oneclient s ro\n"
     assert RM.bar(host_ok, ns_ok, share="/run/share", mount_path="/data", old_devices={"0:70"}) is None
+    twice = host_ok + "5010 9 0:77 / /run/share rw - fuse.oneclient s rw\n"  # the peer's copy: the same device
+    assert RM.bar(twice, ns_ok, share="/run/share", mount_path="/data", old_devices={"0:70"}) is None
     cases = {
+        "the host's mount table shows the new mount on more than one device": (
+            host_ok + "11 1 0:88 / /run/share rw - fuse.oneclient s rw\n",
+            ns_ok,
+        ),
+        "the new mount is the dead one's device": (twice.replace("0:77", "0:70"), ns_ok.replace("0:77", "0:70")),
         "the new mount is not on the host": (root, ns_ok),
-        "the new mount is the dead one's device": (host_ok.replace("0:77", "0:70"), ns_ok.replace("0:77", "0:70")),
         "the agent's mount table could not be read": (host_ok, None),
         "the new mount is not in the agent's mount table": (host_ok, root),
         "the agent's mount table shows the mount more than once": (host_ok, ns_ok + ns_ok.splitlines()[1] + "\n"),
@@ -480,3 +489,36 @@ def test_o97_an_agent_bound_after_the_mount_was_stacked_fails_the_restore_closed
     assert len(fuse_in_agent(host, sbx)) == 1  # the clone of generation one
     assert sbx.restore_mount() == {"ok": False, "why": "the new mount is not in the agent's mount table"}
     assert fuse_in_agent(host, sbx) == []
+
+
+def lists_the_mount_on_another_device_too(host):
+    """The host's table, with each FUSE entry copied on a second device: two mounts at the share that are not one."""
+    real = host.mountinfo
+
+    def table() -> str:
+        text = real()
+        extra = [line.replace(" 0:", " 0:9", 1) for line in text.splitlines() if "fuse.oneclient" in line]
+        return text + "".join(line + "\n" for line in extra)  # nothing before the sidecar has made its mount
+
+    host.mountinfo = table
+
+
+def test_o97_the_start_accepts_a_mount_the_host_lists_twice_on_one_device(world):
+    """O97: measured live: one FUSE mount at the share is two entries of the host's table, on one device. The start's
+    wait for the agent's mount judges the table by its device, so it passes, and the agent's table shows it once."""
+    assert world.host.fuse_peer_entry is True
+    sbx = DockerSandbox.start(world.host, world.s, make_spec(world, "mounted"), **start_options(world))
+    try:
+        entries = [m for m in hostops.fuse_mounts(world.host.mountinfo()) if m["mountpoint"] == share_of(sbx)]
+        assert len(entries) == 2
+        assert len({m["dev"] for m in entries}) == 1
+        assert sbx.exec("print(1)", 30).exit_code == 0
+    finally:
+        sbx.stop()
+
+
+def test_o97_the_start_refuses_a_share_whose_entries_are_on_two_devices(world):
+    """O97: a second device at the share is not the run's mount: the start fails in fixed words, never goes on."""
+    lists_the_mount_on_another_device_too(world.host)
+    with pytest.raises(SandboxError, match="more than one device"):
+        DockerSandbox.start(world.host, world.s, make_spec(world, "mounted"), **start_options(world))
