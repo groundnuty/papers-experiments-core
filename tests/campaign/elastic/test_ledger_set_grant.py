@@ -217,6 +217,21 @@ def test_c66_a_raise_is_refused_while_a_controller_holds_the_ledger_and_works_on
     raise_grants(ledger_path(tmp_path), clock, m1=276.99)
 
 
+def test_c66_a_raise_through_a_link_to_the_ledger_is_refused_while_a_controller_holds_it_by_its_own_path(tmp_path):
+    """C66: the controller's lock is the `campaign.lock` beside the ledger file it opened; a command that reaches the
+    same file through a link in another directory would take another lock and run beside it. It locks both."""
+    ledger, clock = make(tmp_path, runs=RUNS, max_usd=3600.0, grants_usd={"m1": 100.0, "m2": 50.0})
+    link = tmp_path / "ops" / "ledger.sqlite"
+    link.parent.mkdir()
+    link.symlink_to(ledger_path(tmp_path))
+    before = meta(ledger_path(tmp_path))
+    with pytest.raises(GrantRefused, match="controller holds"):
+        raise_grants(link, clock, m1=276.99)
+    assert meta(ledger_path(tmp_path)) == before
+    ledger.close()
+    raise_grants(link, clock, m1=276.99)  # the same raise goes through once no controller holds the file
+
+
 def test_c66_a_ledger_with_no_budget_a_free_model_or_an_unplanned_model_has_no_grant_to_raise(tmp_path):
     """C66: no budget: a lease is granted nothing; a model granted 0 is free; a model with no run is not the
     ledger's."""
@@ -300,6 +315,7 @@ def test_c66_the_command_exits_one_for_a_ledger_refusal_and_two_for_a_model_name
         ("m1=0", "above zero"),
         ("m1=-1", "above zero"),
         ("m1=1.1234567", "micro-dollar"),
+        ("m1=2.00000000000000000000000000001", "micro-dollar"),
         ("m1=9007199254.740993", "at most"),
         ("m1=1e1000000", "at most"),
     ],

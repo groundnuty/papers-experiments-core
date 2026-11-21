@@ -151,6 +151,7 @@ def test_c66_the_flag_changes_no_part_of_the_campaign_fingerprint_a_worker_joins
         ("alpha-stub=nan", "finite"),
         ("alpha-stub=inf", "finite"),
         ("alpha-stub=1.1234567", "micro-dollar"),
+        ("alpha-stub=2.00000000000000000000000000001", "micro-dollar"),
         ("alpha-stub=12345678901.123456", "at most"),
         ("alpha-stub=1e1000000", "at most"),
     ],
@@ -184,15 +185,17 @@ def test_c66_an_allowance_that_makes_a_grant_a_figure_of_dollars_cannot_hold_exa
     assert not path.exists()
 
 
+@pytest.mark.parametrize("typed", ["0.0000001", "2.00000000000000000000000000001"])
 def test_c66_an_allowance_finer_than_a_micro_dollar_from_a_direct_caller_is_refused_not_rounded(
-    tmp_path, clean_environment
+    tmp_path, clean_environment, typed
 ):
     """C66: a caller that does not come through the command line gets the same bound: 0.0000001 USD would be granted as
-    a whole micro-dollar and recorded as none."""
+    a whole micro-dollar and recorded as none, and a figure of 30 digits, more than a Decimal operation keeps at its
+    default precision, must not be rounded to a whole micro-dollar either."""
     study = make_copy(tmp_path, "study")
     path = ledger_path(tmp_path)
     with pytest.raises(ValueError, match="micro-dollars"):
-        create_ledger(path, study, hard_term_s=5400.0, max_usd=500.0, topup_allowances={ALPHA: Decimal("0.0000001")})
+        create_ledger(path, study, hard_term_s=5400.0, max_usd=500.0, topup_allowances={ALPHA: Decimal(typed)})
     assert not path.exists()
 
 

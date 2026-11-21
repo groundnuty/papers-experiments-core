@@ -161,13 +161,18 @@ def set_in_file(
     path: Path, wanted: Mapping[str, int], reason: str, actor: str, *, clock: Callable[[], float] = time.time
 ) -> list[GrantRaise]:
     """Raise grants in the ledger file at `path` under the dispatcher's own lock, in one transaction (the module's
-    docstring). Refused (`GrantRefused`, nothing written) while a controller holds the ledger."""
+    docstring). Refused (`GrantRefused`, nothing written) while a controller holds the ledger. The lock is the
+    `campaign.lock` beside the file, and a controller took the one beside the path it opened, which may be a link to
+    this file from another directory: both directories' locks are taken, the path's and the file's own."""
     if not path.is_file():
         raise FileNotFoundError(f"{path}: no ledger there")
-    lock = DispatchLock(path.parent)
+    locks: list[DispatchLock] = []
     try:
-        lock.acquire()
+        for parent in dict.fromkeys([path.parent, path.resolve().parent]):
+            locks.append(DispatchLock(parent).acquire())
     except CampaignLocked as error:
+        for lock in locks:
+            lock.release()
         raise GrantRefused(
             f"a controller holds this ledger ({error}): one on a core that predates this change would ignore a raised "
             "grant and keep issuing at the pinned one, and none can be told from one that reads it. Stop the "
@@ -185,4 +190,5 @@ def set_in_file(
         finally:
             db.close()
     finally:
-        lock.release()
+        for lock in locks:
+            lock.release()

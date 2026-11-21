@@ -29,6 +29,21 @@ FINEST_DECIMALS = 6  # the ledger counts in micro-dollars
 MAX_USD = Decimal(MAX_GRANT_MICRO) / MICRO
 
 
+def _exact_micro(usd: Decimal) -> int | None:
+    """A positive, finite `usd` in whole micro-dollars, or None when it is finer than one. Read from the digits, never
+    by a `Decimal` operation: those round at the context's precision (28 digits by default) and would take a figure of
+    30 digits for a shorter one. Callers bound `usd` first (`MAX_USD`), so the power below stays small."""
+    _, digits, exponent = usd.as_tuple()
+    assert isinstance(exponent, int)
+    shift = exponent + FINEST_DECIMALS
+    if shift >= 0:
+        return int("".join(map(str, digits))) * 10**shift
+    kept = len(digits) + shift
+    if kept <= 0 or any(digits[kept:]):
+        return None if any(digits) else 0
+    return int("".join(map(str, digits[:kept])))
+
+
 def dollars_of(flag: str, text: str) -> Decimal:
     """The USD of `flag`'s `MODEL=USD` as typed, or an `ArgumentTypeError` naming what is wrong with it."""
     try:
@@ -41,8 +56,7 @@ def dollars_of(flag: str, text: str) -> Decimal:
         raise argparse.ArgumentTypeError(f"{flag}: USD must be above zero, got {text!r}")
     if value > MAX_USD:
         raise argparse.ArgumentTypeError(f"{flag}: USD must be at most {MAX_USD:f}, got {text!r}")
-    exponent = value.normalize().as_tuple().exponent
-    if isinstance(exponent, int) and exponent < -FINEST_DECIMALS:
+    if _exact_micro(value) is None:
         raise argparse.ArgumentTypeError(
             f"{flag}: USD must be no finer than a micro-dollar ({FINEST_DECIMALS} decimals), got {text!r}"
         )
@@ -68,10 +82,10 @@ def micro_of(usd: Decimal) -> int:
     problem = f"{usd} USD is not a whole number of micro-dollars above zero and at most {MAX_USD:f} USD"
     if not usd.is_finite() or usd <= 0 or usd > MAX_USD:  # compared before any arithmetic, which a huge exponent breaks
         raise ValueError(problem)
-    scaled = usd.scaleb(FINEST_DECIMALS)
-    if scaled != scaled.to_integral_value():
+    micro = _exact_micro(usd)
+    if micro is None:
         raise ValueError(problem)
-    return int(scaled)
+    return micro
 
 
 def allowances_micro(allowances: Mapping[str, Decimal]) -> dict[str, int]:
