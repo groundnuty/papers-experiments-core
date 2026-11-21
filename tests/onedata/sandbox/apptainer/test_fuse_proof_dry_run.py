@@ -103,3 +103,52 @@ def test_o97_the_target_is_a_space_whose_holder_is_not_its_own_local_provider_in
         pick_space(load_platform(write_platform(tmp_path / "local", lambda data: with_spaces(data, 2))))
     one = load_platform(write_platform(tmp_path / "one", lambda data: with_placement(data, holder="beta")))
     assert pick_space(one)[1] == "providers[1]"
+
+
+def test_o97_the_live_worlds_rest_calls_dial_the_mapped_addresses_of_a_federation_with_an_address_map():
+    """O97: an HPC federation's names resolve only through its `[addresses]` map (O73), so the seeding's REST calls go
+    through the platform's `MappedTransport`, as its own client's do; a file with no map dials each name itself."""
+    from types import SimpleNamespace
+
+    from fuse_proof_world import space_files
+
+    from expcore_onedata.client import MappedTransport
+
+    def config(addresses):
+        return SimpleNamespace(
+            addresses=addresses,
+            tls=SimpleNamespace(client_verify=lambda: True),
+            admin=SimpleNamespace(read=lambda: "a"),
+        )
+
+    assert isinstance(space_files(config(object()))._http._transport, MappedTransport)
+    assert not isinstance(space_files(config(None))._http._transport, MappedTransport)
+
+
+def test_o97_a_direct_sandbox_takes_the_platforms_own_token_and_spec_with_nothing_held_down():
+    """O97: the control and the unregistered sandboxes are the platform's own mount runs in all but the held-down set,
+    which is empty: no injection of theirs explains a block, so a survivor of theirs is never the agent's."""
+    import dataclasses
+    from types import SimpleNamespace
+
+    from fuse_proof_world import direct_spec
+
+    from expcore_onedata.sandbox.api import DataPathMode, SandboxSpec
+
+    asked = {}
+
+    def mint(mode, lease, ceiling_s, condition):
+        asked["mint"] = (mode, lease, ceiling_s, condition)
+        return SimpleNamespace(data_path="the-token")
+
+    def spec(run_key, level, token, lease):
+        asked["spec"] = (run_key, level, token, lease)
+        return SandboxSpec(run_key=run_key, mode=DataPathMode.MOUNT, held_down=lambda: frozenset({"providers[1]"}))
+
+    made = direct_spec(SimpleNamespace(_mint=mint, _spec=spec), "fuse-proof-control", "mounted", 60.0)
+    assert asked == {
+        "mint": (DataPathMode.MOUNT, None, 60.0, None),
+        "spec": ("fuse-proof-control", "mounted", "the-token", None),
+    }
+    assert made.held_down() == frozenset()
+    assert dataclasses.replace(made, held_down=None).run_key == "fuse-proof-control"

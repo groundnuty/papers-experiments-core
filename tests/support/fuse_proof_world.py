@@ -10,6 +10,7 @@ admission never waits on them. Nothing here is a fake; the dry run's world is `f
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -21,18 +22,18 @@ from expcore.plugin import NO_WAITS
 from expcore_onedata import fault_relay
 from expcore_onedata import linkrecord as LR
 from expcore_onedata.admission import fault_settings_of, run_admission
-from expcore_onedata.client import OnezoneClient
+from expcore_onedata.client import MappedTransport, OnezoneClient
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_serves import provider_serves
 from expcore_onedata.fault_settings import hpc_driver
 from expcore_onedata.faults import FaultInjector
 from expcore_onedata.health import PlatformHealth
-from expcore_onedata.sandbox.api import DataPathMode, Endpoint, SandboxSpec
+from expcore_onedata.sandbox.api import DataPathMode, SandboxSpec
 from expcore_onedata.sandbox.apptainer.hostmount import host_mount_factory
 from expcore_onedata.sandbox.apptainer.node import LocalNode
 from expcore_onedata.sandbox.apptainer.sandbox import ApptainerSandbox
 from expcore_onedata.sandbox.provider import SandboxPlatform
-from expcore_onedata.tokens import TokenIssuer, data_path_spec
+from expcore_onedata.tokens import TokenIssuer
 
 log = logging.getLogger("fuse_proof")
 TOKEN_CEILING_S = 7200.0  # the direct sandboxes' tokens: the whole step, with room
@@ -56,6 +57,22 @@ def pick_space(config: Any) -> tuple[Any, str]:
         if label is not None and label != config.provider_label(entry.support.local):
             return entry, label
     raise SystemExit("no space has a data provider other than the agent's local one: nothing to take down")
+
+
+def space_files(config: Any) -> SpaceFiles:
+    """The platform's REST file calls, dialling each declared name at its mapped address when the file has `[addresses]`
+    (O73, as the platform's own client does): an HPC federation's names resolve nowhere else."""
+    if config.addresses is None:
+        return SpaceFiles(config)
+    return SpaceFiles(config, transport=MappedTransport(config.addresses, verify=config.tls.client_verify()))
+
+
+def direct_spec(platform: SandboxPlatform, run_key: str, level: str, ceiling_s: float) -> SandboxSpec:
+    """The spec of a sandbox started outside any attempt: the platform's own token and spec for `level`, with no
+    held-down set (no injection of this run explains a block in it)."""
+    tokens = platform._mint(DataPathMode.MOUNT, None, ceiling_s, None)
+    spec = platform._spec(run_key, level, tokens.data_path if tokens is not None else None, None)
+    return dataclasses.replace(spec, held_down=lambda: frozenset())
 
 
 class LiveWorld:
@@ -107,25 +124,16 @@ class LiveWorld:
 
     # --- outside the campaign: the control (K) and the unregistered sandbox (N)
     def direct(self, run_key: str) -> ApptainerSandbox:
-        """A mount sandbox started directly, with a data-path token of its own and no injection registered for it."""
-        config = self.config
-        token = self.issuer.mint(
-            data_path_spec([e.space.id for e in config.spaces], "oneclient"),
-            config.principals.data_path,
-            ceiling_s=TOKEN_CEILING_S,
-        )
-        spec = SandboxSpec(
-            run_key=run_key,
-            mode=DataPathMode.MOUNT,
-            token=token,
-            zone=Endpoint.from_url(config.zone.url),
-            provider=Endpoint.from_url(config.local_provider.url),
-            space_holders=config.space_holders(),
-        )
-        return ApptainerSandbox.start(self.node, config.sandbox, spec, mount_helper=host_mount_factory())
+        """A mount sandbox started directly, outside any attempt, with no injection registered for it (`direct_spec`).
+        A launch is refused outside an attempt on a platform with `[faults]`, so the platform's own token and spec are
+        used, and only its held-down set is emptied: a block in it is never the agent's."""
+        return ApptainerSandbox.start(
+            self.node, self.config.sandbox, direct_spec(self.platform, run_key, self.level, TOKEN_CEILING_S),
+            mount_helper=host_mount_factory(),
+        )  # fmt: skip
 
     def files(self) -> SpaceFiles:
-        return SpaceFiles(self.config)
+        return space_files(self.config)
 
     def provider_of(self, label: str) -> str:
         """A provider's configured name from its label, for the platform's own REST calls; never recorded."""
@@ -143,4 +151,4 @@ class LiveWorld:
         self.client.close()
 
 
-__all__ = ["LiveWorld", "mount_level", "pick_space"]
+__all__ = ["LiveWorld", "direct_spec", "mount_level", "pick_space", "space_files"]
