@@ -1,12 +1,13 @@
 # Provenance: new
 """A lease's grant raised by dollars typed at the command line: `elastic create --topup-allowance MODEL=USD` and
-`elastic set-grant LEDGER MODEL=USD` (C65).
+`elastic set-grant LEDGER MODEL=USD` (C66).
 
-A lease's grant is one reservation and the bound of two admission probes (`config.lease_grant_usd`), and workers that
-predate C64 build a lease store's budget gate to count the run in flight and the next run as well, so a lease that has
-spent anything is held. The grant is the one lever a controller has over workers it cannot change: they read it from
-the ledger. An amount is typed in dollars and read exactly as written (never through a float): finite, above zero, no
-finer than the micro-dollar the ledger counts in, and no more than a grant held as a float of dollars keeps exactly
+A lease's grant is one reservation and the bound of two admission probes (`config.lease_grant_usd`). A lease's budget
+gate holds a lease whose spend and reservations pass it: a run pending again after an attempt that spent a reservation
+is weighed as spent plus one more, and on a core that predates C64 a run in flight is counted as reserved and again as
+the next run. The grant is the one lever a controller has over workers it cannot change: they read it from the
+ledger. An amount is typed in dollars and read exactly as written (never through a float): finite, above zero, no finer
+than the micro-dollar the ledger counts in, and no more than a grant held as a float of dollars keeps exactly
 (`MAX_GRANT_MICRO`). A huge exponent is refused by that bound, not overflowed.
 """
 

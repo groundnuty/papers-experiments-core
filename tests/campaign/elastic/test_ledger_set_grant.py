@@ -1,4 +1,4 @@
-"""C65: `elastic set-grant` raises a model's lease grant on an existing ledger, before any lease of the model is issued,
+"""C66: `elastic set-grant` raises a model's lease grant on an existing ledger, before any lease of the model is issued,
 for workers on a core that cannot be changed (they read the grant from the ledger, and the ledger's pinned
 configuration, which an older core also reads, stays byte for byte as it was)."""
 
@@ -58,8 +58,8 @@ def leases_by_model(ledger, clock, federations=4):
     return out
 
 
-def test_c65_set_grant_raises_the_named_models_grant_and_every_later_lease_of_it_carries_it(tmp_path):
-    """C65: m1 is raised from 100 to 276.99 USD; its leases are issued at that grant (the figure a worker reads as
+def test_c66_set_grant_raises_the_named_models_grant_and_every_later_lease_of_it_carries_it(tmp_path):
+    """C66: m1 is raised from 100 to 276.99 USD; its leases are issued at that grant (the figure a worker reads as
     its whole budget) and m2's, not named, at the 50 it had."""
     path, clock = closed(tmp_path)
     raise_grants(path, clock, m1=276.99)
@@ -71,8 +71,8 @@ def test_c65_set_grant_raises_the_named_models_grant_and_every_later_lease_of_it
         ledger.close()
 
 
-def test_c65_the_pinned_configuration_is_the_text_it_was_so_an_older_reader_sees_no_change(tmp_path):
-    """C65: the raised grant is a meta row of its own and the event log's: the `config` row is byte for byte what it
+def test_c66_the_pinned_configuration_is_the_text_it_was_so_an_older_reader_sees_no_change(tmp_path):
+    """C66: the raised grant is a meta row of its own and the event log's: the `config` row is byte for byte what it
     was, so a reader of an older core (its merge, a sibling controller, a worker) reads the grants it always read."""
     path, clock = closed(tmp_path)
     before = meta(path)
@@ -84,8 +84,8 @@ def test_c65_the_pinned_configuration_is_the_text_it_was_so_an_older_reader_sees
     assert LedgerConfig.from_json(after["config"]).grants_usd == {"m1": 100.0, "m2": 50.0}
 
 
-def test_c65_the_campaign_fingerprint_is_untouched_and_a_federation_still_joins_with_it(tmp_path):
-    """C65: the grant is no input to the fingerprint the ledger pins, and a federation joins with the campaign's own."""
+def test_c66_the_campaign_fingerprint_is_untouched_and_a_federation_still_joins_with_it(tmp_path):
+    """C66: the grant is no input to the fingerprint the ledger pins, and a federation joins with the campaign's own."""
     path, clock = closed(tmp_path)
     raise_grants(path, clock, m1=276.99)
     ledger = reopened(path, clock)
@@ -97,8 +97,8 @@ def test_c65_the_campaign_fingerprint_is_untouched_and_a_federation_still_joins_
 
 
 @pytest.mark.parametrize("usd", [100.0, 99.99, 1.0])
-def test_c65_a_grant_is_only_raised_never_set_to_the_current_one_or_below(tmp_path, usd):
-    """C65: a new grant that is not above the current one is refused and nothing is written."""
+def test_c66_a_grant_is_only_raised_never_set_to_the_current_one_or_below(tmp_path, usd):
+    """C66: a new grant that is not above the current one is refused and nothing is written."""
     path, clock = closed(tmp_path)
     before = meta(path)
     with pytest.raises(GrantRefused, match="not above"):
@@ -106,8 +106,8 @@ def test_c65_a_grant_is_only_raised_never_set_to_the_current_one_or_below(tmp_pa
     assert meta(path) == before
 
 
-def test_c65_a_second_raise_is_judged_against_the_first(tmp_path):
-    """C65: the grant in force is the latest raise, so a later raise must be above it."""
+def test_c66_a_second_raise_is_judged_against_the_first(tmp_path):
+    """C66: the grant in force is the latest raise, so a later raise must be above it."""
     path, clock = closed(tmp_path)
     raise_grants(path, clock, m1=150.0)
     with pytest.raises(GrantRefused, match="not above"):
@@ -116,8 +116,8 @@ def test_c65_a_second_raise_is_judged_against_the_first(tmp_path):
     assert json.loads(meta(path)["grant_overrides_micro_usd"]) == {"m1": 200_000_000}
 
 
-def test_c65_a_model_with_a_lease_ever_issued_is_refused_so_no_issued_lease_changes(tmp_path):
-    """C65: once a lease of a model exists, in any state, its grant is pinned, so no lease's accounting changes."""
+def test_c66_a_model_with_a_lease_ever_issued_is_refused_so_no_issued_lease_changes(tmp_path):
+    """C66: once a lease of a model exists, in any state, its grant is pinned, so no lease's accounting changes."""
     path, clock = closed(tmp_path)
     ledger = reopened(path, clock)
     join(ledger, clock, "fed-1")
@@ -129,8 +129,8 @@ def test_c65_a_model_with_a_lease_ever_issued_is_refused_so_no_issued_lease_chan
     assert meta(path) == before
 
 
-def test_c65_a_call_that_names_one_model_with_a_lease_writes_nothing_for_the_other(tmp_path):
-    """C65: the models are raised together or not at all."""
+def test_c66_a_call_that_names_one_model_with_a_lease_writes_nothing_for_the_other(tmp_path):
+    """C66: the models are raised together or not at all."""
     path, clock = closed(tmp_path)
     ledger = reopened(path, clock)
     join(ledger, clock, "fed-1")
@@ -143,8 +143,8 @@ def test_c65_a_call_that_names_one_model_with_a_lease_writes_nothing_for_the_oth
     assert meta(path) == before
 
 
-def test_c65_a_raise_is_a_ledger_event_with_its_actor_model_old_and_new_grant_and_time(tmp_path):
-    """C65: each model raised is one event of the ledger's log, and `status` shows the history."""
+def test_c66_a_raise_is_a_ledger_event_with_its_actor_model_old_and_new_grant_and_time(tmp_path):
+    """C66: each model raised is one event of the ledger's log, and `status` shows the history."""
     path, clock = closed(tmp_path)
     clock.advance(42.0)
     raise_grants(path, clock, m1=276.99, m2=69.245)
@@ -166,8 +166,8 @@ def test_c65_a_raise_is_a_ledger_event_with_its_actor_model_old_and_new_grant_an
     ]
 
 
-def test_c65_grants_at_a_cap_of_ten_each_that_fit_the_budget_are_accepted_and_all_twenty_leases_go_out(tmp_path):
-    """C65: caps 10 and 10 at grants 276.99 and 69.245 need 10 x 276.99 + 10 x 69.245 = 3,462.35 USD, under the
+def test_c66_grants_at_a_cap_of_ten_each_that_fit_the_budget_are_accepted_and_all_twenty_leases_go_out(tmp_path):
+    """C66: caps 10 and 10 at grants 276.99 and 69.245 need 10 x 276.99 + 10 x 69.245 = 3,462.35 USD, under the
     3,600 of `max_usd`: accepted, and the issue path (a grant against `max_usd` less what is committed, settled plus
     locked) lets every lease go out."""
     runs = plan(models=("m1", "m2"), tasks=10, conditions=("api-none",))
@@ -182,8 +182,8 @@ def test_c65_grants_at_a_cap_of_ten_each_that_fit_the_budget_are_accepted_and_al
         ledger.close()
 
 
-def test_c65_grants_whose_caps_would_not_fit_the_budget_are_refused_with_the_arithmetic(tmp_path):
-    """C65: caps 10 and 10 at grants 300 and 70 need 3,700 USD against 3,600: not every cap slot could hold a lease,
+def test_c66_grants_whose_caps_would_not_fit_the_budget_are_refused_with_the_arithmetic(tmp_path):
+    """C66: caps 10 and 10 at grants 300 and 70 need 3,700 USD against 3,600: not every cap slot could hold a lease,
     so the raise is refused and says so."""
     path, clock = closed(tmp_path, caps={"m1": 10, "m2": 10})
     before = meta(path)
@@ -195,8 +195,8 @@ def test_c65_grants_whose_caps_would_not_fit_the_budget_are_refused_with_the_ari
     assert meta(path) == before
 
 
-def test_c65_a_grant_above_the_campaigns_or_the_models_own_ceiling_is_refused(tmp_path):
-    """C65: a lease no ceiling could hold would never go out."""
+def test_c66_a_grant_above_the_campaigns_or_the_models_own_ceiling_is_refused(tmp_path):
+    """C66: a lease no ceiling could hold would never go out."""
     path, clock = closed(tmp_path, max_usd=500.0, per_model_usd={"m1": 300.0})
     with pytest.raises(GrantRefused, match="ceiling"):
         raise_grants(path, clock, m2=500.01)
@@ -205,8 +205,8 @@ def test_c65_a_grant_above_the_campaigns_or_the_models_own_ceiling_is_refused(tm
     raise_grants(path, clock, m1=300.0)  # exactly the ceiling fits
 
 
-def test_c65_a_raise_is_refused_while_a_controller_holds_the_ledger_and_works_once_it_is_gone(tmp_path):
-    """C65: the command takes the dispatcher's own lock for its one transaction, so it never runs beside a controller
+def test_c66_a_raise_is_refused_while_a_controller_holds_the_ledger_and_works_once_it_is_gone(tmp_path):
+    """C66: the command takes the dispatcher's own lock for its one transaction, so it never runs beside a controller
     (whose core may not read a raised grant) and no controller starts under it; the refusal names the controller."""
     ledger, clock = make(tmp_path, runs=RUNS, max_usd=3600.0, grants_usd={"m1": 100.0, "m2": 50.0})
     before = meta(ledger_path(tmp_path))
@@ -217,8 +217,8 @@ def test_c65_a_raise_is_refused_while_a_controller_holds_the_ledger_and_works_on
     raise_grants(ledger_path(tmp_path), clock, m1=276.99)
 
 
-def test_c65_a_ledger_with_no_budget_a_free_model_or_an_unplanned_model_has_no_grant_to_raise(tmp_path):
-    """C65: no budget: a lease is granted nothing; a model granted 0 is free; a model with no run is not the
+def test_c66_a_ledger_with_no_budget_a_free_model_or_an_unplanned_model_has_no_grant_to_raise(tmp_path):
+    """C66: no budget: a lease is granted nothing; a model granted 0 is free; a model with no run is not the
     ledger's."""
     path, clock = closed(tmp_path / "none", max_usd=None, grants_usd={})
     with pytest.raises(GrantRefused, match="no budget"):
@@ -231,8 +231,8 @@ def test_c65_a_ledger_with_no_budget_a_free_model_or_an_unplanned_model_has_no_g
         raise_grants(path, clock, nobody=5.0)
 
 
-def test_c65_the_issue_path_weighs_the_raised_grant_against_the_budget_left(tmp_path):
-    """C65: with 300 USD, m1 at 276.99 leaves 23.01: the first lease goes out and the second waits over the budget
+def test_c66_the_issue_path_weighs_the_raised_grant_against_the_budget_left(tmp_path):
+    """C66: with 300 USD, m1 at 276.99 leaves 23.01: the first lease goes out and the second waits over the budget
     left, where at the 100 it had three would have gone out."""
     runs = plan(models=("m1",), tasks=3, conditions=("api-none",))
     path, clock = closed(tmp_path, runs=runs, max_usd=300.0, grants_usd={"m1": 100.0})
@@ -250,8 +250,8 @@ def test_c65_the_issue_path_weighs_the_raised_grant_against_the_budget_left(tmp_
         ledger.close()
 
 
-def test_c65_the_controllers_view_sizes_the_fleet_with_the_raised_grant(tmp_path):
-    """C65: what the controller reads as the model's grant, to size how many federations the budget can hold, is the
+def test_c66_the_controllers_view_sizes_the_fleet_with_the_raised_grant(tmp_path):
+    """C66: what the controller reads as the model's grant, to size how many federations the budget can hold, is the
     raised one."""
     path, clock = closed(tmp_path)
     raise_grants(path, clock, m1=276.99)
@@ -262,8 +262,8 @@ def test_c65_the_controllers_view_sizes_the_fleet_with_the_raised_grant(tmp_path
         ledger.close()
 
 
-def test_c65_the_command_raises_a_grant_and_says_what_it_did(tmp_path, capsys):
-    """C65: `set-grant LEDGER MODEL=USD... --reason TEXT --actor NAME`: exit 0, each model's old and new grant, and the
+def test_c66_the_command_raises_a_grant_and_says_what_it_did(tmp_path, capsys):
+    """C66: `set-grant LEDGER MODEL=USD... --reason TEXT --actor NAME`: exit 0, each model's old and new grant, and the
     next controller's core named."""
     path, _ = closed(tmp_path)
     args = ["set-grant", str(path), "m1=276.99", "m2=69.245", "--reason", "before the first lease", "--actor", "a"]
@@ -276,8 +276,8 @@ def test_c65_the_command_raises_a_grant_and_says_what_it_did(tmp_path, capsys):
     assert json.loads(meta(path)["grant_overrides_micro_usd"]) == {"m1": 276_990_000, "m2": 69_245_000}
 
 
-def test_c65_the_command_exits_one_for_a_ledger_refusal_and_two_for_a_model_named_twice(tmp_path, capsys):
-    """C65: a refusal by the ledger (a grant not above the current one) is exit 1 with the reason on stderr; a model
+def test_c66_the_command_exits_one_for_a_ledger_refusal_and_two_for_a_model_named_twice(tmp_path, capsys):
+    """C66: a refusal by the ledger (a grant not above the current one) is exit 1 with the reason on stderr; a model
     named twice is a usage error, exit 2, and neither writes a grant."""
     path, _ = closed(tmp_path)
     tail = ["--reason", "r", "--actor", "a"]
@@ -304,10 +304,10 @@ def test_c65_the_command_exits_one_for_a_ledger_refusal_and_two_for_a_model_name
         ("m1=1e1000000", "at most"),
     ],
 )
-def test_c65_an_amount_that_is_not_a_finite_number_of_dollars_above_zero_to_the_micro_dollar_is_a_usage_error(
+def test_c66_an_amount_that_is_not_a_finite_number_of_dollars_above_zero_to_the_micro_dollar_is_a_usage_error(
     tmp_path, capsys, typed, word
 ):
-    """C65: the form is MODEL=USD; USD is read exactly as typed (never through a float), finite, above zero, no finer
+    """C66: the form is MODEL=USD; USD is read exactly as typed (never through a float), finite, above zero, no finer
     than the micro-dollar the ledger counts in, and no more than a grant held as a float of dollars keeps exactly (a
     huge exponent is refused, not overflowed). A usage error as argparse ends it, and nothing is written."""
     path, _ = closed(tmp_path)

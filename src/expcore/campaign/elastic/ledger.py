@@ -121,7 +121,7 @@ class Ledger(LedgerViews):
     ) -> "Ledger":
         """Create a ledger for the runs and the configuration, with each model's first declared fingerprints
         (`declared`, models.toml's `accepted_fingerprints`; a model not named starts with none), and open it.
-        `allowances_micro` are the top-up allowances the grants in `config` were raised by (C65), kept in a meta row of
+        `allowances_micro` are the top-up allowances the grants in `config` were raised by (C66), kept in a meta row of
         their own that is written only when there are some: the pinned configuration keeps the keys it had, which an
         older core reads, and a ledger made with none is the file it was."""
         check_plan(runs, config)
@@ -300,7 +300,7 @@ class Ledger(LedgerViews):
             InFlight(r["model"], r["condition"], r["issued_at"])
             for r in self.db.execute("SELECT * FROM leases WHERE state IN ('issued', 'sent')")
         ]
-        grants = self.grants_micro()  # C65: read inside this transaction, at every lease: a raise is seen at the next
+        grants = self.grants_micro()  # C66: read inside this transaction, at every lease: a raise is seen at the next
         chosen = choose(
             current,
             pending,

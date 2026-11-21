@@ -61,7 +61,7 @@ def choose(
     """The run to lease from the current set's pending runs, or why the federation waits. `ceilings` and `caps` are the
     ones in force (raised, or changed); by default the configuration's own. `paused` gives each model paused by values
     seen undeclared, with them, and `operator_paused` each model an operator paused, with the reason given (C55); a
-    model may be both. `grants` are the lease grants in force in micro-dollars (raised, C65); by default the
+    model may be both. `grants` are the lease grants in force in micro-dollars (raised, C66); by default the
     configuration's own."""
     ceilings = pinned(config) if ceilings is None else ceilings
     caps = config.caps if caps is None else caps

@@ -75,7 +75,7 @@ class PauseRefused(LedgerError):
 
 
 class GrantRefused(LedgerError):
-    """A grant raise (C65) that is not above the grant in force, is for a model with a lease ever issued, a free model,
+    """A grant raise (C66) that is not above the grant in force, is for a model with a lease ever issued, a free model,
     a model with no run or a ledger with no budget, is above a ceiling or beyond what the caps could hold, or is asked
     of a ledger a controller holds."""
 
@@ -342,7 +342,7 @@ class OperatorPause:
 
 @dataclass(frozen=True)
 class GrantRaise:
-    """One raise of a model's lease grant before any lease of it was issued (C65), with when, why and by whom.
+    """One raise of a model's lease grant before any lease of it was issued (C66), with when, why and by whom.
     `event_seq` is the sequence number of the ledger event that records it."""
 
     event_seq: int
@@ -363,7 +363,7 @@ class Status:
     `declarations` the log, oldest first, both None for a ledger made before the log; `paused` is each model paused by
     what a lease's run saw undeclared, with those values (C48); `operator_pauses` is each model an operator has paused
     and not resumed, with the pause that holds it, and `pause_log` every pause and resume, oldest first (C55);
-    `grant_raises` is every raise of a lease grant, oldest first (C65)."""
+    `grant_raises` is every raise of a lease grant, oldest first (C66)."""
 
     ceiling_micro: int | None
     committed_micro: int

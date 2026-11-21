@@ -60,13 +60,13 @@ class LedgerViews:
         return {key[len(ENVIRONMENT_PREFIX) :]: value for key, value in rows}
 
     def topup_allowances_micro(self) -> dict[str, int]:
-        """Each model's top-up allowance in micro-dollars, as `create --topup-allowance` recorded it (C65): part of the
+        """Each model's top-up allowance in micro-dollars, as `create --topup-allowance` recorded it (C66): part of the
         model's grant, which `config.grants_usd` holds; empty for a ledger made without the flag."""
         text = self._meta(TOPUP_ALLOWANCES_KEY)
         return {} if text is None else {model: int(micro) for model, micro in json.loads(text).items()}
 
     def grants_micro(self) -> dict[str, int]:
-        """Each model's lease grant in micro-dollars now: the pinned one, replaced by its raise (C65). What a lease is
+        """Each model's lease grant in micro-dollars now: the pinned one, replaced by its raise (C66). What a lease is
         issued at, and what a controller sizes the fleet by."""
         return grants.in_force(self.db, self.config)
 

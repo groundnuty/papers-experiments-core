@@ -10,10 +10,11 @@
   `DIR` is the study as a federation runs it (its `platform.toml` beside `study.toml`, where the study has one). It
   refuses a ledger that exists; the ledger is closed when it is made, so a controller can open it. Each `--cap` is a
   model's starting cap on the leases it holds at once (a whole number from 1; a model not named has none), and the
-  model must be one the study plans. Each `--topup-allowance` (C65) raises one model's lease grant by USD dollars (not
-  below 0, no finer than a micro-dollar, which is what the ledger counts in) on top of its reservation and two
-  admission probes: for workers whose budget gate holds a lease that has spent anything, since it counts its run in
-  flight and again as the next one, a grant of two reservations and what was spent never does. It takes a model the
+  model must be one the study plans. Each `--topup-allowance` (C66) raises one model's lease grant by USD dollars (above
+  0, no finer than a micro-dollar, which is what the ledger counts in) on top of its reservation and two admission
+  probes. A lease's budget gate holds a lease whose spend and reservations pass its grant (a run pending again after an
+  attempt that spent a reservation needs about two, and on a core that predates C64 so does a run in flight, counted as
+  reserved and again as the next run); a grant of two reservations and the spend never holds one. It takes a model the
   study plans and prices, once, and needs `--max-usd` (without a budget a lease is granted nothing); the grant may not
   pass `--max-usd`. The allowance is recorded in a meta row of its own, nowhere in the fingerprint or the pinned
   configuration, and workers read the raised grant from the ledger. Each model's `accepted_fingerprints` in models.toml
@@ -23,7 +24,7 @@
   expired, lost), each model's own ceiling, and the history of raises; each model's cap in force and the history of
   its changes; each model's declared fingerprints, the models paused by an undeclared one seen, and the declaration
   log.
-- `set-grant LEDGER MODEL=USD... --reason TEXT --actor NAME` (C65): raise models' lease grants to USD dollars each,
+- `set-grant LEDGER MODEL=USD... --reason TEXT --actor NAME` (C66): raise models' lease grants to USD dollars each,
   on an existing ledger, for workers on a core that cannot be changed (they read the grant from the ledger). Only a
   raise (a grant not above the one in force is refused), only before any lease of the model has ever been issued (an
   issued lease's accounting never changes), and only if the caps still fit the budget (the sum of cap times grant over
@@ -174,7 +175,7 @@ def _pause_lines(status: Status) -> list[str]:
 
 
 def _grant_lines(status: Status) -> list[str]:
-    """The log of raised lease grants (C65); nothing for a ledger no grant was raised on, so its status reads as
+    """The log of raised lease grants (C66); nothing for a ledger no grant was raised on, so its status reads as
     it did."""
     if not status.grant_raises:
         return []
@@ -206,7 +207,7 @@ def create_ledger(
     Raises `LedgerError` for a ledger that exists, a cap or a top-up allowance on a model the study does not plan, or an
     allowance on a free one; the study layer's own errors for a study that cannot be loaded; and `CoreVersionUnknown`
     for a core whose commit is unknown or whose install is stale: the campaign fingerprint holds the core's identity,
-    so a ledger made on it no run would serve. `topup_allowances` raise the named models' grants (C65; the
+    so a ledger made on it no run would serve. `topup_allowances` raise the named models' grants (C66; the
     module's docstring) and need `max_usd`."""
     from expcore.campaign.manifest import fingerprint_sha256
     from expcore.provenance.core_check import require_core

@@ -194,14 +194,14 @@ def check_plan(runs: Sequence[LedgerRun], config: LedgerConfig) -> None:
             raise ValueError(f"model {model}'s grant {usd_of(grant):g} USD is above its per_model_usd {ceiling:g}")
 
 
-TOPUP_ALLOWANCES_KEY = "topup_allowances_micro_usd"  # the meta row of the allowances `create` was given (C65)
-MAX_GRANT_MICRO = 2**53  # a float of dollars holds a count of micro-dollars exactly only up to here (C65)
+TOPUP_ALLOWANCES_KEY = "topup_allowances_micro_usd"  # the meta row of the allowances `create` was given (C66)
+MAX_GRANT_MICRO = 2**53  # a float of dollars holds a count of micro-dollars exactly only up to here (C66)
 
 
 def check_grant_held_exactly(model: str, micro: int) -> None:
     """Refuse a grant that a float of dollars, which is how the pinned configuration holds it and how a worker's
     budget takes it, cannot keep to the micro-dollar: past `MAX_GRANT_MICRO` it rounds, and a grant that rounds up
-    passes the ceiling it was checked against (C65)."""
+    passes the ceiling it was checked against (C66)."""
     if micro > MAX_GRANT_MICRO or micro_up(usd_of(micro)) != micro:
         raise ValueError(
             f"model {model}'s grant of {micro} micro-dollars is not one a figure of dollars holds exactly "

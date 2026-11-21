@@ -1,5 +1,5 @@
 # Provenance: new
-"""A model's lease grant raised on an existing ledger, before any lease of the model is issued (C65).
+"""A model's lease grant raised on an existing ledger, before any lease of the model is issued (C66).
 
 Workers on a core that cannot be changed read a lease's grant from the ledger and take it as their whole budget, and
 the ledger's pinned configuration is read by cores that predate this change (a sibling controller, the merge). So the
