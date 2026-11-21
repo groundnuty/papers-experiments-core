@@ -38,13 +38,27 @@ def sees(label: str) -> str:
 
 
 @pytest.fixture(scope="module")
-def userns():
-    """Skip unless an unprivileged user and mount namespace can be made here."""
+def userns(tmp_path_factory):
+    """Skip unless an unprivileged user and mount namespace can be made here AND the mounts the test needs can be made
+    in it (a host may allow the namespace and deny its mounts, as AppArmor's restriction of user namespaces does)."""
     if shutil.which("unshare") is None:
         pytest.skip("`unshare` is not installed")
-    probe = subprocess.run(["unshare", "-Urm", "true"], capture_output=True, timeout=30, check=False)
+    probe = subprocess.run(
+        [
+            "unshare",
+            "-Urm",
+            "bash",
+            "-c",
+            PRELUDE.replace('mkdir "$D/share" "$D/data"', 'mkdir "$D/share"') + STACK_GENERATION_ONE,
+            "bash",
+            str(tmp_path_factory.mktemp("probe")),
+        ],
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
     if probe.returncode != 0:
-        pytest.skip("unprivileged user and mount namespaces are not allowed here")
+        pytest.skip("unprivileged user and mount namespaces, with their mounts, are not allowed here")
 
 
 def played(tmp_path, script: str) -> dict[str, str]:
