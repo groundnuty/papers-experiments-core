@@ -371,7 +371,7 @@ A model request's only bound in the loop is the agent's time left. Replies are n
 
 - A request with no reply by the bound is given up and never sent again. The attempt ends as infrastructure of kind `endpoint`: it is set aside and charged, and the run is attempted again up to `max_attempts`. The record's failed request names the bound, and `route.abandoned_request` has the reason `request_bound`, with the bound on the request's prompt.
 - The bound reaches every request of a step, a resend after a transient error too, while it is shorter than both the agent's time left and the ceiling left when the step starts. Once it is not, the step runs as it does without the key, and a request that hangs is the agent's time cap, or the ceiling, as before. A bound at or above the time cap leaves every request as it was, though it still changes the caps in the fingerprint.
-- Pick the bound well above the slowest reply that is not a hang: the longest reply `max_output_tokens` allows, at the slowest model's decode rate, plus the prompt's prefill. A reply of 32,768 tokens at 10 tokens a second takes about 3,300 s. The `latency_s` of each turn in a pilot's records shows how long replies really take. A bound below the slowest of them turns slow replies into infrastructure, attempted again instead of scored.
+- Pick the bound well above the slowest reply that is not a hang. **2,400 s is the recommended value.** Every completed reply of three earlier campaigns, 51,233 replies, took about 4.7 s at the median, 25 s at the 90th percentile and 75 s at the 99th; the slowest took 952 s, on a long context, and none took over 1,800 s. 2,400 s is 2.5 times the slowest. A study whose models or contexts are slower checks the `latency_s` of each turn in its pilot's records. A bound below the slowest real reply turns slow replies into infrastructure, attempted again instead of scored.
 - The core's two adapters, OpenAI-compatible and Anthropic, honour it. A backend of your own (a plugin's `backend_factory`) is bounded only if it has a `bound_requests(seconds)` method: the loop calls it before each step with the bound, or None when the bound is not the shorter, and the backend must give a request up at the bound by raising `ModelRequestTimedOut` (`expcore.errors`), never resend it, and report it in `info()["abandoned_request"]`, which is what marks the attempt's usage incomplete.
 - Declare it before the campaign starts: the bound is one of the campaign's caps, which are in its fingerprint, so a store that started without the key is not resumed with it: start a new store. A study that never declares it keeps its fingerprint, its configuration and its behaviour.
 
@@ -384,9 +384,9 @@ assert "model_request_bound_s" not in study.campaign.caps()["agent"]  # so its c
 bounded = Path("request-bound-study")
 shutil.copytree("my-study", bounded)
 toml = bounded / "campaign.toml"
-toml.write_text(toml.read_text().replace("[agent]\n", "[agent]\nmodel_request_bound_s = 3600\n", 1))
+toml.write_text(toml.read_text().replace("[agent]\n", "[agent]\nmodel_request_bound_s = 2400\n", 1))
 declared = load_campaign(toml)
-assert declared.agent.model_request_bound_s == 3600.0
+assert declared.agent.model_request_bound_s == 2400.0
 assert declared.caps() != study.campaign.caps()  # another fingerprint: a store without the bound is not resumed with it
 shutil.rmtree(bounded)
 ```

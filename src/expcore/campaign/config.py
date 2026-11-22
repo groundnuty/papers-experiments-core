@@ -20,7 +20,7 @@ The file is validated when it is loaded, with messages that name the file and th
     tool_server_call_bound_s = 300   # optional: the longest one call to a tool server may take, in seconds (L17)
     code_cell_bound_s = 3600      # optional: the longest one code cell may run, in seconds; past it the cell is killed,
                                   # the agent is told, and the run goes on (L18)
-    model_request_bound_s = 3600  # optional: the longest one model request may wait for its reply, in seconds; past
+    model_request_bound_s = 2400  # optional: the longest one model request may wait for its reply, in seconds; past
                                   # it the request is given up, not resent, and the attempt is endpoint infrastructure
                                   # (B21)
 

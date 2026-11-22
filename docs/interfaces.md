@@ -389,7 +389,7 @@ Inside the loop a model request's bound is the agent's time left alone: replies 
 
     # my-study/campaign.toml
     [agent]
-    model_request_bound_s = 3600   # optional: positive and finite, in seconds
+    model_request_bound_s = 2400   # optional: positive and finite, in seconds; 2,400 s is the recommended value
 
 `AgentConfig.model_request_bound_s` (`expcore.loop.config`) is the same value, `None` when the study declares none.
 
@@ -399,7 +399,7 @@ Inside the loop a model request's bound is the agent's time left alone: replies 
 - **A bound at or past the time left arms nothing.** The step then runs as without the key: a request that hangs is cut by the watch at the agent's time cap, or at the ceiling, as before (L16). Since the loop arms the bound only while it is the first deadline at the step's start, its expiry is never the moment of the loop's cut, and the watch takes no reading for it. A resend later in the same step keeps the step's bound; if the time left has fallen below the bound by then, the watch's cut comes first.
 - **Replay raises it again.** The record holds the request as a `failed_request` of kind `infra` (`endpoint`, the detail naming the bound), which the recorded backend raises as an `InfraError` at the same point; the bound's expiry took no clock reading, so the replay reads the clock as the run did. The bound is a value of `agent_config`, so changing it is a divergence at `agent_config_sha256`.
 - **A study that declares no bound is unchanged,** byte for byte: `model_request_bound_s` is left out of `agent_config` (never a null), so the configuration hash, the record's `agent_config` and the campaign's caps are the same. A declared bound is part of the campaign's caps in the fingerprint, so a store started without it is not resumed with it: start a new store.
-- **The value** must be above the longest legitimate reply: the most `max_output_tokens` allows at the slowest model's decode rate, plus its prefill, which the `latency_s` of each turn in a pilot's records shows. A bound below a legitimate reply turns it into infrastructure, attempted again and never scored.
+- **The value.** Undeclared by default, so a campaign that does not declare it is unchanged. The recommended value is 2,400 s: every completed reply of three earlier campaigns (51,233 replies) took about 4.7 s at the median, 75 s at the 99th percentile and 952 s at the slowest, on a long context, with none over 1,800 s, and 2,400 s is 2.5 times the slowest. The bound must stay above the slowest legitimate reply, which a study with slower models or longer contexts checks in the `latency_s` of its pilot's turns: a bound below a legitimate reply turns it into infrastructure, attempted again and never scored.
 
 ### Usage fields beyond the counts
 
