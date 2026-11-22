@@ -11,6 +11,7 @@ from elastic_support import (
     ledger_path,
     lose,
     make,
+    overdue,
     plan,
 )
 
@@ -128,6 +129,21 @@ def test_c68_a_lost_lease_nobody_can_settle_releases_its_run_once_its_settle_is_
     (event,) = [event for event in ledger.events() if event["kind"] == "settle_overdue"]
     assert (event["lease_id"], event["run_key"]) == (lost.lease_id, lost.run_key)
     assert (event["detail"]["charged"], event["detail"]["waited_s"]) == (1, ledger.config.site_out_s)
+    again = leased(ledger, "fed-2")
+    assert (again.run_key, again.attempt_base) == (lost.run_key, 1)
+    assert_invariants(ledger)
+
+
+def test_c68_a_settle_of_the_spend_alone_keeps_the_hold_until_the_overdue(tmp_path):
+    """C68: a settle with no charged attempts frees the money but gives no count, and a lease is settled once, so a
+    count it lacks could never be given later: the run stays held until the overdue, then goes at the loss's one."""
+    ledger, clock = make(tmp_path, **ONE, **PRICED)
+    lost = lose(ledger, clock, "fed-1")
+    join(ledger, clock, "fed-2")
+    ledger.settle(lost.lease_id, 100_000, "root")
+    assert ledger.lease(lost.lease_id).charge_micro == 100_000
+    _waits(ledger, "fed-2", "not settled with its attempts")
+    overdue(ledger, clock)
     again = leased(ledger, "fed-2")
     assert (again.run_key, again.attempt_base) == (lost.run_key, 1)
     assert_invariants(ledger)

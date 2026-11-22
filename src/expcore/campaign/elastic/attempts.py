@@ -28,9 +28,10 @@ settle (to the dead store's attempts), so a pending run is held, not leased, whi
 
 - `expired` with its holder not proven ended: it may still be charging attempts, and its loss is still to be counted.
   The dead-holder rule proves every holder ended in the end (at the latest its recorded job end plus KillWait);
-- lost (`lost`, or `expired` with its holder proven ended) in a ledger with a budget, and neither settled nor
-  overdue: its settle may still name more attempts than its loss's one. Without a budget nothing is settled, so the
-  loss's count is final at once.
+- lost (`lost`, or `expired` with its holder proven ended) in a ledger with a budget, and neither settled with its
+  charged attempts nor overdue: its settle may still name more attempts than its loss's one. A settle of its spend
+  alone gives no count, and a lease is settled once, so it ends nothing: the overdue does. Without a budget nothing
+  is settled, so the loss's count is final at once.
 
 A settle that never comes (a dead store nobody can read, a site no controller reads, a spend above the grant) must not
 hold its run for ever: `site_out_s` after the lease could first be settled (its loss; for a holder the controller
@@ -57,13 +58,14 @@ _UNSETTLED = (
     " f.end_proof AS fed_proof, f.kill_wait_s AS fed_kill_wait"
     " FROM leases l JOIN federations f ON f.label = l.federation JOIN runs r ON r.run_key = l.run_key"
     " WHERE r.state = 'pending' AND (l.state = 'lost' OR (l.state = 'expired' AND f.ended_at IS NOT NULL))"
-    " AND NOT EXISTS (SELECT 1 FROM settlements s WHERE s.lease_id = l.id) ORDER BY l.id"
+    " AND NOT EXISTS (SELECT 1 FROM settlements s WHERE s.lease_id = l.id AND s.charged IS NOT NULL) ORDER BY l.id"
 )
 
 
 def _unsettled(db: sqlite3.Connection) -> list[sqlite3.Row]:
-    """The lost leases of pending runs that are neither settled nor overdue. The log is read once for the overdue
-    ones (it has no index by kind or lease, as `pauses` reads it), not once for each lease."""
+    """The lost leases of pending runs neither settled with their charged attempts nor overdue (a settle of the spend
+    alone gives no count, and a lease is settled once, so only the overdue ends it). The log is read once for the
+    overdue ones (it has no index by kind or lease, as `pauses` reads it), not once for each lease."""
     done = {row[0] for row in db.execute("SELECT lease_id FROM events WHERE kind=?", (OVERDUE,))}
     return [row for row in db.execute(_UNSETTLED) if row["id"] not in done]
 
@@ -79,8 +81,8 @@ def holds(db: sqlite3.Connection, config: LedgerConfig) -> dict[str, str]:
     if config.max_usd is not None:
         for row in _unsettled(db):
             held.setdefault(row["run_key"], []).append(
-                f"lease {row['id']} is lost and not settled: its dead store may show more attempts than its loss "
-                f"counted (final at its settle, or {config.site_out_s:g} s after it could first be settled)"
+                f"lease {row['id']} is lost and not settled with its attempts: its dead store may show more than its "
+                f"loss counted (final at such a settle, or {config.site_out_s:g} s after it could first be settled)"
             )
     return {run_key: "; ".join(reasons) for run_key, reasons in held.items()}
 
@@ -95,9 +97,9 @@ def settleable_at(row: sqlite3.Row) -> float:
 
 
 def overdue(db: sqlite3.Connection, config: LedgerConfig, now: float, opened_at: float) -> None:
-    """Log `settle_overdue` for each lost lease of a pending run that has gone `site_out_s` unsettled since it could
-    first be settled, or since the ledger was opened (`opened_at`) if that is later, in the caller's transaction: its
-    loss's count is final, and its run is no longer held for it."""
+    """Log `settle_overdue` for each lost lease of a pending run that has gone `site_out_s` with no settle of its
+    charged attempts since it could first be settled, or since the ledger was opened (`opened_at`) if that is later,
+    in the caller's transaction: its loss's count is final, and its run is no longer held for it."""
     if config.max_usd is None:
         return  # nothing is settled, so no lost lease holds its run
     for row in _unsettled(db):

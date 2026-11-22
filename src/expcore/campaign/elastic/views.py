@@ -176,7 +176,7 @@ class LedgerViews:
 
     def holds(self) -> dict[str, str]:
         """Each pending run that is not leased now, with why (C68, `attempts.holds`): a lease of it expired with its
-        holder not proven ended, or, with a budget, lost and neither settled nor overdue."""
+        holder not proven ended, or, with a budget, lost and neither settled with its charged attempts nor overdue."""
         return attempts.holds(self.db, self.config)
 
     def ceilings(self) -> Ceilings:

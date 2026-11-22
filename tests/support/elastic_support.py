@@ -4,6 +4,7 @@ import hashlib
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 from expcore.campaign.elastic import Completion, Lease, Ledger, LedgerConfig, LedgerRun, SiteReading
 
@@ -138,9 +139,9 @@ def overdue(ledger: Ledger, clock: FakeClock, site: str = SITE, beats: Mapping[i
     ledger.observe_site(site, SiteReading(heartbeats=dict(beats or {})))
 
 
-def _assert_issued_after_final_counts(ledger: Ledger, live: Sequence[Lease], settled: Mapping[int, object]) -> None:
+def _assert_issued_after_final_counts(ledger: Ledger, live: Sequence[Lease], settled: Mapping[int, Any]) -> None:
     """C68: no lease in flight follows a lease of its run whose count may still rise: one expired with its holder not
-    proven ended, or, with a budget, one lost that is neither settled nor overdue."""
+    proven ended, or, with a budget, one lost that is neither settled with its charged attempts nor overdue."""
     overdue_ids = {event["lease_id"] for event in ledger.events() if event["kind"] == "settle_overdue"}
     priced = ledger.config.max_usd is not None
     for lease in live:
@@ -150,7 +151,8 @@ def _assert_issued_after_final_counts(ledger: Ledger, live: Sequence[Lease], set
             running = earlier.state == "expired" and not earlier.proven
             assert not running, f"lease {lease.lease_id} follows lease {earlier.lease_id}, whose holder may still run"
             lost = earlier.state == "lost" or (earlier.state == "expired" and earlier.proven)
-            open_ = priced and lost and earlier.lease_id not in settled and earlier.lease_id not in overdue_ids
+            counted = earlier.lease_id in settled and settled[earlier.lease_id].charged is not None
+            open_ = priced and lost and not counted and earlier.lease_id not in overdue_ids
             assert not open_, f"lease {lease.lease_id} follows lease {earlier.lease_id}, whose settle may still come"
 
 

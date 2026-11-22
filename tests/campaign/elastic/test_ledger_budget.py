@@ -118,7 +118,8 @@ def test_c42_a_random_walk_of_leases_expiries_completions_losses_proofs_and_rest
     attempts allowed so that losses exhaust runs and a lower real count reopens them: no run is leased twice at once, no
     cap, ceiling (as raised) or budget is passed, no run is counted done twice, a settle never passes its grant, an
     exhausted run has no attempt left and a pending one has, and none is lost across expiries and restarts. Once the
-    federations stop failing, every run ends or waits only for the budget, and no slot is held."""
+    federations stop failing and every loss nobody settled with its attempts is overdue (C68), every run ends or waits
+    only for the budget, and no slot is held."""
     rng = random.Random(462)
     runs = plan(models=("m1", "m2"), tasks=8, sets={"api-none": 1})
     grants = {"m1": 1.0, "m2": 0.5}
@@ -146,6 +147,12 @@ def test_c42_a_random_walk_of_leases_expiries_completions_losses_proofs_and_rest
     for _ in range(100):  # the federations stop failing: every lease completes
         _settle(ledger, clock, labels)
         assert_invariants(ledger)
+    if ledger.holds():  # C68: a loss nobody settled with its attempts holds its run until its settle is overdue
+        overdue(ledger, clock, beats={lease.lease_id: 10**6 for lease in _live(ledger)})
+        for _ in range(100):
+            _settle(ledger, clock, labels)
+            assert_invariants(ledger)
+    assert not ledger.holds()
     states = {run.state for run in ledger.runs()}
     assert states <= {"done", "infra_exhausted", "pending"}
     assert "done" in states
