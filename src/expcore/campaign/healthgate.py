@@ -68,7 +68,11 @@ every run is held until a check passes, but it holds its own run too (`hold`) in
 attempt, and the outage's record says `"charged": false`. The flag rides on a deferral as well: a deferral past its
 bound then closes the gate blocking without charging the run that found it. A post-run check that fails so sets the
 attempt aside as one an outage overlapped (`outage_discarded`, never charged), since the failure is not its own; a
-platform answers `charge=True` for a failure the judged attempt left itself.
+platform answers `charge=True` for a failure the judged attempt left itself. A pre-run check that fails for a run whose
+previous attempt, itself charged, failed its post-run check (`before_run(covered=True)`,
+`expcore.campaign.start_after_check`) closes the
+gate the same way, record and event included, and still answers `found`: the runner writes that attempt and sets it
+aside uncharged, once.
 
 **Every check runs in its caller's context** (`contextvars`), so a post-run check, which runs inside the run's
 admission (`expcore.campaign.attempt`: a platform's hook that holds a resource from before the attempt until after
@@ -331,7 +335,7 @@ class PreRun:
     """What a pre-run check lets the run do: `go`, `hold` (stay pending, charge nothing: the gate is closed, by a new
     outage this run found included when its check charges no one), `defer` (the check was deferred: stay pending,
     charge nothing, try again after `recheck_s`, the gate left open) or `found` (this run found a new outage and is
-    charged its one attempt)."""
+    charged its one attempt, unless the caller told the check the run was `covered` by a failed post-run check)."""
 
     verdict: str
     detail: str
@@ -519,14 +523,19 @@ class HealthGate:
         with self._lock:
             return health, self._open
 
-    def before_run(self, run_key: str, *, attempt: int | None = None) -> PreRun:
+    def before_run(self, run_key: str, *, attempt: int | None = None, covered: bool = False) -> PreRun:
         """Check before an attempt. A closed gate holds the run without a check; a passing check lets it go unless the
         gate closed while the check was out; a deferred check defers the run and leaves the gate as it is; a failing
         check closes the gate and charges this run, or holds it when the check charges no one (`Health.charge`) or
         another run closed the gate first.
 
         `attempt` is the number the try will have (`CheckContext.attempt`): a check that takes the context is given
-        `CheckContext(run_key, attempt, PRE_RUN)`, or None when no attempt is named."""
+        `CheckContext(run_key, attempt, PRE_RUN)`, or None when no attempt is named.
+
+        `covered`: the run's previous attempt, itself charged, failed its post-run check (`start_after_check`), so the caller sets the
+        attempt a failure here would cost aside uncharged. The gate closes as it does for a check that charges no one,
+        and its record and event say so (`"charged": false`), but the verdict is still `found`, since the run's attempt
+        is written. A check that charges no one holds the run as before."""
         context = None if attempt is None else CheckContext(run_key, attempt, PRE_RUN)
         if self._open is not None:
             return PreRun(HOLD, "the gate is closed")
@@ -549,7 +558,7 @@ class HealthGate:
                 return PreRun(DEFER, health.detail)  # a wait, not a failure: nothing is closed or charged
             blocking = True  # a wait past its bound: the holder may never let go
             detail = f"{detail} (deferred for {age:.0f} s, past max_defer_s of {self.max_defer_s:g} s)"
-        if not self._close(run_key, detail, blocking=blocking, charge=health.charge):
+        if not self._close(run_key, detail, blocking=blocking, charge=health.charge and not covered):
             return PreRun(HOLD, "another run's failed check closed the gate first")
         return PreRun(FOUND, detail) if health.charge else PreRun(HOLD, detail)
 
