@@ -10,11 +10,17 @@ would have exhausted the run for a fault the run never caused.
 
 **The rule.** After an attempt whose post-run check failed and was not deferred (`RiskedStarts.mark`), the run's next
 attempt in this process is covered. It is set aside uncharged when, and only when, the executor's own result is a
-charged infrastructure failure before the agent's first turn, whatever its kind (`spared`): with a record, one with no
-completed turn (`model_turns == 0`); with none (the executor raised, and `model_turns` is then a default, not a count),
-one whose usage is known to be no request (`turn_usage == ()`: its complete call log held none, `no_request`, or a
-first-turn refusal sent none). An executor that raised with requests in its log, or kept no call log (a campaign with
-no budget), is charged as before. The
+charged infrastructure failure before the agent's first turn, whatever its kind (`turnless`, `spared`). With a record,
+that is one with no completed turn (`model_turns == 0`). With none (the executor raised, and `model_turns` is then a
+default, not a count) it is shown two ways. When a call log is kept (a campaign with a budget), the log alone decides,
+as it does for spend: the usage must be known to be no request (`turn_usage == ()`: the complete log held none,
+`no_request`, or a first-turn refusal sent none). When none is kept (no budget: a lease of a free model, whose grant is
+0, has none), the row's call log and usage are NULL whatever the executor did, so they prove nothing; the attempt's own
+backend, built for it alone, must then say it started no request (`no_request.counted_none`: `requests_sent` is the
+whole number 0, every resend counted; a backend that keeps no count confirms nothing). The incident's start was of
+this second kind: a lease of a free model, its row's usage NULL, its induction failing before any model call. An
+executor that raised with a request in its log, or whose backend counted one, or kept no count, is charged as
+before. The
 attempt is then kept as one an outage overlapped (`outage_kind` set to the campaign's health kind, `outage_discarded`),
 as a post-run failure another attempt left already is (`expcore.campaign.attempt`), and its outcome's detail says why
 it was not charged, first (`REASON`): the row's `detail` and the marker carry it. An event of kind `EVENT` is written
@@ -40,9 +46,11 @@ in the result's transaction too.
 
 import dataclasses
 import threading
+from typing import Any
 
 from expcore.campaign.attempts import classify
 from expcore.campaign.markers import AttemptResult
+from expcore.campaign.no_request import counted_none
 
 EVENT = "start_spared_after_failed_check"  # the store's event for a start this rule set aside
 REASON = "set aside uncharged: the run's previous attempt's post-run health check failed"  # the detail's lead
@@ -68,14 +76,22 @@ class RiskedStarts:
             return found
 
 
-def spared(result: AttemptResult, health_kind: str, *, recorded: bool) -> AttemptResult | None:
+def turnless(result: AttemptResult, *, recorded: bool, logged: bool, backend: Any) -> bool:
+    """Whether the attempt is shown to have taken no turn of the agent (see the module docstring). `recorded`: the
+    executor returned a record, whose `model_turns` counts its completed turns; `logged`: the attempt kept a call log
+    (a budget), which then alone decides for an executor that raised; `backend`: the attempt's own backend, whose
+    `requests_sent` decides when no log is kept."""
+    if recorded:
+        return result.model_turns == 0
+    if result.turn_usage == ():
+        return True
+    return not logged and counted_none(backend)
+
+
+def spared(result: AttemptResult, health_kind: str) -> AttemptResult | None:
     """The executor's result set aside uncharged, as an outage overlapped it, with `REASON` leading its detail, when
-    the rule covers it (a charged infrastructure failure before the agent's first turn); else None. `recorded`: the
-    executor returned a record, so `model_turns` counts its completed turns; without one only a usage known to be no
-    request (`turn_usage == ()`) shows that no turn was taken."""
-    if result.model_turns != 0 or result.outage_kind is not None:
-        return None
-    if not recorded and result.turn_usage != ():
+    it is a charged infrastructure failure (the caller has shown it took no turn, `turnless`); else None."""
+    if result.outage_kind is not None:
         return None
     state, charged, _ = classify(result, result.treatment_kinds, result.treatment_targets)
     if state != "infra_fail" or not charged:

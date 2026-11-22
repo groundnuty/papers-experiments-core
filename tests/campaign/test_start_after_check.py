@@ -22,7 +22,7 @@ from expcore.campaign.markers import AttemptResult, read_marker, write_marker
 from expcore.campaign.run_lease import RunLease
 from expcore.campaign.scheduler import Scheduler
 from expcore.campaign.shard_run import ShardStart
-from expcore.campaign.start_after_check import EVENT, REASON, RiskedStarts, spared
+from expcore.campaign.start_after_check import EVENT, REASON, RiskedStarts, spared, turnless
 from expcore.config.prices import Price
 from expcore.errors import InfraError, register_infra_kind
 from expcore.loop.outcomes import Outcome
@@ -128,11 +128,44 @@ def test_a_failure_after_the_first_turn_is_charged_after_a_failed_check(tmp_path
     assert events == []
 
 
-def test_a_raised_start_with_no_call_log_is_charged_since_no_turn_is_known(tmp_path):
-    """Without a budget no call log is kept, so a raised executor's usage is unknown and nothing shows that it took no
-    turn: the start's failure is charged, as before."""
+def test_with_no_call_log_a_raised_start_whose_backend_sent_nothing_is_spared(tmp_path):
+    """The incident's own row: no budget, so no call log (`calls_sent`, `calls_usage`, `turn_usage` and `spend_basis`
+    NULL, `usage_complete` 0, whatever the executor did); the executor raised its start's kind before any model call,
+    and its backend counted no request: the start is set aside uncharged, and the row says why."""
     check = Scripted("pass", "fail")
     rows, events, _ = campaign(tmp_path, check, "finish", ("raise_infra", START), "finish", budget=False)
+    assert rows == [("infra_fail", 1, 1), ("outage_discarded", 0, 2), ("done", 0, 2)]
+    assert len(events) == 1
+
+
+def test_the_spared_row_with_no_call_log_has_the_incidents_shape(tmp_path):
+    """Every usage column of the spared row is as the incident's was (NULL, `usage_complete` 0): the rule did not need
+    them, and changed none of them; only the state, the charge, `outage_kind` and the detail's lead differ."""
+    executor = FakeExecutor({KEY: ["finish", ("raise_infra", START), "finish"]})
+    with build(tmp_path, health=Scripted("pass", "fail"), **options(executor, budget=False)) as scheduler:
+        scheduler.run()
+        [row] = scheduler.store.q("SELECT * FROM attempts WHERE state='outage_discarded'")
+    usage = ("calls_sent", "calls_usage", "turn_usage", "spend_basis", "input_tokens", "output_tokens")
+    assert [row[column] for column in usage] == [None] * len(usage)
+    assert (row["usage_complete"], row["charged"], row["infra_kind"], row["outage_kind"]) == (0, 0, START, "sandbox")
+    assert row["detail"].startswith(REASON)
+
+
+async def counts_nothing_then_raises(request):
+    """A study's executor whose backend keeps no count of its requests, raising its start's kind."""
+    request.backend.requests_sent = None
+    raise InfraError(START, "the start state did not verify")
+
+
+@pytest.mark.parametrize(
+    "behaviour",
+    [turn_then_raise, counts_nothing_then_raises],
+    ids=["its backend counted a request", "its backend keeps no count"],
+)
+def test_with_no_call_log_a_raised_start_is_charged_unless_its_backend_shows_no_request(tmp_path, behaviour):
+    """With no call log only the attempt's own backend can show that it reached no model: one that counted a request,
+    or keeps no count, confirms nothing, and the start's failure is charged as before."""
+    rows, events, _ = campaign(tmp_path, Scripted("pass", "fail"), "finish", behaviour, "finish", budget=False)
     assert rows == [("infra_fail", 1, 1), ("infra_fail", 1, 2), ("done", 0, 3)]
     assert events == []
 
@@ -170,10 +203,19 @@ def test_a_recorded_infrastructure_end_with_no_turn_is_spared_too(tmp_path):
     assert len(events) == 1
 
 
-def test_in_a_leases_store_the_start_after_a_failed_check_is_spared(tmp_path):
-    """The live shape, in the store a lease runs its one run in (its grant as the budget, so a call log is kept): the
-    first attempt's post-run check fails, the second attempt raises its start's kind before any request, and it is set
-    aside uncharged, so the run is not one failure from exhausted; the third attempt finishes."""
+@pytest.mark.parametrize(
+    ("grant_micro", "models", "budget", "usage"),
+    [
+        (40_000_000, TABLE, Budget(max_usd=40.0), ("[]", "measured")),
+        (0, models_for("m1", free=True), None, (None, None)),
+    ],
+    ids=["a priced model, its grant the budget", "a free model, a grant of 0 and no budget"],
+)
+def test_in_a_leases_store_the_start_after_a_failed_check_is_spared(tmp_path, grant_micro, models, budget, usage):
+    """The live shape, in the store a lease runs its one run in: the first attempt's post-run check fails, the second
+    attempt raises its start's kind before any model call, and it is set aside uncharged, so the run is not one failure
+    from exhausted; the third finishes. With a grant the call log shows no request; a free model's lease (the
+    incident's) keeps no log, and its backend's count shows it."""
     schema = make_schema()
     plan = {"tasks": ("task-a",), "models": ("m1",), "seeds": (1,)}
     whole = make_manifest(schema, 7, **plan)
@@ -183,7 +225,7 @@ def test_in_a_leases_store_the_start_after_a_failed_check_is_spared(tmp_path):
         run_key=key,
         lease_id=1,
         attempt_base=0,
-        grant_micro_usd=40_000_000,
+        grant_micro_usd=grant_micro,
         campaign_sha256=fingerprint_sha256(fingerprint),
         expires_utc="2099-01-01T00:00:00Z",
     )
@@ -196,19 +238,19 @@ def test_in_a_leases_store_the_start_after_a_failed_check_is_spared(tmp_path):
         fingerprint,
         executor,
         agent_config=executor.config,
-        models=TABLE,
+        models=models,
         endpoints={"m1": Endpoint("m1", "unit-m1", "https://llm.example.invalid/m1")},
-        settings=settings_for(max_attempts=3, budget=Budget(max_usd=40.0)),
+        settings=settings_for(max_attempts=3, budget=budget),
         backend_factory=Factory(),
-        shard=ShardStart(lease, {}, {"unit_caps": {"unit-m1": 1}, "budget": None}),
+        shard=ShardStart(lease, {}, {"unit_caps": {"unit-m1": 1}, "budget": None if budget is None else {}}),
         health=Scripted("pass", "fail"),
     )
     with scheduler:
         scheduler.run()
         rows = attempts_of(scheduler.store, key)
-        [usage] = scheduler.store.q("SELECT turn_usage, spend_basis FROM attempts WHERE state='outage_discarded'")
+        [spared_row] = scheduler.store.q("SELECT turn_usage, spend_basis FROM attempts WHERE state='outage_discarded'")
     assert rows == [("infra_fail", 1, 1), ("outage_discarded", 0, 2), ("done", 0, 2)]
-    assert (usage["turn_usage"], usage["spend_basis"]) == ("[]", "measured")  # known to have sent no request
+    assert (spared_row["turn_usage"], spared_row["spend_basis"]) == usage
 
 
 def test_the_mark_is_used_up_by_the_runs_next_attempt_whatever_it_ends_in():
@@ -225,31 +267,57 @@ def start_failure(kind: str = START, turns: int = 0, usage=()) -> AttemptResult:
     return AttemptResult(outcome, LATER, 2.0, model_turns=turns, turn_usage=usage)
 
 
+class Counting:
+    """A backend's count of the requests it started, or none kept (`requests_sent` absent)."""
+
+    def __init__(self, sent=None):
+        if sent is not None:
+            self.requests_sent = sent
+
+
 @pytest.mark.parametrize(
-    ("result", "recorded", "covered"),
+    ("result", "recorded", "logged", "backend", "no_turn"),
     [
-        (start_failure(), False, True),
-        (start_failure("sandbox"), False, True),
-        (start_failure(usage=None), False, False),
-        (start_failure(usage=None), True, True),
-        (start_failure(turns=1, usage=((10, 1, None, None),)), True, False),
-        (start_failure("key_rejected"), False, False),
-        (AttemptResult(Outcome("finished"), LATER, 2.0), True, False),
+        (start_failure(turns=0, usage=None), True, False, Counting(3), True),
+        (start_failure(turns=1, usage=((10, 1, None, None),)), True, True, Counting(0), False),
+        (start_failure(usage=()), False, True, Counting(3), True),
+        (start_failure(usage=None), False, True, Counting(0), False),
+        (start_failure(usage=None), False, False, Counting(0), True),
+        (start_failure(usage=None), False, False, Counting(1), False),
+        (start_failure(usage=None), False, False, Counting(), False),
     ],
     ids=[
-        "raised, no request",
-        "raised, the core's kind, no request",
-        "raised, usage unknown",
-        "recorded, no turn",
-        "recorded, a turn",
-        "uncharged already",
-        "scored",
+        "a record with no turn",
+        "a record with a turn",
+        "raised, the log shows no request",
+        "raised, a log that shows one decides, whatever the backend says",
+        "raised, no log, the backend counted none",
+        "raised, no log, the backend counted one",
+        "raised, no log, the backend keeps no count",
     ],
 )
-def test_only_a_charged_infrastructure_failure_before_the_first_turn_is_spared(result, recorded, covered):
-    """`spared` sets aside a charged infrastructure failure whose record counts no turn, or which raised with a usage
-    known to be no request, whatever its kind; everything else is left as it is."""
-    found = spared(result, "sandbox", recorded=recorded)
+def test_no_turn_is_shown_by_the_record_the_call_log_or_with_no_log_the_backends_count(
+    result, recorded, logged, backend, no_turn
+):
+    """`turnless`: a record counts its turns; a raised executor's call log, when kept, alone decides; with no log kept,
+    the attempt's own backend must have counted no request, and one that keeps no count confirms nothing."""
+    assert turnless(result, recorded=recorded, logged=logged, backend=backend) is no_turn
+
+
+@pytest.mark.parametrize(
+    ("result", "covered"),
+    [
+        (start_failure(), True),
+        (start_failure("sandbox"), True),
+        (start_failure("key_rejected"), False),
+        (AttemptResult(Outcome("finished"), LATER, 2.0), False),
+    ],
+    ids=["a study's start", "the core's kind", "uncharged already", "scored"],
+)
+def test_only_a_charged_infrastructure_failure_is_set_aside(result, covered):
+    """`spared` sets aside a charged infrastructure failure, whatever its kind, its detail led by why; anything else is
+    left as it is."""
+    found = spared(result, "sandbox")
     assert (found is not None) is covered
     if covered:
         assert found.outage_kind == "sandbox"
@@ -260,6 +328,6 @@ def test_only_a_charged_infrastructure_failure_before_the_first_turn_is_spared(r
 
 def test_a_spared_start_reads_back_from_its_marker_unchanged(tmp_path):
     """No marker field is added: the spared result is written and read back as it is."""
-    found = spared(start_failure(), "sandbox", recorded=False)
+    found = spared(start_failure(), "sandbox")
     write_marker(tmp_path, KEY, 7, found)
     assert read_marker(tmp_path, KEY, 7) == found

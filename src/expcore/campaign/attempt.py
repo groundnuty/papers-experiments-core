@@ -81,7 +81,7 @@ from expcore.campaign.session_bind import bind_session
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.start_after_check import EVENT as SPARED_EVENT
 from expcore.campaign.start_after_check import REASON as SPARED_REASON
-from expcore.campaign.start_after_check import RiskedStarts, spared
+from expcore.campaign.start_after_check import RiskedStarts, spared, turnless
 from expcore.campaign.start_diagnostic import WITHHELD_ERROR, snapshot_of
 from expcore.campaign.store import Store
 from expcore.campaign.topup import AttemptSpend, Ledger
@@ -391,7 +391,10 @@ class AttemptRunner:
                 result, unsent = self._settle_failure(result, guard, backend, begun.id)
                 if result.outcome.defect is not None:  # the attempt keeps the class and stack hash, the log the rest
                     defects(error, result.outcome.defect)
-            covered = spared(result, p.settings.health_kind, recorded=record is not None) if at_risk else None
+            no_turn = at_risk and turnless(
+                result, recorded=record is not None, logged=guard is not None, backend=backend
+            )
+            covered = spared(result, p.settings.health_kind) if no_turn else None
             result = result if covered is None else covered  # the executor's own failure, before any judgment of it
             result, risks_next = self._post_run(result, model, key, begun)
             result, moved = self._judge(result, record, model, key)

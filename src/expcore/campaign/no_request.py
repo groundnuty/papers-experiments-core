@@ -51,7 +51,7 @@ def no_request_in(calls_sent: Any, calls_usage: Any, topup_usd: Any, backend: An
     log = read_log(calls_sent, calls_usage)
     if log is None or log.sent != 0 or log.answered:
         return False
-    return _no_top_up(topup_usd) and _counted_none(backend)
+    return _no_top_up(topup_usd) and counted_none(backend)
 
 
 def settle_unsent(
@@ -80,7 +80,7 @@ def _no_top_up(topup_usd: Any) -> bool:
     return isinstance(topup_usd, int | float) and not isinstance(topup_usd, bool) and topup_usd == 0
 
 
-def _counted_none(backend: Any) -> bool:
+def counted_none(backend: Any) -> bool:
     """Whether the backend says it started no request: its `requests_sent` is the whole number 0. A backend that keeps
     no count, or one that is None, above 0, no whole number or that cannot be read, confirms nothing."""
     try:
