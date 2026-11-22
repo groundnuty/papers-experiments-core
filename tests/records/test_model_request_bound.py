@@ -14,7 +14,7 @@ from openai.types.chat import ChatCompletion
 from record_support import record_run
 
 from expcore.config.models import Limits, ModelSpec
-from expcore.models.adapters import OpenAICompatAdapter
+from expcore.models.adapters import OpenAICompatAdapter, StubAdapter
 from expcore.records.record import RunRecord, decode
 from expcore.records.schema import RecordError, validate
 from expcore.replay.replay import replay_record
@@ -137,3 +137,18 @@ def test_b21_a_record_of_version_two_knows_no_such_key():
     data["agent_config"]["model_request_bound_s"] = 600.0
     with pytest.raises(RecordError, match="model_request_bound_s"):
         validate(data)
+
+
+class OwnBackend(StubAdapter):
+    """Stands in for a backend of a study's own that cannot take the bound: it has no `bound_requests`."""
+
+    bound_requests = None
+
+
+def test_b21_the_recording_is_judged_by_the_backend_it_wraps_and_a_backend_without_the_method_is_refused():
+    """B21: the recording wrapper exposes the wrapped backend's `bound_requests`, so a declared bound reaches a core
+    adapter through it, and a backend that has none is refused by name before anything is sent, not by the wrapper's."""
+    backend = OwnBackend(["done"])
+    with pytest.raises(ValueError, match="the model backend OwnBackend has no bound_requests"):
+        record_run([], {}, backend=backend, model_request_bound_s=600.0)
+    assert backend.requests_sent == 0

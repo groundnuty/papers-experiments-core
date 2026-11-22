@@ -9,7 +9,8 @@ and cut as without the key. The adapters' side, the send given up at the bound a
 
 import asyncio
 
-from loop_support import FakeProvider, slow
+import pytest
+from loop_support import FakeProvider, ScriptedBackend, slow
 
 from expcore.errors import ModelRequestTimedOut
 from expcore.loop.config import AgentConfig
@@ -33,6 +34,12 @@ class TakesTheBound(StubAdapter):
             self.clock.advance(self.seconds)
             await asyncio.Event().wait()
         return await super().step()
+
+
+class OwnBackend(StubAdapter):
+    """Stands in for a backend of a study's own that cannot take the bound: it has no `bound_requests`."""
+
+    bound_requests = None
 
 
 def test_b21_the_bound_is_handed_while_it_is_the_shorter_and_lifted_once_the_time_left_is(run, clock):
@@ -88,3 +95,27 @@ def test_b21_a_request_given_up_at_the_bound_ends_the_attempt_as_endpoint_infras
     assert backend.handed == [100.0]
     assert (result.outcome.name, result.outcome.infra_kind) == ("infrastructure", "endpoint")
     assert result.outcome.detail == "the model endpoint did not answer a request within 100 s; not resent"
+
+
+def test_b21_a_declared_bound_refuses_a_backend_that_cannot_take_it_before_the_loop_starts(run):
+    """B21: a bound that a backend cannot arm would be hashed into the record and never applied, so `run_agent` refuses
+    it before the loop starts, naming the backend and the bound; nothing is sent."""
+    backend = OwnBackend(["done"])
+    with pytest.raises(ValueError, match=r"model_request_bound_s = 600 is declared, but the model backend OwnBackend"):
+        run(backend, [FakeProvider({"t": lambda a: "x"})], model_request_bound_s=600)
+    assert backend.requests_sent == 0
+
+
+def test_b21_a_stub_subclass_takes_a_declared_bound_and_runs_as_without_it(run):
+    """B21: the stub sends nothing, so it takes the bound and ignores it, and so does a subclass of it, as a study's
+    reference agent is: a run that declares the bound starts and ends as it does without the key."""
+    backend = ScriptedBackend([[("t", {})], "done"])
+    result = run(backend, [FakeProvider({"t": lambda a: "x"})], model_request_bound_s=600)
+    assert result.outcome.name == "finished"
+    assert result.config["model_request_bound_s"] == 600
+
+
+def test_b21_an_undeclared_bound_never_refuses_a_backend_without_bound_requests(run):
+    """B21: without the key nothing is checked, so a backend of a study's own runs as it always did."""
+    result = run(OwnBackend(["done"]), [FakeProvider({"t": lambda a: "x"})])
+    assert result.outcome.name == "finished"

@@ -746,6 +746,10 @@ class StubAdapter:
         """Replace the script and start it from its first item; the conversation so far is not touched."""
         self._script, self._i = list(script), 0
 
+    def bound_requests(self, seconds: float | None) -> None:
+        """Take the study's bound on one model request and ignore it (B21): the stub sends no request, so there is
+        nothing to bound, and a run that declares the bound is not refused for it. Its subclasses inherit this."""
+
     def info(self) -> dict[str, Any]:
         """Describe the stub as a route."""
         return {

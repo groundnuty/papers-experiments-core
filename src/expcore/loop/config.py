@@ -82,10 +82,10 @@ class AgentConfig:
       ceiling left, and the core's adapters then send each request of the step under it. A request with no reply by
       the bound is given up, never resent (B03), and ends the attempt as `endpoint` infrastructure, which the campaign
       charges and runs again, instead of hanging until the agent's time cap and being scored as the agent's. At or
-      past the time left nothing is armed, and the loop's own cut ends the step as without the key. A backend of a
-      study's own is bounded only if it takes the bound (`bound_requests`). None, the default, leaves every request
-      bounded by the agent's time alone. It is recorded and hashed as the other bounds are, with no list of tools
-      beside it, and an undeclared one is not written at all.
+      past the time left nothing is armed, and the loop's own cut ends the step as without the key. A backend that
+      cannot take the bound (no `bound_requests`) is refused when the bound is declared (`unarmable`). None, the
+      default, leaves every request bounded by the agent's time alone. It is recorded and hashed as the other bounds
+      are, with no list of tools beside it, and an undeclared one is not written at all.
     """
 
     limits: Limits
@@ -183,6 +183,21 @@ class AgentConfig:
         if tick.ceiling_left_s is not None and not declared < tick.ceiling_left_s:
             return None
         return declared
+
+    def unarmable(self, backend: object) -> str | None:
+        """Say why a declared `model_request_bound_s` cannot reach `backend`, or None when it can or none is declared
+        (B21). It cannot when the backend has no `bound_requests`: such a run would hash a bound it never arms, so the
+        campaign refuses it at admission and `run_agent` before the loop starts. A wrapper that exposes the method of
+        the backend it wraps (`RecordingBackend`) is judged, and named, by that backend. The stub adapter takes the
+        bound and ignores it, since it sends nothing to bound."""
+        if self.model_request_bound_s is None or getattr(backend, "bound_requests", None) is not None:
+            return None
+        named = type(getattr(backend, "inner", backend)).__name__
+        return (
+            f"[agent] model_request_bound_s = {self.model_request_bound_s:g} is declared, but the model backend "
+            f"{named} has no bound_requests method, so none of its requests could be bounded: give the backend "
+            "bound_requests (B21), or leave the key out"
+        )
 
     def as_dict(self) -> dict[str, Any]:
         """Return every value as the record keeps it.

@@ -79,6 +79,9 @@ async def run_agent(
             f"the tool box caps output at {toolbox.cap_chars} characters but the run configuration says "
             f"{config.limits.output_cap_chars}: the configuration hash must describe what the model saw"
         )
+    unarmable = config.unarmable(backend)  # a declared bound no backend method can take is refused (B21)
+    if unarmable is not None:
+        raise ValueError(unarmable)
     if timer is None:
         timer = config.timer(clock)
     elif timer.time_cap_s != config.limits.time_cap_s or timer.ceiling_s != config.ceiling_s:

@@ -7,12 +7,14 @@ a request and never answers; every other answers.
 
 import asyncio
 
+import pytest
 from loop_support import FakeProvider
 from openai.types.chat import ChatCompletion
 from record_support import CODE, make_config
-from scheduler_support import FakeExecutor, attempts_of, build, settings_for
+from scheduler_support import Factory, FakeExecutor, ReportingBackend, attempts_of, build, settings_for
 
 from expcore.campaign.executor import record_run
+from expcore.config.loading import ConfigError
 from expcore.models.adapters import OpenAICompatAdapter
 
 BOUND_S = 0.05  # real seconds: the hung request is given up at once
@@ -96,3 +98,39 @@ def test_b21_an_attempt_given_up_at_the_request_bound_is_charged_and_the_run_goe
     assert first.route["abandoned_request"]["reason"] == "request_bound"
     assert first.agent_config["model_request_bound_s"] == BOUND_S
     assert factory.clients[1].requests == 1
+
+
+class OwnBackend(ReportingBackend):
+    """Stands in for a backend of a study's own that cannot take the bound: it has no `bound_requests`."""
+
+    bound_requests = None
+
+
+class OwnFactory(Factory):
+    """A plugin's factory whose backends cannot take the bound."""
+
+    def __call__(self, spec, *, seed, limits, base_url, time_left):
+        self.calls.append((spec.key, seed, base_url))
+        backend = OwnBackend(spec.key, seed, base_url)
+        self.built.append(backend)
+        return backend
+
+
+def test_b21_a_campaign_whose_backend_cannot_take_a_declared_bound_is_refused_at_admission(tmp_path):
+    """B21: the bound would be in the fingerprint and never armed, so the campaign is refused when it admits the model,
+    naming the model, its backend and the bound, before any run starts; the backend it built is closed."""
+    factory = OwnFactory()
+    executor = FakeExecutor(config=make_config(model_request_bound_s=2400))
+    refused = pytest.raises(ConfigError, match=r"model 'm1' \(stub\): .*model_request_bound_s = 2400 .*OwnBackend")
+    with refused, build(tmp_path, executor=executor, factory=factory, plan=SMALL) as scheduler:
+        scheduler.run()
+    assert executor.requests == []
+    assert all(backend.closed for backend in factory.built)
+
+
+def test_b21_a_stub_campaign_with_the_bound_declared_runs_every_run(tmp_path):
+    """B21: a campaign on the stub, whose backends are subclasses of the core's `StubAdapter`, takes the bound and runs
+    as without it: its smoke and test campaigns are not refused for declaring the bound their real campaign pins."""
+    executor = FakeExecutor(config=make_config(model_request_bound_s=2400))
+    with build(tmp_path, executor=executor, plan=SMALL) as scheduler:
+        assert scheduler.run().statuses == {"done": 3}
