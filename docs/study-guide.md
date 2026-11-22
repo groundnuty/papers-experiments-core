@@ -365,6 +365,32 @@ An agent's code cell is its own time, so a cell that never returns can spend a w
 - The record's `agent_config.code_cell_bound_s` holds the limit and `agent_config.code_cell_tools` the tools it reached. A cell that outlives its kill is still infrastructure (`cell_unkillable`) and ends the run, with one exception (O97): when a backend that can restore its mount aborted it, and every process left was blocked on a file of a provider the study's own manipulation holds down at that moment, the cell is the agent's time limit too. The agent is told the same timeout, its clock is paused while the mount is restored, and the run goes on. Any other process left (a wait between two providers that are up, a read of the agent's own work directory, nothing the study holds down) ends the run as before. Either way, the cell's call carries `cell_deadline` in the record: how the deadline ended, what each process left was blocked on, and whose block the verdict made it.
 - Declare it before the campaign starts: the limit is one of the campaign's caps, which are in its fingerprint, and `campaign.toml`'s hash is in it too, so a store that started without the key is not resumed with it: start a new store. A study that never declares it is unchanged, byte for byte.
 
+### Bounding one model request
+
+A model request's only bound in the loop is the agent's time left. Replies are not streamed, and the client's read timeout is never shorter than the time cap plus 60 s. An endpoint that takes a request and never answers therefore holds the run until the agent's time cap, and the run is scored as the agent's time cap. With a cap of several hours, that is hours of a slot spent on a run that says nothing about the agent. `[agent] model_request_bound_s` in `campaign.toml` declares a bound on one request, in seconds: positive and finite, and optional.
+
+- A request with no reply by the bound is given up and never sent again. The attempt ends as infrastructure of kind `endpoint`: it is set aside and charged, and the run is attempted again up to `max_attempts`. The record's failed request names the bound, and `route.abandoned_request` has the reason `request_bound`, with the bound on the request's prompt.
+- The bound reaches every request of a step, a resend after a transient error too, while it is shorter than both the agent's time left and the ceiling left when the step starts. Once it is not, the step runs as it does without the key, and a request that hangs is the agent's time cap, or the ceiling, as before. A bound at or above the time cap leaves every request as it was, though it still changes the caps in the fingerprint.
+- Pick the bound well above the slowest reply that is not a hang: the longest reply `max_output_tokens` allows, at the slowest model's decode rate, plus the prompt's prefill. A reply of 32,768 tokens at 10 tokens a second takes about 3,300 s. The `latency_s` of each turn in a pilot's records shows how long replies really take. A bound below the slowest of them turns slow replies into infrastructure, attempted again instead of scored.
+- The core's two adapters, OpenAI-compatible and Anthropic, honour it. A backend of your own (a plugin's `backend_factory`) is bounded only if it has a `bound_requests(seconds)` method: the loop calls it before each step with the bound, or None when the bound is not the shorter, and the backend must give a request up at the bound by raising `ModelRequestTimedOut` (`expcore.errors`) and never resend it.
+- Declare it before the campaign starts: the bound is one of the campaign's caps, which are in its fingerprint, so a store that started without the key is not resumed with it: start a new store. A study that never declares it keeps its fingerprint, its configuration and its behaviour.
+
+```python
+from expcore.campaign.config import load_campaign
+
+assert study.campaign.agent.model_request_bound_s is None  # the example declares none
+assert "model_request_bound_s" not in study.campaign.caps()["agent"]  # so its caps are what they were
+
+bounded = Path("request-bound-study")
+shutil.copytree("my-study", bounded)
+toml = bounded / "campaign.toml"
+toml.write_text(toml.read_text().replace("[agent]\n", "[agent]\nmodel_request_bound_s = 3600\n", 1))
+declared = load_campaign(toml)
+assert declared.agent.model_request_bound_s == 3600.0
+assert declared.caps() != study.campaign.caps()  # another fingerprint: a store without the bound is not resumed with it
+shutil.rmtree(bounded)
+```
+
 ### Prices and the budget
 
 A model's price is `[models.<key>.price]` in `models.toml`, in US dollars per million tokens: `input_per_mtok` and `output_per_mtok`, and optionally `cache_write_per_mtok` and `cache_read_per_mtok`, which are the input price when left out. A model the study hosts itself says `free = true` instead. With a budget, every planned model that is not free also declares its endpoint's context window, `context_tokens`, for the reason given below. `run` refuses to start or resume the campaign without it, naming `models.toml` and the model's key; checking, analysing, reporting and a package's check of a finished study do not need it.

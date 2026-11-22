@@ -6,7 +6,8 @@
 
 OpenAI-compatible chat completions and the Anthropic Messages API are driven without an agent SDK, so the full
 transcript and the per-turn usage are recorded the same way for every model. Replies are not streamed. Requests go
-through `Retrier`, which turns the SDKs' own retries off so every retry is counted and recorded.
+through `Retrier`, which turns the SDKs' own retries off so every retry is counted and recorded. Under a study's bound on
+one request, which the loop hands over before each step, every send is given up when it has no reply by the bound (B21).
 
 Per-backend tool-calling adaptation:
   * all backends: tool-call arguments that are not a JSON object are never resent; the history carries
