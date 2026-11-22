@@ -131,13 +131,36 @@ def lose(ledger: Ledger, clock: FakeClock, label: str) -> Lease:
     return ledger.lease(lease.lease_id)
 
 
+def overdue(ledger: Ledger, clock: FakeClock, site: str = SITE, beats: Mapping[int, int] | None = None) -> None:
+    """Let `site_out_s` and a KillWait pass and read the site (`beats` for its leases in flight), so each lost lease
+    nobody settled is overdue (C68): its loss's count is final and its run may be leased again."""
+    clock.advance(ledger.config.site_out_s + 180.0)
+    ledger.observe_site(site, SiteReading(heartbeats=dict(beats or {})))
+
+
+def _assert_issued_after_final_counts(ledger: Ledger, live: Sequence[Lease], settled: Mapping[int, object]) -> None:
+    """C68: no lease in flight follows a lease of its run whose count may still rise: one expired with its holder not
+    proven ended, or, with a budget, one lost that is neither settled nor overdue."""
+    overdue_ids = {event["lease_id"] for event in ledger.events() if event["kind"] == "settle_overdue"}
+    priced = ledger.config.max_usd is not None
+    for lease in live:
+        for earlier in ledger.leases():
+            if earlier.run_key != lease.run_key or earlier.lease_id >= lease.lease_id:
+                continue
+            running = earlier.state == "expired" and not earlier.proven
+            assert not running, f"lease {lease.lease_id} follows lease {earlier.lease_id}, whose holder may still run"
+            lost = earlier.state == "lost" or (earlier.state == "expired" and earlier.proven)
+            open_ = priced and lost and earlier.lease_id not in settled and earlier.lease_id not in overdue_ids
+            assert not open_, f"lease {lease.lease_id} follows lease {earlier.lease_id}, whose settle may still come"
+
+
 def assert_invariants(ledger: Ledger) -> None:
     """What every step must keep: one live lease per run and per federation, a live lease being its run's latest, no
     budget or ceiling (as raised) passed, no cap passed by live and held-back leases together, at most one counted
     done lease per run, which is the run's latest when the run is done, a settlement never above its lease's grant,
     a run's charged attempts being the sum of what its leases were counted for (an exhausted run has none left, a
-    pending one always has one), and a locked total that is the grants
-    of the held leases nobody settled."""
+    pending one always has one), no lease in flight issued before its run's earlier counts were final (C68), and a
+    locked total that is the grants of the held leases nobody settled."""
     leases = ledger.leases()
     runs = {run.run_key: run for run in ledger.runs()}
     live = [lease for lease in leases if lease.state in ("issued", "sent")]
@@ -172,6 +195,7 @@ def assert_invariants(ledger: Ledger) -> None:
     for lease in leases:
         if lease.lease_id in settled:
             assert settled[lease.lease_id].spend_micro <= lease.grant_micro, "a settlement passes its grant"
+    _assert_issued_after_final_counts(ledger, live, settled)
     held = sum(
         lease.grant_micro
         for lease in leases

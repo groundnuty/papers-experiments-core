@@ -14,6 +14,7 @@ from elastic_support import (
     join,
     leased,
     make,
+    overdue,
     plan,
 )
 
@@ -67,14 +68,16 @@ def test_c42_a_federation_gets_its_next_lease_once_its_last_is_completed(tmp_pat
 
 @pytest.mark.parametrize("first_to_report", ["old", "new"])
 def test_c42_a_duplicate_completion_counts_the_latest_lease_and_keeps_the_other_as_evidence(tmp_path, first_to_report):
-    """C42: a run leased again after its lease expired has two completions; the latest lease's counts whatever order
-    they arrive in, and the other is superseded, its spend counted."""
+    """C42: a run leased again after its lease expired (its holder proven ended and its settle overdue, C68) has two
+    completions; the latest lease's counts whatever order they arrive in, and the other is superseded, its spend
+    counted."""
     ledger, clock = make(tmp_path, runs=plan(tasks=1, conditions=("api-none",)), max_usd=10.0, grants_usd={"m1": 1.0})
     join(ledger, clock, "fed-1")
     join(ledger, clock, "fed-2")
     old = leased(ledger, "fed-1")
     _expire(ledger, clock, old)
     ledger.prove_ended("fed-1", "cancelled")
+    overdue(ledger, clock)
     new = leased(ledger, "fed-2")
     assert new.run_key == old.run_key
     assert new.lease_id > old.lease_id

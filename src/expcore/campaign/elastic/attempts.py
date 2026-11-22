@@ -20,12 +20,102 @@ lease, its old and new counts, the run's, and why. Only the count decides, and o
 that is `done` or `harness_error` stays so, and a run whose real attempts reach `max_attempts` stays exhausted. Two
 leases of one run can each have an attempt of one number: the lease id, which the lease's store records in every
 record and export row, tells them apart.
+
+**A run is leased again only once its earlier leases' counts are final** (`holds`, C68). A lease's store allows
+`max_attempts - attempt_base` attempts, and its base is the run's count at its issue, so a count that rises after the
+next lease is issued lets the run pass `max_attempts` across its leases. A count rises at a loss (to one) and at a
+settle (to the dead store's attempts), so a pending run is held, not leased, while a lease of it is:
+
+- `expired` with its holder not proven ended: it may still be charging attempts, and its loss is still to be counted.
+  The dead-holder rule proves every holder ended in the end (at the latest its recorded job end plus KillWait);
+- lost (`lost`, or `expired` with its holder proven ended) in a ledger with a budget, and neither settled nor
+  overdue: its settle may still name more attempts than its loss's one. Without a budget nothing is settled, so the
+  loss's count is final at once.
+
+A settle that never comes (a dead store nobody can read, a site no controller reads, a spend above the grant) must not
+hold its run for ever: `site_out_s` after the lease could first be settled (its loss; for a holder the controller
+cancelled, its proven end plus KillWait), the sweep logs `settle_overdue` for it, and its loss's count is final from
+then on. A settle that lands after that is still applied as any other.
 """
 
 import sqlite3
 
 from expcore.campaign.elastic import schema
 from expcore.campaign.elastic.config import LedgerConfig
+
+OVERDUE = "settle_overdue"  # the event that makes a lost lease's count final with no settle
+
+_RUNNING = (
+    "SELECT l.id, l.run_key FROM leases l JOIN federations f ON f.label = l.federation"
+    " JOIN runs r ON r.run_key = l.run_key"
+    " WHERE r.state = 'pending' AND l.state = 'expired' AND f.ended_at IS NULL ORDER BY l.id"
+)
+_UNSETTLED = (
+    "SELECT l.id, l.run_key, l.federation, l.state, l.ended_at, l.charged_added, f.ended_at AS fed_ended,"
+    " f.end_proof AS fed_proof, f.kill_wait_s AS fed_kill_wait"
+    " FROM leases l JOIN federations f ON f.label = l.federation JOIN runs r ON r.run_key = l.run_key"
+    " WHERE r.state = 'pending' AND (l.state = 'lost' OR (l.state = 'expired' AND f.ended_at IS NOT NULL))"
+    " AND NOT EXISTS (SELECT 1 FROM settlements s WHERE s.lease_id = l.id) ORDER BY l.id"
+)
+
+
+def _unsettled(db: sqlite3.Connection) -> list[sqlite3.Row]:
+    """The lost leases of pending runs that are neither settled nor overdue. The log is read once for the overdue
+    ones (it has no index by kind or lease, as `pauses` reads it), not once for each lease."""
+    done = {row[0] for row in db.execute("SELECT lease_id FROM events WHERE kind=?", (OVERDUE,))}
+    return [row for row in db.execute(_UNSETTLED) if row["id"] not in done]
+
+
+def holds(db: sqlite3.Connection, config: LedgerConfig) -> dict[str, str]:
+    """Each pending run that is not leased now, with why: a lease of it whose count may still rise (module
+    docstring). Read from the file alone, with no clock, so a reader without the lock sees what `issue` sees."""
+    held: dict[str, list[str]] = {}
+    for row in db.execute(_RUNNING):
+        held.setdefault(row["run_key"], []).append(
+            f"lease {row['id']} expired and its holder is not proven ended: it may still charge attempts"
+        )
+    if config.max_usd is not None:
+        for row in _unsettled(db):
+            held.setdefault(row["run_key"], []).append(
+                f"lease {row['id']} is lost and not settled: its dead store may show more attempts than its loss "
+                f"counted (final at its settle, or {config.site_out_s:g} s after it could first be settled)"
+            )
+    return {run_key: "; ".join(reasons) for run_key, reasons in held.items()}
+
+
+def settleable_at(row: sqlite3.Row) -> float:
+    """When a lost lease (a row of `_unsettled`) could first be settled: its loss, or its holder's proven end, plus
+    KillWait for a holder the controller cancelled (`settling.apply` refuses it before then)."""
+    if row["state"] == "lost":
+        return row["ended_at"]
+    wait = row["fed_kill_wait"] if row["fed_proof"] == "cancelled" else 0.0
+    return row["fed_ended"] + wait
+
+
+def overdue(db: sqlite3.Connection, config: LedgerConfig, now: float) -> None:
+    """Log `settle_overdue` for each lost lease of a pending run that has gone `site_out_s` unsettled since it could
+    first be settled, in the caller's transaction: its loss's count is final, and its run is no longer held for it."""
+    if config.max_usd is None:
+        return  # nothing is settled, so no lost lease holds its run
+    for row in _unsettled(db):
+        since = settleable_at(row)
+        if now - since < config.site_out_s:
+            continue
+        schema.add_event(
+            db,
+            now,
+            OVERDUE,
+            run_key=row["run_key"],
+            lease_id=row["id"],
+            federation=row["federation"],
+            since=since,
+            waited_s=config.site_out_s,
+            charged=row["charged_added"],
+            reason=(
+                f"lease {row['id']} was not settled within {config.site_out_s:g} s of when it could first be: its "
+                f"loss's {row['charged_added']} charged attempt(s) are final, and its run may be leased again"
+            ),
+        )
 
 
 def log_reopen(

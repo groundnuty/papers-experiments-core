@@ -13,6 +13,7 @@ from elastic_support import (
     leased,
     ledger_path,
     make,
+    overdue,
     plan,
 )
 
@@ -35,8 +36,9 @@ def model(key: str, price: Price | None = DEAR, *, free: bool = False) -> ModelS
 
 
 def test_c42_the_budget_is_never_passed_when_an_expired_run_is_leased_again_and_both_spend_their_grant(tmp_path):
-    """C42: a run whose lease expired is leased again while the first holder may still be spending: both grants are
-    held together, so with both spent to the bound the total is still within max_usd, and the next lease waits."""
+    """C42: a run whose lease expired is leased again once its holder is proven ended and its settle is overdue (C68),
+    while the first lease is still charged its grant: both grants are held together, so with both spent to the bound
+    the total is still within max_usd, and the next lease waits."""
     ledger, clock = make(tmp_path, runs=plan(tasks=3, conditions=("api-none",)), max_usd=3.0, grants_usd={"m1": 1.0})
     for label in ("fed-1", "fed-2", "fed-3", "fed-4"):
         join(ledger, clock, label)
@@ -47,6 +49,8 @@ def test_c42_the_budget_is_never_passed_when_an_expired_run_is_leased_again_and_
     clock.advance(101)
     ledger.observe_site(SITE, SiteReading(heartbeats={other.lease_id: 3}))
     assert ledger.lease(first.lease_id).state == "expired"
+    ledger.prove_ended("fed-1", "cancelled")
+    overdue(ledger, clock, beats={other.lease_id: 4})
     again = leased(ledger, "fed-3")
     assert again.run_key == first.run_key
     assert_invariants(ledger)

@@ -12,7 +12,9 @@ shown ended; the sweep expires what it must.
   verified (`verify_archive`); one that never verifies is `lost` and its run goes back to pending.
 - **Expiry.** A lease expires when its site was read and its counter stood still for `stale_s` of reads, when it is
   past its hard term, or when its site went unread for `site_out_s`. After a restart no lease expires until its site
-  is read, save by the site's own `site_out_s`, counted from the reopen. Expiry puts the run back to pending at once.
+  is read, save by the site's own `site_out_s`, counted from the reopen. Expiry puts the run back to pending at once,
+  but the run is not leased again until the expired lease's count is final (`attempts.holds`, C68): its holder
+  proven ended, and with a budget its settle read or overdue.
 - **The dead-holder rule.** An expired lease keeps its cap slot and its grant until its holder's job is proven ended:
   a terminal state or the controller's cancel (`prove_ended`), or the recorded job end plus KillWait once its site was
   read after that moment (so any completion it left is collected first) or its site is out, as `campaign.lease`
@@ -74,6 +76,7 @@ from expcore.campaign.elastic.records import (
 from expcore.campaign.elastic.views import LedgerViews, environment_key
 from expcore.campaign.lock import DispatchLock
 
+HELD_SHOWN = 5  # the held runs a `Wait` names (C68)
 _LABEL = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")  # an operator's label, as a shard's: never a host name or an address
 
 
@@ -292,10 +295,19 @@ class Ledger(LedgerViews):
         current = self.db.execute("SELECT MIN(set_index) FROM runs WHERE state='pending'").fetchone()[0]
         if current is None:
             return Wait("no run is pending")
-        pending = [
-            Pending(r["run_key"], r["seq"], r["model"], r["condition"])
-            for r in self.db.execute("SELECT * FROM runs WHERE state='pending' AND set_index=?", (current,))
-        ]
+        # C68: a held run keeps its set current (nothing is sent ahead) but is skipped, so the set's others still lease
+        holds = attempts.holds(self.db, self.config)
+        rows = self.db.execute("SELECT * FROM runs WHERE state='pending' AND set_index=? ORDER BY seq", (current,))
+        pending, held_runs = [], []
+        for r in rows:
+            if r["run_key"] in holds:
+                held_runs.append(f"run {r['run_key']} is held: {holds[r['run_key']]}")
+            else:
+                pending.append(Pending(r["run_key"], r["seq"], r["model"], r["condition"]))
+        if len(held_runs) > HELD_SHOWN:  # a site out holds every run it had: name a few, count the rest
+            held_runs = [*held_runs[:HELD_SHOWN], f"{len(held_runs) - HELD_SHOWN} more run(s) held"]
+        if not pending:
+            return Wait(f"set {current} waits: " + "; ".join(held_runs))
         in_flight = [
             InFlight(r["model"], r["condition"], r["issued_at"])
             for r in self.db.execute("SELECT * FROM leases WHERE state IN ('issued', 'sent')")
@@ -317,7 +329,7 @@ class Ledger(LedgerViews):
             grants,
         )
         if isinstance(chosen, Wait):
-            return chosen
+            return Wait("; ".join([chosen.reason, *held_runs]))
         run = self.db.execute("SELECT * FROM runs WHERE run_key=?", (chosen.run_key,)).fetchone()
         grant = grants.get(run["model"], 0)
         cursor = self.db.execute(
@@ -550,9 +562,11 @@ class Ledger(LedgerViews):
                 self._expire(row, now, "hard_term")
             elif last - row["renewed_at"] >= cfg.stale_s:
                 self._expire(row, now, "stale")
+        attempts.overdue(self.db, cfg, now)  # C68: a settle that never came holds its run no longer
 
     def _expire(self, row: Any, now: float, reason: str) -> None:
-        """The lease expires and its run goes back to pending at once; its slot and grant stay held."""
+        """The lease expires and its run goes back to pending at once (held until its count is final, C68); its slot
+        and grant stay held."""
         self.db.execute("UPDATE leases SET state='expired', ended_at=? WHERE id=?", (now, row["id"]))
         attempts.requeue(self.db, self.config, row["run_key"])
         self._event(

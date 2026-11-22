@@ -71,6 +71,7 @@ def test_c45_a_ledger_whose_recorded_verdict_is_not_the_rules_is_refused(tmp_pat
     ledger.mark_sent(lost.lease_id)
     clock.advance(400.0)
     ledger.observe_site(SITE, SiteReading())  # no heartbeat: it expires and its run goes back to pending
+    ledger.prove_ended("fed-a", "cancelled")  # C68: the run is leased again once its holder is proven ended
     again = leased(ledger, "fed-b")
     assert again.run_key == lost.run_key
     assert finish(ledger, again) == "counted"

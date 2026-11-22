@@ -10,8 +10,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign.elastic import attempts, declarations, grants, pauses, schema
 from expcore.campaign.elastic import caps as cap_table
-from expcore.campaign.elastic import declarations, grants, pauses, schema
 from expcore.campaign.elastic.ceilings import effective, history
 from expcore.campaign.elastic.config import PRIOR_RUNS, TOPUP_ALLOWANCES_KEY, LedgerConfig
 from expcore.campaign.elastic.records import (
@@ -164,12 +164,20 @@ class LedgerViews:
     def demand(self) -> Demand:
         """The current set, its pending runs per model, and the cap slots held per model: what a controller's target
         reads (with `caps()`). A paused model's runs still count (C48): its federations stay up through the pause, so
-        its leases go out the moment it is declared."""
+        its leases go out the moment it is declared. A held run (`holds`, C68) keeps its set current, as `issue` does,
+        and does not count: no lease of it can be issued until its earlier lease's count is final."""
         current = self.db.execute("SELECT MIN(set_index) FROM runs WHERE state='pending'").fetchone()[0]
-        rows = self.db.execute(
-            "SELECT model, COUNT(*) FROM runs WHERE state='pending' AND set_index=? GROUP BY model", (current,)
-        ).fetchall()
-        return Demand(set_index=current, pending=dict(rows), slots=self.slots())
+        held = self.holds()
+        pending: dict[str, int] = {}
+        for row in self.db.execute("SELECT run_key, model FROM runs WHERE state='pending' AND set_index=?", (current,)):
+            if row["run_key"] not in held:
+                pending[row["model"]] = pending.get(row["model"], 0) + 1
+        return Demand(set_index=current, pending=pending, slots=self.slots())
+
+    def holds(self) -> dict[str, str]:
+        """Each pending run that is not leased now, with why (C68, `attempts.holds`): a lease of it expired with its
+        holder not proven ended, or, with a budget, lost and neither settled nor overdue."""
+        return attempts.holds(self.db, self.config)
 
     def ceilings(self) -> Ceilings:
         """The dollar ceilings in force: the pinned ones, or as raised (`raise_ceiling`)."""
