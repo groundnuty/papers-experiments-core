@@ -1,0 +1,25 @@
+# The one contrast a study must declare; the proof reads records, never this analysis.
+alpha = 0.05
+holm_family = ["outage-vs-control"]
+
+[bootstrap]
+replicates = 200
+seed = 20261122
+ci_level = 0.95
+
+[power]
+seed = 1
+n_simulations = 50
+target_clusters = 10
+target_difference = 0.2
+sd_grid = [0.1, 0.2]
+
+[estimators.wilcoxon_cluster_bootstrap]
+method = "auto"
+
+[contrasts.outage-vs-control]
+conditions = ["owner_down", "control"]
+outcome = "finished"
+estimator = "wilcoxon_cluster_bootstrap"
+cluster = "region"
+treatment_outcomes = "scored"
