@@ -6,9 +6,11 @@ the key's nor the budget's (`UNCHARGED_KINDS`) nor a platform's hold (`expcore.e
 back because what the run needs is held by another live attempt, or was left unfit by an earlier one) and no outage
 overlapped it. Interrupted, outage-discarded and
 harness-error attempts are never charged. The charge is decided once, when the attempt finishes, and stored in the row.
-A start that failed before the agent's first turn right after the run's previous attempt's post-run check failed is
-set aside as outage-discarded, once (`expcore.campaign.start_after_check`), so it carries the decision in its own
-`outage_kind` and `classify` needs nothing more.
+A start that failed before the agent's first turn right after the run's previous attempt's post-run check failed, and
+a pre-run outage the run finds right after one, are set aside as outage-discarded, once
+(`expcore.campaign.start_after_check`), so each carries the decision in its own `outage_kind` and `classify` needs
+nothing more: the store's charged count, the lease store's journal lines and the completion that names the count all
+read the row's `charged`, which is 0.
 
 Treatment. A condition may declare infrastructure kinds that are its treatment (`FactorSchema.treatment_kinds`). An
 attempt that ends as infrastructure of such a kind, under that condition, is a scored final attempt: its state is

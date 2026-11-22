@@ -166,6 +166,21 @@ def test_an_infra_fail_the_journal_alone_saw_end_costs_its_run_an_attempt_only_i
     assert found.charged_attempts == before.charged_attempts + 1
 
 
+@pytest.mark.parametrize("charged", [0, None], ids=["the line says 0", "a journal that predates the field"])
+def test_a_spared_pre_run_outage_the_journal_alone_saw_end_costs_its_run_no_attempt(base, ended, charged):
+    """A pre-run outage set aside uncharged after a failed post-run check (`start_after_check`) ends `outage_discarded`
+    with `charged` 0 in the journal: a settle that reads the dead store takes it as no attempt, as the store would,
+    whether the line says so or (a journal that predates the field) only its state does."""
+    place = _mid_run(base, ended, f"later-spared-{charged}")
+    before = _read(place)
+    _append(place, *_later_attempt(place, "outage_discarded", charged=charged))
+    after = _read(place)
+    assert before is not None
+    assert after is not None
+    assert after.spend_micro > before.spend_micro
+    assert after.charged_attempts == before.charged_attempts
+
+
 def test_the_journal_a_lease_run_writes_names_whether_each_attempt_was_charged(ended):
     """C46: Each `attempt` line of a real run's journal carries the row's `charged`, as the store holds it."""
     db = sqlite3.connect(ended / "study" / "out" / "state.sqlite")
