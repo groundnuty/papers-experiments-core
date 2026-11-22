@@ -3,10 +3,11 @@ budget left, since when each federation is idle; and a dry run's read-only view,
 nothing."""
 
 import pytest
-from elastic_support import finish, join, leased, ledger_path, make, plan
+from control_support import member, settings, site
+from elastic_support import SITE, finish, join, leased, ledger_path, make, plan
 
 from expcore.campaign.elastic import Ledger, SiteReading
-from expcore.campaign.elastic.control import environment_digest, ledger_view, read_only
+from expcore.campaign.elastic.control import Add, Drain, Retire, decide, environment_digest, ledger_view, read_only
 
 
 def test_c43_the_ledger_view_gives_slots_held_leases_in_flight_budget_left_and_idle_since(tmp_path):
@@ -80,3 +81,29 @@ def test_c43_the_environment_a_federation_joins_with_is_the_digest_step_4_checks
     for bad in ({}, ["python"]):
         with pytest.raises(ValueError, match="non-empty mapping"):
             environment_digest(bad)
+
+
+def test_c68_a_held_run_last_in_its_set_leaves_demand_at_zero_and_the_controller_drains_only_idle_members(tmp_path):
+    """C68: the set's last pending run is held for its expired lease, so demand is 0 until the hold ends and nothing
+    goes to the later set. The controller's tick plans nothing worse than at any demand of 0: the member whose lease
+    expired on a running job is drained to be replaced, as before, the idle one is drained past its re-up cost, the
+    one holding a live lease is left alone, and nothing is retired or added."""
+    runs = plan(models=("m1", "m2"), tasks=1, sets={"mount-read": 1})  # set 0: each model's api-none run
+    ledger, clock = make(tmp_path, runs=runs)
+    labels = ("site-a-fed-1", "site-a-fed-2", "site-a-fed-3")
+    for label in labels:
+        join(ledger, clock, label, site=SITE)
+    held, live = leased(ledger, labels[0]), leased(ledger, labels[1])
+    ledger.observe_site(SITE, SiteReading(heartbeats={held.lease_id: 1, live.lease_id: 1}))
+    clock.advance(ledger.config.stale_s + 1)
+    ledger.observe_site(SITE, SiteReading(heartbeats={live.lease_id: 2}))
+    assert ledger.lease(held.lease_id).state == "expired"
+    assert held.run_key in ledger.holds()
+    view = ledger_view(ledger)
+    assert (view.demand.set_index, view.demand.pending, view.leases_wanted()) == (0, {}, 0)
+    fleet = site(members=[member("fed-1"), member("fed-2"), member("fed-3")])
+    decision = decide(clock(), view, [(settings(retire_idle_s=60.0), fleet)])
+    drained = sorted(action.label for action in decision.actions if isinstance(action, Drain))
+    assert drained == ["site-a-fed-1", "site-a-fed-3"]
+    assert not [action for action in decision.actions if isinstance(action, Retire | Add)]
+    assert all(getattr(action, "label", None) != labels[1] for action in decision.actions)

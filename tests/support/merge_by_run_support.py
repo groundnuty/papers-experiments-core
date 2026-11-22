@@ -253,6 +253,8 @@ def small_fleet(base: Path, env: dict[str, str], *, superseded: bool = False) ->
         ledger.observe_site(DOOMED["fed-z"], SiteReading())
         for label in late:
             ledger.prove_ended(label, "terminal")
+        clock.now += ledger.config.site_out_s  # C68: no settle comes for them, so their runs go out once it is overdue
+        ledger.observe_site(DOOMED["fed-z"], SiteReading())
         _lease_every_run(fleet, ledger)
         if superseded:
             lx = leases["fed-x"]

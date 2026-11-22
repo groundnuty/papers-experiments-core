@@ -1,7 +1,7 @@
 """A run's charged attempts across its leases: one count, a lost lease costing one, and settle giving the real one."""
 
 import pytest
-from elastic_support import SITE, assert_invariants, completion, finish, join, leased, lose, make, plan
+from elastic_support import SITE, assert_invariants, completion, finish, join, leased, lose, make, overdue, plan
 
 from expcore.campaign.elastic import Return, SettleRefused, SiteReading, Wait
 
@@ -63,9 +63,14 @@ def test_c42_a_completion_read_after_the_loss_was_counted_replaces_it_with_its_o
 
 def test_c42_settling_with_the_attempts_charged_replaces_the_losss_one(tmp_path):
     """C42: a settle that reads the dead store's log gives the lease's charged attempts, which replace the one the
-    loss was charged; without them the one stays."""
+    loss was charged; without them the one stays. Each loss's settle goes overdue (C68) before the run is leased
+    again, and a settle read after that still counts."""
     ledger, clock = make(tmp_path, **PRICED)
-    unread, two, none = (lose(ledger, clock, f"fed-{n}") for n in (1, 2, 3))
+    losses = []
+    for n in (1, 2, 3):
+        losses.append(lose(ledger, clock, f"fed-{n}"))
+        overdue(ledger, clock)
+    unread, two, none = losses
     ledger.settle(unread.lease_id, 100_000, "root")
     assert ledger.run(unread.run_key).charged == 3  # one for each of the three losses
     first = ledger.settle(two.lease_id, 100_000, "root", attempts_charged=2)
@@ -110,10 +115,12 @@ def test_c42_a_settle_refuses_more_attempts_than_the_lease_could_have_charged_an
 
 @pytest.mark.parametrize("how", ["cancel", "return", "expire"])
 def test_c42_a_run_put_back_with_no_attempt_left_is_exhausted_however_it_goes_back(tmp_path, how):
-    """C42: a settle names two attempts for lease A while B is in flight, so when B is cancelled, returned unstarted or
-    expired the run is pending with every attempt of 2 charged: it is exhausted, not leased again."""
+    """C42: a settle names two attempts for lease A while B is in flight (A's settle went overdue first, C68), so when
+    B is cancelled, returned unstarted or expired the run is pending with every attempt of 2 charged: it is
+    exhausted, not leased again."""
     ledger, clock = make(tmp_path, **PRICED, max_attempts=2)
     lost = lose(ledger, clock, "fed-1")
+    overdue(ledger, clock)
     join(ledger, clock, "fed-2")
     second = leased(ledger, "fed-2")
     assert second.attempt_base == 1
@@ -198,9 +205,11 @@ def test_c42_a_lost_lease_exhausts_its_run_at_max_attempts(tmp_path):
 def test_c42_a_run_its_losses_exhausted_reopens_when_the_real_count_leaves_it_below_max_attempts(tmp_path, how, word):
     """C42: two lost leases exhaust a run of two attempts, the second one conservatively. When the second lease's real
     count (a settle, a return that shows it unstarted, a late completion) is lower, the run is below `max_attempts`
-    again: it goes back to pending, the log names the lease and the old and new counts, and the next lease leases it."""
+    again: it goes back to pending, the log names the lease and the old and new counts, and the next lease leases it.
+    The first loss's settle went overdue (C68) before the second lease."""
     ledger, clock = make(tmp_path, **PRICED, max_attempts=2)
     first = lose(ledger, clock, "fed-1")
+    overdue(ledger, clock)
     second = lose(ledger, clock, "fed-2")
     assert second.run_key == first.run_key
     assert (ledger.run(first.run_key).charged, ledger.run(first.run_key).state) == (2, "infra_exhausted")
@@ -227,9 +236,11 @@ def test_c42_a_run_its_losses_exhausted_reopens_when_the_real_count_leaves_it_be
 def test_c42_a_run_exhausted_by_its_real_attempts_stays_exhausted_when_a_loss_is_taken_back(tmp_path):
     """C42: a settle names two real attempts of two allowed while the next lease is in flight; that lease expires, so
     the run is exhausted by real attempts. Its own loss, counted one on top and then settled at none, leaves the run at
-    the two real ones: still no attempt left, so no reopen."""
+    the two real ones: still no attempt left, so no reopen. The first loss's settle went overdue (C68) before the
+    next lease."""
     ledger, clock = make(tmp_path, **PRICED, max_attempts=2)
     first = lose(ledger, clock, "fed-1")
+    overdue(ledger, clock)
     join(ledger, clock, "fed-2")
     second = leased(ledger, "fed-2")
     ledger.settle(first.lease_id, 100_000, "root", attempts_charged=2)
@@ -249,9 +260,11 @@ def test_c42_a_run_exhausted_by_its_real_attempts_stays_exhausted_when_a_loss_is
 
 def test_c42_a_done_run_does_not_reopen_when_an_earlier_loss_is_settled_at_fewer_attempts(tmp_path):
     """C42: a run is done by its second lease's counted completion; settling the first lease's loss at none lowers the
-    run's charged attempts below `max_attempts` and leaves it done."""
+    run's charged attempts below `max_attempts` and leaves it done. The first loss's settle went overdue (C68) before
+    the second lease."""
     ledger, clock = make(tmp_path, **PRICED, max_attempts=2)
     first = lose(ledger, clock, "fed-1")
+    overdue(ledger, clock)
     join(ledger, clock, "fed-2")
     second = leased(ledger, "fed-2")
     assert finish(ledger, second, state="done", charged=1) == "counted"

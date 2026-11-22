@@ -12,6 +12,7 @@ from elastic_support import (
     ledger_path,
     lose,
     make,
+    overdue,
     plan,
 )
 
@@ -197,11 +198,15 @@ def test_c42_evidence_read_after_a_settle_never_raises_the_settled_charge_and_ma
     """C42: a completion verified or a return read after a settle replaces the settled spend only with a lower one: a
     higher one would pass a budget the released money was leased out of, so the charge stays and the contradiction
     is logged. An archive that never verifies leaves the settled spend, and the same return read again changes
-    nothing."""
+    nothing. Each loss's spend is settled and its settle goes overdue (C68: a spend alone gives no count) before the
+    next lease."""
     ledger, clock = make(tmp_path, **LOOSE)
-    higher, lower, never, return_high, return_low = (lose(ledger, clock, f"fed-{n}") for n in range(1, 6))
-    for lease in (higher, lower, never, return_high, return_low):
-        ledger.settle(lease.lease_id, 300_000, "root")
+    losses = []
+    for n in range(1, 6):
+        losses.append(lose(ledger, clock, f"fed-{n}"))
+        ledger.settle(losses[-1].lease_id, 300_000, "root")
+        overdue(ledger, clock)
+    higher, lower, never, return_high, return_low = losses
     both = (completion(higher, spend_usd=0.5), completion(lower, spend_usd=0.1))
     ledger.observe_site(SITE, SiteReading(completions=both))
     assert ledger.verify_archive(higher.lease_id, archive(higher.lease_id)) == "superseded"
