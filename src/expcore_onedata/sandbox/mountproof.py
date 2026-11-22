@@ -70,7 +70,7 @@ CELL_ALIVE_AT_CLOSE = "cell_alive_at_close"
 CELL, HOST_PROCESS, CLOSE = "cell", "host_process", "close"
 # Apptainer's image helpers run outside the pivot, with the host's root and `/proc`, for as long as their cell does: one
 # in a PID namespace with the run's mount in its table is no cell, and is passed over while it is outside the pivot.
-IMAGE_HELPERS = frozenset({"squashfuse_ll", "squashfuse", "fuse2fs", "fuse-overlayfs"})
+IMAGE_HELPERS = frozenset({"squashfuse_ll"})  # the one seen live: add a name only when one is
 OTHER_EVERY = 20  # a process of another uid is read again every this many polls (about 1 s at the watcher's 50 ms)
 
 
