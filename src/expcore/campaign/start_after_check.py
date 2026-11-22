@@ -17,14 +17,16 @@ first-turn refusal sent none). An executor that raised with requests in its log,
 no budget), is charged as before. The
 attempt is then kept as one an outage overlapped (`outage_kind` set to the campaign's health kind, `outage_discarded`),
 as a post-run failure another attempt left already is (`expcore.campaign.attempt`), and its outcome's detail says why
-it was not charged, first (`REASON`): the row's `detail`, the marker and the export all carry it. An event of kind
-`EVENT` is written in the result's transaction too.
+it was not charged, first (`REASON`): the row's `detail` and the marker carry it. An event of kind `EVENT` is written
+in the result's transaction too.
 
-**The bound: one uncharged attempt per failed post-run check.**
+**The bound: at most one attempt spared per failed post-run check, and never two in a row.**
 - *Once.* The mark is taken by the run's next attempt whatever it ends in: a pre-run check that finds an outage, a
   scored result, or a start failure. A start set aside by this rule never marks the run again, even when its own
-  post-run check fails too, so the failure after it is charged: of two consecutive attempts at least one is charged,
-  and a run can never loop uncharged on a platform that keeps failing its checks.
+  post-run check fails too, so the start failure after it is charged unless something else already spares it (an
+  outage the gate was closed for, a platform's hold): this rule adds at most one uncharged attempt after each failed
+  check of an attempt it did not itself spare, so on a platform that keeps failing its checks the run still spends
+  its attempts and reaches its limit.
 - *Only after a failed check.* A post-run check that passed, or was deferred (it verified nothing and found nothing
   failing), marks nothing.
 - *Only before the agent's first turn.* A failure after a completed turn is charged as always.

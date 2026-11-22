@@ -7,17 +7,21 @@ live in a running campaign: such a start was charged, and the run came within on
 """
 
 import pytest
-from campaign_support import LATER, make_schema
+from campaign_support import LATER, make_fingerprint, make_manifest, make_schema
 from loop_support import FakeProvider
 from record_support import CODE
-from scheduler_support import FakeExecutor, attempts_of, build, key_of, models_for, settings_for
+from scheduler_support import Factory, FakeExecutor, attempts_of, build, key_of, models_for, seed_store, settings_for
 
 from expcore.campaign.attempts import classify
-from expcore.campaign.executor import record_run
+from expcore.campaign.executor import Endpoint, record_run
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.gate import Budget
 from expcore.campaign.healthgate import Health
+from expcore.campaign.manifest import Manifest, fingerprint_sha256
 from expcore.campaign.markers import AttemptResult, read_marker, write_marker
+from expcore.campaign.run_lease import RunLease
+from expcore.campaign.scheduler import Scheduler
+from expcore.campaign.shard_run import ShardStart
 from expcore.campaign.start_after_check import EVENT, REASON, RiskedStarts, spared
 from expcore.config.prices import Price
 from expcore.errors import InfraError, register_infra_kind
@@ -155,6 +159,56 @@ def test_a_spared_start_committed_from_its_marker_after_a_kill_is_uncharged(tmp_
         rows = restart.store.q("SELECT state, charged, attempt, detail FROM attempts ORDER BY id")
     assert [tuple(row)[:3] for row in rows[:2]] == [("infra_fail", 1, 1), ("outage_discarded", 0, 2)]
     assert rows[1]["detail"].startswith(REASON)
+
+
+def test_a_recorded_infrastructure_end_with_no_turn_is_spared_too(tmp_path):
+    """An executor that returns a record whose loop ended as infrastructure before any completed turn (its first
+    request failed) is covered as well: the record counts its turns, so no call log is needed to show none."""
+    rows, events, details = campaign(tmp_path, Scripted("pass", "fail"), "finish", ("infra", START), "finish")
+    assert rows == [("infra_fail", 1, 1), ("outage_discarded", 0, 2), ("done", 0, 2)]
+    assert details[1].startswith(REASON)
+    assert len(events) == 1
+
+
+def test_in_a_leases_store_the_start_after_a_failed_check_is_spared(tmp_path):
+    """The live shape, in the store a lease runs its one run in (its grant as the budget, so a call log is kept): the
+    first attempt's post-run check fails, the second attempt raises its start's kind before any request, and it is set
+    aside uncharged, so the run is not one failure from exhausted; the third attempt finishes."""
+    schema = make_schema()
+    plan = {"tasks": ("task-a",), "models": ("m1",), "seeds": (1,)}
+    whole = make_manifest(schema, 7, **plan)
+    fingerprint = make_fingerprint(schema, task_ids=("task-a",), model_keys=("m1",), seed_ids=(1,))
+    key = whole.rows[0].key.text
+    lease = RunLease(
+        run_key=key,
+        lease_id=1,
+        attempt_base=0,
+        grant_micro_usd=40_000_000,
+        campaign_sha256=fingerprint_sha256(fingerprint),
+        expires_utc="2099-01-01T00:00:00Z",
+    )
+    seed_store(tmp_path, schema)
+    executor = FakeExecutor({key: ["finish", ("raise_infra", START), "finish"]})
+    scheduler = Scheduler(
+        tmp_path,
+        schema,
+        Manifest(whole.order_seed, (whole.rows[0],)),
+        fingerprint,
+        executor,
+        agent_config=executor.config,
+        models=TABLE,
+        endpoints={"m1": Endpoint("m1", "unit-m1", "https://llm.example.invalid/m1")},
+        settings=settings_for(max_attempts=3, budget=Budget(max_usd=40.0)),
+        backend_factory=Factory(),
+        shard=ShardStart(lease, {}, {"unit_caps": {"unit-m1": 1}, "budget": None}),
+        health=Scripted("pass", "fail"),
+    )
+    with scheduler:
+        scheduler.run()
+        rows = attempts_of(scheduler.store, key)
+        [usage] = scheduler.store.q("SELECT turn_usage, spend_basis FROM attempts WHERE state='outage_discarded'")
+    assert rows == [("infra_fail", 1, 1), ("outage_discarded", 0, 2), ("done", 0, 2)]
+    assert (usage["turn_usage"], usage["spend_basis"]) == ("[]", "measured")  # known to have sent no request
 
 
 def test_the_mark_is_used_up_by_the_runs_next_attempt_whatever_it_ends_in():
