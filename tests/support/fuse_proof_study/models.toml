@@ -1,0 +1,9 @@
+# One stub that plays the proof's script (`fuse_proof.script`): no network, no key.
+[models.proof-stub]
+backend = "stub"
+status = "frozen"
+context_tokens = 65536
+
+[models.proof-stub.price]
+input_per_mtok = 1.0
+output_per_mtok = 2.0

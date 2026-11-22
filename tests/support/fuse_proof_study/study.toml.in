@@ -1,0 +1,26 @@
+# The O97 live proof's minimal study (written by tests/live/fuse_abort_apptainer.py; never a study of the paper).
+# `owner_down` takes the space's data provider down through the run's own injector; `control` reads the same files
+# with every provider up. @TARGET@ is the provider label the driver picked (`fuse_proof_world.pick_space`).
+# @PLATFORMS@ is the Onedata layer's kinds module live, with the federation's platform.toml copied beside this file
+# (the platform reads its longest deferral there); the offline dry run lists none, its process has the kinds already.
+[study]
+name = "fuse-proof"
+plugin = "plugin.py"
+code = ["study.toml", "models.toml", "campaign.toml", "preregistration.toml", "plugin.py", "prompt.txt", "fuse_proof.json"]
+platforms = @PLATFORMS@
+
+[factors.outage]
+levels = ["owner_down", "none"]
+
+[identity]
+order = ["task", "outage", "model", "seed"]
+
+[conditions.owner_down]
+outage = "owner_down"
+infrastructure_is_treatment = [{ kind = "provider_outage", target = "@TARGET@" }]
+
+[conditions.control]
+outage = "none"
+
+[tasks.read]
+region = "one"
