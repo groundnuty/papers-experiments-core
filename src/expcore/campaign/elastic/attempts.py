@@ -35,7 +35,9 @@ settle (to the dead store's attempts), so a pending run is held, not leased, whi
 A settle that never comes (a dead store nobody can read, a site no controller reads, a spend above the grant) must not
 hold its run for ever: `site_out_s` after the lease could first be settled (its loss; for a holder the controller
 cancelled, its proven end plus KillWait), the sweep logs `settle_overdue` for it, and its loss's count is final from
-then on. A settle that lands after that is still applied as any other.
+then on. Only the controller that holds the ledger settles, so the wait counts from the ledger's open when that is
+later, as expiry does: a restart leaves it a whole `site_out_s` to read the dead stores before any loss is final. A
+settle that lands after that is still applied as any other.
 """
 
 import sqlite3
@@ -92,13 +94,14 @@ def settleable_at(row: sqlite3.Row) -> float:
     return row["fed_ended"] + wait
 
 
-def overdue(db: sqlite3.Connection, config: LedgerConfig, now: float) -> None:
+def overdue(db: sqlite3.Connection, config: LedgerConfig, now: float, opened_at: float) -> None:
     """Log `settle_overdue` for each lost lease of a pending run that has gone `site_out_s` unsettled since it could
-    first be settled, in the caller's transaction: its loss's count is final, and its run is no longer held for it."""
+    first be settled, or since the ledger was opened (`opened_at`) if that is later, in the caller's transaction: its
+    loss's count is final, and its run is no longer held for it."""
     if config.max_usd is None:
         return  # nothing is settled, so no lost lease holds its run
     for row in _unsettled(db):
-        since = settleable_at(row)
+        since = max(settleable_at(row), opened_at)  # a controller just restarted has had no tick to settle it
         if now - since < config.site_out_s:
             continue
         schema.add_event(

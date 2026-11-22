@@ -9,7 +9,7 @@ import hashlib
 import sqlite3
 
 import pytest
-from elastic_support import SITE, completion, finish, join, leased, make
+from elastic_support import SITE, completion, finish, join, leased, lose, make, overdue
 
 from expcore.campaign.elastic import SiteReading
 from expcore.campaign.ledger_read import LedgerRefused, read_ledger, take_ledger_snapshot
@@ -120,3 +120,19 @@ def test_c45_a_file_that_is_not_a_ledger_is_refused(tmp_path):
     db.close()
     with pytest.raises(LedgerRefused, match="not a ledger"):
         facts_of(tmp_path, other)
+
+
+def test_c68_a_ledger_whose_lost_lease_went_overdue_reads_and_its_run_is_on_the_later_lease(tmp_path):
+    """C68: `settle_overdue` is a step of the log the read keeps and does not refuse: the run's latest lease is the
+    one issued after the loss's settle went overdue, and the lost lease is still unsettled."""
+    ledger, clock = make(tmp_path, runs=None, max_usd=10.0, grants_usd={"m1": 1.0})
+    lost = lose(ledger, clock, "fed-a")
+    overdue(ledger, clock)
+    join(ledger, clock, "fed-b")
+    again = leased(ledger, "fed-b")
+    assert again.run_key == lost.run_key
+    assert [event["lease_id"] for event in ledger.events() if event["kind"] == "settle_overdue"] == [lost.lease_id]
+    facts = facts_of(tmp_path, ledger.path)
+    ledger.close()
+    assert facts.runs[lost.run_key].lease_id == again.lease_id
+    assert lost.lease_id not in facts.settlements

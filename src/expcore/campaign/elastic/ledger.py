@@ -562,7 +562,7 @@ class Ledger(LedgerViews):
                 self._expire(row, now, "hard_term")
             elif last - row["renewed_at"] >= cfg.stale_s:
                 self._expire(row, now, "stale")
-        attempts.overdue(self.db, cfg, now)  # C68: a settle that never came holds its run no longer
+        attempts.overdue(self.db, cfg, now, self._opened_at)  # C68: a settle that never came holds its run no longer
 
     def _expire(self, row: Any, now: float, reason: str) -> None:
         """The lease expires and its run goes back to pending at once (held until its count is final, C68); its slot

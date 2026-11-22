@@ -8,12 +8,13 @@ from elastic_support import (
     finish,
     join,
     leased,
+    ledger_path,
     lose,
     make,
     plan,
 )
 
-from expcore.campaign.elastic import Return, SiteReading, Wait
+from expcore.campaign.elastic import Ledger, Return, SiteReading, Wait
 from expcore.campaign.elastic.control import ledger_view
 from expcore.campaign.elastic.ledger import HELD_SHOWN
 
@@ -130,6 +131,26 @@ def test_c68_a_lost_lease_nobody_can_settle_releases_its_run_once_its_settle_is_
     again = leased(ledger, "fed-2")
     assert (again.run_key, again.attempt_base) == (lost.run_key, 1)
     assert_invariants(ledger)
+
+
+def test_c68_a_restart_gives_the_controller_a_whole_site_out_to_settle_before_a_loss_is_overdue(tmp_path):
+    """C68: only the controller holding the ledger settles, so a loss whose wait ran out while it was down is not
+    overdue at the first sweep after the reopen: the wait counts from the reopen, as expiry's does."""
+    ledger, clock = make(tmp_path, **ONE, **PRICED)
+    lost = lose(ledger, clock, "fed-1")
+    join(ledger, clock, "fed-2")
+    ledger.close()
+    clock.advance(ledger.config.site_out_s * 3)
+    reopened = Ledger.open(ledger_path(tmp_path), clock)
+    reopened.observe_site(SITE, SiteReading())
+    assert not [event for event in reopened.events() if event["kind"] == "settle_overdue"]
+    _waits(reopened, "fed-2", "not settled")
+    clock.advance(reopened.config.site_out_s)
+    reopened.observe_site(SITE, SiteReading())
+    again = leased(reopened, "fed-2")
+    assert (again.run_key, again.attempt_base) == (lost.run_key, 1)
+    assert_invariants(reopened)
+    reopened.close()
 
 
 def test_c68_a_holder_the_controller_cancelled_is_overdue_only_after_its_killwait_too(tmp_path):
