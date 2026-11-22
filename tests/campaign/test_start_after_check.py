@@ -6,6 +6,8 @@ uncharged, its detail led by why (`expcore.campaign.start_after_check`); the fai
 live in a running campaign: such a start was charged, and the run came within one failure of being exhausted.
 """
 
+import asyncio
+
 import pytest
 from campaign_support import LATER, make_fingerprint, make_manifest, make_schema
 from loop_support import FakeProvider
@@ -26,7 +28,7 @@ from expcore.campaign.start_after_check import EVENT, REASON, RiskedStarts, spar
 from expcore.config.prices import Price
 from expcore.errors import InfraError, register_infra_kind
 from expcore.loop.outcomes import Outcome
-from expcore.models.adapters import ModelTurn
+from expcore.models.adapters import ModelTurn, StubAdapter
 
 START = "start_unverified"  # a study's own start, as a kind it declares
 register_infra_kind(START, "the start the run induces on the platform did not verify")
@@ -302,6 +304,18 @@ def test_no_turn_is_shown_by_the_record_the_call_log_or_with_no_log_the_backends
     """`turnless`: a record counts its turns; a raised executor's call log, when kept, alone decides; with no log kept,
     the attempt's own backend must have counted no request, and one that keeps no count confirms nothing."""
     assert turnless(result, recorded=recorded, logged=logged, backend=backend) is no_turn
+
+
+def test_the_core_stub_backend_shows_a_start_before_its_first_reply_as_turnless():
+    """The core's scripted stub (`StubAdapter`, what a model whose entry says backend = "stub" is built as) keeps
+    `requests_sent`: 0 until its script is asked for a reply, so with no call log a start that failed before that is
+    shown turnless; once it has given a reply, it is not."""
+    stub = StubAdapter(["done"])
+    failure = start_failure(usage=None)
+    assert turnless(failure, recorded=False, logged=False, backend=stub) is True
+    stub.begin("be brief", "do the task", [])
+    asyncio.run(stub.step())
+    assert turnless(failure, recorded=False, logged=False, backend=stub) is False
 
 
 @pytest.mark.parametrize(
