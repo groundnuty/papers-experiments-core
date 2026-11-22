@@ -5,8 +5,8 @@
 The order is fixed, and each step is decided by what a kill at that point must leave behind (C04):
 
 1. the **health gate**: a held run stays pending and charges nothing; the run that finds an outage is its one attempt,
-   which is set aside uncharged, once, when the run's previous attempt's post-run check failed
-   (`start_after_check`);
+   which is set aside uncharged, once, when the run's previous attempt, itself charged, failed its post-run
+   check (`start_after_check`);
 2. a **lease**, when the platform declares resources: with none to be had (every key quarantined, or none declared) the
    run is left unstarted and uses no attempt, because no attempt row exists yet (C19);
 3. **the gates again**: a lease can take a long wait, in which the health gate may have closed, a harness stop or a
@@ -147,7 +147,7 @@ class Parts:
 
 class AttemptRunner:
     """Runs attempts; safe to call from several worker threads, because all its state is in the store and its parts,
-    but for the runs whose last attempt's post-run check failed (`risked`, under a lock of its own)."""
+    but for the runs whose last attempt, a charged one, failed its post-run check (`risked`, under a lock)."""
 
     def __init__(self, parts: Parts):
         self.p = parts
@@ -306,10 +306,10 @@ class AttemptRunner:
 
     def _charge_outage(self, row: Any, factors: Mapping[str, Any], detail: str) -> float:
         """The run found an outage with its pre-run check: it is the outage's one attempt, and nothing was run. When the
-        run's previous attempt's post-run check failed, that attempt is set aside uncharged instead, once
-        (`start_after_check`): the outage is the one that attempt left, and the mark is used up, so the next outage, or
-        a start failure, is charged. The gate was told (`before_run(covered=...)`), so its record says no run was
-        charged."""
+        run's previous attempt, itself charged, failed its post-run check, this attempt is set aside uncharged instead,
+        once (`start_after_check`): the outage is the one that attempt left, and the mark is used up, so the next
+        outage, or a start failure, is charged. The gate was told (`before_run(covered=...)`), so its record says no
+        run was charged."""
         p = self.p
         key = row["run_key"]
         at_risk = self.risked.take(key)  # this is the run's next attempt: a start covered by the mark is no longer next

@@ -63,7 +63,8 @@ in the result's transaction too.
   it, so this attempt's own post-run failure, an instrument's refusal and the endpoint's identity are charged as before.
   A pre-run outage with no failed post-run check before it is charged as the outage's one attempt, as always.
 - *In this process.* The mark lives in memory: a restart in between forgets it and the start, or the pre-run outage,
-  is charged, as before.
+  is charged, as before. So does a run leased again (a new lease's process starts without the mark): its first pre-run
+  outage there is charged, whatever its earlier lease's attempts were.
   The decision itself is carried on the result (`outage_kind`, `detail`), in its marker and its row, so a result
   committed from its marker after a restart is classified the same (`attempts.classify`), and no field is added to the
   marker, the store or the record.

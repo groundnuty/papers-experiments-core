@@ -69,7 +69,8 @@ attempt, and the outage's record says `"charged": false`. The flag rides on a de
 bound then closes the gate blocking without charging the run that found it. A post-run check that fails so sets the
 attempt aside as one an outage overlapped (`outage_discarded`, never charged), since the failure is not its own; a
 platform answers `charge=True` for a failure the judged attempt left itself. A pre-run check that fails for a run whose
-previous attempt's post-run check failed (`before_run(covered=True)`, `expcore.campaign.start_after_check`) closes the
+previous attempt, itself charged, failed its post-run check (`before_run(covered=True)`,
+`expcore.campaign.start_after_check`) closes the
 gate the same way, record and event included, and still answers `found`: the runner writes that attempt and sets it
 aside uncharged, once.
 
@@ -531,7 +532,7 @@ class HealthGate:
         `attempt` is the number the try will have (`CheckContext.attempt`): a check that takes the context is given
         `CheckContext(run_key, attempt, PRE_RUN)`, or None when no attempt is named.
 
-        `covered`: the run's previous attempt's post-run check failed (`start_after_check`), so the caller sets the
+        `covered`: the run's previous attempt, itself charged, failed its post-run check (`start_after_check`), so the caller sets the
         attempt a failure here would cost aside uncharged. The gate closes as it does for a check that charges no one,
         and its record and event say so (`"charged": false`), but the verdict is still `found`, since the run's attempt
         is written. A check that charges no one holds the run as before."""
