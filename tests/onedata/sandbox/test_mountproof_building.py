@@ -117,6 +117,19 @@ def test_a_helper_seen_before_the_namespace_is_proved_is_no_failed_poll_once_it_
     assert (poll.failed, [ok for _, ok, _, _ in proofs]) == (0, [True])
 
 
+def test_a_cell_whose_namespace_link_is_readable_only_after_the_pivot_is_no_failed_poll_when_it_ends():
+    """The `ns/pid` link is gated like `ns/mnt`: seen without it while being built, a cell is pending as a process, and
+    proved under its namespace once it can be read; the first entry must not outlive the proof."""
+    proc = node(building(500, ns=None))
+    poll, proofs = polled(proc, **SEEN)
+    proc.procs[500].ns = "pid:[4026532100]"
+    pivoted(proc, 500)
+    poll.poll()
+    del proc.procs[500]
+    poll.poll()
+    assert (poll.failed, [ok for _, ok, _, _ in proofs]) == (0, [True])
+
+
 def test_proving_one_namespace_does_not_prove_another_that_was_only_being_built():
     proc = node(building(500), cell_process(600, ns=OTHER_PID_NS))
     poll, proofs = polled(proc, **SEEN)

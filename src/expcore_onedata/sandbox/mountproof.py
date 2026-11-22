@@ -298,6 +298,15 @@ class CellPoll:
                 cell = {"pid": pid, "start_time": started, "nspid_depth": depth}
                 self._emit(CLOSE, False, [CELL_ALIVE_AT_CLOSE], cell, None)
 
+    def _proved_pending(self, key: Any, seen: Seen) -> None:
+        """A process is judged: its namespace is no longer pending, and neither is the process, which may have been
+        pending under another key (its namespace link could not be read while it was being built)."""
+        self._pending.pop(key, None)
+        for other, members in list(self._pending.items()):
+            members.discard(seen)
+            if not members:
+                del self._pending[other]
+
     def _unproved_gone(self) -> bool:
         """Whether a namespace seen only while its cell was being built has no process left: it was never proved, so the
         poll counts as failed (the cell may have run, unjudged)."""
@@ -359,7 +368,7 @@ class CellPoll:
             if key not in self._proved:
                 self._pending.setdefault(key, set()).add((pid, started))
             return
-        self._pending.pop(key, None)
+        self._proved_pending(key, (pid, started))
         problems = oneclient_problems(self._proc, self._host) + mount_problems(mounts, self._host)
         if key not in self._proved:
             self._proved[key] = set(problems)
