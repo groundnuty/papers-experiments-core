@@ -4,7 +4,9 @@
 
 The order is fixed, and each step is decided by what a kill at that point must leave behind (C04):
 
-1. the **health gate**: a held run stays pending and charges nothing; the run that finds an outage is its one attempt;
+1. the **health gate**: a held run stays pending and charges nothing; the run that finds an outage is its one attempt,
+   which is set aside uncharged, once, when the run's previous attempt, itself charged, failed its post-run
+   check (`start_after_check`);
 2. a **lease**, when the platform declares resources: with none to be had (every key quarantined, or none declared) the
    run is left unstarted and uses no attempt, because no attempt row exists yet (C19);
 3. **the gates again**: a lease can take a long wait, in which the health gate may have closed, a harness stop or a
@@ -145,7 +147,7 @@ class Parts:
 
 class AttemptRunner:
     """Runs attempts; safe to call from several worker threads, because all its state is in the store and its parts,
-    but for the runs whose last attempt's post-run check failed (`risked`, under a lock of its own)."""
+    but for the runs whose last attempt, a charged one, failed its post-run check (`risked`, under a lock)."""
 
     def __init__(self, parts: Parts):
         self.p = parts
@@ -172,7 +174,8 @@ class AttemptRunner:
         key, factors = row["run_key"], json.loads(row["factors"])
         if p.health is not None:
             # the number this try will have, as `Store.begin_attempt` numbers it: the check is told its attempt
-            pre = p.health.before_run(key, attempt=p.store.charged_attempts(key) + 1)
+            number = p.store.charged_attempts(key) + 1
+            pre = p.health.before_run(key, attempt=number, covered=self.risked.marked(key))
             if pre.verdict == HOLD:
                 return 0.0  # nothing is tried, charged or recorded; the gate holds dispatch
             if pre.verdict == DEFER:  # the platform is held on purpose: a wait, so nothing is tried or charged
@@ -302,10 +305,14 @@ class AttemptRunner:
         return begun, run_dir
 
     def _charge_outage(self, row: Any, factors: Mapping[str, Any], detail: str) -> float:
-        """The run found an outage with its pre-run check: it is the outage's one attempt, and nothing was run."""
+        """The run found an outage with its pre-run check: it is the outage's one attempt, and nothing was run. When the
+        run's previous attempt, itself charged, failed its post-run check, this attempt is set aside uncharged instead,
+        once (`start_after_check`): the outage is the one that attempt left, and the mark is used up, so the next
+        outage, or a start failure, is charged. The gate was told (`before_run(covered=...)`), so its record says no
+        run was charged."""
         p = self.p
         key = row["run_key"]
-        self.risked.take(key)  # this is the run's next attempt: a start covered by the mark is no longer next
+        at_risk = self.risked.take(key)  # this is the run's next attempt: a start covered by the mark is no longer next
         begun, run_dir = self._begin(row, reserved_capped=p.reserved_capped(key))
         outcome = Outcome("infrastructure", f"pre-run health check failed: {detail}", infra_kind=p.settings.health_kind)
         result = AttemptResult(  # no request was sent: known to be no turn, so it costs 0 at any price (C24)
@@ -318,7 +325,14 @@ class AttemptRunner:
             treatment_targets=self.treatment_targets(factors, key),
             turn_usage=(),
         )
-        self._finish(begun, run_dir, key, result)
+        covered = spared(result, p.settings.health_kind) if at_risk else None
+        result = result if covered is None else covered
+
+        def bookkeeping() -> None:  # in the transaction of the result: both stand, or neither does
+            text = f"{key}: the pre-run health check found an outage and nothing was started; {SPARED_REASON}"
+            p.store.event(p.stamp(), SPARED_EVENT, factors["model"], text)
+
+        self._finish(begun, run_dir, key, result, None if covered is None else bookkeeping)
         return p.settings.retry_delay_s
 
     def _attempt(
@@ -430,7 +444,9 @@ class AttemptRunner:
                     )
 
             status = self._finish(begun, run_dir, key, result, bookkeeping)
-            if risks_next and covered is None and status == "pending":  # never two in a row: a run cannot loop
+            # Never two in a row, and only after a charged attempt: every spare then follows an attempt that cost its
+            # run one, so a platform that keeps failing its checks cannot make attempts free, and a run cannot loop.
+            if risks_next and covered is None and status == "pending" and classify(result, kinds, targets).charged:
                 self.risked.mark(key)
             defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
             return p.settings.retry_delay_s if status == "pending" else 0.0
