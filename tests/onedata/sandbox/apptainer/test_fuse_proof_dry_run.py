@@ -239,3 +239,17 @@ def test_o97_the_live_study_passes_the_campaigns_deferral_checks_at_its_start(tm
     scheduler.check_declared_deferral(admission.declared_deferral_s(), reported, exposed=True)
     scheduler.check_deferral_bound(reported)
     client.close()
+
+
+def test_o97_the_live_world_makes_the_sandboxes_work_root_as_the_worker_does(tmp_path):
+    """O97 (H3 try 1 on Helios): a sandbox refuses a start without its work root, and the driver starts its control and
+    negative sandboxes itself, so it makes the root first, 0700, as the HPC worker does; an existing root is kept."""
+    import stat
+
+    from fuse_proof_world import make_work_root
+
+    root = tmp_path / "agent"
+    make_work_root(root)
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    make_work_root(root)  # already there: kept, never an error
+    assert root.is_dir()

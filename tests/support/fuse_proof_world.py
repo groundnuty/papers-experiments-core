@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,17 @@ def direct_spec(platform: SandboxPlatform, run_key: str, level: str, ceiling_s: 
     return dataclasses.replace(spec, held_down=lambda: frozenset())
 
 
+def make_work_root(path: Path) -> None:
+    """Make the sandboxes' work root on this node, 0700, before any sandbox starts (the sandbox refuses a start without
+    it), as the HPC worker does before its dispatcher (`deploy/hpc-federation/shards.py`, `make_work_root`); an existing
+    one is left for the sandbox's own check (`layout.check_work_root`: this user's directory, no link, 0700)."""
+    try:
+        os.mkdir(path, 0o700)
+        os.chmod(path, 0o700)
+    except FileExistsError:
+        pass
+
+
 class LiveWorld:
     """The platform's objects over the federation whose platform file is `platform_file`."""
 
@@ -92,6 +104,7 @@ class LiveWorld:
         )
         self.driver = hpc_driver(self.settings, probe=probe, transport=transport)
         self.node = LocalNode()
+        make_work_root(Path(config.sandbox.work_root))  # the worker's first step on a node: the H3 try 1 lesson
         self.level = mount_level(config)
         self.entry, self.target = pick_space(config)
         self.local_name = self.entry.support.local  # the picked space's own local provider
@@ -161,4 +174,4 @@ class LiveWorld:
         self.client.close()
 
 
-__all__ = ["LiveWorld", "direct_spec", "mount_level", "pick_space", "space_files"]
+__all__ = ["LiveWorld", "direct_spec", "make_work_root", "mount_level", "pick_space", "space_files"]
