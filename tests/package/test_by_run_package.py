@@ -122,6 +122,27 @@ def meta(data: bytes, where: Path, key: str) -> str:
         connection.close()
 
 
+def tables(data: bytes, where: Path) -> dict[str, list[tuple]]:
+    """Every table of a snapshot with its rows, sorted, read from a copy of its bytes."""
+    where.write_bytes(data)
+    connection = sqlite3.connect(where)
+    try:
+        names = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+        return {name: sorted(connection.execute(f'SELECT * FROM "{name}"').fetchall(), key=repr) for name in names}
+    finally:
+        connection.close()
+
+
+def changed(before: bytes, after: bytes, where: Path) -> dict[str, set]:
+    """What differs between two snapshots: each table whose rows differ, with the meta keys whose rows differ."""
+    old, new = tables(before, where), tables(after, where)
+    assert set(old) == set(new)
+    found: dict[str, set] = {name: set() for name in old if old[name] != new[name]}
+    if "meta" in found:
+        found["meta"] = {row[0] for row in set(old["meta"]) ^ set(new["meta"])}
+    return found
+
+
 def stored(document: dict) -> list[tuple[str, str]]:
     """Each lease store's snapshot merge.json lists, by its place in the package, with the hash it names."""
     found = [(f"out/leases/{e['lease_id']}/{SNAPSHOT}", e["snapshot_sha256"]) for e in document["leases"]]
@@ -195,25 +216,35 @@ def test_c67_an_anonymised_package_has_no_source_and_re_pins_the_fingerprint_eve
     check = json.loads(files["out/runs/replay-check.json"])
     assert check["merge"]["sha256"] == sha(files[MERGE])
     assert verify_package(root) == []
+    batch = (campaign.root / LEDGER).read_bytes()  # the re-pin touches nothing else: no event, no other table
+    assert changed(batch, files[LEDGER], tmp_path / "compare.sqlite") == {"meta": {"config"}}
+    config = json.loads(meta(batch, tmp_path / "ledger.sqlite", "config")) | {"fingerprint": document["fingerprint"]}
+    assert json.loads(meta(files[LEDGER], tmp_path / "ledger.sqlite", "config")) == config
+    for path, _ in stored(document):
+        store = (campaign.root / path).read_bytes()
+        assert changed(store, files[path], tmp_path / "compare.sqlite") == {"meta": {FINGERPRINT_KEY, META_SHARD}}
+
+
+BINDING = "its lease was issued for another campaign than the ledger's"  # `merge_by_run._check_binding`
 
 
 @pytest.mark.parametrize(
-    ("place", "left"),
+    ("place", "left", "reason"),
     [
-        ("_repin_lease", lambda pinned, repinned, where: dict(pinned)),
-        ("_repin_ledger", lambda config, repinned, where: dict(config)),
-        ("_repin_merge", lambda document, repinned: document),
+        ("_repin_lease", lambda pinned, repinned, where: dict(pinned), BINDING),
+        ("_repin_ledger", lambda config, repinned, where: dict(config), BINDING),
+        ("_repin_merge", lambda document, repinned: document, "it differs in fingerprint"),
     ],
     ids=["pinned-lease", "ledger-config", "merge-file"],
 )
 def test_c67_an_anonymised_package_with_one_place_left_at_the_original_hash_is_refused(
-    campaign, hashes, anonymisation, tmp_path, monkeypatch, place, left
+    campaign, hashes, anonymisation, tmp_path, monkeypatch, place, left, reason
 ):
     """C67: a re-pin that leaves any one of the three places (each store's pinned lease, the ledger's configuration,
     merge.json's fingerprint) at the original hash makes a package whose own analysis refuses its stores, so the build
     refuses it and writes nothing."""
     monkeypatch.setattr(by_run, place, left)
-    with pytest.raises(PackageError, match="the anonymised records cannot be analysed"):
+    with pytest.raises(PackageError, match=rf"the anonymised records cannot be analysed: .*{re.escape(reason)}"):
         build_package(campaign.root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation)
     assert not list((tmp_path / "dist").glob("*.tar.gz"))
 
@@ -328,3 +359,15 @@ def test_c67_a_merge_by_run_the_replay_check_was_made_without_is_refused(tmp_pat
             require_bound(tmp_path, check)
     else:
         require_bound(tmp_path, check)
+
+
+def test_c67_a_build_refuses_a_merge_by_run_beside_a_check_that_names_no_merge(campaign, hashes, tmp_path):
+    """C67: the build itself refuses the study whose replay check names no merge while its out/merge.json is a merge
+    by run, before it takes any lease snapshot that file let the spec select."""
+    root = copy_campaign(campaign, tmp_path, "unbound").root
+    path = root / "out" / "runs" / "replay-check.json"
+    check = json.loads(path.read_text(encoding="utf-8"))
+    del check["merge"]
+    path.write_text(json.dumps(check, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    with pytest.raises(PackageError, match=r"out/merge\.json: a merge by run, but the replay check was made without"):
+        build_package(root, tmp_path / "dist", hashes=hashes)
