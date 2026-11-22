@@ -64,6 +64,9 @@ Version 3 also carries, after `exec_check`, the optional `cell_deadline` of a to
 a cell whose process outlived its kill at the cell's deadline (the deadline's outcome and steps, what each survivor was
 blocked on, whose block it was), a section whose nested shape `expcore.records.cell_deadline` checks. A call whose
 deadline did not fire with a survivor has none, never a null; a replay serves it as recorded.
+Version 3 also carries the optional bound a study may declare on one model request (B21): the agent configuration's
+`model_request_bound_s`, left out when the study declares none, with no list beside it. A request given up at it is an
+ordinary `failed_request` of kind `infra` (`endpoint`), which a replay raises again.
 Until v0.1.0 is tagged every extension of version 3 is strictly additive: optional fields only, no existing field
 changes meaning or validation, the fields version 3 had at its first merge point keep the shape frozen in
 `tests/data/record-v3-fields.json`, and the fixtures in `tests/data/record-v3/`, one per merge point, keep validating
@@ -375,6 +378,9 @@ TOOL_SERVER_TOOLS = "tool_server_tools"
 # when the study declares none, and beside it and only with it `code_cell_tools`, the tools that run code cells.
 CODE_CELL_BOUND = "code_cell_bound_s"
 CODE_CELL_TOOLS = "code_cell_tools"
+# The optional bound on one model request (B21): in the agent configuration only when the study declares it, and alone,
+# since it reaches every request of the run and no list of tools.
+MODEL_REQUEST_BOUND = "model_request_bound_s"
 
 
 def reply_count_rule(version: str) -> bool:
@@ -657,20 +663,21 @@ def _check_configuration(config: Any, version: str, schemas: Sequence[SchemaVers
     `tool_server_call_bound_s` is optional in a record of version 3 or later, and unknown to an earlier one: absent when
     the study declared none, never a null, and a number above nothing and finite when it did (L17). The names of the
     tools it reached, `tool_server_tools`, are written with it and only with it, as a list of tool names. The code
-    cell limit, `code_cell_bound_s`, and its `code_cell_tools` are the same in every respect (L18).
+    cell limit, `code_cell_bound_s`, and its `code_cell_tools` are the same in every respect (L18). The bound on one
+    model request, `model_request_bound_s`, is the same number with no list beside it (B21).
     """
     later = set(config_defaults(version, schemas))
     pairs = ((TOOL_SERVER_CALL_BOUND, TOOL_SERVER_TOOLS), (CODE_CELL_BOUND, CODE_CELL_TOOLS))
-    optional = {name for pair in pairs for name in pair}
+    optional = {name for pair in pairs for name in pair} | {MODEL_REQUEST_BOUND}
     allowed = ({f.name for f in dataclasses.fields(AgentConfig)} | {"terminal_tools"} | optional) - later
     if _number(version) < _number(TOOL_SERVER_CALL_BOUND_FROM):
         allowed -= optional
     _check_keys("agent_config", config, allowed, required=allowed - optional)
-    for bound_key, tools_key in pairs:
+    for bound_key, tools_key in (*pairs, (MODEL_REQUEST_BOUND, None)):
         bound = config.get(bound_key)
         if bound_key in config and not (_fits(bound, NUM) and bound > 0):
             raise RecordError(f"agent_config.{bound_key}: expected a number of seconds above nothing, got {bound!r}")
-        if (tools_key in config) != (bound_key in config):
+        if tools_key is not None and (tools_key in config) != (bound_key in config):
             raise RecordError(f"agent_config.{tools_key}: held when {bound_key} is, and only then")
     _check_keys("agent_config.limits", config["limits"], {f.name for f in dataclasses.fields(Limits)})
     for key in ("terminal_tools", *(k for k in (TOOL_SERVER_TOOLS, CODE_CELL_TOOLS) if k in config)):

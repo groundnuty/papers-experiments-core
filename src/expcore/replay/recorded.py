@@ -128,6 +128,10 @@ class RecordedBackend:
             route["settings_sent_sha256"] = self._latest
         return copy.deepcopy(info_of_route(route))
 
+    def bound_requests(self, seconds: float | None) -> None:
+        """Take the bound on one model request and ignore it (B21): a recorded request is served, not sent, and one the
+        run gave up at the bound is raised again as its recorded failure."""
+
     def begin(self, system: str, user: str, tools: list[dict]) -> None:
         """Start the conversation as every backend does: the system prompt when there is one, then the user prompt."""
         self._conversation = [{"role": "system", "content": system}] if system else []

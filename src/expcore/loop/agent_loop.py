@@ -79,6 +79,9 @@ async def run_agent(
             f"the tool box caps output at {toolbox.cap_chars} characters but the run configuration says "
             f"{config.limits.output_cap_chars}: the configuration hash must describe what the model saw"
         )
+    unarmable = config.unarmable(backend)  # a declared bound no backend method can take is refused (B21)
+    if unarmable is not None:
+        raise ValueError(unarmable)
     if timer is None:
         timer = config.timer(clock)
     elif timer.time_cap_s != config.limits.time_cap_s or timer.ceiling_s != config.ceiling_s:
@@ -192,8 +195,16 @@ class _Run:
     # --- model calls ----------------------------------------------------------------------------------------------
 
     async def _step(self, tick: Tick) -> ModelTurn:
-        """Ask the model for its next reply, cut when the agent's time or the ceiling is used up (L04)."""
+        """Ask the model for its next reply, cut when the agent's time or the ceiling is used up (L04).
+
+        Under a declared `model_request_bound_s` the backend is first told the bound on each request of this step, or
+        None when the bound is not the shorter (B21): a request it gives up at the bound raises `ModelRequestTimedOut`,
+        an `endpoint` infrastructure failure. A backend without `bound_requests` is not told.
+        """
         by_kind0 = self.timer.infra_wait_by_kind
+        hand = getattr(self.backend, "bound_requests", None)
+        if hand is not None and self.config.model_request_bound_s is not None:
+            hand(self.config.request_bound_for(tick))
         try:
             return await self.watcher.run(self.backend.step(), tick)
         except Cut as cut:

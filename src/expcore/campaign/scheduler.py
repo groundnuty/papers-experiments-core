@@ -437,6 +437,10 @@ class Scheduler:
             backend = self.backend_factory(
                 spec, seed=0, limits=self.agent_config.limits, base_url=endpoint.base_url, time_left=None
             )
+            unarmable = self.agent_config.unarmable(backend)  # built as every run's is: refused before any run (B21)
+            if unarmable is not None:
+                asyncio.run(backend.aclose())
+                raise ConfigError(f"model {model!r} ({spec.backend}): {unarmable}")
             metered = None if pays is None else MeteredProbes(backend, pays, model)
             probed = reply_cap.probed(spec, self.backend_factory, self.settings.budget is not None)
 
