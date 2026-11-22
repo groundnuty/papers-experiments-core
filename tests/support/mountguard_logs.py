@@ -33,8 +33,16 @@ def canary() -> list[dict[str, Any]]:
     ]
 
 
-def proof(label: str = "cell", *, ok: bool = True, problems=(), cell=None) -> dict[str, Any]:
-    return {"event": "proof", "label": label, "ok": ok, "problems": list(problems), "cell": dict(cell or CELL)}
+def proof(label: str = "cell", *, ok: bool = True, problems=(), cell=None, **detail) -> dict[str, Any]:
+    """One proof line; `detail` are the keys a failed one gains (`offending`, `offending_total`, `process`)."""
+    return {
+        "event": "proof",
+        "label": label,
+        "ok": ok,
+        "problems": list(problems),
+        "cell": dict(cell or CELL),
+        **detail,
+    }
 
 
 def lines(

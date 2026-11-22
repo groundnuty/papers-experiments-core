@@ -31,6 +31,17 @@ host, through the host's `/proc`, which no cell can see or write. Everything is 
 - **At the close** (`close`), a cell of this run still alive is a failed proof, label `close`, `cell_alive_at_close`:
   the window was closed while the agent could still act, so nothing after is watched.
 
+A cell Apptainer is still building is not judged: until it pivots into its own root, a nested process's mount table is
+the host's, or a copy of it, with the host's `/proc` and protected directories. While its mount namespace is the
+watcher's own or its `/` mount is the host's (same device and root), it is looked at again at the next poll; a
+namespace left with no process for a whole poll having been seen only so was never proved, which is a failed poll (not a
+failed proof), so "never proved" stays visible. A process judged once is judged at every later look, built or not.
+Apptainer's image helpers (`squashfuse_ll`) stay outside the pivot, with the host's root and `/proc`, for their cell's
+life: they are no cells, and are passed over while outside it.
+
+A failed `cell` proof records what failed it, in `mountdetail`'s words (kinds of mount, never a path): each mount that
+made `host_proc_in_cell` or `protected_reachable`, and the process's root, mount namespace and root mount.
+
 A poll that cannot list `/proc`, or a nested process of this uid whose mount table cannot be read, counts as a failed
 poll: it may have hidden a cell. What this cannot see: a cell that starts and ends between two polls is never proved;
 the run's proof rests on the cells it caught (the backend's start holds its canary cell open for a second) and on every
@@ -45,7 +56,9 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from expcore_onedata.sandbox import mountdetail as MD
 from expcore_onedata.sandbox.hostops import MountTableError, parse_mountinfo
+from expcore_onedata.sandbox.mountpending import Pending, Seen
 
 ONECLIENT_NOT_HOST = "oneclient_not_host"
 ONECLIENT_UNREAD = "oneclient_unread"
@@ -55,6 +68,9 @@ PROTECTED_UNRESOLVED = "protected_unresolved"
 SAME_PID_NAMESPACE = "same_pid_namespace"
 CELL_ALIVE_AT_CLOSE = "cell_alive_at_close"
 CELL, HOST_PROCESS, CLOSE = "cell", "host_process", "close"
+# Apptainer's image helpers run outside the pivot, with the host's root and `/proc`, for as long as their cell does: one
+# in a PID namespace with the run's mount in its table is no cell, and is passed over while it is outside the pivot.
+IMAGE_HELPERS = frozenset({"squashfuse_ll"})  # the one seen live: add a name only when one is
 OTHER_EVERY = 20  # a process of another uid is read again every this many polls (about 1 s at the watcher's 50 ms)
 
 
@@ -95,7 +111,10 @@ class Protected:
 @dataclass(frozen=True)
 class Host:
     """What the watcher learns of the host at its start: its own depth, uid and mount table's `proc` devices, the run's
-    FUSE mount (its device and the host's mount point of it), the protected directories and oneclient."""
+    FUSE mount (its device and the host's mount point of it), the protected directories and oneclient; and, to tell a
+    cell still being built from a finished one, the device and root of the host's `/` mount (`root_mount`), the
+    watcher's mount namespace (`mnt_ns`) and the host's mounts as (device, root, point) (`entries`); None or empty when
+    unread, and then no cell is taken to be still being built."""
 
     depth: int
     uid: int
@@ -104,6 +123,9 @@ class Host:
     mountpoint: str
     protected: tuple[Protected, ...]
     oneclient: int
+    root_mount: tuple[str, str] | None = None
+    mnt_ns: str | None = None
+    entries: frozenset[tuple[str, str, str]] = frozenset()
 
 
 def status_field(text: str, name: str) -> str | None:
@@ -180,18 +202,48 @@ def proc_devs(host_mountinfo: str) -> frozenset[str]:
     return frozenset(m["dev"] for m in parse_mountinfo(host_mountinfo) if m["fstype"] == "proc")
 
 
+def host_mounts(host_mountinfo: str) -> tuple[tuple[str, str] | None, frozenset[tuple[str, str, str]]]:
+    """The device and root of the host's `/` mount (the last one) and every mount of its table as (device, root, point);
+    None and empty when the table cannot be read whole."""
+    try:
+        mounts = parse_mountinfo(host_mountinfo)
+    except MountTableError:
+        return None, frozenset()
+    roots = [(m["dev"], m["root"]) for m in mounts if m["mountpoint"] == "/"]
+    return roots[-1], frozenset((m["dev"], m["root"], m["mountpoint"]) for m in mounts)
+
+
+def _relation(root: str, protected: str) -> str:
+    """How a mount's root lies to a protected directory's path in one file system: `is`, `holds` or `under` it."""
+    if root == protected:
+        return "is"
+    return "under" if _under(root, protected) else "holds"
+
+
+def offending(cell_mounts: Sequence[Mapping[str, str]], host: Host) -> list[MD.Offence]:
+    """Each mount of a cell's table that makes a problem: one on a `proc` device of the host's, or one that is, holds or
+    lies under a protected directory (with the directory's index and how the mount's root lies to it)."""
+    found: list[MD.Offence] = [(HOST_PROC_IN_CELL, m, None, None) for m in cell_mounts if m["dev"] in host.proc_devs]
+    for index, p in enumerate(host.protected):
+        if p.dev is None or p.fs_path is None:
+            continue
+        found += [
+            (PROTECTED_REACHABLE, m, index, _relation(m["root"], p.fs_path))
+            for m in cell_mounts
+            if m["dev"] == p.dev and _nested(m["root"], p.fs_path)
+        ]
+    return found
+
+
 def mount_problems(cell_mounts: Sequence[Mapping[str, str]], host: Host) -> list[str]:
     """What a cell's mount table shows that it must not: the host's `/proc`, a protected directory."""
+    named = {problem for problem, *_ in offending(cell_mounts, host)}
     found = []
-    if any(m["dev"] in host.proc_devs for m in cell_mounts):
+    if HOST_PROC_IN_CELL in named:
         found.append(HOST_PROC_IN_CELL)
     if any(p.dev is None or p.fs_path is None for p in host.protected):
         found.append(PROTECTED_UNRESOLVED)
-    if any(
-        m["dev"] == p.dev and p.fs_path is not None and _nested(m["root"], p.fs_path)
-        for m in cell_mounts
-        for p in host.protected
-    ):
+    if PROTECTED_REACHABLE in named:
         found.append(PROTECTED_REACHABLE)
     return found
 
@@ -207,28 +259,33 @@ def oneclient_problems(proc: ProcView, host: Host) -> list[str]:
     return [] if len(values) == host.depth else [ONECLIENT_NOT_HOST]
 
 
-Seen = tuple[int, int]  # a process by its pid and start time
-
-
 class CellPoll:
-    """The polls of one run (the module's docstring). `emit(label, ok, problems, cell)` writes a proof line."""
+    """The polls of one run (the module's docstring). `emit(label, ok, problems, cell, detail)` writes a proof line;
+    `detail` is None for a passing one, else the keys the failed one gains (`mountdetail`)."""
 
-    def __init__(self, proc: ProcView, host: Host, emit: Callable[[str, bool, list[str], dict[str, int]], None]):
+    def __init__(self, proc: ProcView, host: Host, emit: Callable[..., None]):
         self._proc, self._host, self._emit = proc, host, emit
         self._later: dict[int, int] = {}  # processes of another uid by pid, with the poll that reads them again
         self._proved: dict[Any, set[str]] = {}  # each namespace proved, with the problems written for it
+        self._building = Pending(self._started)  # namespaces seen only while their cells were being built
+        self._judged: set[Seen] = set()  # processes judged once: never taken to be still being built again
+        self._ns: dict[Seen, str] = {}  # each process's PID namespace link, as last read
         self.cells: dict[Seen, int] = {}  # the processes found to be this run's cells, with their depth
         self.polls = 0
         self.failed = 0
 
     def poll(self) -> None:
         """Look at each process of this uid, and at each of another uid when it is due (the module's docstring)."""
+        if self._poll():
+            self.failed += 1
+
+    def _poll(self) -> bool:
+        """One poll; whether it failed."""
         self.polls += 1
         try:
             pids = list(self._proc.pids())
         except OSError:
-            self.failed += 1
-            return
+            return True
         listed = set(pids)
         self._later = {pid: due for pid, due in self._later.items() if pid in listed}
         broken = False
@@ -236,16 +293,30 @@ class CellPoll:
             if self._later.get(pid, 0) > self.polls:
                 continue
             broken = self._look(pid) is False or broken
-        if broken:
-            self.failed += 1
+        lost = self._building.lost(self._proved)
+        return lost or broken
 
     def close(self) -> None:
-        """The last poll, then a failed proof for each of the run's cells still alive."""
-        self.poll()
+        """The last poll, then a failed proof for each of the run's cells still alive. The last poll is failed, once, if
+        it failed or a namespace seen only while being built is lost or still not proved."""
+        broken = self._poll()
+        if broken or self._building.unsettled(self._proved):
+            self.failed += 1
         for (pid, started), depth in sorted(self.cells.items()):
             if self._started(pid) == started:
                 cell = {"pid": pid, "start_time": started, "nspid_depth": depth}
-                self._emit(CLOSE, False, [CELL_ALIVE_AT_CLOSE], cell)
+                self._emit(CLOSE, False, [CELL_ALIVE_AT_CLOSE], cell, None)
+
+    def _key(self, pid: int, seen: Seen) -> Any:
+        """A process's namespace: its PID namespace link (as last read, when it cannot be read now), else the process.
+        None when another process has the pid since the look began: the start time is read again after the link, the
+        look's last read, so nothing read is then taken for this process's."""
+        link = self._namespace(pid)
+        if self._started(pid) != seen[1]:
+            return None
+        if link is not None:
+            self._ns[seen] = link
+        return self._ns.get(seen, seen)
 
     def _started(self, pid: int) -> int | None:
         try:
@@ -273,31 +344,65 @@ class CellPoll:
         except (OSError, MountTableError):
             # a nested process of ours we cannot read may be a cell: a failed poll, and looked at again next poll
             return False if len(values) > self._host.depth else None
-        self._judge(pid, started, values, mounts)
+        self._judge(pid, started, values, mounts, status_field(status, "Name"))
         return None
 
-    def _judge(self, pid: int, started: int, values: tuple[int, ...], mounts: list[dict[str, str]]) -> None:
+    def _judge(
+        self, pid: int, started: int, values: tuple[int, ...], mounts: list[dict[str, str]], name: str | None
+    ) -> None:
         """A proof line for a cell of the run's the first time its namespace is seen, and a failed one whenever a later
         look finds a problem not written yet; a failed one for a process of the node's namespace holding the run's
         mount elsewhere."""
         ours = [m for m in mounts if self._host.fuse_dev is not None and m["dev"] == self._host.fuse_dev]
-        if not ours:
-            return
+        seen = (pid, started)
+        if not ours and seen not in self._judged:
+            return  # the run's mount finds a cell; it does not keep a judged one in view
         cell = {"pid": pid, "start_time": started, "nspid_depth": len(values)}
         if len(values) <= self._host.depth:
             if any(m["mountpoint"] != self._host.mountpoint for m in ours) and (pid, started) not in self.cells:
                 self.cells[(pid, started)] = len(values)
-                self._emit(HOST_PROCESS, False, [SAME_PID_NAMESPACE], cell)
+                self._emit(HOST_PROCESS, False, [SAME_PID_NAMESPACE], cell, {"process": self._view(pid, mounts)})
             return
-        self.cells[(pid, started)] = len(values)
-        key = self._namespace(pid) or (pid, started)
+        building = seen not in self._judged and self._being_built(pid, mounts)
+        if building and name in IMAGE_HELPERS:
+            return  # an image helper outside the pivot is no cell; with a root of its own, whatever its name, it is
+        key = self._key(pid, seen)
+        if key is None:
+            return
+        self.cells[seen] = len(values)
+        if building:
+            self._building.add(key, seen, key not in self._proved)
+            return
+        self._judged.add(seen)
+        self._building.settled(key, seen)
         problems = oneclient_problems(self._proc, self._host) + mount_problems(mounts, self._host)
         if key not in self._proved:
             self._proved[key] = set(problems)
-            self._emit(CELL, not problems, problems, cell)
+            self._emit(CELL, not problems, problems, cell, self._detail(pid, mounts) if problems else None)
         elif set(problems) - self._proved[key]:
             self._proved[key] |= set(problems)
-            self._emit(CELL, False, problems, cell)
+            self._emit(CELL, False, problems, cell, self._detail(pid, mounts))
+
+    def _root_mount(self, mounts: Sequence[Mapping[str, str]]) -> str:
+        """Whose a process's `/` mount is: the host's (the same device and root, so the pivot is not done), its own, or
+        unknown (it has none, or the host's could not be read)."""
+        roots = [(m["dev"], m["root"]) for m in mounts if m["mountpoint"] == "/"]
+        if not roots or self._host.root_mount is None:
+            return MD.UNKNOWN
+        return MD.HOST if roots[-1] == self._host.root_mount else MD.OWN
+
+    def _being_built(self, pid: int, mounts: Sequence[Mapping[str, str]]) -> bool:
+        """Whether a nested process is still being made into a cell, so its mounts are not the cell's yet: its mount
+        namespace is the watcher's own (before it unshares one), or its `/` mount is the host's (before it pivots)."""
+        same = MD.mnt_ns_state(pid, self._host.mnt_ns, self._proc.readlink) == MD.SAME
+        return same or self._root_mount(mounts) == MD.HOST
+
+    def _view(self, pid: int, mounts: Sequence[Mapping[str, str]]) -> dict[str, str]:
+        return MD.process_view(pid, self._host.mnt_ns, self._proc.readlink, self._root_mount(mounts))
+
+    def _detail(self, pid: int, mounts: Sequence[Mapping[str, str]]) -> dict[str, Any]:
+        """What failed a cell's proof (the module's docstring): the offending mounts and the process's view."""
+        return {**MD.entries(offending(mounts, self._host), self._host.entries), "process": self._view(pid, mounts)}
 
     def _namespace(self, pid: int) -> str | None:
         try:
@@ -307,4 +412,14 @@ class CellPoll:
         return link if link.startswith("pid:[") else None
 
 
-__all__ = ["CellPoll", "Host", "HostProc", "ProcView", "Protected", "fuse_dev", "proc_devs", "protected_at"]
+__all__ = [
+    "CellPoll",
+    "Host",
+    "HostProc",
+    "ProcView",
+    "Protected",
+    "fuse_dev",
+    "host_mounts",
+    "proc_devs",
+    "protected_at",
+]

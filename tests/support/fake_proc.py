@@ -1,7 +1,8 @@
 """A host's `/proc` in memory, for the mount watcher's proofs (`expcore_onedata.sandbox.mountproof.ProcView`).
 
 Every device, path and pid is invented. A process is its `stat`, `status` (uid and `NSpid`), `mountinfo` and PID
-namespace link; a mount table is built from `(dev, root, mountpoint, fstype)` rows, with the root mount first.
+namespace links (PID, and mount namespace and root where a test sets them); a mount table is built from `(dev, root,
+mountpoint, fstype)` rows, with the root mount first.
 """
 
 from __future__ import annotations
@@ -49,12 +50,18 @@ class P:
     ns: str | None = "pid:[4026531836]"
     tracer: int = 0
     unreadable_mounts: bool = False
+    name: str = "x"  # the process's command name, `Name` of its status
+    mnt_ns: str | None = None  # `ns/mnt`; None is a link that cannot be read
+    root: str | None = None  # `root`; None likewise
+    stat_fails: list[bool] = field(default_factory=list)  # one entry per `stat` read: True refuses that read
+    starts: list[int] = field(default_factory=list)  # one start time per `stat` read, the last repeated: a reused pid
 
 
 @dataclass
 class FakeProc:
     procs: dict[int, P] = field(default_factory=dict)
     listing_fails: bool = False
+    own_mnt_ns: str | None = None  # the watcher's own `/proc/self/ns/mnt`; None cannot be read
 
     def add(self, *procs: P) -> FakeProc:
         for proc in procs:
@@ -76,10 +83,13 @@ class FakeProc:
     def read(self, path: str) -> str:
         proc, what = self._proc(path)
         if what == "stat":
-            return f"{proc.pid} (a (b) c) S 1 " + " ".join(["0"] * 17) + f" {proc.start} 0 0\n"
+            if proc.stat_fails and proc.stat_fails.pop(0):
+                raise PermissionError(path)
+            start = proc.starts.pop(0) if len(proc.starts) > 1 else (proc.starts[0] if proc.starts else proc.start)
+            return f"{proc.pid} (a (b) c) S 1 " + " ".join(["0"] * 17) + f" {start} 0 0\n"
         if what == "status":
             ns, uid = "\t".join(str(v) for v in proc.nspid), "\t".join([str(proc.uid)] * 4)
-            return f"Name:\tx\nUid:\t{uid}\nTracerPid:\t{proc.tracer}\nNSpid:\t{ns}\n"
+            return f"Name:\t{proc.name}\nUid:\t{uid}\nTracerPid:\t{proc.tracer}\nNSpid:\t{ns}\n"
         if what == "mountinfo":
             if proc.unreadable_mounts:
                 raise PermissionError(path)
@@ -87,10 +97,15 @@ class FakeProc:
         raise FileNotFoundError(path)
 
     def readlink(self, path: str) -> str:
+        if path == "/proc/self/ns/mnt":
+            if self.own_mnt_ns is None:
+                raise PermissionError(path)
+            return self.own_mnt_ns
         proc, what = self._proc(path)
-        if what != "ns/pid" or proc.ns is None:
+        link = {"ns/pid": proc.ns, "ns/mnt": proc.mnt_ns, "root": proc.root}.get(what)
+        if link is None:
             raise PermissionError(path)
-        return proc.ns
+        return link
 
 
 def host_process(pid: int, **kw) -> P:

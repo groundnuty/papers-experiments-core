@@ -4,6 +4,7 @@ The watcher in the process is given a `/proc` in memory for its proofs; the one 
 `/proc` and the real mount table, which hold no FUSE mount of the run's, so its log is read as unproven.
 """
 
+import json
 import os
 import signal
 import subprocess
@@ -17,6 +18,7 @@ from fake_proc import UID, FakeProc, P, cell_process, host_process, table
 
 from expcore.mountguard import log as guard_log
 from expcore.mountguard import read_log, snapshot, verdict_of
+from expcore_onedata.sandbox import mountproof as MP
 from expcore_onedata.sandbox import mountwatch as MW
 
 NONCE = "0123456789abcdef0123456789abcdef"
@@ -128,6 +130,63 @@ def test_a_run_whose_cells_were_never_caught_is_unproven(run):
     assert reading.intact
     assert reading.isolation_problems == (guard_log.NO_PROOF,)
     assert verdict_of(snapshot(reading)) == "unknown"
+
+
+def host_table(run) -> str:
+    """The mount table the in-process watcher is given (`watcher`): the real one and the run's mount."""
+    mount = os.path.realpath(run.mountpoint)
+    return real_table() + f"9999 1 {FUSE} / {mount} rw - fuse.oneclient oneclient rw,user_id={UID}\n"
+
+
+def proofs_of(data: bytes) -> list[dict]:
+    return [json.loads(line) for line in data.decode().splitlines() if json.loads(line)["event"] == "proof"]
+
+
+def test_a_failed_cell_proof_in_the_log_carries_what_failed_it_and_names_no_path(run):
+    """O60: the line gains `offending` and `process`; the run's paths are not in it, and the core reads it as before."""
+    host_proc = next(iter(MP.proc_devs(real_table())))
+    bound = table(
+        ("0:99997", "/", "/", "overlay"), (host_proc, "/", "/hostproc", "proc"), (FUSE, "/", "/data", "fuse.x")
+    )
+    w = watcher(run, FakeProc().add(host_process(99), cell_process(500, mountinfo=bound)))
+    os.unlink(run.token)
+    w.tick()
+    data = finish(w, run)
+    (line,) = [p for p in proofs_of(data) if p["label"] == "cell"]
+    assert line["problems"] == ["host_proc_in_cell"]
+    assert [(e["problem"], e["fstype"], e["point"]) for e in line["offending"]] == [
+        ("host_proc_in_cell", "proc", "other")
+    ]
+    assert line["offending_total"] == 1
+    assert set(line["process"]) == {"root", "mnt_ns", "root_mount"}
+    assert set(line["cell"]) == {"pid", "start_time", "nspid_depth"}
+    assert run.mountpoint.encode() not in data
+    assert os.path.dirname(run.token).encode() not in data
+    assert "host_proc_in_cell" in read_log(data, NONCE).isolation_problems
+
+
+def test_a_cell_still_a_copy_of_the_host_when_the_window_closes_is_a_failed_poll_in_the_log(run):
+    """O60: a cell seen only while it is being built is not judged, and is never proved: the run is unproven."""
+    copy = cell_process(500, mountinfo=host_table(run))
+    w = watcher(run, FakeProc().add(host_process(99), copy))
+    os.unlink(run.token)
+    w.tick()
+    data = finish(w, run)
+    assert [p["label"] for p in proofs_of(data)] == ["close"]  # a cell alive at the close; no judgment of its table
+    reading = read_log(data, NONCE)
+    assert guard_log.POLL_FAILED in reading.isolation_problems
+
+
+def test_the_watcher_reads_the_hosts_root_mount_and_its_own_mount_namespace_at_its_start(run):
+    proc = FakeProc(own_mnt_ns="mnt:[4026531841]").add(host_process(99))
+    w = watcher(run, proc)
+    assert w.host.mnt_ns == "mnt:[4026531841]"
+    assert w.host.root_mount == MP.host_mounts(host_table(run))[0]
+    assert w.host.entries == MP.host_mounts(host_table(run))[1]
+
+
+def test_a_watcher_that_cannot_read_its_own_mount_namespace_still_starts(run):
+    assert watcher(run, FakeProc().add(host_process(99))).host.mnt_ns is None
 
 
 def test_a_cell_alive_when_the_window_closes_makes_the_run_unknown(run):

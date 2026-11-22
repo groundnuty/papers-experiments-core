@@ -21,7 +21,9 @@ privilege. It:
   cell of the run's still alive is a failed proof), writes `disarmed` and its end line, and exits 0.
 
 The log (`expcore.mountguard.log` reads it) is created 0600 and refused if it exists; it is JSON lines numbered from
-0 with `wall` and `mono` readings. It names no path and no token: an event's entry is `self`, `token` or `other`. Past
+0 with `wall` and `mono` readings. It names no path and no token: an event's entry is `self`, `token` or `other`, and a
+failed proof says what kind of mount and process failed it (`mountdetail`: devices, file system types, roles, never a
+path). Past
 `MAX_LINES` lines, or when a write fails, a line is counted in the end line's `unwritten` and not written; the reader
 takes any as damage. The watcher refuses to start (exit 2, nothing logged) when it cannot read its own `NSpid`.
 """
@@ -37,7 +39,7 @@ import signal
 import struct
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from expcore_onedata.sandbox import mountproof as MP
@@ -167,6 +169,14 @@ def _ptrace_scope() -> int | None:
     return int(value) if value in ("0", "1", "2", "3") else None
 
 
+def _own_mnt_ns(proc: MP.ProcView) -> str | None:
+    """The watcher's own mount namespace as `/proc/self/ns/mnt` names it, or None when it cannot be read."""
+    try:
+        return proc.readlink("/proc/self/ns/mnt")
+    except OSError:
+        return None
+
+
 class Watcher:
     """One run's watcher (the module's docstring); `proc` and `mountinfo` are the host's, injectable for tests."""
 
@@ -192,7 +202,10 @@ class Watcher:
         mountpoint = os.path.realpath(args.mountpoint)
         dev = MP.fuse_dev(mountinfo, mountpoint) if devs else None
         protected = tuple(MP.protected_at(path, mountinfo) for path in args.protect)
-        self.host = MP.Host(len(depth), uid, devs, dev, mountpoint, protected, int(pid))
+        root_mount, entries = MP.host_mounts(mountinfo)
+        self.host = MP.Host(
+            len(depth), uid, devs, dev, mountpoint, protected, int(pid), root_mount, _own_mnt_ns(proc), entries
+        )
         self.log.write("start", format=FORMAT, nonce=args.nonce, pid=os.getpid(), uid=uid, nspid_depth=len(depth),
                        ptrace_scope=_ptrace_scope(), watches=watches, mount_seen=dev is not None)  # fmt: skip
         oc = proc_status(proc, int(pid), int(start))
@@ -201,8 +214,10 @@ class Watcher:
         self.cells = MP.CellPoll(proc, self.host, self._proof)
         self.armed, self.deleted = False, set()
 
-    def _proof(self, label: str, ok: bool, problems: list[str], cell: dict[str, int]) -> None:
-        self.log.write("proof", label=label, ok=ok, problems=problems, cell=cell)
+    def _proof(
+        self, label: str, ok: bool, problems: list[str], cell: dict[str, int], detail: Mapping[str, Any] | None = None
+    ) -> None:
+        self.log.write("proof", label=label, ok=ok, problems=problems, cell=cell, **(detail or {}))
 
     def events(self) -> None:
         for target, mask, name in self.inotify.read():
