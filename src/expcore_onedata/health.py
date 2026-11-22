@@ -51,9 +51,10 @@ the content type its verdict is not kept: a stuck link is remedied while the cam
 every call after a failure, and whenever its last run is older than `[link_check] every_s` (600 s by default). A failure
 at the first call holds every run until a re-check of the closed gate passes; one later, a link that stuck
 mid-campaign, closes the gate, sets the run whose check found it aside as infrastructure and holds the whole campaign
-the same way. With `[faults]` and a declared `heal`, a stuck pair the check finds is healed by the fault gate around it,
-between runs and under its own exclusive admission (`fault_gate_heal`), and the call answers healthy only once the
-check passes again; `gate_heal` holds the latest such heal's record. A federation with no pair (every space supported
+the same way. With `[faults]` and a declared `heal`, a stuck pair the check finds (an untested pair counts as one,
+`fault_matrix.PairState.heals`) is healed by the fault gate around it, between runs and under its own exclusive
+admission (`fault_gate_heal`), and the call answers healthy only once the check passes again; `gate_heal` holds the
+latest such heal's record. A federation with no pair (every space supported
 by the local provider alone) has nothing to check; one
 with pairs and no `[link_check]` always fails. `links` holds the last report: each pair's seconds and bytes and the
 transfers the check made. `monotonic` and `sleep` are its clock and its pauses, a test's `Ticker`. The check writes

@@ -24,7 +24,10 @@ The order is fixed, and each step is decided by what a kill at that point must l
    row to the store's record of the result the attempt is **live** (`liveness.running`): a hold a platform takes in it
    names the attempt, and reads as ended the moment the store has the result;
 6. the post-run health check, an instrument's refusal (or a fault injector's reading in the record that its restore was
-   not verified, O11) and the served-identity check, which can turn the result into infrastructure (C11, C31, C16);
+   not verified, O11) and the served-identity check, which can turn the result into infrastructure (C11, C31, C16).
+   Before them, a start that failed before the agent's first turn right after the run's previous attempt's post-run
+   check failed is set aside uncharged, once (`start_after_check`), and a failed post-run check of this attempt marks
+   the run's next attempt;
 7. the **outcome marker**, then the **store's record** of the result, in this order, with the unit's and the
    harness-error bookkeeping in the same transaction as the result (C04, C15, C10), so a kill cannot keep the result and
    lose the stop or the failure it caused; the lease ends after it. A result committed from its marker at the next
@@ -76,6 +79,9 @@ from expcore.campaign.no_request import REASON as ZERO_REASON
 from expcore.campaign.no_request import settle_unsent
 from expcore.campaign.session_bind import bind_session
 from expcore.campaign.settings import SchedulerConfig
+from expcore.campaign.start_after_check import EVENT as SPARED_EVENT
+from expcore.campaign.start_after_check import REASON as SPARED_REASON
+from expcore.campaign.start_after_check import RiskedStarts, spared, turnless
 from expcore.campaign.start_diagnostic import WITHHELD_ERROR, snapshot_of
 from expcore.campaign.store import Store
 from expcore.campaign.topup import AttemptSpend, Ledger
@@ -138,10 +144,12 @@ class Parts:
 
 
 class AttemptRunner:
-    """Runs attempts; safe to call from several worker threads, because all its state is in the store and its parts."""
+    """Runs attempts; safe to call from several worker threads, because all its state is in the store and its parts,
+    but for the runs whose last attempt's post-run check failed (`risked`, under a lock of its own)."""
 
     def __init__(self, parts: Parts):
         self.p = parts
+        self.risked = RiskedStarts()  # in memory: a restart forgets it, and the start is charged as before
 
     def treatment_kinds(self, factors: Mapping[str, Any], run_key: str) -> tuple[str, ...]:
         """Return the infrastructure kinds the run's condition declares as its treatment."""
@@ -297,6 +305,7 @@ class AttemptRunner:
         """The run found an outage with its pre-run check: it is the outage's one attempt, and nothing was run."""
         p = self.p
         key = row["run_key"]
+        self.risked.take(key)  # this is the run's next attempt: a start covered by the mark is no longer next
         begun, run_dir = self._begin(row, reserved_capped=p.reserved_capped(key))
         outcome = Outcome("infrastructure", f"pre-run health check failed: {detail}", infra_kind=p.settings.health_kind)
         result = AttemptResult(  # no request was sent: known to be no turn, so it costs 0 at any price (C24)
@@ -331,6 +340,7 @@ class AttemptRunner:
         # so an attempt whose usage turns out unknown is charged that bound; the guard takes unknown as yes, which
         # checks more, never less.
         decided = p.reserved_capped(key)
+        at_risk = self.risked.take(key)  # the run's previous attempt's post-run check failed
         begun, run_dir = self._begin(row, lease, admission=admission, reserved_capped=decided)
         bind_session(backend, p.store, key, begun.number, p.lease_id)  # B20: the opaque id of this attempt, if sent
         live = contextlib.nullcontext() if p.campaign is None else liveness.running(p.campaign, begun.id)
@@ -381,7 +391,13 @@ class AttemptRunner:
                 result, unsent = self._settle_failure(result, guard, backend, begun.id)
                 if result.outcome.defect is not None:  # the attempt keeps the class and stack hash, the log the rest
                     defects(error, result.outcome.defect)
-            result, moved = self._judge(result, record, model, key, begun)
+            no_turn = at_risk and turnless(
+                result, recorded=record is not None, logged=guard is not None, backend=backend
+            )
+            covered = spared(result, p.settings.health_kind) if no_turn else None
+            result = result if covered is None else covered  # the executor's own failure, before any judgment of it
+            result, risks_next = self._post_run(result, model, key, begun)
+            result, moved = self._judge(result, record, model, key)
             mix = None if record is None else p.identities.deployment_mix(model, record.transcript)  # B18
             named = None if record is None else deployment_ids(record.transcript)  # B20
             switched = record is not None and deployments_switched(record.transcript)
@@ -390,6 +406,9 @@ class AttemptRunner:
                 self._bookkeeping(model, endpoint, key, result, kinds, targets, moved)
                 if unsent:  # the row and the marker say `measured`; this says why (C05)
                     p.store.event(p.stamp(), ZERO_EVENT, model, f"{key}: {ZERO_REASON}; charged 0, basis measured")
+                if covered is not None:
+                    text = f"{key}: {covered.outcome.infra_kind} before the agent's first turn; {SPARED_REASON}"
+                    p.store.event(p.stamp(), SPARED_EVENT, model, text)
                 if mix is not None:
                     p.store.record_deployments(begun.id, mix)
                 if named is not None or switched:  # a split no header names shows in the fingerprints alone
@@ -411,6 +430,8 @@ class AttemptRunner:
                     )
 
             status = self._finish(begun, run_dir, key, result, bookkeeping)
+            if risks_next and covered is None and status == "pending":  # never two in a row: a run cannot loop
+                self.risked.mark(key)
             defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
             return p.settings.retry_delay_s if status == "pending" else 0.0
 
@@ -474,39 +495,44 @@ class AttemptRunner:
         [row] = self.p.store.q("SELECT calls_sent, calls_usage, topup_usd FROM attempts WHERE id=?", (attempt_id,))
         return row["calls_sent"], row["calls_usage"], row["topup_usd"]
 
-    def _judge(
-        self, result: AttemptResult, record: Any, model: str, key: str, begun: BegunAttempt
-    ) -> tuple[AttemptResult, bool]:
-        """Apply the post-run health check (C11) and the served-identity check (C16) to a result. The post-run check
-        is told the attempt it judges (`CheckContext`): the run, the number and the id of the row `begun` made."""
+    def _post_run(self, result: AttemptResult, model: str, key: str, begun: BegunAttempt) -> tuple[AttemptResult, bool]:
+        """Apply the post-run health check (C11) to a result, and say whether it failed and was not deferred, which
+        covers the run's next start (`start_after_check`). The check is told the attempt it judges (`CheckContext`):
+        the run, the number and the id of the row `begun` made."""
         p = self.p
-        if p.health is not None:
-            note = prerun.current()
-            if note is not None:
-                note.pop(prerun.HEALTH_READING, None)  # only a check made from here on leaves the post-run reading
-                note[prerun.EXECUTOR_RETURNED] = (
-                    True  # nothing of the run is in progress now: no leftover is its own work
-                )
-            health, outage = p.health.after_run(key, attempt=begun.number, attempt_id=begun.id)
-            result = self._keep_reading(result, note, model, key)
-            if health.deferred:  # it verified nothing: no result is scored on it, treatment included (C11)
-                result = unverified(result, health.detail)
-                text = f"{key}: {health.detail}; nothing is scored on it ({result.outcome.infra_kind or 'set aside'})"
-                p.store.event(p.stamp(), "post_run_check_deferred", model, text)
-            elif not health.ok and outage is not None:
-                result = dataclasses.replace(result, outage_kind=p.settings.health_kind)  # the outage's, set aside
-                p.health.note_discard(outage, result.input_tokens, result.output_tokens)
-            elif not health.ok and not health.charge:  # a failure another attempt left: overlapped, never charged
-                result = dataclasses.replace(result, outage_kind=p.settings.health_kind)
-                text = f"{key}: {health.detail}; set aside as overlapped by a failure another attempt left, uncharged"
-                p.store.event(p.stamp(), "post_run_check_failed", model, text)
-            elif not health.ok and not result.outcome.set_aside:
-                text = f"post-run health check failed: {health.detail}"
-                result = dataclasses.replace(
-                    result, outcome=Outcome("infrastructure", text, infra_kind=p.settings.health_kind)
-                )
-            elif not health.ok:
-                p.store.event(p.stamp(), "post_run_check_failed", model, f"{key}: {health.detail}; the outcome stands")
+        if p.health is None:
+            return result, False
+        note = prerun.current()
+        if note is not None:
+            note.pop(prerun.HEALTH_READING, None)  # only a check made from here on leaves the post-run reading
+            note[prerun.EXECUTOR_RETURNED] = True  # nothing of the run is in progress now: no leftover is its own work
+        health, outage = p.health.after_run(key, attempt=begun.number, attempt_id=begun.id)
+        risks = not health.ok and not health.deferred
+        result = self._keep_reading(result, note, model, key)
+        if health.deferred:  # it verified nothing: no result is scored on it, treatment included (C11)
+            result = unverified(result, health.detail)
+            text = f"{key}: {health.detail}; nothing is scored on it ({result.outcome.infra_kind or 'set aside'})"
+            p.store.event(p.stamp(), "post_run_check_deferred", model, text)
+        elif not health.ok and outage is not None:
+            result = dataclasses.replace(result, outage_kind=p.settings.health_kind)  # the outage's, set aside
+            p.health.note_discard(outage, result.input_tokens, result.output_tokens)
+        elif not health.ok and not health.charge:  # a failure another attempt left: overlapped, never charged
+            result = dataclasses.replace(result, outage_kind=p.settings.health_kind)
+            text = f"{key}: {health.detail}; set aside as overlapped by a failure another attempt left, uncharged"
+            p.store.event(p.stamp(), "post_run_check_failed", model, text)
+        elif not health.ok and not result.outcome.set_aside:
+            text = f"post-run health check failed: {health.detail}"
+            result = dataclasses.replace(
+                result, outcome=Outcome("infrastructure", text, infra_kind=p.settings.health_kind)
+            )
+        elif not health.ok:
+            p.store.event(p.stamp(), "post_run_check_failed", model, f"{key}: {health.detail}; the outcome stands")
+        return result, risks
+
+    def _judge(self, result: AttemptResult, record: Any, model: str, key: str) -> tuple[AttemptResult, bool]:
+        """Apply an instrument's refusal (C31) and the served-identity check (C16) to a result the post-run check has
+        judged; say whether the endpoint's identity moved."""
+        p = self.p
         if record is None:
             return result, False
         result = self._judge_instruments(result, record, model, key)

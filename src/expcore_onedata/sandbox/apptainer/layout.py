@@ -18,7 +18,7 @@ import stat
 import threading
 from pathlib import Path
 
-from expcore_onedata.sandbox.api import SandboxError, StartRefused
+from expcore_onedata.sandbox.api import SandboxError, SandboxIntegrityError, StartRefused
 from expcore_onedata.sandbox.apptainer.argv import bindable
 from expcore_onedata.sandbox.apptainer.settings import Pinned
 from expcore_onedata.sandbox.apptainer.sockets import socket_path_problem
@@ -100,7 +100,7 @@ def copy_pinned(pin: Pinned, target: Path, what: str, *, mode: int = 0o444) -> N
         raise SandboxError(f"{what} could not be copied into the run's directory") from None
     if not same:
         target.unlink(missing_ok=True)
-        raise SandboxError(f"{what} is not the file it is pinned to (its SHA-256 differs)")
+        raise SandboxIntegrityError(f"{what} is not the file it is pinned to (its SHA-256 differs)")
     target.chmod(mode)
 
 

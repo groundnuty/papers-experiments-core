@@ -88,6 +88,7 @@ from expcore_onedata.sandbox.api import (
     ExecResult,
     ReadOnlyInput,
     SandboxError,
+    SandboxIntegrityError,
     SandboxSpec,
     ServerProcess,
     StartRefused,
@@ -346,7 +347,7 @@ class ApptainerSandbox:
         except OSError:
             same = False
         if not same:
-            raise SandboxError("the agent's image changed on the node since it was pinned")
+            raise SandboxIntegrityError("the agent's image changed on the node since it was pinned")
 
     # ------------------------------------------------------------------------------------------------ the record
     def run_record(self) -> None:
@@ -451,7 +452,9 @@ class ApptainerSandbox:
         # through a link, even one that stays in the run: the reaper never follows one (`runs.remove_inside`)
         linked = [p for p in paths if p not in outside and Path(os.path.realpath(p)) != real / p.relative_to(self.dir)]
         if outside or linked:
-            raise SandboxError("the mount helper named a token file outside the run's directory or through a link")
+            raise SandboxIntegrityError(
+                "the mount helper named a token file outside the run's directory or through a link"
+            )
         self._token_files = [*self._token_files, *paths]
         self.run_record()
         return self._mount.start()
@@ -734,7 +737,7 @@ class ApptainerSandbox:
         r = self._cells.run(READ_ONLY_PROBE.format(path="/ro-probe"), PROBE_S, record=False)
         if r.exit_code != 0 or r.stdout.strip() != f"blocked {errno.EROFS}":
             log.error("read-only probe of the root said %r (%s)", r.stdout.strip(), describe_stderr(r.stderr))
-            raise SandboxError("the root is not read-only for the agent")
+            raise SandboxIntegrityError("the root is not read-only for the agent")
         self._meta["read_only_verified"] = {"root": True}
 
     def _verify_resolv(self) -> None:
@@ -865,7 +868,7 @@ class ApptainerSandbox:
                 log.error("read-only input %d could not be copied: %s", n, describe_error(error))
                 raise SandboxError(f"read-only input {n} could not be copied into the run's directory") from None
             if item.sha256 is not None and found["sha256"] != item.sha256:
-                raise SandboxError(f"read-only input {n} is no longer the content it was declared with")
+                raise SandboxIntegrityError(f"read-only input {n} is no longer the content it was declared with")
             for root, dirs, files in os.walk(copy):
                 for name in (*dirs, *files):
                     path = os.path.join(root, name)
@@ -888,14 +891,14 @@ class ApptainerSandbox:
             r = self._cells.run(inputs.probe_source(target, name, runnable), PROBE_S, record=False)
             why = inputs.judge(r.stdout, runnable is not None)
             if why is not None:
-                raise SandboxError(f"read-only input {n} is not read-only for the agent: {why}")
+                raise SandboxIntegrityError(f"read-only input {n} is not read-only for the agent: {why}")
             for what, root in (("copy", copy), ("source", item.source)):
                 try:
                     same = inputs.digest(root)["sha256"] == found["sha256"]
                 except (OSError, inputs.InputUnsafe):
                     same = False
                 if not same:
-                    raise SandboxError(f"read-only input {n} changed between its hash and its mount ({what})")
+                    raise SandboxIntegrityError(f"read-only input {n} changed between its hash and its mount ({what})")
         if self._inputs:
             self._meta["read_only_verified"]["inputs"] = True
 

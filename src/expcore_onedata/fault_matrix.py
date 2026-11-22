@@ -2,8 +2,13 @@
 """The pair matrix the link heal reads (O35): the link check of every ordered pair, by label.
 
 `LinkMatrix` is `linkcheck.check_links`'s report as the heal needs it: each pair's reader and source by label
-(`providers[i]`, never a name, O12), whether it passed, its seconds, and whether its fetch failed (`stuck`: a link that
-transferred nothing; a pair whose probe could not be made ready was not tested, fails too, and names no link to heal).
+(`providers[i]`, never a name, O12), whether it passed, its seconds, whether its fetch failed (`stuck`: a link that
+transferred nothing) and whether it was not tested at all (`untested`: its probe could not be made ready, or no fresh
+probe could be written). An untested pair fails too, and **the heal treats it as a stuck link** (`PairState.heals`):
+its reader is healed as a stuck pair's is, wherever the heal reads the matrix (the fault gate's trigger, a restore's
+check, and each fresh read a heal makes), with the same bounds, settle and latch. Seen live in a running campaign: a
+run's post-run check found a pair untested, no heal followed (the pair named no link to heal), and the next start on
+the federation failed. A pair that was read and returned bytes other than the probe's was tested, and is neither.
 Its record (`to_json`) holds every pair, the count of failing pairs per source, and the source they all share when they
 share one, which names a crashed provider. A check whose record was not written (`linkrecord.fact`) says so in its own
 record, `link_record` and `link_record_reason`, and in no other case holds either key.
@@ -27,17 +32,25 @@ def label_order(label: str) -> tuple[int, str]:
 
 @dataclass(frozen=True)
 class PairState:
-    """One ordered pair of the link check, by label: `reader` fetched from `source`. `stuck` is a failed fetch."""
+    """One ordered pair of the link check, by label: `reader` fetched from `source`. `stuck` is a failed fetch;
+    `untested` a pair whose probe could not be made ready, so nothing was fetched."""
 
     reader: str
     source: str
     ok: bool
     seconds: float | None = None
     stuck: bool = False
+    untested: bool = False
+
+    @property
+    def heals(self) -> bool:
+        """Whether the heal acts on this pair's reader: a failing pair whose fetch failed, or that was not tested."""
+        return not self.ok and (self.stuck or self.untested)
 
     def to_json(self) -> dict[str, Any]:
         seconds = None if self.seconds is None else round(self.seconds, 3)
-        return {"reader": self.reader, "source": self.source, "ok": self.ok, "seconds": seconds, "stuck": self.stuck}
+        shown = {"reader": self.reader, "source": self.source, "ok": self.ok, "seconds": seconds, "stuck": self.stuck}
+        return {**shown, "untested": True} if self.untested else shown  # the key only when true: older records alike
 
 
 @dataclass(frozen=True)
@@ -51,10 +64,19 @@ class LinkMatrix:
 
     @classmethod
     def from_report(cls, report: Any) -> "LinkMatrix":
-        """From a `linkcheck.LinkReport`: a pair is stuck when its fetch failed (its result names the remedy), and a
-        record the check did not write (`LinkReport.not_written`) is carried over."""
+        """From a `linkcheck.LinkReport`: a pair is stuck when its fetch failed (its result names the remedy), untested
+        when its result says it was not tested, and a record the check did not write (`LinkReport.not_written`) is
+        carried over."""
         pairs = tuple(
-            PairState(p.reader, p.source, p.ok, p.seconds, not p.ok and p.remedy is not None) for p in report.pairs
+            PairState(
+                p.reader,
+                p.source,
+                p.ok,
+                p.seconds,
+                not p.ok and p.remedy is not None,
+                not p.ok and getattr(p, "untested", False) is True,
+            )
+            for p in report.pairs
         )
         return cls(bool(report.ok), str(report.detail), pairs, getattr(report, "not_written", None))
 
@@ -66,8 +88,9 @@ class LinkMatrix:
         return {pair.source for pair in self.failing()}
 
     def stuck_readers(self) -> list[str]:
-        """The readers of the stuck pairs, in label order."""
-        return sorted({pair.reader for pair in self.failing() if pair.stuck}, key=label_order)
+        """The readers the heal acts on, in label order: those of the stuck pairs and of the untested ones
+        (`PairState.heals`)."""
+        return sorted({pair.reader for pair in self.failing() if pair.heals}, key=label_order)
 
     def shared_source(self) -> str | None:
         """The source every failing pair shares, when they share one (the crashed provider of the pattern)."""

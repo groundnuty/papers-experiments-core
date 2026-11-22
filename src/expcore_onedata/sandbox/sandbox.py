@@ -99,6 +99,7 @@ from expcore_onedata.sandbox.api import (
     ExecResult,
     ReadOnlyInput,
     SandboxError,
+    SandboxIntegrityError,
     SandboxSpec,
     StartRefused,
 )
@@ -1068,7 +1069,7 @@ class DockerSandbox:
             said = r.stdout.strip()
             if r.exit_code != 0 or said != f"blocked {errno.EROFS}":
                 log.error("read-only probe of the %s said %r (%s)", what, said, describe_stderr(r.stderr))
-                raise SandboxError(f"the {what} is not read-only for the agent")
+                raise SandboxIntegrityError(f"the {what} is not read-only for the agent")
             proved[what] = True
         self._meta["read_only_verified"] = proved
 
@@ -1185,7 +1186,7 @@ class DockerSandbox:
                 log.error("read-only input %d could not be copied: %s", n, describe_error(error))
                 raise SandboxError(f"read-only input {n} could not be copied into the run's directory") from None
             if item.sha256 is not None and facts["sha256"] != item.sha256:
-                raise SandboxError(f"read-only input {n} is no longer the content it was declared with")
+                raise SandboxIntegrityError(f"read-only input {n} is no longer the content it was declared with")
             self._read_only_on_the_host(n, copy)
             recorded.append({"path": item.target, **facts})
             copies.append((copy, item.target))
@@ -1230,14 +1231,14 @@ class DockerSandbox:
             why = inputs.judge(r.stdout, runnable is not None)
             if why is not None:
                 log.error("read-only input %d: %s (%s)", n, why, describe_stderr(r.stderr))
-                raise SandboxError(f"read-only input {n} is not read-only for the agent: {why}")
+                raise SandboxIntegrityError(f"read-only input {n} is not read-only for the agent: {why}")
             for what, root in (("copy", copy), ("source", item.source)):
                 try:
                     same = inputs.digest(root)["sha256"] == facts["sha256"]
                 except (OSError, inputs.InputUnsafe):
                     same = False
                 if not same:
-                    raise SandboxError(f"read-only input {n} changed between its hash and its mount ({what})")
+                    raise SandboxIntegrityError(f"read-only input {n} changed between its hash and its mount ({what})")
         if self._inputs:
             self._meta["read_only_verified"]["inputs"] = True
 
