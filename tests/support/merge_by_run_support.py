@@ -234,6 +234,37 @@ def build_fleet(base: Path, env: dict[str, str]) -> Fleet:
     return fleet
 
 
+def small_fleet(base: Path, env: dict[str, str], *, superseded: bool = False) -> Fleet:
+    """A fleet with only what a package of a batch merged by run needs: every run counted at a healthy federation, and
+    one lease that expired and left nothing behind (`fed-z`), listed as evidence with no snapshot. With `superseded`,
+    `fed-x` also takes a lease that expires, and its node's completion, read once every run is counted, is superseded:
+    its store is evidence the merge must be given. The ledger is closed at the end."""
+    sha = fingerprint_sha256(campaign_fingerprint(by_run_study(base, "template")))
+    clock = FakeClock()
+    ledger, path = _new_ledger(base, sha, clock)
+    fleet = Fleet(base, env, path, sha)
+    late = ("fed-z", "fed-x") if superseded else ("fed-z",)
+    try:
+        leases = {label: ledger.issue(label) for label in late}
+        for lease in leases.values():
+            assert isinstance(lease, Lease), lease
+            ledger.mark_sent(lease.lease_id)
+        clock.now += 400.0  # no heartbeat since they were sent: a read of their site expires them
+        ledger.observe_site(DOOMED["fed-z"], SiteReading())
+        for label in late:
+            ledger.prove_ended(label, "terminal")
+        _lease_every_run(fleet, ledger)
+        if superseded:
+            lx = leases["fed-x"]
+            fleet.stores[lx.lease_id] = run_lease(base, env, lx, sha)
+            assert complete(ledger, lx, fleet.stores[lx.lease_id], DOOMED["fed-x"]) == "superseded"
+            fleet.superseded = lx.lease_id
+    finally:
+        ledger.close()
+    fleet.vanished = leases["fed-z"].lease_id
+    return fleet
+
+
 def _exhaust_a_run(ledger: Ledger, clock: FakeClock, sha: str) -> tuple[str, tuple[int, ...]]:
     """Lose leases to fresh federations at site-b (each sent, never heard from, its job proven ended) until a run is
     exhausted by the losses, then settle every loss at no spend and one attempt, so the run is final; the runs lost
