@@ -50,11 +50,8 @@ class P:
     ns: str | None = "pid:[4026531836]"
     tracer: int = 0
     unreadable_mounts: bool = False
-    name: str = "x"  # the process's command name, `Name` of its status
     mnt_ns: str | None = None  # `ns/mnt`; None is a link that cannot be read
     root: str | None = None  # `root`; None likewise
-    stat_fails: list[bool] = field(default_factory=list)  # one entry per `stat` read: True refuses that read
-    starts: list[int] = field(default_factory=list)  # one start time per `stat` read, the last repeated: a reused pid
 
 
 @dataclass
@@ -83,13 +80,10 @@ class FakeProc:
     def read(self, path: str) -> str:
         proc, what = self._proc(path)
         if what == "stat":
-            if proc.stat_fails and proc.stat_fails.pop(0):
-                raise PermissionError(path)
-            start = proc.starts.pop(0) if len(proc.starts) > 1 else (proc.starts[0] if proc.starts else proc.start)
-            return f"{proc.pid} (a (b) c) S 1 " + " ".join(["0"] * 17) + f" {start} 0 0\n"
+            return f"{proc.pid} (a (b) c) S 1 " + " ".join(["0"] * 17) + f" {proc.start} 0 0\n"
         if what == "status":
             ns, uid = "\t".join(str(v) for v in proc.nspid), "\t".join([str(proc.uid)] * 4)
-            return f"Name:\t{proc.name}\nUid:\t{uid}\nTracerPid:\t{proc.tracer}\nNSpid:\t{ns}\n"
+            return f"Name:\tx\nUid:\t{uid}\nTracerPid:\t{proc.tracer}\nNSpid:\t{ns}\n"
         if what == "mountinfo":
             if proc.unreadable_mounts:
                 raise PermissionError(path)

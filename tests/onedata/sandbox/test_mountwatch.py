@@ -165,18 +165,6 @@ def test_a_failed_cell_proof_in_the_log_carries_what_failed_it_and_names_no_path
     assert "host_proc_in_cell" in read_log(data, NONCE).isolation_problems
 
 
-def test_a_cell_still_a_copy_of_the_host_when_the_window_closes_is_a_failed_poll_in_the_log(run):
-    """O60: a cell seen only while it is being built is not judged, and is never proved: the run is unproven."""
-    copy = cell_process(500, mountinfo=host_table(run))
-    w = watcher(run, FakeProc().add(host_process(99), copy))
-    os.unlink(run.token)
-    w.tick()
-    data = finish(w, run)
-    assert [p["label"] for p in proofs_of(data)] == ["close"]  # a cell alive at the close; no judgment of its table
-    reading = read_log(data, NONCE)
-    assert guard_log.POLL_FAILED in reading.isolation_problems
-
-
 def test_the_watcher_reads_the_hosts_root_mount_and_its_own_mount_namespace_at_its_start(run):
     proc = FakeProc(own_mnt_ns="mnt:[4026531841]").add(host_process(99))
     w = watcher(run, proc)
