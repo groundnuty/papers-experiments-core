@@ -45,10 +45,12 @@ in the result's transaction too.
   nothing either: the next pre-run outage, and the next start failure, are charged, whichever of the two the mark was
   spent on.
 - *Only after a charged attempt.* A post-run check that fails and charges no one (`Health.charge`), or that fails while
-  the gate is closed, discards its attempt uncharged: that attempt marks nothing, so every spare follows an attempt
-  that cost its run one, and a platform that alternates such answers with chargeable pre-run failures cannot make
-  attempts free. Together with the bound above, a run spends at least one charged attempt for each one spared and
-  reaches its limit.
+  the gate is closed, sets its attempt aside uncharged (a scored treatment stays scored): that attempt marks nothing,
+  so every spare follows an attempt that cost its run one, and a platform that alternates such answers with chargeable
+  pre-run failures cannot make attempts free through this rule. Together with the bound above, a run never has more
+  attempts spared than it has charged. Attempts that are uncharged for other reasons stay free as they always were (a
+  platform's hold, a key's rejection, a post-run check that charges no one every time): a platform that answers so
+  every time is bounded by the budget and the campaign's own stops, not by this rule.
 - *The gate stays closed.* A pre-run outage closes the health gate (`HealthGate._close`), whether it is spared or not,
   and a run that has not passed its pre-run check yet is held until the dispatcher's own check passes. A worker already
   past its own pre-run check when another run's check closes the gate still starts, as it always did. The spare event
