@@ -179,6 +179,11 @@ class LedgerViews:
         holder not proven ended, or, with a budget, lost and neither settled with its charged attempts nor overdue."""
         return attempts.holds(self.db, self.config)
 
+    def held_for_settle(self) -> set[str]:
+        """The pending runs held for a lost lease of theirs that is neither settled with its charged attempts nor
+        overdue (C68): a settle with them, or the overdue, lets them be leased."""
+        return attempts.held_for_settle(self.db, self.config)
+
     def ceilings(self) -> Ceilings:
         """The dollar ceilings in force: the pinned ones, or as raised (`raise_ceiling`)."""
         return effective(self.db, self.config)

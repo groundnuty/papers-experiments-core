@@ -87,6 +87,12 @@ def holds(db: sqlite3.Connection, config: LedgerConfig) -> dict[str, str]:
     return {run_key: "; ".join(reasons) for run_key, reasons in held.items()}
 
 
+def held_for_settle(db: sqlite3.Connection, config: LedgerConfig) -> set[str]:
+    """The pending runs held for a lost lease's settle (the second hold, module docstring): leased the moment a settle
+    gives the lease's attempts, or at its overdue. Empty without a budget."""
+    return set() if config.max_usd is None else {row["run_key"] for row in _unsettled(db)}
+
+
 def settleable_at(row: sqlite3.Row) -> float:
     """When a lost lease (a row of `_unsettled`) could first be settled: its loss, or its holder's proven end, plus
     KillWait for a holder the controller cancelled (`settling.apply` refuses it before then)."""

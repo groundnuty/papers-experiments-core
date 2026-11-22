@@ -234,3 +234,16 @@ def test_c68_the_controller_keeps_a_federation_for_a_run_held_until_its_settle(t
     ledger.settle(lost.lease_id, 100_000, "root", attempts_charged=1)
     view = ledger_view(ledger)
     assert (view.demand.pending, view.reopenable) == ({"m1": 1}, 0)
+
+
+def test_c68_the_controller_keeps_the_federation_through_a_settle_of_the_spend_alone_until_the_overdue(tmp_path):
+    """C68: a settle of the spend alone leaves the run held, so the controller still keeps a federation for it until
+    its overdue lets it be leased."""
+    ledger, clock = make(tmp_path, **ONE, **PRICED)
+    lost = lose(ledger, clock, "fed-1")
+    ledger.settle(lost.lease_id, 100_000, "root")
+    view = ledger_view(ledger)
+    assert (view.demand.pending, view.reopenable, view.lost) == ({}, 1, ())
+    overdue(ledger, clock)
+    view = ledger_view(ledger)
+    assert (view.demand.pending, view.reopenable) == ({"m1": 1}, 0)

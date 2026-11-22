@@ -262,11 +262,13 @@ def ledger_view(views: LedgerViews) -> LedgerView:
         if lease.lease_id not in settled and (lease.state == "lost" or (lease.state == "expired" and lease.proven))
     )
     # An exhausted run is not final while a lost lease of it is unsettled: a settle that shows fewer attempts reopens
-    # it. A pending run held for such a lease (C68) is leased once it settles. Only a ledger with a budget settles, so
-    # only there may such a run come back.
-    waiting = {run.run_key for run in views.runs() if run.state == "infra_exhausted"} | set(views.holds())
+    # it. A pending run held for a lost lease's settle (C68; a settle of its spend alone included) is leased once a
+    # settle gives its attempts or it is overdue. Only a ledger with a budget settles, so only there may such a run
+    # come back.
+    exhausted = {run.run_key for run in views.runs() if run.state == "infra_exhausted"}
     lost_ids = {lease_id for lease_id, _, _ in lost}
-    reopenable = len({lease.run_key for lease in leases if lease.lease_id in lost_ids and lease.run_key in waiting})
+    reopening = {lease.run_key for lease in leases if lease.lease_id in lost_ids and lease.run_key in exhausted}
+    reopenable = len(reopening | views.held_for_settle())
     money = {"ceiling_micro": status.ceiling_micro, "committed_micro": status.committed_micro,
              "remaining_micro": status.remaining_micro, "locked_micro": status.locked_micro,
              "locked_by_state": dict(status.locked_by_state)}  # fmt: skip
