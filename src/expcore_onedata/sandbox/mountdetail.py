@@ -6,8 +6,9 @@ A proof line goes into the run's evidence, and the watcher's log "names no path 
 failed proof says what KIND of mount broke it, never where it is: the device and file system type (kernel numbers and
 names), whether the mount's root and point are one of the few system names every node has or something else, whether the
 same mount is in the host's own table (a cell whose table is a copy of the host's), and for a protected directory its
-index in the watcher's list and how the mount's root relates to it. Every value is one of a closed set or matches a
-pattern that cannot hold a host, a user or a token, so a malformed mount table cannot put text of its own in the line.
+index in the watcher's list and how the mount's root relates to it. Every value is one of a closed set (the file system
+type from a list, never a `fuse` subtype's own text) or a number pair, so a mount table cannot put text of its own in
+the line.
 
 The keys are additive: a proof line gains `offending` (at most `MAX_ENTRIES` entries), `offending_total` and `process`;
 no key of an older line changes, and `cell` stays exactly `pid`, `start_time`, `nspid_depth`, which the reader requires.
@@ -26,7 +27,16 @@ UNREAD = "unread"
 SAME, DIFFERENT = "same", "different"
 HOST, OWN = "host", "own"  # a process's root mount is the host's, or its own
 DEV = re.compile(r"\d{1,10}:\d{1,10}")
-FSTYPE = re.compile(r"[A-Za-z0-9_.+-]{1,24}")
+# File system types a mount table names, by the kernel's name; a `fuse.<subtype>` not listed is `fuse` and any other
+# type `other`, as a subtype is the mounting program's own text and may hold a name.
+FSTYPES = frozenset(
+    {
+        "proc", "tmpfs", "overlay", "ext2", "ext3", "ext4", "xfs", "btrfs", "squashfs", "ramfs", "rootfs", "devtmpfs",
+        "devpts", "sysfs", "cgroup", "cgroup2", "mqueue", "hugetlbfs", "debugfs", "tracefs", "securityfs", "pstore",
+        "bpf", "configfs", "binfmt_misc", "fusectl", "autofs", "nfs", "nfs4", "cifs", "lustre", "gpfs", "9p", "vfat",
+        "iso9660", "fuse", "fuse.oneclient", "fuse.squashfuse", "fuse.fuse-overlayfs",
+    }
+)  # fmt: skip
 
 # A mount an entry is made from: (problem, mount, index of the protected directory or None, relation or None).
 Offence = tuple[str, Mapping[str, str], "int | None", "str | None"]
@@ -37,6 +47,13 @@ def generic(path: str) -> str:
     return path if path in GENERIC_PATHS else OTHER
 
 
+def fstype(name: str) -> str:
+    """A file system type from the closed list, `fuse` for another `fuse.<subtype>`, else `other`."""
+    if name in FSTYPES:
+        return name
+    return "fuse" if name.startswith("fuse.") else OTHER
+
+
 def entries(found: Sequence[Offence], host_entries: frozenset[tuple[str, str, str]]) -> dict[str, Any]:
     """The `offending` and `offending_total` keys of a failed proof: the first `MAX_ENTRIES` mounts that triggered a
     problem, and how many did."""
@@ -45,7 +62,7 @@ def entries(found: Sequence[Offence], host_entries: frozenset[tuple[str, str, st
         entry: dict[str, Any] = {
             "problem": problem,
             "dev": mount["dev"] if DEV.fullmatch(mount["dev"]) else UNKNOWN,
-            "fstype": mount["fstype"] if FSTYPE.fullmatch(mount["fstype"]) else UNKNOWN,
+            "fstype": fstype(mount["fstype"]),
             "root": generic(mount["root"]),
             "point": generic(mount["mountpoint"]),
             "host_copy": (mount["dev"], mount["root"], mount["mountpoint"]) in host_entries,

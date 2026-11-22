@@ -34,8 +34,8 @@ host, through the host's `/proc`, which no cell can see or write. Everything is 
 A cell Apptainer is still building is not judged: until it pivots into its own root, a nested process's mount table is
 the host's, or a copy of it, with the host's `/proc` and protected directories. While its mount namespace is the
 watcher's own or its `/` mount is the host's (same device and root), it is looked at again at the next poll; a
-namespace whose processes are all gone having been seen only so was never proved, which is a failed poll (not a failed
-proof), so "never proved" stays visible.
+namespace left with no process for a whole poll having been seen only so was never proved, which is a failed poll (not a
+failed proof), so "never proved" stays visible. A process judged once is judged at every later look, built or not.
 
 A failed `cell` proof records what failed it, in `mountdetail`'s words (kinds of mount, never a path): each mount that
 made `host_proc_in_cell` or `protected_reachable`, and the process's root, mount namespace and root mount.
@@ -56,6 +56,7 @@ from typing import Any, Protocol
 
 from expcore_onedata.sandbox import mountdetail as MD
 from expcore_onedata.sandbox.hostops import MountTableError, parse_mountinfo
+from expcore_onedata.sandbox.mountpending import Pending, Seen
 
 ONECLIENT_NOT_HOST = "oneclient_not_host"
 ONECLIENT_UNREAD = "oneclient_unread"
@@ -253,9 +254,6 @@ def oneclient_problems(proc: ProcView, host: Host) -> list[str]:
     return [] if len(values) == host.depth else [ONECLIENT_NOT_HOST]
 
 
-Seen = tuple[int, int]  # a process by its pid and start time
-
-
 class CellPoll:
     """The polls of one run (the module's docstring). `emit(label, ok, problems, cell, detail)` writes a proof line;
     `detail` is None for a passing one, else the keys the failed one gains (`mountdetail`)."""
@@ -264,19 +262,25 @@ class CellPoll:
         self._proc, self._host, self._emit = proc, host, emit
         self._later: dict[int, int] = {}  # processes of another uid by pid, with the poll that reads them again
         self._proved: dict[Any, set[str]] = {}  # each namespace proved, with the problems written for it
-        self._pending: dict[Any, set[Seen]] = {}  # namespaces seen only while still being built, with their processes
+        self._building = Pending(self._started)  # namespaces seen only while their cells were being built
+        self._judged: set[Seen] = set()  # processes judged once: never taken to be still being built again
+        self._ns: dict[Seen, str] = {}  # each process's PID namespace link, as last read
         self.cells: dict[Seen, int] = {}  # the processes found to be this run's cells, with their depth
         self.polls = 0
         self.failed = 0
 
     def poll(self) -> None:
         """Look at each process of this uid, and at each of another uid when it is due (the module's docstring)."""
+        if self._poll():
+            self.failed += 1
+
+    def _poll(self) -> bool:
+        """One poll; whether it failed."""
         self.polls += 1
         try:
             pids = list(self._proc.pids())
         except OSError:
-            self.failed += 1
-            return
+            return True
         listed = set(pids)
         self._later = {pid: due for pid, due in self._later.items() if pid in listed}
         broken = False
@@ -284,41 +288,26 @@ class CellPoll:
             if self._later.get(pid, 0) > self.polls:
                 continue
             broken = self._look(pid) is False or broken
-        if self._unproved_gone() or broken:
-            self.failed += 1
+        lost = self._building.lost(self._proved)
+        return lost or broken
 
     def close(self) -> None:
-        """The last poll, then a failed proof for each of the run's cells still alive, and a failed poll for a namespace
-        seen only while being built and still not proved."""
-        self.poll()
-        if self._pending:
+        """The last poll, then a failed proof for each of the run's cells still alive. The last poll is failed, once, if
+        it failed or a namespace seen only while being built is lost or still not proved."""
+        broken = self._poll()
+        if broken or self._building.unsettled(self._proved):
             self.failed += 1
         for (pid, started), depth in sorted(self.cells.items()):
             if self._started(pid) == started:
                 cell = {"pid": pid, "start_time": started, "nspid_depth": depth}
                 self._emit(CLOSE, False, [CELL_ALIVE_AT_CLOSE], cell, None)
 
-    def _proved_pending(self, key: Any, seen: Seen) -> None:
-        """A process is judged: its namespace is no longer pending, and neither is the process, which may have been
-        pending under another key (its namespace link could not be read while it was being built)."""
-        self._pending.pop(key, None)
-        for other, members in list(self._pending.items()):
-            members.discard(seen)
-            if not members:
-                del self._pending[other]
-
-    def _unproved_gone(self) -> bool:
-        """Whether a namespace seen only while its cell was being built has no process left: it was never proved, so the
-        poll counts as failed (the cell may have run, unjudged)."""
-        gone = False
-        for key, members in list(self._pending.items()):
-            alive = {m for m in members if self._started(m[0]) == m[1]}
-            if alive:
-                self._pending[key] = alive
-            else:
-                del self._pending[key]
-                gone = True
-        return gone
+    def _key(self, pid: int, seen: Seen) -> Any:
+        """A process's namespace: its PID namespace link, as last read when it cannot be read now, else the process."""
+        link = self._namespace(pid)
+        if link is not None:
+            self._ns[seen] = link
+        return self._ns.get(seen, seen)
 
     def _started(self, pid: int) -> int | None:
         try:
@@ -362,13 +351,14 @@ class CellPoll:
                 self.cells[(pid, started)] = len(values)
                 self._emit(HOST_PROCESS, False, [SAME_PID_NAMESPACE], cell, {"process": self._view(pid, mounts)})
             return
-        self.cells[(pid, started)] = len(values)
-        key = self._namespace(pid) or (pid, started)
-        if self._being_built(pid, mounts):
-            if key not in self._proved:
-                self._pending.setdefault(key, set()).add((pid, started))
+        seen = (pid, started)
+        self.cells[seen] = len(values)
+        key = self._key(pid, seen)
+        if seen not in self._judged and self._being_built(pid, mounts):
+            self._building.add(key, seen, key not in self._proved)
             return
-        self._proved_pending(key, (pid, started))
+        self._judged.add(seen)
+        self._building.settled(key, seen)
         problems = oneclient_problems(self._proc, self._host) + mount_problems(mounts, self._host)
         if key not in self._proved:
             self._proved[key] = set(problems)

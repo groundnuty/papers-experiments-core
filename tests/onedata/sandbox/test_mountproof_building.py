@@ -70,6 +70,8 @@ def test_a_namespace_seen_only_while_being_built_is_a_failed_poll_when_it_ends_a
     assert poll.failed == 0
     del proc.procs[500]
     poll.poll()
+    assert poll.failed == 0  # a successor in its namespace may yet be listed: the loss is counted a poll later
+    poll.poll()
     assert (poll.failed, proofs) == (1, [])
 
 
@@ -85,8 +87,8 @@ def test_a_failed_poll_is_counted_once_for_a_namespace_whose_every_process_ends(
     proc = node(building(500), building(501, inner=7))
     poll, _ = polled(proc, **SEEN)
     del proc.procs[500], proc.procs[501]
-    poll.poll()
-    poll.poll()
+    for _ in range(4):
+        poll.poll()
     assert poll.failed == 1
 
 
@@ -135,7 +137,78 @@ def test_proving_one_namespace_does_not_prove_another_that_was_only_being_built(
     poll, proofs = polled(proc, **SEEN)
     del proc.procs[500]
     poll.poll()
+    poll.poll()
     assert (poll.failed, [ok for _, ok, _, _ in proofs]) == (1, [True])
+
+
+def test_a_process_judged_once_is_judged_at_every_later_look_even_back_in_the_hosts_mount_namespace():
+    """A proved cell that joins the watcher's mount namespace shows the host's `/proc` again: a failed proof, not a
+    process being built."""
+    proc = node(cell_process(500, mnt_ns=COPY_NS))
+    poll, proofs = polled(proc, **SEEN)
+    proc.procs[500].mnt_ns, proc.procs[500].mountinfo = WATCHER_MNT_NS, HOST_TABLE
+    poll.poll()
+    assert [(ok, problems) for _, ok, problems, _ in proofs][-1][0] is False
+    assert MP.HOST_PROC_IN_CELL in proofs[-1][2]
+    assert proofs.details[-1]["process"]["mnt_ns"] == "same"
+
+
+def test_a_process_judged_once_is_judged_again_when_its_root_mount_becomes_the_hosts():
+    proc = node(cell_process(500, mnt_ns=COPY_NS))
+    poll, proofs = polled(proc, **SEEN)
+    proc.procs[500].mountinfo = HOST_TABLE
+    poll.poll()
+    assert proofs[-1][2][0] == MP.HOST_PROC_IN_CELL
+
+
+def test_a_helper_whose_namespace_link_becomes_readable_while_being_built_is_no_failed_poll_when_it_ends():
+    """Pending as a process while its `ns/pid` cannot be read, then as its namespace: one entry, not two."""
+    proc = node(building(500, ns=None), building(501, inner=7, ns=None))
+    poll, proofs = polled(proc, **SEEN)
+    proc.procs[500].ns = proc.procs[501].ns = "pid:[4026532100]"
+    poll.poll()
+    pivoted(proc, 501)
+    poll.poll()  # the sibling proves the namespace
+    del proc.procs[500]
+    for _ in range(3):
+        poll.poll()
+    assert (poll.failed, [ok for _, ok, _, _ in proofs]) == (0, [True])
+
+
+def test_a_namespace_link_that_cannot_be_read_again_keeps_the_namespace_it_was_read_as():
+    proc = node(building(500), building(501, inner=7))
+    poll, proofs = polled(proc, **SEEN)
+    proc.procs[500].ns = None
+    poll.poll()
+    pivoted(proc, 501)
+    poll.poll()
+    del proc.procs[500]
+    for _ in range(3):
+        poll.poll()
+    assert (poll.failed, [ok for _, ok, _, _ in proofs]) == (0, [True])
+
+
+def test_a_successor_forked_as_a_helper_ends_is_no_failed_poll():
+    """The helper ends and its successor in the namespace is not in that poll's listing; the next poll proves it."""
+    proc = node(building(500))
+    poll, proofs = polled(proc, **SEEN)
+    del proc.procs[500]
+    poll.poll()
+    proc.add(cell_process(501, inner=7))
+    poll.poll()
+    poll.poll()
+    assert (poll.failed, [ok for _, ok, _, _ in proofs]) == (0, [True])
+
+
+def test_the_close_counts_one_failed_poll_for_its_final_poll_whatever_it_finds():
+    """One namespace lost and another still being built: the final poll is one poll, and one failed poll."""
+    proc = node(building(500), building(501, inner=7, ns=OTHER_PID_NS))
+    poll, _ = polled(proc, **SEEN)
+    del proc.procs[500]
+    poll.poll()
+    before = poll.failed
+    poll.close()
+    assert (before, poll.failed, poll.polls) == (0, 1, 3)
 
 
 def test_without_the_hosts_root_and_namespace_a_copy_is_judged_as_it_was():

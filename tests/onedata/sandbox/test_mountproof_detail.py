@@ -56,14 +56,22 @@ def test_a_passing_proof_carries_no_detail():
 
 
 def test_the_detail_names_no_path_and_no_text_of_a_mount_table():
-    """The log names no path: a mount's point and root are a system name or `other`, its device and file system type a
-    number pair and a short name or `?`, whatever the table holds."""
+    """The log names no path: a mount's point and root are a system name or `other`, its device a number pair or `?` and
+    its file system type a name from a list or `other`, whatever the table holds."""
     private = {"dev": "x:y", "root": "/srv/invented/data", "mountpoint": "/scratch/invented/run", "fstype": "e" * 40}
     found = [(MP.HOST_PROC_IN_CELL, private, None, None)]
     detail = MD.entries(found, frozenset())
-    assert detail["offending"][0] == {"problem": MP.HOST_PROC_IN_CELL, "dev": "?", "fstype": "?", "root": "other",
+    assert detail["offending"][0] == {"problem": MP.HOST_PROC_IN_CELL, "dev": "?", "fstype": "other", "root": "other",
                                       "point": "other", "host_copy": False}  # fmt: skip
     assert "invented" not in json.dumps(detail)
+
+
+def test_a_fuse_subtype_is_never_written_as_the_mounting_programs_own_text():
+    """A `fuse.<subtype>` is a name the mounting program chose, and may hold a user's or a host's: it is `fuse` unless
+    it is one the core's own run names."""
+    assert [MD.fstype(name) for name in ("fuse.alice", "fuse.oneclient", "fuse", "proc", "alice", "")] == [
+        "fuse", "fuse.oneclient", "fuse", "proc", "other", "other",
+    ]  # fmt: skip
 
 
 def test_the_process_view_records_the_root_and_whether_the_mount_namespace_is_the_watchers():
