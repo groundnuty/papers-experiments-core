@@ -19,7 +19,10 @@ The log is JSON lines, each numbered by the watcher (`seq` 0, 1, 2, ...) with it
   oneclient's status could no longer be read (`why`: `gone` when the process ended, `unreadable` otherwise);
 - `proof`: one isolation proof from outside (`label`: `cell` for a cell of the run's, `host_process` for a process
   of the node's PID namespace that holds the run's mount where the host has none, `close` for a cell still alive when
-  the window closed; `ok`, `problems`, the `cell` it read: `pid`, `start_time`, `nspid_depth`);
+  the window closed; `ok`, `problems`, the `cell` it read: `pid`, `start_time`, `nspid_depth`). A failed one may also
+  carry `offending`, `offending_total` and `process`: what failed it, in words that name no path
+  (`expcore_onedata.sandbox.mountdetail`). They are additive: this reader ignores them, and `cell` keeps exactly its
+  three keys, which a reader of the older line requires;
 - `end`: the lines before it (`lines`), oneclient's samples taken (`samples`), the polls of the node's processes
   (`polls`) and those that could not list them (`polls_failed`), and the lines it could not write (`unwritten`).
 

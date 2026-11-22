@@ -1,7 +1,8 @@
 """A host's `/proc` in memory, for the mount watcher's proofs (`expcore_onedata.sandbox.mountproof.ProcView`).
 
 Every device, path and pid is invented. A process is its `stat`, `status` (uid and `NSpid`), `mountinfo` and PID
-namespace link; a mount table is built from `(dev, root, mountpoint, fstype)` rows, with the root mount first.
+namespace links (PID, and mount namespace and root where a test sets them); a mount table is built from `(dev, root,
+mountpoint, fstype)` rows, with the root mount first.
 """
 
 from __future__ import annotations
@@ -49,12 +50,15 @@ class P:
     ns: str | None = "pid:[4026531836]"
     tracer: int = 0
     unreadable_mounts: bool = False
+    mnt_ns: str | None = None  # `ns/mnt`; None is a link that cannot be read
+    root: str | None = None  # `root`; None likewise
 
 
 @dataclass
 class FakeProc:
     procs: dict[int, P] = field(default_factory=dict)
     listing_fails: bool = False
+    own_mnt_ns: str | None = None  # the watcher's own `/proc/self/ns/mnt`; None cannot be read
 
     def add(self, *procs: P) -> FakeProc:
         for proc in procs:
@@ -87,10 +91,15 @@ class FakeProc:
         raise FileNotFoundError(path)
 
     def readlink(self, path: str) -> str:
+        if path == "/proc/self/ns/mnt":
+            if self.own_mnt_ns is None:
+                raise PermissionError(path)
+            return self.own_mnt_ns
         proc, what = self._proc(path)
-        if what != "ns/pid" or proc.ns is None:
+        link = {"ns/pid": proc.ns, "ns/mnt": proc.mnt_ns, "root": proc.root}.get(what)
+        if link is None:
             raise PermissionError(path)
-        return proc.ns
+        return link
 
 
 def host_process(pid: int, **kw) -> P:

@@ -228,6 +228,43 @@ def test_one_failed_proof_among_passing_ones_leaves_the_isolation_unproven_with_
     assert "same_pid_namespace" in reading.isolation_problems
 
 
+DETAIL = {
+    "offending": [
+        {
+            "problem": "host_proc_in_cell",
+            "dev": "0:20",
+            "fstype": "proc",
+            "root": "/",
+            "point": "/proc",
+            "host_copy": True,
+        }
+    ],
+    "offending_total": 1,
+    "process": {"root": "/", "mnt_ns": "different", "root_mount": "own"},
+}  # the keys a failed proof gained (`expcore_onedata.sandbox.mountdetail`): additive, the old format has none
+
+
+def test_a_failed_proof_line_of_the_old_format_still_reads():
+    """The format name is unchanged: a log written before the detail keys existed reads as it did."""
+    old = proof(ok=False, problems=["host_proc_in_cell"])
+    assert set(old) == {"event", "label", "ok", "problems", "cell"}
+    reading = read_log(log(proofs=[old]), NONCE)
+    assert reading.intact
+    assert reading.isolation_problems == (guard_log.PROOF_FAILED, "host_proc_in_cell")
+
+
+def test_a_failed_proof_line_with_the_detail_keys_reads_as_the_old_one_did():
+    problems = ["host_proc_in_cell"]
+    new = read_log(log(proofs=[proof(ok=False, problems=problems, **DETAIL)]), NONCE)
+    assert new == read_log(log(proofs=[proof(ok=False, problems=problems)]), NONCE)
+
+
+def test_a_proof_cell_with_a_key_of_its_own_is_still_refused():
+    """The detail never goes in `cell`: a reader of the old format takes any key there for damage."""
+    cell = {"pid": 4242, "start_time": 777, "nspid_depth": 2, "offending": []}
+    assert guard_log.UNPARSEABLE in read_log(log(proofs=[proof(cell=cell)]), NONCE).problems
+
+
 def test_a_proof_with_problems_is_failed_whatever_its_ok_says():
     forged = proof(ok=True, problems=["host_proc_in_cell"])
     assert guard_log.PROOF_FAILED in read_log(log(proofs=[forged]), NONCE).isolation_problems

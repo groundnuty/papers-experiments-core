@@ -16,29 +16,9 @@ from fake_proc import (
     host_process,
     table,
 )
+from mountproof_support import ONECLIENT, node, polled
 
 from expcore_onedata.sandbox import mountproof as MP
-
-ONECLIENT = 99
-GUARD = MP.Protected("0:30", "/run/guard/token")
-
-
-def host(**kw) -> MP.Host:
-    base = {"depth": 1, "uid": UID, "proc_devs": frozenset({HOST_PROC[0]}), "fuse_dev": FUSE_DEV,
-            "mountpoint": HOST_MOUNTPOINT, "protected": (GUARD,), "oneclient": ONECLIENT}  # fmt: skip
-    return MP.Host(**{**base, **kw})
-
-
-def polled(proc: FakeProc, **kw):
-    """Poll once; the proofs written, as (label, ok, problems)."""
-    proofs = []
-    poll = MP.CellPoll(proc, host(**kw), lambda label, ok, problems, cell: proofs.append((label, ok, problems, cell)))
-    poll.poll()
-    return poll, proofs
-
-
-def node(*procs) -> FakeProc:
-    return FakeProc().add(host_process(ONECLIENT), *procs)
 
 
 def test_a_cell_in_its_own_namespace_with_the_runs_mount_and_nothing_protected_is_proved():
