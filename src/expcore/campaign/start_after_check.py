@@ -44,7 +44,13 @@ in the result's transaction too.
   nothing either: the next pre-run outage, and the next start failure, are charged, whichever of the two the mark was
   spent on.
 - *The gate stays closed.* A pre-run outage closes the health gate (`HealthGate._close`), whether it is spared or not,
-  and no run starts until the dispatcher's own check passes, so sparing it opens no loop of free attempts.
+  and a run that has not passed its pre-run check yet is held until the dispatcher's own check passes, so sparing it
+  opens no loop of free attempts of its own. What the rule leaves as it was: a post-run check that charges no one
+  (`Health.charge`), or that fails while the gate is closed, discards its attempt uncharged and still marks the run,
+  so a platform that alternates such answers with chargeable pre-run failures can make attempts free, as it could with
+  the start rule; and a worker already past its own pre-run check when another run's check closes the gate still starts.
+  The spare event is written in the result's transaction, so a result committed from its marker after a kill has the
+  row's detail and no event.
 - *Only after a failed check.* A post-run check that passed, or was deferred (it verified nothing and found nothing
   failing), marks nothing.
 - *Only before the agent's first turn.* A failure after a completed turn is charged as always.
