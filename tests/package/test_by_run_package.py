@@ -27,6 +27,7 @@ from expcore.campaign.shard import META_ENVIRONMENT, META_SHARD
 from expcore.package import build as package_build
 from expcore.package import by_run
 from expcore.package.build import build_package, verify_package
+from expcore.package.by_run import require_bound
 from expcore.package.spec import PackageError
 from expcore.provenance import environment as environment_module
 from expcore.provenance.environment import CORE_DISTRIBUTION
@@ -301,3 +302,29 @@ def test_c67_a_batch_merged_by_run_tampered_after_its_check_is_refused_naming_th
     refusal = edit(root)
     with pytest.raises(PackageError, match=refusal):
         build_package(root, tmp_path / "dist", hashes=hashes, anonymise=anonymisation if anonymised else None)
+
+
+@pytest.mark.parametrize(
+    ("check", "merge", "refused"),
+    [
+        ({"snapshot": {}}, {"schema": "expcore-merge/2"}, True),
+        ({"merge": {"file": "merge.json"}}, {"schema": "expcore-merge/2"}, False),
+        ({"snapshot": {}}, {"schema": "expcore-merge/1"}, False),
+        ({"snapshot": {}}, None, False),
+    ],
+    ids=["by-run-unmerged-check", "by-run-merged-check", "merge-of-shards", "no-merge-file"],
+)
+def test_c67_a_merge_by_run_the_replay_check_was_made_without_is_refused(tmp_path, check, merge, refused):
+    """C67: out/merge.json of a merge by run lets the spec select lease snapshots, so beside a replay check that names
+    no merge (a stale file beside an unmerged batch) the build refuses it, as `analyze` does; a check that names a
+    merge binds the file by its hash, and a merge of shards or no merge.json is as before."""
+    if merge is not None:
+        (tmp_path / "out").mkdir()
+        (tmp_path / MERGE).write_text(json.dumps(merge), encoding="utf-8")
+    if refused:
+        with pytest.raises(
+            PackageError, match=r"out/merge\.json: a merge by run, but the replay check was made without"
+        ):
+            require_bound(tmp_path, check)
+    else:
+        require_bound(tmp_path, check)

@@ -33,7 +33,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from expcore.campaign.by_run_layout import is_by_run
 from expcore.campaign.manifest import fingerprint_sha256
+from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
 from expcore.campaign.resume import FINGERPRINT_KEY
 from expcore.campaign.shard import META_SHARD
 from expcore.campaign.shard_run import canonical
@@ -52,6 +54,19 @@ class Repinned:
     sha256: str
 
 
+def require_bound(root: Path, check: Mapping[str, Any]) -> None:
+    """Refuse a study whose out/merge.json is a merge by run while its replay check names no merge: that file lets the
+    spec select out/leases and out/evidence (`spec.merged_by_run`), so a stale one beside an unmerged batch would put
+    snapshots no check vouched for in the package. A check that names a merge binds merge.json by its hash, which the
+    build compares (`identity.verify_merged_inputs`)."""
+    path = Path(root) / MERGE_PATH
+    if MERGE_KEY in check or path.is_symlink() or not path.is_file() or not is_by_run(path.read_bytes()):
+        return
+    raise PackageError(
+        f"{MERGE_PATH}: a merge by run, but the replay check was made without it; run `python -m expcore check` again"
+    )
+
+
 def verify_inputs(files: Mapping[str, bytes], raw: bytes) -> MergedByRun:
     """Refuse a batch merged by run whose ledger snapshot, or one of whose lease store snapshots, is not the bytes
     merge.json (`raw`) names, naming the first; return what the package holds of the batch."""
@@ -67,8 +82,10 @@ def verify_inputs(files: Mapping[str, bytes], raw: bytes) -> MergedByRun:
 def anonymise(files: dict[str, bytes], scratch: Path) -> tuple[dict[str, str], Repinned]:
     """Rewrite, in `files` (mutated in place: the caller's copy of the package), every lease store's snapshot without
     the environment's sources and re-pin the campaign fingerprint's hash in the three places (module docstring).
-    Returns each old hash with its new one, the snapshots', the ledger's and the fingerprint's (the export lists them,
-    so the author's is compared with them swapped, `identity._outputs`), and the fingerprint's re-pin."""
+    Returns each old hash with its new one, the snapshots' and the ledger's (the export lists them, so the author's is
+    compared with them swapped, `identity._outputs`), and the fingerprint's re-pin. The fingerprint's hash is not
+    swapped: the export carries it only in its campaign fingerprint, which is derived again (`identity`), so a text that
+    quotes it, a declaration's reason say, is compared as it is."""
     from expcore.campaign.merged_by_run import merge_text  # on this branch only (C42)
 
     merged = by_run_files(files[MERGE_PATH])
@@ -94,7 +111,7 @@ def anonymise(files: dict[str, bytes], scratch: Path) -> tuple[dict[str, str], R
         entry["snapshot_sha256"] = swaps.get(entry["snapshot_sha256"], entry["snapshot_sha256"])
     document["ledger_sha256"] = swaps[document["ledger_sha256"]]
     files[MERGE_PATH] = merge_text(document).encode("utf-8")
-    return swaps | {repinned.original: repinned.sha256}, repinned
+    return swaps, repinned
 
 
 def _store_facts(data: bytes, where: str, scratch: Path) -> tuple[dict[str, Any], dict[str, Any]]:

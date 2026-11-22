@@ -66,7 +66,7 @@ from expcore.config.loading import ConfigError
 from expcore.models.route import sdk_version
 from expcore.package.anonymise import Anonymisation, holds_term, load_anonymisation, refuse_models, rewrite
 from expcore.package.archive import SUMS_FILE, render_sums, verify_sums, write_archive
-from expcore.package.by_run import Repinned
+from expcore.package.by_run import Repinned, require_bound
 from expcore.package.identity import (
     PREFIX_DIGITS,
     anonymise_identity,
@@ -496,6 +496,7 @@ def _selection(study_root: Path) -> tuple[StudyConfig, PackageSpec, dict[str, by
     spec = load_spec(study.root)
     files = {path: (study.root / path).read_bytes() for path in select(study.root, spec)}
     check = _read_json(files, f"{OUT_DIR}/{RUNS_DIR}/{CHECK_FILE}", "the replay check")
+    require_bound(study.root, check)  # the merge by run select() took out/leases and out/evidence by is the check's
     missing = [path for path in _required(study, check, files) if path not in files]
     if missing:
         more = f" and {len(missing) - 1} more" if len(missing) > 1 else ""
