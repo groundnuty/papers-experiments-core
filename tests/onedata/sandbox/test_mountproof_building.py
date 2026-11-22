@@ -250,6 +250,57 @@ def test_a_pid_taken_by_another_process_during_a_look_binds_nothing_of_the_first
     assert (proofs, poll.failed) == ([], 0)
 
 
+def helper(pid: int, **kw):
+    """Apptainer's image helper: nested in a PID namespace, outside the pivot, so with the host's root and the host's
+    `/proc`, and the run's mount in its table."""
+    return cell_process(pid, mountinfo=HOST_TABLE, mnt_ns=COPY_NS, name="squashfuse_ll", **kw)
+
+
+def test_apptainers_image_helper_outside_the_pivot_is_not_judged_as_a_cell():
+    """O60 (live): its root is the host's and it sees the host's `/proc`; judged, it was the failed proof of
+    `host_proc_in_cell` and `protected_reachable`. It is no cell: not judged, not pending, no failed poll."""
+    proc = node(helper(500, ns=OTHER_PID_NS))
+    poll, proofs = polled(proc, **SEEN)
+    for _ in range(5):
+        poll.poll()
+    del proc.procs[500]
+    for _ in range(3):
+        poll.poll()
+    assert (proofs, poll.failed, poll.cells) == ([], 0, {})
+
+
+def test_an_image_helper_is_no_cell_alive_at_the_close():
+    poll, proofs = polled(node(helper(500, ns=OTHER_PID_NS)), **SEEN)
+    poll.close()
+    assert (proofs, poll.failed) == ([], 0)
+
+
+def test_a_cell_whose_namespace_holds_an_image_helper_is_proved_beside_it():
+    proc = node(helper(500), cell_process(501, inner=7))
+    poll, proofs = polled(proc, **SEEN)
+    assert ([ok for _, ok, _, _ in proofs], poll.failed) == ([True], 0)
+
+
+def test_a_process_with_a_helpers_name_and_a_root_of_its_own_is_judged_as_a_cell():
+    """The name excuses only a process outside the pivot: one with its own root is a cell, whatever it is called."""
+    proc = node(cell_process(500, name="squashfuse_ll"))
+    poll, proofs = polled(proc, **SEEN)
+    pivoted(proc, 500, (HOST_PROC[0], "/", "/hostproc", "proc"))
+    poll.poll()
+    assert [(ok, problems) for _, ok, problems, _ in proofs] == [(True, []), (False, [MP.HOST_PROC_IN_CELL])]
+
+
+def test_a_process_outside_the_pivot_with_another_name_is_a_cell_being_built():
+    """Nothing but an image helper's own name is passed over: the same table under another name is pending."""
+    proc = node(helper(500, ns=OTHER_PID_NS))
+    proc.procs[500].name = "python3"
+    poll, proofs = polled(proc, **SEEN)
+    del proc.procs[500]
+    for _ in range(3):
+        poll.poll()
+    assert (proofs, poll.failed) == ([], 1)
+
+
 def test_without_the_hosts_root_and_namespace_a_copy_is_judged_as_it_was():
     """Nothing says the cell is still being built when the watcher could not read the host's own root and namespace."""
     _, proofs = polled(node(building(500)))

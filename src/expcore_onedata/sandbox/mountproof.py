@@ -36,6 +36,8 @@ the host's, or a copy of it, with the host's `/proc` and protected directories. 
 watcher's own or its `/` mount is the host's (same device and root), it is looked at again at the next poll; a
 namespace left with no process for a whole poll having been seen only so was never proved, which is a failed poll (not a
 failed proof), so "never proved" stays visible. A process judged once is judged at every later look, built or not.
+Apptainer's image helpers (`squashfuse_ll`) stay outside the pivot, with the host's root and `/proc`, for their cell's
+life: they are no cells, and are passed over while outside it.
 
 A failed `cell` proof records what failed it, in `mountdetail`'s words (kinds of mount, never a path): each mount that
 made `host_proc_in_cell` or `protected_reachable`, and the process's root, mount namespace and root mount.
@@ -66,6 +68,9 @@ PROTECTED_UNRESOLVED = "protected_unresolved"
 SAME_PID_NAMESPACE = "same_pid_namespace"
 CELL_ALIVE_AT_CLOSE = "cell_alive_at_close"
 CELL, HOST_PROCESS, CLOSE = "cell", "host_process", "close"
+# Apptainer's image helpers run outside the pivot, with the host's root and `/proc`, for as long as their cell does: one
+# in a PID namespace with the run's mount in its table is no cell, and is passed over while it is outside the pivot.
+IMAGE_HELPERS = frozenset({"squashfuse_ll", "squashfuse", "fuse2fs", "fuse-overlayfs"})
 OTHER_EVERY = 20  # a process of another uid is read again every this many polls (about 1 s at the watcher's 50 ms)
 
 
@@ -339,10 +344,12 @@ class CellPoll:
         except (OSError, MountTableError):
             # a nested process of ours we cannot read may be a cell: a failed poll, and looked at again next poll
             return False if len(values) > self._host.depth else None
-        self._judge(pid, started, values, mounts)
+        self._judge(pid, started, values, mounts, status_field(status, "Name"))
         return None
 
-    def _judge(self, pid: int, started: int, values: tuple[int, ...], mounts: list[dict[str, str]]) -> None:
+    def _judge(
+        self, pid: int, started: int, values: tuple[int, ...], mounts: list[dict[str, str]], name: str | None
+    ) -> None:
         """A proof line for a cell of the run's the first time its namespace is seen, and a failed one whenever a later
         look finds a problem not written yet; a failed one for a process of the node's namespace holding the run's
         mount elsewhere."""
@@ -356,11 +363,14 @@ class CellPoll:
                 self.cells[(pid, started)] = len(values)
                 self._emit(HOST_PROCESS, False, [SAME_PID_NAMESPACE], cell, {"process": self._view(pid, mounts)})
             return
+        building = seen not in self._judged and self._being_built(pid, mounts)
+        if building and name in IMAGE_HELPERS:
+            return  # an image helper outside the pivot is no cell; with a root of its own, whatever its name, it is
         key = self._key(pid, seen)
         if key is None:
             return
         self.cells[seen] = len(values)
-        if seen not in self._judged and self._being_built(pid, mounts):
+        if building:
             self._building.add(key, seen, key not in self._proved)
             return
         self._judged.add(seen)
