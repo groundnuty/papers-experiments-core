@@ -7,13 +7,17 @@ loop's, tested in `tests/loop/test_model_request_bound.py`.
 """
 
 import asyncio
+import time
 
+import httpx
 import pytest
+from openai import AsyncOpenAI
 
 from expcore.errors import InfraError, ModelRequestTimedOut
 from expcore.models.adapters import REQUEST_BOUND, AnthropicAdapter, OpenAICompatAdapter, ToolResult
 
 BOUND_S = 0.05
+SDK_BOUND_S = 0.5  # the real SDK's first request spends tens of milliseconds before it reaches the transport
 TOOLS = [{"name": "run", "description": "run code", "input_schema": {"type": "object", "properties": {}}}]
 
 
@@ -65,6 +69,38 @@ def test_b21_a_request_accepted_and_never_answered_ends_at_the_bound_as_endpoint
     assert raised.value.detail == "the model endpoint did not answer a request within 0.05 s; not resent"
     entry = backend.info()["abandoned_request"]
     assert (entry["reason"], entry["usage"], entry["prompt_bound_by"]) == (REQUEST_BOUND, "unknown", "bytes")
+
+
+@pytest.mark.parametrize("deployment_header", [None, "x-served-by"], ids=["create", "raw-response"])
+def test_b21_the_real_sdk_under_the_bound_gives_a_request_that_never_answers_up_once_and_promptly(
+    make_spec, limits, deployment_header
+):
+    """B21: the real `AsyncOpenAI` client over a transport that takes the request and never answers, on both of the
+    adapter's paths (`create`, and the raw-response path a `deployment_header` takes): the bound's cancel comes out of
+    the SDK as the bound's expiry, never as a cancel of the run or a connection error the retrier would resend; one
+    request is sent, and the step returns at the bound, not after an unwind of its own."""
+    taken = []
+
+    async def front(request):
+        taken.append(request)
+        await asyncio.Event().wait()
+
+    client = AsyncOpenAI(
+        base_url="https://llm.example.invalid/v1",
+        api_key="k",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(front)),
+    )
+    backend = OpenAICompatAdapter(make_spec(deployment_header=deployment_header), 7, limits, client=client)
+    backend.bound_requests(SDK_BOUND_S)
+    backend.begin("", "go", [])
+    started = time.monotonic()
+    with pytest.raises(ModelRequestTimedOut):
+        step(backend)
+    assert time.monotonic() - started < SDK_BOUND_S + 1.0
+    assert len(taken) == 1
+    assert backend.requests_sent == 1
+    assert backend.info()["abandoned_request"]["reason"] == REQUEST_BOUND
 
 
 def test_b21_the_anthropic_adapter_gives_a_request_up_at_the_bound_alike(make_spec, limits, fake_client):
