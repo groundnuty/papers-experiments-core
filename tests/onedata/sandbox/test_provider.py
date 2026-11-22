@@ -8,15 +8,28 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from campaign_support import LATER, make_schema
 from fake_host import FakeHost
 from sandbox_support import COMPLETE_LEVEL, FAST
+from scheduler_support import FakeExecutor, attempts_of, build, key_of, settings_for
 
+from expcore.campaign.attempts import classify
+from expcore.campaign.executor import failure_result
+from expcore.campaign.factors import FactorSchema
 from expcore.campaign.lease import LeasePool
 from expcore.errors import InfraError
-from expcore_onedata.sandbox.api import DataPathMode, SandboxError
+from expcore_onedata.sandbox.api import (
+    DataPathMode,
+    SandboxError,
+    SandboxIntegrityError,
+    SandboxStartFailed,
+    StartRefused,
+)
 from expcore_onedata.sandbox.hostops import CmdResult, MountTableError, fuse_mounts, parse_mountinfo
+from expcore_onedata.sandbox.oneclient_build import version_of
 from expcore_onedata.sandbox.provider import SandboxPlatform, SandboxProbe
 from expcore_onedata.sandbox.registry import Registry
+from expcore_onedata.sandbox.sandbox import DockerSandbox
 from expcore_onedata.testing import NOW
 from expcore_onedata.tokens import TokenRefused
 from expcore_onedata.users import GROUP, JOURNAL, SAFETY_MARGIN_S, TokenJournal, group_of
@@ -617,6 +630,119 @@ def test_o15_a_start_that_failed_is_stopped_again_by_the_launch_and_the_error_is
         run_launch(stage, "via-gate", lease)
     assert nothing_of_the_sandbox_is_left(stage)
     assert stage.platform.sandbox_probe().resource_gone(lease.key, {}) is True
+
+
+def test_a_start_that_failed_is_infrastructure_of_kind_sandbox_and_still_a_sandbox_error(stage, tmp_path, monkeypatch):
+    """A start that failed after it had made its containers (a probe of the start that did not answer) raises
+    `SandboxStartFailed`, once the launch has stopped what it made: infrastructure of the core's kind `sandbox`, and
+    still a `SandboxError` for the platform's own callers."""
+
+    def probe_did_not_answer(_sandbox):
+        raise SandboxError("a probe of the start did not answer in time")
+
+    monkeypatch.setattr(DockerSandbox, "_verify_read_only", probe_did_not_answer)
+    lease = lease_pool(stage, tmp_path).acquire(GROUP, run_key="run-1")
+    with pytest.raises(SandboxStartFailed) as caught:
+        run_launch(stage, "via-gate", lease)
+    assert isinstance(caught.value, InfraError)
+    assert isinstance(caught.value, SandboxError)
+    assert caught.value.kind == "sandbox"
+    assert "did not answer in time" in caught.value.detail
+    assert nothing_of_the_sandbox_is_left(stage)
+    assert stage.platform.sandbox_probe().resource_gone(lease.key, {}) is True
+
+
+def test_a_start_whose_read_only_probe_wrote_is_an_integrity_breach_left_as_it_was(stage, tmp_path):
+    """A failed integrity check of the start (the agent's root was writable) is no transient failure: it is raised as
+    `SandboxIntegrityError`, never as infrastructure, so it keeps its old path and is not run again, and the launch
+    still stops what the start made."""
+    stage.host.exec_handler = lambda container, argv, stdin: CmdResult(0, "WRITABLE\n")
+    lease = lease_pool(stage, tmp_path).acquire(GROUP, run_key="run-1")
+    with pytest.raises(SandboxIntegrityError, match="not read-only") as caught:
+        run_launch(stage, "via-gate", lease)
+    assert not isinstance(caught.value, InfraError)
+    assert failure_result(caught.value, ended_utc=LATER, wall_s=1.0).outcome.name == "harness_defect"
+    assert nothing_of_the_sandbox_is_left(stage)
+
+
+def version_probe_timed_out(_sandbox):
+    """The live start: oneclient's bundle did not answer its version probe in time (exit 124)."""
+    version_of(124, "")
+
+
+def test_a_version_probe_that_timed_out_at_the_start_is_infrastructure_not_a_harness_defect(stage, monkeypatch):
+    """Seen live in a running campaign: on a member just healed after a link wedge, the mount's oneclient bundle did not
+    answer its version probe (exit 124) as the sandbox started, before any turn, and the attempt ended as a harness
+    error, which ends the run. The launch now raises it as infrastructure of kind `sandbox`, charged and run again."""
+    monkeypatch.setattr(DockerSandbox, "begin", version_probe_timed_out)
+    with pytest.raises(SandboxStartFailed) as caught:
+        run_launch(stage, "via-gate")
+    result = failure_result(caught.value, ended_utc=LATER, wall_s=1200.0)
+    assert (result.outcome.name, result.outcome.infra_kind) == ("infrastructure", "sandbox")
+    assert "oneclient's --version did not name its version (exit 124)" in result.outcome.detail
+    assert classify(result) == ("infra_fail", True, False)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [StartRefused("a setting the start rejects"), TypeError("a bug of the harness")],
+    ids=["a refusal before anything existed", "a bug of the harness"],
+)
+def test_a_refusal_or_a_bug_at_the_start_is_left_as_it_was(stage, monkeypatch, error):
+    """Only a `SandboxError` of a start that began is infrastructure: a refusal before anything existed and an
+    exception that is no `SandboxError` are raised as they were, and stay what they were for the core."""
+
+    def begin(_sandbox):
+        raise error
+
+    monkeypatch.setattr(DockerSandbox, "begin", begin)
+    with pytest.raises(type(error)) as caught:
+        run_launch(stage, "via-gate")
+    assert not isinstance(caught.value, InfraError)
+    assert failure_result(caught.value, ended_utc=LATER, wall_s=1.0).outcome.name == "harness_defect"
+
+
+def test_a_sandbox_error_after_the_start_is_left_as_it_was(stage):
+    """A `SandboxError` raised in the run's body, after the start, is not the start's: it is raised as it was."""
+
+    async def body(sandbox):
+        raise SandboxError("a cell's exec failed after the start")
+
+    with pytest.raises(SandboxError) as caught:
+        run_launch(stage, "via-gate", None, body)
+    assert not isinstance(caught.value, InfraError)
+    assert not stage.host.containers
+
+
+SCHEMA = make_schema()
+ONE = FactorSchema(SCHEMA.declared, SCHEMA.order, {"api-none": SCHEMA.conditions["api-none"]})  # a plan of one run
+ONE_KEY = key_of(ONE, "api-none")
+
+
+def start_raising(error):
+    async def behaviour(request):
+        raise error
+
+    return behaviour
+
+
+@pytest.mark.parametrize(
+    ("error", "rows"),
+    [
+        (SandboxStartFailed(SandboxError("oneclient's --version did not name its version (exit 124)")), None),
+        (SandboxError("oneclient's --version did not name its version (exit 124)"), [("harness_error", 0, 1)]),
+    ],
+    ids=["the launch's start failure", "a bare sandbox error, as before"],
+)
+def test_a_start_failure_is_run_again_while_a_bare_sandbox_error_still_ends_the_run(tmp_path, error, rows):
+    """Through the scheduler: an attempt whose executor ends in the launch's start failure is charged infrastructure,
+    and the run is tried again and finishes; a bare `SandboxError` is still a harness error, which ends the run."""
+    executor = FakeExecutor({ONE_KEY: [start_raising(error), "finish"]})
+    options = {"schema": ONE, "executor": executor, "plan": {"tasks": ("task-a",), "seeds": (1,)}}
+    with build(tmp_path, settings=settings_for(max_attempts=3), **options) as scheduler:
+        scheduler.run()
+        found = attempts_of(scheduler.store, ONE_KEY)
+    assert found == (rows or [("infra_fail", 1, 1), ("done", 0, 2)])
 
 
 class RecordingLauncher:

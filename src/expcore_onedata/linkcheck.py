@@ -76,7 +76,10 @@ never a Compose `down`). Waiting also clears it, after the synchronizer's 1,800 
 **Fail closed.** A pair whose probe cannot be found, written, seen or made cold was not tested, and fails naming the
 pair and why; so does every pair when platform.toml declares none of `[link_check]`; so does a pair whose probe a
 provider outside `[link_check].providers` holds, or whose holding by any provider cannot be read, and a pair whose probe
-files are all retired when a fresh one cannot be written. Unknown is never a pass.
+files are all retired when a fresh one cannot be written. Unknown is never a pass. Such a pair is marked `untested`
+(in the record only when true), and a declared heal treats it as it treats a stuck link (`fault_matrix`): live, a pair
+whose probe could not be made ready after a run was followed by a start that failed on the same federation, so not
+testing a pair is taken as the link's symptom, never as a pass and never as a reason to leave it unhealed.
 
 **The record** (`LinkReport.to_json()`): each pair by position (`providers[i]`, never a name, O12; `reader` is the
 provider that reads the pair, the platform's local provider or another; `local` holds the same value and is its
@@ -170,6 +173,7 @@ class PairResult:
     )
     purged: int = 0  # the retired probes of the source that a passing check deleted
     unpurged: int = 0  # those it could not delete, which the next passing check deletes
+    untested: bool = False  # its probe could not be made ready, so nothing was fetched: failing, and healed as stuck
 
     @property
     def local(self) -> str:
@@ -193,6 +197,7 @@ class PairResult:
             "retired": self.retired,
             "purged": self.purged,
             "unpurged": self.unpurged,
+            **({"untested": True} if self.untested else {}),  # only when it was not tested, so older records read alike
         }
 
 
@@ -433,15 +438,16 @@ class _Check:
         return _with(result, retired=retired.ok, reason=f"{result.reason}{note}", unpurged=retired.undeleted)
 
     def _prepared(self, pair: Pair) -> _Ready | PairResult:
-        """The pair's probe made ready, or the failed result of a pair that could not be tested."""
+        """The pair's probe made ready, or the failed result of a pair that could not be tested (`untested`: it fails,
+        and the heal treats it as a stuck link, `fault_matrix.PairState.untested`)."""
         reader, source = (self._label(name) for name in pair)
         try:
             return self.prepare(pair)
         except NoFreshProbe as error:
-            return PairResult(reader, source, False, reason=str(error))
+            return PairResult(reader, source, False, reason=str(error), untested=True)
         except (PlatformError, consistency.WaitTimeout, ProbeNotReady) as error:
             why = f"{source} -> {reader} was not tested: its probe could not be made ready ({error})"
-            return PairResult(reader, source, False, reason=why)
+            return PairResult(reader, source, False, reason=why, untested=True)
 
     def run(self, pairs: Sequence[Pair], workers: int) -> tuple[PairResult, ...]:
         """Prepare every pair and fetch the ready ones, at most `workers` at once, settle each probe, and evict the

@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from expcore_onedata.readlog import files, paths
-from expcore_onedata.sandbox.api import SandboxError
+from expcore_onedata.sandbox.api import SandboxIntegrityError
 from expcore_onedata.sandbox.containers import READLOG_LOG_NAME, READLOG_PROGRAM_NAME, ReadLogDirs
 
 DIRECTORY = "readlog"  # under the run's directory: the collector's program and its log
@@ -83,7 +83,7 @@ def _pinned_copy(source: Path, target: Path, pin: str | None = None) -> str:
     target.chmod(0o444)
     found = files.sha256_of(target)
     if pin is not None and found != pin:
-        raise SandboxError("the run's copy of the read-log collector is not the pinned file")
+        raise SandboxIntegrityError("the run's copy of the read-log collector is not the pinned file")
     return found
 
 

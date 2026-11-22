@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
+from expcore.errors import InfraError
 from expcore_onedata.addresses import AddressMap
 from expcore_onedata.sandbox.gatepolicy import PAGED
 
@@ -29,6 +30,35 @@ class StartRefused(SandboxError, ValueError):
 
     Nothing was created, so the caller loses no attempt. A start that fails after it created something raises
     `SandboxError` instead, and its cleanup has run (or is registered to run again).
+    """
+
+
+class SandboxStartFailed(InfraError, SandboxError):
+    """The sandbox's start failed after it began making things: infrastructure of the core's kind `sandbox`, charged
+    and run again like any other, never a defect of the harness (`SandboxPlatform.launch` raises it).
+
+    Seen live in a running campaign: on a member just healed after a link wedge, the mount's oneclient bundle did not
+    answer its version probe in time (`oneclient's --version did not name its version (exit 124)`, a `SandboxError` from
+    the start), and the attempt ended as a harness error, which ends the run. The start comes before the run's body, so
+    before any turn of the agent: nothing the agent or the harness's own logic did is in question, only whether the
+    platform could bring the sandbox up. It is still a `SandboxError`, so the platform's own callers that catch one are
+    unchanged. A refusal before anything existed (`StartRefused`), a failed integrity or contract check
+    (`SandboxIntegrityError`), an exception that is no `SandboxError` (a bug of the harness), and a `SandboxError`
+    raised after the start, in the run's body or its teardown, are left as they were.
+    """
+
+    def __init__(self, cause: SandboxError) -> None:
+        super().__init__("sandbox", f"the sandbox did not start: {cause}"[:600])
+
+
+class SandboxIntegrityError(SandboxError):
+    """The sandbox is not what was declared, pinned or promised: an integrity or contract check failed. Examples are a
+    read-only probe that wrote, an input or pinned file whose content changed, and a helper of the harness that named
+    a token file outside the run's directory.
+
+    It is never the transient failure `SandboxStartFailed` stands for: running the attempt again would charge the run
+    for a breach that stops it, or hide one that a restored file made pass. So a start that raises it keeps its old
+    path, as any `SandboxError` did before (`SandboxPlatform.launch`).
     """
 
 

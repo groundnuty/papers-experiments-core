@@ -28,6 +28,7 @@ from expcore.config.loading import ConfigError
 from expcore_onedata import linkcheck
 from expcore_onedata.client import OnezoneClient, OutOfScope
 from expcore_onedata.config import load_platform
+from expcore_onedata.fault_matrix import LinkMatrix
 from expcore_onedata.health import PlatformHealth
 from expcore_onedata.linkcheck import PROBE_PREFIX, probe_content, probe_name
 from expcore_onedata.testing import SPACE_NAME, with_placement, write_platform
@@ -415,6 +416,42 @@ def test_o35_a_holding_that_cannot_be_read_fails_the_pair_and_is_never_dropped(
     assert other.ok
     assert probe not in alpha_reads(fake, calls)
     assert not any(value in report.detail for value in (*CONFIGURED, holder))
+
+
+def test_o35_a_pair_that_could_not_be_tested_is_marked_untested_and_healed_as_a_stuck_link(
+    fake, config, client, ticker
+):
+    """O35: a pair whose probe could not be made ready still fails the check, and is marked `untested` in its result
+    and its record (the key only when true), naming no fetch remedy; the matrix the heal reads treats it as a stuck
+    link, and a pair that passed is neither."""
+    assert run(config, client, ticker).ok
+    probe = probe_of(fake, BETA_ID)
+    fake.distribution_entries[(probe, GAMMA_ID)] = {"virtualSize": 7}  # a holding that cannot be read
+    report = run(config, client, ticker)
+    assert not report.ok
+    failed, other = pair_of(report, "alpha", "beta"), pair_of(report, "alpha", "gamma")
+    assert (failed.ok, failed.untested, failed.remedy) == (False, True, None)
+    assert "was not tested" in failed.reason
+    assert failed.to_json()["untested"] is True
+    assert (other.ok, other.untested, "untested" in other.to_json()) == (True, False, False)
+    states = {(pair.reader, pair.source): pair for pair in LinkMatrix.from_report(report).pairs}
+    untested = states[("providers[0]", "providers[1]")]
+    assert (untested.stuck, untested.untested, untested.heals) == (False, True, True)
+    assert not states[("providers[0]", "providers[2]")].heals
+
+
+def test_o35_a_pair_whose_fetch_failed_is_stuck_and_not_untested(fake, config, client, ticker):
+    """O35: a pair whose fetch failed was tested: it names the remedy, is not marked untested, and is stuck."""
+    stuck_beta(fake, ticker)
+    report = run(config, client, ticker)
+    failed = pair_of(report, "alpha", "beta")
+    assert (failed.ok, failed.untested) == (False, False)
+    assert failed.remedy is not None
+    assert "untested" not in failed.to_json()
+    state = {(pair.reader, pair.source): pair for pair in LinkMatrix.from_report(report).pairs}[
+        ("providers[0]", "providers[1]")
+    ]
+    assert (state.stuck, state.untested, state.heals) == (True, False, True)
 
 
 def test_o35_a_provider_that_lists_no_blocks_is_not_a_holder(fake, config, client, ticker):

@@ -8,9 +8,12 @@ restored) then wait. The platform's health check runs before any attempt launche
 
 - **Only on stuck pairs.** It acts only when the gate's own all-pairs link check, in the call that is answering and in
   its thread (the report the rest of the check made there, never one another call made), found a pair whose fetch
-  failed (a stuck pair, `fault_matrix.PairState.stuck`), never as routine: a check whose pairs pass, one whose only
-  failure is an untested pair, or one that failed before its link check (the space) heals nothing; and a heal whose own
-  fresh matrix shows no stuck pair (it recovered meanwhile, or only an untested pair fails) does nothing either.
+  failed or that it could not test (a stuck pair, `fault_matrix.PairState.heals`: an untested pair is healed as a stuck
+  link is, since live a pair found untested after a run was followed by a failed start), never as routine: a check
+  whose pairs pass, one whose only failure is a pair read with the wrong bytes, or one that failed before its link
+  check (the space) heals nothing; and a heal whose own fresh matrix shows no stuck or untested pair (it recovered
+  meanwhile) does nothing either. A check under a run's admission (a post-run check) heals nothing, untested pair or
+  not: the next check that holds no admission makes its own link check and heals what that finds.
 - **Only between runs, under an exclusive admission of the gate's own.** Never inside a run's admission (a post-run
   check, when the run's tokens may still be in play), and a check under a run's admission keeps a share of it until it
   ends, so one that outlives its caller still holds the federation. The gate lets its shared hold go and takes the

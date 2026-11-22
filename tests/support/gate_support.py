@@ -31,10 +31,11 @@ class ProcessEnded(BaseException):  # what a kill does to the healing thread, no
 
 class Federation(FakeServices):
     """Providers' services with scripted pairs, by label. `stuck` holds the failing pairs as (reader, source) whose
-    fetch failed; `untested` those whose probe could not be made ready (failing, with no stuck link). A link restart of
-    a reader mends its own stuck pairs unless `link_fixes[reader]` says what it mends; a container restart of a reader
-    in `container_fixes` mends its pairs. `reads` notes every all-pairs check with the clock's time: `gate` for the
-    gate's own, `heal` for the heal's; `actions` every ping, link restart, stop, start and arming of the session
+    fetch failed; `untested` those whose probe could not be made ready (failing, and healed as a stuck link is);
+    `misread` those read with bytes other than the probe's (failing, and nothing to heal). A link restart of a reader
+    mends its own stuck and untested pairs unless `link_fixes[reader]` says what it mends; a container restart of a
+    reader in `container_fixes` mends its pairs. `reads` notes every all-pairs check with the clock's time: `gate` for
+    the gate's own, `heal` for the heal's; `actions` every ping, link restart, stop, start and arming of the session
     gate."""
 
     def __init__(self, stores=None):
@@ -43,6 +44,7 @@ class Federation(FakeServices):
         self.label = {service: f"providers[{index}]" for index, service in enumerate(stores.values())}
         self.stuck: set[tuple[str, str]] = {(READER, CRASHED)}
         self.untested: set[tuple[str, str]] = set()
+        self.misread: set[tuple[str, str]] = set()
         self.link_fixes: dict[str, tuple[tuple[str, str], ...]] = {}
         self.container_fixes: set[str] = set()
         self.clock: FakeClock | None = None
@@ -63,9 +65,16 @@ class Federation(FakeServices):
 
     def matrix(self) -> LinkMatrix:
         labels = list(self.label.values())
-        failing = self.stuck | self.untested
+        failing = self.stuck | self.untested | self.misread
         pairs = tuple(
-            PairState(reader, source, (reader, source) not in failing, 0.1, (reader, source) in self.stuck)
+            PairState(
+                reader,
+                source,
+                (reader, source) not in failing,
+                0.1,
+                (reader, source) in self.stuck,
+                (reader, source) in self.untested,
+            )
             for reader in labels
             for source in labels
             if reader != source
@@ -110,8 +119,9 @@ class Federation(FakeServices):
         time.sleep(self.restart_s)
         reader = self.label[service]
         fixes = self.link_fixes.get(reader)
-        mended = {pair for pair in self.stuck if pair[0] == reader} if fixes is None else set(fixes)
+        mended = {pair for pair in self.stuck | self.untested if pair[0] == reader} if fixes is None else set(fixes)
         self.stuck -= mended
+        self.untested -= mended
         return "ok"
 
     def stop(self, service):

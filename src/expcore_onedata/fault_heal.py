@@ -450,8 +450,12 @@ class LinkHeal:
         current = before = self._read()
         if current.ok:
             return self._end("healed", current, before)
-        if self._only_stuck and not current.stuck_readers():  # no failed fetch: no link to heal, so nothing is done
-            why = "the heal's fresh link check could not run" if not current.pairs else "no pair failed a fetch"
+        if self._only_stuck and not current.stuck_readers():  # no failed fetch, nothing untested: nothing to heal
+            why = (
+                "the heal's fresh link check could not run"
+                if not current.pairs
+                else "no pair failed a fetch or was untested"
+            )
             return self._end("links_stuck", current, before, f"{why} in the heal's fresh matrix, so nothing was done")
         if self._mode == "all_links":
             stop, current, why = self._all_links(before)
