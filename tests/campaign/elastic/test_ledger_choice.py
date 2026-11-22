@@ -49,7 +49,8 @@ def test_c42_a_returned_run_reopens_its_set(tmp_path):
 
 
 def test_c42_a_run_expired_in_an_earlier_set_reopens_it(tmp_path):
-    """C42: an expired lease puts its run back, so its set is the current one again."""
+    """C42: an expired lease puts its run back, so its set is the current one again: nothing is sent ahead to the later
+    set while the run is held for its holder (C68), and once the holder is proven ended the run goes out."""
     runs = plan(tasks=1, sets=CORE_FIRST)
     ledger, clock = make(tmp_path, runs=runs)
     for label in ("fed-1", "fed-2", "fed-3"):
@@ -62,6 +63,11 @@ def test_c42_a_run_expired_in_an_earlier_set_reopens_it(tmp_path):
     clock.advance(101)
     ledger.observe_site(SITE, SiteReading(heartbeats={later.lease_id: 3}))
     assert ledger.lease(core.lease_id).state == "expired"
+    waiting = ledger.issue("fed-3")
+    assert isinstance(waiting, Wait)
+    assert waiting.reason.startswith("set 0 waits: ")
+    assert f"run {core.run_key} is held" in waiting.reason
+    ledger.prove_ended("fed-1", "terminal")
     assert leased(ledger, "fed-3").run_key == core.run_key
 
 

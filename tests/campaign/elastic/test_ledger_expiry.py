@@ -10,6 +10,7 @@ from elastic_support import (
     leased,
     ledger_path,
     make,
+    overdue,
     plan,
 )
 
@@ -25,9 +26,11 @@ def _beat(ledger, lease, counter, site=SITE):
 
 def test_c42_expiry_before_proof_requeues_the_run_at_once_but_holds_its_grant_and_cap_slot(tmp_path):
     """C42: a stale heartbeat on a readable site expires the lease and puts its run back to pending at once; the cap
-    slot and the grant stay held, so the model at cap 1 waits until the holder is proven ended, and then the same
-    run goes out again with the expired lease charged at its bound."""
-    ledger, clock = make(tmp_path, **ONE_RUN, caps={"m1": 1}, max_usd=10.0, grants_usd={"m1": 2.0})
+    slot and the grant stay held, so the model at cap 1 waits until the holder is proven ended, and the run itself is
+    held until its count is final (C68): once its settle is overdue the same run goes out again with the expired
+    lease charged at its bound."""
+    runs = plan(tasks=2, conditions=("api-none",))
+    ledger, clock = make(tmp_path, runs=runs, caps={"m1": 1}, max_usd=10.0, grants_usd={"m1": 2.0})
     join(ledger, clock, "fed-1")
     join(ledger, clock, "fed-2")
     first = leased(ledger, "fed-1")
@@ -41,10 +44,12 @@ def test_c42_expiry_before_proof_requeues_the_run_at_once_but_holds_its_grant_an
     waiting = ledger.issue("fed-2")
     assert isinstance(waiting, Wait)
     assert "cap" in waiting.reason
+    assert f"run {first.run_key} is held: lease {first.lease_id} expired" in waiting.reason
     assert_invariants(ledger)
     ledger.prove_ended("fed-1", "cancelled")
     assert ledger.slots() == {}
     assert ledger.committed_micro()[0] == 2_000_000  # proven ended with no completion: charged at its bound
+    overdue(ledger, clock)
     second = leased(ledger, "fed-2")
     assert (second.run_key, second.attempt_base) == (first.run_key, 1)  # the loss was one charged attempt
     assert_invariants(ledger)

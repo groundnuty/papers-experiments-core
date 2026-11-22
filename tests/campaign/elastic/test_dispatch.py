@@ -159,11 +159,12 @@ def test_c44_a_heartbeat_that_advances_keeps_its_lease_and_one_that_stands_still
 
 def test_c44_a_partition_expires_a_sites_leases_after_site_out_and_the_late_completion_is_superseded(tmp_path):
     """C44: a site unreachable for N ticks is unread, not stale: its lease holds until the ledger's site_out_s (15
-    minutes), then expires, and its run goes to another site's federation. When the site returns, the completion the
-    first federation left is read and fenced: the later lease's completion is the run's, the earlier one is
-    superseded, and the run is counted once."""
+    minutes), then expires. Its run is held while its holder may still run (C68), and goes to another site's
+    federation once the unread site's job is proven ended (its recorded end plus KillWait passed). When the site
+    returns, the completion the first federation left is read and fenced: the later lease's completion is the run's,
+    the earlier one is superseded, and the run is counted once."""
     ledger, clock = make(tmp_path, **ONE_RUN, caps={"m1": 2})
-    join(ledger, clock, "fed-a")
+    join(ledger, clock, "fed-a", job_end_in_s=1000.0)
     ssh = FakeSsh()
     site_a, site_b = site_of(tmp_path), site_of(tmp_path, "site-b")
     dispatch = dispatcher(tmp_path, ledger, ssh, site_a, site_b)
@@ -178,6 +179,10 @@ def test_c44_a_partition_expires_a_sites_leases_after_site_out_and_the_late_comp
     ticks(dispatch, clock, 1)
     assert ledger.lease(first.lease_id).state == "expired"
     ticks(dispatch, clock, 1)
+    assert [lease.federation for lease in ledger.leases()] == ["fed-a"]  # held: fed-a may still be running it
+    assert first.run_key in ledger.holds()
+    ticks(dispatch, clock, 7)  # past fed-a's recorded end plus KillWait
+    assert {fed.label: fed.end_proof for fed in ledger.federations()}["fed-a"] == "walltime"
     second = next(lease for lease in ledger.leases() if lease.federation == "fed-b")
     assert (second.run_key, second.state) == (first.run_key, "sent")
     complete(site_a, "fed-a", first)

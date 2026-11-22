@@ -203,7 +203,9 @@ class LedgerView:
     hard_term_s: float
     lost: tuple[tuple[int, str, str], ...] = ()  # (lease id, federation, state) of each lost lease not yet settled
     money: Mapping[str, object] = field(default_factory=dict)  # the ledger's `status()`, for the log and the status
-    reopenable: int = 0  # runs exhausted by a loss's conservative charge whose lost lease a settle may still reopen
+    # runs a settle of a lost lease may still let be leased: exhausted by its loss's conservative charge, or held for
+    # it (C68)
+    reopenable: int = 0
 
     def leases_wanted(self) -> int:
         """How many more leases the ledger could issue now: each model of the current set below its cap with runs
@@ -260,10 +262,13 @@ def ledger_view(views: LedgerViews) -> LedgerView:
         if lease.lease_id not in settled and (lease.state == "lost" or (lease.state == "expired" and lease.proven))
     )
     # An exhausted run is not final while a lost lease of it is unsettled: a settle that shows fewer attempts reopens
-    # it. Only a ledger with a budget settles, so only there may such a run come back.
+    # it. A pending run held for a lost lease's settle (C68; a settle of its spend alone included) is leased once a
+    # settle gives its attempts or it is overdue. Only a ledger with a budget settles, so only there may such a run
+    # come back.
     exhausted = {run.run_key for run in views.runs() if run.state == "infra_exhausted"}
     lost_ids = {lease_id for lease_id, _, _ in lost}
-    reopenable = len({lease.run_key for lease in leases if lease.lease_id in lost_ids and lease.run_key in exhausted})
+    reopening = {lease.run_key for lease in leases if lease.lease_id in lost_ids and lease.run_key in exhausted}
+    reopenable = len(reopening | views.held_for_settle())
     money = {"ceiling_micro": status.ceiling_micro, "committed_micro": status.committed_micro,
              "remaining_micro": status.remaining_micro, "locked_micro": status.locked_micro,
              "locked_by_state": dict(status.locked_by_state)}  # fmt: skip

@@ -27,7 +27,8 @@ def test_c42_a_draining_federation_gets_no_new_lease_and_its_lease_in_flight_sti
 
 def test_c42_demand_gives_the_current_set_its_pending_runs_and_the_slots_held_per_model(tmp_path):
     """C42: the controller's target reads the current set, its pending runs per model and the cap slots held per
-    model (in flight and held back); an expired lease's run counts as pending again while its slot stays held."""
+    model (in flight and held back); an expired lease's run is held (C68), its set still current, and counts as
+    pending again once its holder is proven ended."""
     runs = plan(models=("m1", "m2"), tasks=2, sets={"mount-read": 1})
     ledger, clock = make(tmp_path, runs=runs, caps={"m1": 1})
     assert ledger.demand() == Demand(set_index=0, pending={"m1": 2, "m2": 2}, slots={})
@@ -39,7 +40,7 @@ def test_c42_demand_gives_the_current_set_its_pending_runs_and_the_slots_held_pe
     clock.advance(301)
     ledger.observe_site(SITE, SiteReading())
     assert ledger.lease(first.lease_id).state == "expired"
-    assert ledger.demand() == Demand(set_index=0, pending={"m1": 2, "m2": 2}, slots={"m1": 1, "m2": 1})
+    assert ledger.demand() == Demand(set_index=0, pending={"m1": 1, "m2": 1}, slots={"m1": 1, "m2": 1})
     ledger.prove_ended("fed-1", "cancelled")
     ledger.prove_ended("fed-2", "cancelled")
     assert ledger.demand() == Demand(set_index=0, pending={"m1": 2, "m2": 2}, slots={})
