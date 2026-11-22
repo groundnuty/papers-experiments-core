@@ -42,9 +42,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -180,41 +181,73 @@ def record_checks(text: str | None) -> tuple[bool, bool]:
     return valid, replayed
 
 
-def negative(world: Any, injector: Any, box: Any, owner_path: str, bound_s: float) -> dict[str, Any]:
-    """N's cell under the driver's own outage (P12): what its deadline and its next cell were."""
-    result: dict[str, Any] = {}
+def negative(box: Any, owner_path: str, rest: str, bound_s: float, local_held: int | None) -> dict[str, Any]:
+    """N's cell under the driver's own outage (P12): what its deadline and its next cell showed, as a summary
+    (`fuse_proof.negative_summary`); the raw deadline, which names the space, never leaves this function."""
     done = box.exec(FP.owner_read(owner_path), bound_s)
     deadlines = (box.metadata() or {}).get("cell_deadlines") or []
-    result["deadline"] = deadlines[-1] if deadlines else None
-    result["restore_pending"] = bool(getattr(done, "restore_pending", False))
     try:
         box.exec("print('next')", 30)
-        result["next_cell"] = "ran"
+        next_cell = "ran"
     except InfraError as refused:
-        result["next_cell"] = refused.kind
-    return result
+        next_cell = refused.kind
+    return FP.negative_summary(
+        deadlines[-1] if deadlines else None, rest=rest, restore_pending=bool(getattr(done, "restore_pending", False)),
+        next_cell=next_cell, local_held_before=local_held,
+    )  # fmt: skip
 
 
-def teardown(world: Any, files: Any, boxes: dict[str, Any]) -> list[str]:
-    """Stop the direct sandboxes, count the proof's FUSE mounts left and remove the seeded files; what went wrong."""
+def teardown(world: Any, files: Any, boxes: dict[str, Any], injector: Any = None) -> list[str]:
+    """Bring the negative's provider back (a second `clear`, which verifies a restore a cut left unverified and does
+    nothing after a verified one), stop the direct sandboxes, count the proof's FUSE mounts left and remove the seeded
+    files: each step on its own, so one that fails never skips the others. What went wrong."""
     found: list[str] = []
-    free = getattr(world, "free", None)
-    for name, box in boxes.items():
-        if box is None:
-            continue
-        if free is not None:
-            free(f"fuse-proof-{name}")
+    with _cuts_deferred():
+        if injector is not None:
+            try:
+                if injector.clear() is False:
+                    found.append("the negative's provider restore is not verified")
+            except Exception as error:
+                found.append(f"the negative's provider restore raised {type(error).__name__}")
+        free = getattr(world, "free", None)
+        for name, box in boxes.items():
+            if box is None:
+                continue
+            try:
+                if free is not None:
+                    free(f"fuse-proof-{name}")
+                box.stop()
+            except Exception as error:
+                found.append(f"the {name} sandbox's stop raised {type(error).__name__}")
         try:
-            box.stop()
+            left = world.mounts_left()
+            if left:
+                found.append(f"{left} FUSE mount(s) of the proof are left")
         except Exception as error:
-            found.append(f"the {name} sandbox's stop raised {type(error).__name__}")
-    left = world.mounts_left()
-    if left:
-        found.append(f"{left} FUSE mount(s) of the proof are left")
-    removed = files.remove_all()
-    if removed:
-        found.append(f"{len(removed)} seeded file(s) could not be removed")
+            found.append(f"the proof's FUSE mounts could not be counted ({type(error).__name__})")
+        if files is not None:
+            try:
+                removed = files.remove_all()
+                if removed:
+                    found.append(f"{len(removed)} seeded file(s) could not be removed")
+            except Exception as error:
+                found.append(f"the seeded files' removal raised {type(error).__name__}")
     return found
+
+
+@contextlib.contextmanager
+def _cuts_deferred() -> Iterator[None]:
+    """SIGINT and SIGTERM ignored for the body (the teardown), in the main thread, where a handler can be set: a cut
+    that lands meanwhile never leaves a sandbox, a mount or a seeded file behind. Elsewhere, nothing changes."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = {sig: signal.signal(sig, signal.SIG_IGN) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def run_proof(
@@ -238,31 +271,35 @@ def run_proof(
     def mark(name: str) -> None:
         facts["times"][name] = round(time.monotonic() - began, 1)
 
-    files = world.files()
-    local, owner_provider = world.local_name, world.provider_of(world.target)
-    folder = "fuse-proof" if settings_world == "fake" else f"fuse-proof-{uuid.uuid4().hex[:8]}"
-    root = files.root(local, world.space_id)
-    top = files.make(local, root, folder, "DIR")
-    seeded = wait_seen(files, owner_provider, top)
-    # one owner-only file per outage: a read of one whose fetch ends after its restore gives the local provider a copy,
-    # so the registered read and the negative's never share a file
-    owners: dict[str, str] = {}
-    for name in (REGISTERED_FILE, NEGATIVE_FILE):
-        owners[name] = files.make(owner_provider, top, name, "REG")
-        files.write(owner_provider, owners[name], 0, OWNER_BYTES)
-        seeded = seeded and wait_seen(files, local, owners[name])
-    here = files.make(local, top, "local.bin", "REG")
-    files.write(local, here, 0, LOCAL_BYTES)
-    seeded = seeded and wait_seen(files, owner_provider, here)
-    space_root = f"{world.mount_path}/{world.space_name}"
-    path_of = {name: f"{space_root}/{folder}/{name}" for name in owners}
-    owner_path, negative_path = path_of[REGISTERED_FILE], path_of[NEGATIVE_FILE]
-    local_path = f"{space_root}/{folder}/local.bin"
-    facts.update(seeded=seeded, owner_rest=f"{folder}/{REGISTERED_FILE}")
-    facts["local_sha256"] = hashlib.sha256(LOCAL_BYTES if settings_world != "fake" else _fake_local()).hexdigest()
-    mark("seeded")
-    control = unregistered = None
+    files = control = unregistered = injector = None
     try:
+        files = world.files()  # the seeding is inside the teardown's reach: what it made is removed however it ends
+        local, owner_provider = world.local_name, world.provider_of(world.target)
+        folder = "fuse-proof" if settings_world == "fake" else f"fuse-proof-{uuid.uuid4().hex[:8]}"
+        root = files.root(local, world.space_id)
+        top = files.make(local, root, folder, "DIR")
+        seeded = wait_seen(files, owner_provider, top)
+        # one owner-only file per outage: a read of one whose fetch ends after its restore gives the local provider a
+        # copy, so the registered read and the negative's never share a file
+        owners: dict[str, str] = {}
+        for name in (REGISTERED_FILE, NEGATIVE_FILE):
+            owners[name] = files.make(owner_provider, top, name, "REG")
+            files.write(owner_provider, owners[name], 0, OWNER_BYTES)
+            seeded = seeded and wait_seen(files, local, owners[name])
+        here = files.make(local, top, "local.bin", "REG")
+        files.write(local, here, 0, LOCAL_BYTES)
+        seeded = seeded and wait_seen(files, owner_provider, here)
+        space_root = f"{world.mount_path}/{world.space_name}"
+        path_of = {name: f"{space_root}/{folder}/{name}" for name in owners}
+        rest_of = {name: f"{folder}/{name}" for name in owners}
+        owner_path, negative_path = path_of[REGISTERED_FILE], path_of[NEGATIVE_FILE]
+        local_path = f"{space_root}/{folder}/local.bin"
+        local_sha = hashlib.sha256(LOCAL_BYTES if settings_world != "fake" else _fake_local()).hexdigest()
+        facts.update(seeded=seeded, owner_rest=rest_of[REGISTERED_FILE], local_sha256=local_sha)
+        mark("seeded")
+        if not seeded:
+            raise ProofStopped("the seeded files were not all seen in time")
+
         control = world.direct("fuse-proof-control")
         reads: list[str | None] = [sha_of(control.exec(FP.local_read(local_path, space_root), 60).stdout)]
         mark("control_up")
@@ -290,37 +327,41 @@ def run_proof(
         facts["campaign_exit"] = run_campaign(study)
         mark("registered_done")
         record, text = registered_record(study)
-        facts["registered"] = FP.record_facts(record) if record is not None else {}
+        if record is not None:
+            facts["registered"] = FP.record_facts(
+                record, rest=rest_of[REGISTERED_FILE], bound_s=bound_s, local_sha256=local_sha
+            )
         facts["record_valid"], facts["replayed"] = record_checks(text)
         reads.append(sha_of(control.exec(FP.local_read(local_path, space_root), 60).stdout))
-        if record is None:
-            raise ProofStopped(f"the campaign wrote no registered record (exit {facts['campaign_exit']})")
+        if record is None or facts["campaign_exit"] != 0:  # no second outage after a campaign that failed
+            raise ProofStopped(
+                f"the campaign exited {facts['campaign_exit']} (registered record: {record is not None})"
+            )
 
         sleep(gap_s)  # the run's clear waited out the session drain already: this only adds to it
         mark("gap_done")
         unregistered = world.direct("fuse-proof-negative")
-        injector = world.injector(world.target)
+        negative_held = world.local_held(owners[NEGATIVE_FILE])
+        if negative_held != 0:
+            raise ProofStopped(f"the local provider holds {negative_held} byte(s) of the negative's file")
+        injector = world.injector(world.target)  # kept for the teardown: a cut in its clear is cleared again there
         with injector.session({"run_key": "fuse-proof-negative-outage", "attempt": 1}):
             mark("negative_outage")
-            facts["negative"] = negative(world, injector, unregistered, negative_path, bound_s)
+            facts["negative"] = negative(unregistered, negative_path, rest_of[NEGATIVE_FILE], bound_s, negative_held)
             reads.append(sha_of(control.exec(FP.local_read(local_path, space_root), 60).stdout))
         mark("negative_restored")
-        facts["negative_problems"] = FP.negative_problems(facts["negative"])
-        facts["negative"]["deadline"] = None  # its record is checked above; the facts keep the verdict only
         facts["control"] = {"reads": reads, **mount_facts(control)}
-        facts["control_problems"] = FP.control_problems(facts["control"])
     except ProofStopped as stopped:  # a stop of the proof's own: the teardown runs, and the facts say why
         facts["stopped"] = str(stopped)
     except BaseException as error:  # a cut (the file-count watcher's SIGINT) or a failure: the teardown still runs
         facts["cut"] = type(error).__name__
         raise
     finally:
-        facts["teardown_problems"] = teardown(world, files, {"control": control, "negative": unregistered})
-        facts["scans"] = "not_run"  # the facts are scanned on the host they are pulled to
+        facts["teardown_problems"] = teardown(
+            world, files, {"control": control, "negative": unregistered}, injector=injector
+        )
         mark("done")
-        cut = [f"the proof was cut ({facts['cut']}): nothing after it was shown"] if "cut" in facts else []
-        stopped = [f"the proof stopped: {facts['stopped']}"] if "stopped" in facts else []
-        facts["problems"] = FP.problems(facts) + cut + stopped
+        facts["problems"] = FP.problems(facts)
         (out / "facts.json").write_text(json.dumps(facts, indent=1, default=str), encoding="utf-8")
     return facts
 
@@ -333,19 +374,25 @@ def _fake_local() -> bytes:
 
 def live_campaign(study: Path) -> int:
     """The campaign in a process of its own, on this interpreter, as a study's run is made. A SIGINT or SIGTERM to the
-    driver (the file-count watcher's cut, or the step's end) is passed on to it as SIGINT and its end is awaited: its
-    injector clears and its sandbox stops on their own way out, never killed under them. The driver then tears down
-    its own sandboxes and files (`run_proof`)."""
-    child = subprocess.Popen([sys.executable, "-I", "-B", "-m", "expcore", "run", str(study)])
+    driver (the file-count watcher's cut, or the step's end) is passed on to it once, as SIGINT, and its end is awaited:
+    its injector clears and its sandbox stops on their own way out, never killed under them. The handler is in place
+    before the child starts, so a cut in between is remembered and passed on as soon as there is a child. The driver
+    then tears down its own sandboxes and files (`run_proof`)."""
     asked: list[int] = []
+    child: subprocess.Popen[bytes] | None = None
 
     def forward(signum: int, frame: Any) -> None:
         asked.append(signum)
-        with contextlib.suppress(ProcessLookupError):
-            child.send_signal(signal.SIGINT)
+        if child is not None and len(asked) == 1:
+            with contextlib.suppress(ProcessLookupError):
+                child.send_signal(signal.SIGINT)
 
     previous = {sig: signal.signal(sig, forward) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
+        child = subprocess.Popen([sys.executable, "-I", "-B", "-m", "expcore", "run", str(study)])
+        if asked:  # a cut before the child existed
+            with contextlib.suppress(ProcessLookupError):
+                child.send_signal(signal.SIGINT)
         code = child.wait()
     finally:
         for sig, handler in previous.items():

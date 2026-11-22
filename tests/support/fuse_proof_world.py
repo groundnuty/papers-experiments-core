@@ -35,7 +35,7 @@ from expcore_onedata.sandbox.apptainer.hostmount import host_mount_factory
 from expcore_onedata.sandbox.apptainer.node import LocalNode
 from expcore_onedata.sandbox.apptainer.sandbox import ApptainerSandbox
 from expcore_onedata.sandbox.provider import SandboxPlatform
-from expcore_onedata.tokens import TokenIssuer
+from expcore_onedata.tokens import Plane, TokenIssuer
 
 log = logging.getLogger("fuse_proof")
 TOKEN_CEILING_S = 7200.0  # the direct sandboxes' tokens: the whole step, with room
@@ -51,10 +51,14 @@ def mount_level(config: Any) -> str:
 
 def pick_space(config: Any) -> tuple[Any, str]:
     """A space whose data provider is not the agent's local one for that space, and that provider's label: the target
-    the outage takes down. The first such space, in the file's order. Each entry's own support set names its local
-    provider: `config.support` is the one-space form's alone, and a file of several spaces refuses it."""
+    the outage takes down. The first such space, in the file's order, of those a data-path token reaches. Each entry's
+    own support set names its local provider: `config.support` is the one-space form's alone, and a file of several
+    spaces refuses it."""
     holders = config.space_holders()
+    mountable = set(config.space_ids(Plane.DATA_PATH))  # the spaces a data-path token reaches: a mount shows no other
     for entry in config.spaces:
+        if entry.space.id not in mountable:
+            continue
         label = holders.get(entry.space.name)
         if label is not None and label != config.provider_label(entry.support.local):
             return entry, label

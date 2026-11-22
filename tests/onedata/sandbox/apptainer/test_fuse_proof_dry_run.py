@@ -11,6 +11,7 @@ campaign are the core's own. The pass list is the live one (`fuse_proof.problems
 """
 
 import importlib.util
+import json
 import shutil
 from pathlib import Path
 
@@ -62,12 +63,13 @@ def test_o97_the_registered_attempt_is_the_agents_and_its_mount_comes_back_twice
 
 
 def test_o97_the_unregistered_read_under_the_same_outage_stays_infrastructure(proof):
-    assert proof["negative_problems"] == []
+    assert FP.negative_problems(proof["negative"]) == []
     assert proof["negative"]["next_cell"] == "cell_unkillable"
+    assert (proof["negative"]["outcome"], proof["negative"]["blocked_on_expected"]) == ("mount_aborted", True)
 
 
 def test_o97_the_control_reads_the_same_file_three_times_and_is_never_touched(proof):
-    assert proof["control_problems"] == []
+    assert FP.control_problems(proof["control"], proof["local_sha256"]) == []
     assert len(proof["control"]["reads"]) == 3
 
 
@@ -171,7 +173,9 @@ def test_o97_a_registered_file_the_local_provider_already_holds_stops_the_proof_
     )  # fmt: skip
     assert campaigns == []
     assert facts["local_held_before"] == len(fuse_proof_fake.OWNER_BYTES)
-    assert any("the proof stopped: the local provider holds" in p for p in facts["problems"])
+    assert facts["stopped"].startswith("the local provider holds")
+    assert any("did not run whole (stopped)" in p for p in facts["problems"])
+    assert any("held 16384 byte(s) of the registered file" in p for p in facts["problems"])
     assert facts["teardown_problems"] == []
 
 
@@ -253,3 +257,115 @@ def test_o97_the_live_world_makes_the_sandboxes_work_root_as_the_worker_does(tmp
     assert stat.S_IMODE(root.stat().st_mode) == 0o700
     make_work_root(root)  # already there: kept, never an error
     assert root.is_dir()
+
+
+# ------------------------------------------------------------------------------------------------ the Codex round
+def test_o97_the_facts_hold_no_space_name_no_path_of_the_mount_and_no_text_of_the_record(proof):
+    """O97 (Codex): the facts hold labels, counts, numbers and booleans; no space name, no mount path, no tool text."""
+    written = json.dumps(proof)
+    assert fuse_proof_fake.SPACE not in written
+    assert "/data/" not in written
+    assert "text_tail" not in written
+    assert "deadline" not in json.dumps(proof["negative"])
+
+
+def test_o97_the_pass_list_computes_every_verdict_from_the_facts(proof):
+    """O97 (Codex): a passing set of facts fails once its control or negative summary is gone, its control digests are
+    not the local file's, its campaign failed, or it was stopped or cut: no verdict is taken from a cached list."""
+    import copy
+
+    assert FP.problems(proof) == []
+
+    def without(change):
+        facts = copy.deepcopy(proof)
+        change(facts)
+        return FP.problems(facts)
+
+    assert any(p.startswith("P7:") for p in without(lambda f: f.pop("control")))
+    assert any(p.startswith("P12:") for p in without(lambda f: f.pop("negative")))
+    assert any(p.startswith("P7:") for p in without(lambda f: f["control"].update(reads=["0" * 64] * 3)))
+    assert any(p.startswith("P4:") for p in without(lambda f: f.update(campaign_exit=1)))
+    assert any(p.startswith("P1:") for p in without(lambda f: f.update(stopped="a stop")))
+    assert any(p.startswith("P1:") for p in without(lambda f: f.update(cut="KeyboardInterrupt")))
+    assert any(p.startswith("P1:") for p in without(lambda f: f.update(seeded=False)))
+    assert any(p.startswith("P12:") for p in without(lambda f: f["negative"].update(outcome="sandbox_stopped")))
+
+
+def test_o97_a_survivors_file_and_another_survivors_call_are_never_joined():
+    """O97 (Codex): the registered file named by one survivor and a task in D of another prove nothing together."""
+    deadline = {
+        "outcome": "mount_restored",
+        "steps": [{"step": "survived", "left": 2, "states": ["D", "S"]}],
+        "survivors": [
+            {"comm": "a", "state": "S", "tasks": [{"state": "S"}], "waits_on": [{"mount": "data", "path": "f/x.bin"}]},
+            {"comm": "b", "state": "D", "tasks": [{"state": "D", "wchan": "w", "syscall": {"nr": 0, "fd": 3}}]},
+        ],
+    }
+    assert FP.deadline_facts(deadline, "f/x.bin")["blocked_on_expected"] is False
+    deadline["survivors"][1]["waits_on"] = [{"mount": "data", "path": "f/x.bin"}]
+    assert FP.deadline_facts(deadline, "f/x.bin")["blocked_on_expected"] is True
+
+
+def test_o97_a_seeding_that_fails_part_way_leaves_nothing_behind(tmp_path, monkeypatch):
+    """O97 (Codex): what the seeding made before it failed is removed by the teardown, which the seeding is inside."""
+    world = fuse_proof_fake.FakeWorld(tmp_path / "world")
+    world.install(monkeypatch)
+    made = fuse_proof_fake.FakeFiles()
+    calls = {"writes": 0}
+
+    def failing_write(provider, file_id, offset, data):
+        calls["writes"] += 1
+        if calls["writes"] == 2:
+            raise RuntimeError("a write answered 500")
+
+    monkeypatch.setattr(made, "write", failing_write)
+    monkeypatch.setattr(world, "files", lambda: made)
+    with pytest.raises(RuntimeError):
+        load_driver().run_proof(
+            world, tmp_path / "out", bound_s=BOUND_S, time_cap_s=120, gap_s=0.0, second_cycle=True,
+            run_campaign=lambda study: 0, settings_world="fake",
+        )  # fmt: skip
+    assert made.created == []
+    facts = json.loads((tmp_path / "out" / "facts.json").read_text())
+    assert facts["cut"] == "RuntimeError"
+    assert facts["problems"]
+
+
+def test_o97_one_teardown_step_that_fails_never_skips_the_others(tmp_path):
+    """O97 (Codex): a mount count that raises still lets the seeded files be removed and the injector be cleared."""
+    cleared, made = [], fuse_proof_fake.FakeFiles()
+    made.created.append("a-file")
+
+    class World:
+        def mounts_left(self):
+            raise OSError("the mount table could not be read")
+
+    class Injector:
+        def clear(self):
+            cleared.append(True)
+            return False
+
+    found = load_driver().teardown(World(), made, {"control": None}, injector=Injector())
+    assert cleared == [True]
+    assert made.created == []
+    assert "the negative's provider restore is not verified" in found
+    assert any("could not be counted" in p for p in found)
+
+
+def test_o97_the_target_is_never_a_space_the_data_path_token_does_not_reach(tmp_path, monkeypatch):
+    """O97 (Codex): a space whose token planes leave out the data path is never mounted, so it is never the target."""
+    from fuse_proof_world import pick_space
+
+    from expcore_onedata.config import load_platform
+    from expcore_onedata.testing import ADMIN_ENV, write_platform
+    from expcore_onedata.testing.world import SPACE_NAMES, with_spaces
+
+    monkeypatch.setenv(ADMIN_ENV, "admin-credential-value")
+
+    def two_remote(data):
+        with_spaces(data, 3)
+        data["spaces"][1].update(holder="beta", tokens=["tool_server"])  # the first remote one: no data path
+        data["spaces"][2].update(holder="beta")
+
+    entry, target = pick_space(load_platform(write_platform(tmp_path, two_remote)))
+    assert (entry.space.name, target) == (SPACE_NAMES[2], "providers[1]")
