@@ -11,6 +11,7 @@ campaign are the core's own. The pass list is the live one (`fuse_proof.problems
 """
 
 import importlib.util
+import shutil
 from pathlib import Path
 
 import fuse_proof as FP
@@ -179,3 +180,62 @@ def test_o97_the_control_condition_never_reads_the_owner_only_file():
     file the registered run must find only on its owner."""
     control = FP.script("/data/s/owner.bin", "/data/s/local.bin", "/data/s", second_cycle=True, owner_reads=False)
     assert not any(FP.OWNER_MARK in call[1]["code"] for turn in control if isinstance(turn, list) for call in turn)
+
+
+def test_o97_the_live_study_passes_the_campaigns_deferral_checks_at_its_start(tmp_path, monkeypatch):
+    """O97 (before H3 on Helios): the minimal study as the driver writes it live, beside a platform file that heals
+    every link over several spaces, is held to the platform's own deferral as the scheduler holds it at its start
+    (`Scheduler._check_deferral`, with the core's own `platform_deferrals`, the platform's health check and run
+    admission): the driver's `max_defer_s` covers what the platform declares, so the campaign is not refused at its
+    start after the federation is up."""
+    from fault_support import faults_table
+
+    from expcore.campaign.healthgate import deferral_bound
+    from expcore.study.config import load_study
+    from expcore.study.platform_deferral import platform_deferrals
+    from expcore_onedata.admission import run_admission
+    from expcore_onedata.client import OnezoneClient
+    from expcore_onedata.config import load_platform
+    from expcore_onedata.health import PlatformHealth
+    from expcore_onedata.testing import ADMIN_ENV, write_platform
+    from expcore_onedata.testing.world import with_link_check, with_spaces
+    from expcore_onedata.tokens import TokenIssuer
+
+    monkeypatch.setenv(ADMIN_ENV, "admin-credential-value")
+
+    def heals_every_link(data):
+        with_spaces(data, 2)
+        data["spaces"][1].update(holder="beta")
+        with_link_check(data)
+        data["faults"] = faults_table(  # the journal in full, as `up` renders it: one beside study.toml is refused
+            heal="all_links",
+            heal_container_fallback=True,
+            gate_timeout_s=300,
+            journal=str(tmp_path / "fed" / "journal"),
+        )
+        data["tokens"] = {**data.get("tokens", {}), "margin_s": 20000}
+
+    (tmp_path / "fed").mkdir()
+    platform = write_platform(tmp_path / "fed", heals_every_link)
+    driver = load_driver()
+    settings = {"support": str(DRIVER.parents[1] / "support"), "world": "live", "platform": str(platform)}
+    study_dir = driver.write_study(
+        tmp_path / "out", settings, target="providers[1]", bound_s=30, time_cap_s=900, platform=platform
+    )
+    # the fixture's platform file names its credentials and manifests relatively; a rendered one names them absolutely
+    shutil.copytree(tmp_path / "fed", study_dir, dirs_exist_ok=True, ignore=shutil.ignore_patterns("platform.toml"))
+    study = load_study(study_dir)
+    config = load_platform(study_dir / "platform.toml")
+    client = OnezoneClient(config)
+    health = PlatformHealth(config, client, TokenIssuer(client, config))
+    admission = run_admission(config, study.schema)
+    scheduler = study.campaign.scheduler
+    declared, reported = platform_deferrals(study), deferral_bound(health)
+    assert declared  # the platform declares its deferral from its own file
+    assert reported is not None  # and so does its health check
+    assert scheduler.max_defer_s == driver.max_defer_s_for(study_dir / "platform.toml")
+    for found in declared:  # the scheduler's own checks, in its order; each raises on a refusal
+        scheduler.check_declared_deferral(found.bound, reported, exposed=True, source="the platform")
+    scheduler.check_declared_deferral(admission.declared_deferral_s(), reported, exposed=True)
+    scheduler.check_deferral_bound(reported)
+    client.close()
