@@ -66,6 +66,7 @@ from expcore.config.loading import ConfigError
 from expcore.models.route import sdk_version
 from expcore.package.anonymise import Anonymisation, holds_term, load_anonymisation, refuse_models, rewrite
 from expcore.package.archive import SUMS_FILE, render_sums, verify_sums, write_archive
+from expcore.package.by_run import Repinned
 from expcore.package.identity import (
     PREFIX_DIGITS,
     anonymise_identity,
@@ -115,6 +116,7 @@ from expcore.study.pipeline import ANALYSIS_FILE, OUT_DIR, OUTPUT_FILES, RUNS_DI
 PACKAGE_FILE = "PACKAGE.json"
 PACKAGE_FORMAT = "expcore-package/1"
 SIDE_FILES_KEY = "side_files"  # the key of PACKAGE.json that records the study's declaration of side files
+REPINNED_KEY = "campaign_fingerprint_repinned"  # PACKAGE.json's record of an anonymised merge by run's re-pin (C67)
 # The refusals a build's steps raise, whose message is shown as it is (after the redactor); any other exception is
 # shown after its kind.
 _REFUSALS = (PackageError, ConfigError, Refused, BatchNotVerified, EnvironmentUnknown, CodeVersionUnknown)
@@ -232,6 +234,7 @@ def _package_json(
     rewritten_identity: bool,
     binaries: Mapping[str, list[dict[str, str]]],
     exempt: Mapping[str, str],
+    repinned: Repinned | None = None,
 ) -> bytes:
     data = {
         "format": PACKAGE_FORMAT,
@@ -274,6 +277,15 @@ def _package_json(
     }
     if study.side_files:  # recorded only when declared, so the package of a study that declares none is as before
         data[SIDE_FILES_KEY] = declared(study.side_files)
+    if repinned is not None:  # an anonymised batch merged by run: the hash it re-pinned, traceable to the plain package
+        data[REPINNED_KEY] = {
+            "original_sha256": repinned.original,
+            "sha256": repinned.sha256,
+            "where": (
+                "the campaign fingerprint without the environment's sources: each lease snapshot's fingerprint and "
+                "pinned lease, the ledger snapshot's configuration and merge.json"
+            ),
+        }
     return (json.dumps(data, indent=1, sort_keys=True) + "\n").encode("utf-8")
 
 
@@ -405,6 +417,7 @@ def _collect(
     others = [p for p in files if not p.startswith(f"{OUT_DIR}/") and p not in covered]  # the identity and check vouch
     state = note_tracking(study.root, others, redactor, terms is not None, allow_uncommitted, warn)
     hidden_commits, hidden_urls = frozenset(), frozenset()
+    repinned = None
     if terms is not None:
         rewritten = list(terms.files)
         verify_inputs(files, check)  # before a record is read: the bytes must be the ones the check hashed
@@ -413,7 +426,7 @@ def _collect(
         )
         never = set(covered_files(study.root, study.scope)) | opaque  # code, and files attested unread
         files = rewrite(files, terms, code=never, out_prefix=f"{OUT_DIR}/")
-        files, code, env = anonymise_identity(
+        files, code, env, repinned = anonymise_identity(
             files, root=study.root, scope=study.scope, check=check, env=env, parent=out_dir
         )
     vendored = _wheels(env, vendor, wheels)
@@ -449,6 +462,7 @@ def _collect(
         rewritten_identity=terms is not None,
         binaries=read.binaries,
         exempt=exempt,
+        repinned=repinned,
     )
     files[STAMP] = stamp_bytes(
         files, study.root, study.scope, str(code["commit"]), str(check.get("checked_at")), out_dir

@@ -1,32 +1,35 @@
 # Provenance: new
 """The replication package of a batch merged by run (C45, merge.json `expcore-merge/2`, `campaign.merged_by_run`).
 
-Such a batch keeps, beside `runs/`, each counted lease's store snapshot (`leases/<lease id>/`), the evidence of every
-other lease store the merge was given (`evidence/<lease id>/`, never analysed), the ledger snapshot and merge.json,
-which names each snapshot's SHA-256 and the ledger's. The package holds merge.json, the ledger snapshot, every counted
-lease's snapshot and the evidence `spec.packaged_evidence` lets in (`spec.MergedByRun`); merge.json lists every
-evidence lease by hash whether or not its snapshot goes in. A merge of shards (`expcore-merge/1`) is packaged as
-before, by `identity`.
+Such a batch keeps, beside `runs/`, each counted lease's store snapshot (`leases/<lease id>/`), the snapshot of every
+other lease store the merge was given (`evidence/<lease id>/`, never analysed as the batch, read by a declared
+sensitivity), the ledger snapshot and merge.json, which names each snapshot's SHA-256 and the ledger's. The package
+holds all of them (`spec.MergedByRun`); an evidence lease that left no store is listed in merge.json with no hash and
+has no file. A merge of shards (`expcore-merge/1`) is packaged as before, by `identity`.
 
-- `verify_inputs`: every build, before anything is read or rewritten, holds each snapshot the package takes to the
-  bytes merge.json names (merge.json itself is held to the bytes the replay check hashed, `identity`), naming the
-  first that is missing or differs by its place in the package.
-- `anonymise`: an anonymised build rewrites each snapshot it takes without the environment's sources, as the merge of
-  shards' snapshots are rewritten. That changes the campaign fingerprint's SHA-256, which the merge by run binds in
-  three places beside merge.json: the fingerprint each snapshot holds, the lease each store pins (`campaign_sha256`)
-  and the ledger's configuration (`fingerprint`). Each of them moves from the old hash to the new one, the ledger
-  snapshot is rewritten for it, and merge.json is written as the merge by run writes it of the rewritten files: the
-  fingerprint's hash, the ledger's and each rewritten snapshot's change, nothing else does. The analysis rebuilds
-  merge.json from the snapshots, the ledger and the plan and refuses one that differs, so the package's own check is
-  what proves the rewrite whole.
+- `verify_inputs`: every build, before anything is read or rewritten, holds each snapshot to the bytes merge.json
+  names (merge.json itself is held to the bytes the replay check hashed, `identity`), naming the first that is missing
+  or differs by its place in the package.
+- `anonymise`: an anonymised build rewrites each lease store's snapshot without the environment's sources, as the merge
+  of shards' snapshots are rewritten. That changes the campaign fingerprint's SHA-256, which the merge by run binds in
+  three more places, and an anonymised build re-pins exactly those: each store's pinned lease (`campaign_sha256`), the
+  ledger snapshot's configuration (its `fingerprint`; no event and no other table is touched, and its events never
+  name it), and merge.json, written as the merge by run writes it of the rewritten files (its `fingerprint`,
+  `ledger_sha256` and snapshot hashes change, nothing else does). A place that does not hold the original hash is
+  refused. The analysis rebuilds merge.json from the snapshots, the ledger and the plan and refuses one that differs,
+  and any place left at the original hash, so the package's own check is what proves the re-pin whole. The original
+  hash and the re-pinned one (`Repinned`) go into the package's `PACKAGE.json`, which keeps the anonymised package
+  traceable to the plain one.
 
 The merge by run's modules load the elastic ledger's, so they are imported on this branch only (C42).
 """
 
+import copy
 import hashlib
 import json
 import sqlite3
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -40,9 +43,18 @@ from expcore.provenance.environment import without_sources
 LEDGER_CONFIG = "config"  # the ledger's meta key of its pinned configuration (`elastic.LedgerConfig.to_json`)
 
 
+@dataclass(frozen=True)
+class Repinned:
+    """The campaign fingerprint's SHA-256 as the batch merged by run binds it (`original`), and as the anonymised
+    package re-pins it: the hash of the fingerprint without the environment's sources (`sha256`)."""
+
+    original: str
+    sha256: str
+
+
 def verify_inputs(files: Mapping[str, bytes], raw: bytes) -> MergedByRun:
-    """Refuse a batch merged by run whose ledger snapshot, or one of whose counted (or packaged evidence) snapshots,
-    is not the bytes merge.json (`raw`) names, naming the first; return what the package holds of the batch."""
+    """Refuse a batch merged by run whose ledger snapshot, or one of whose lease store snapshots, is not the bytes
+    merge.json (`raw`) names, naming the first; return what the package holds of the batch."""
     merged = by_run_files(raw)
     for path, sha256 in merged.named():
         data = files.get(path)
@@ -52,54 +64,72 @@ def verify_inputs(files: Mapping[str, bytes], raw: bytes) -> MergedByRun:
     return merged
 
 
-def anonymise(files: dict[str, bytes], scratch: Path) -> dict[str, str]:
-    """Rewrite, in `files` (mutated in place: the caller's copy of the package), every snapshot of the batch merged by
-    run the package holds without the environment's sources, the campaign fingerprint's hash wherever the merge binds
-    it, and merge.json from the rewritten files (module docstring). Returns each old hash with its new one, the
-    snapshots', the ledger's and the fingerprint's: the export lists them, so the author's is compared with them
-    swapped (`identity._outputs`)."""
+def anonymise(files: dict[str, bytes], scratch: Path) -> tuple[dict[str, str], Repinned]:
+    """Rewrite, in `files` (mutated in place: the caller's copy of the package), every lease store's snapshot without
+    the environment's sources and re-pin the campaign fingerprint's hash in the three places (module docstring).
+    Returns each old hash with its new one, the snapshots', the ledger's and the fingerprint's (the export lists them,
+    so the author's is compared with them swapped, `identity._outputs`), and the fingerprint's re-pin."""
     from expcore.campaign.merged_by_run import merge_text  # on this branch only (C42)
 
     merged = by_run_files(files[MERGE_PATH])
-    document: dict[str, Any] = json.loads(json.dumps(merged.document))  # a copy of every level, to rewrite
+    stores = {path: _store_facts(files[path], path, scratch) for path, _ in merged.snapshots()}
+    pins = {
+        Repinned(fingerprint_sha256(found), fingerprint_sha256(_without_sources(found))) for found, _ in stores.values()
+    }
+    if len(pins) != 1:
+        raise PackageError(f"{MERGE_PATH}: its lease snapshots hold more than one campaign fingerprint")
+    (repinned,) = pins
     swaps: dict[str, str] = {}
-    fingerprints: dict[str, str] = {}  # the old fingerprint hash, with its new one
     for path, sha256 in merged.snapshots():
-        files[path] = _store_without_sources(files[path], path, scratch, fingerprints)
+        fingerprint, pinned = stores[path]
+        values = {FINGERPRINT_KEY: _without_sources(fingerprint), META_SHARD: _repin_lease(pinned, repinned, path)}
+        files[path] = _rewritten(files[path], path, scratch, {key: canonical(value) for key, value in values.items()})
         swaps[sha256] = hashlib.sha256(files[path]).hexdigest()
-    old_ledger = document["ledger_sha256"]
-    files[merged.ledger] = _ledger_rewritten(files[merged.ledger], merged.ledger, scratch, fingerprints)
-    swaps[old_ledger] = document["ledger_sha256"] = hashlib.sha256(files[merged.ledger]).hexdigest()
+    config = json.loads(_meta(files[merged.ledger], merged.ledger, scratch, (LEDGER_CONFIG,))[LEDGER_CONFIG])
+    config_text = json.dumps(_repin_ledger(config, repinned, merged.ledger), sort_keys=True)  # `LedgerConfig.to_json`
+    files[merged.ledger] = _rewritten(files[merged.ledger], merged.ledger, scratch, {LEDGER_CONFIG: config_text})
+    swaps[merged.document["ledger_sha256"]] = hashlib.sha256(files[merged.ledger]).hexdigest()
+    document = _repin_merge(copy.deepcopy(dict(merged.document)), repinned)
     for entry in [*document["leases"], *document["evidence"]]:
         entry["snapshot_sha256"] = swaps.get(entry["snapshot_sha256"], entry["snapshot_sha256"])
-    document["fingerprint"] = fingerprints.get(document["fingerprint"], document["fingerprint"])
+    document["ledger_sha256"] = swaps[document["ledger_sha256"]]
     files[MERGE_PATH] = merge_text(document).encode("utf-8")
-    return swaps | fingerprints
+    return swaps | {repinned.original: repinned.sha256}, repinned
 
 
-def _store_without_sources(data: bytes, where: str, scratch: Path, fingerprints: dict[str, str]) -> bytes:
-    """A lease store's snapshot with no source in its fingerprint's environment and its pinned lease issued for the
-    fingerprint so rewritten, rebuilt so that no old copy of either remains; records the old hash and the new one."""
+def _store_facts(data: bytes, where: str, scratch: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """A lease store snapshot's campaign fingerprint and the lease it pins; refuse a snapshot that lacks either."""
     meta = _meta(data, where, scratch, (FINGERPRINT_KEY, META_SHARD))
     fingerprint, pinned = json.loads(meta[FINGERPRINT_KEY]), json.loads(meta[META_SHARD])
     if not isinstance(fingerprint, dict) or "environment" not in fingerprint or not isinstance(pinned, dict):
         raise PackageError(f"{where}: records no environment or no lease; run the campaign with this core")
-    old = fingerprint_sha256(fingerprint)
-    fingerprint["environment"] = without_sources(fingerprint["environment"])
-    new = fingerprints.setdefault(old, fingerprint_sha256(fingerprint))
-    if pinned.get("campaign_sha256") == old:  # another hash is the analysis's to refuse, as it was before
-        pinned["campaign_sha256"] = new
-    return _rewritten(scratch, {FINGERPRINT_KEY: canonical(fingerprint), META_SHARD: canonical(pinned)})
+    return fingerprint, pinned
 
 
-def _ledger_rewritten(data: bytes, where: str, scratch: Path, fingerprints: Mapping[str, str]) -> bytes:
-    """The ledger snapshot with its configuration pinning the rewritten fingerprint's hash, in the text the ledger
-    writes it in (`LedgerConfig.to_json`: sorted keys); its events never name the fingerprint."""
-    config = json.loads(_meta(data, where, scratch, (LEDGER_CONFIG,))[LEDGER_CONFIG])
-    if not isinstance(config, dict) or config.get("fingerprint") not in fingerprints:
+def _without_sources(fingerprint: Mapping[str, Any]) -> dict[str, Any]:
+    """The campaign fingerprint with no source in its environment: what the anonymised snapshot holds."""
+    return {**fingerprint, "environment": without_sources(fingerprint["environment"])}
+
+
+def _repin_lease(pinned: Mapping[str, Any], repinned: Repinned, where: str) -> dict[str, Any]:
+    """The first place: the lease a store pins, issued for the re-pinned fingerprint."""
+    if pinned.get("campaign_sha256") != repinned.original:
+        raise PackageError(f"{where}: its lease was issued for another campaign fingerprint than its store holds")
+    return {**pinned, "campaign_sha256": repinned.sha256}
+
+
+def _repin_ledger(config: Mapping[str, Any], repinned: Repinned, where: str) -> dict[str, Any]:
+    """The second place: the ledger's pinned configuration, made for the re-pinned fingerprint."""
+    if config.get("fingerprint") != repinned.original:
         raise PackageError(f"{where}: pins another campaign fingerprint than its lease snapshots hold")
-    config["fingerprint"] = fingerprints[config["fingerprint"]]
-    return _rewritten(scratch, {LEDGER_CONFIG: json.dumps(config, sort_keys=True)})
+    return {**config, "fingerprint": repinned.sha256}
+
+
+def _repin_merge(document: dict[str, Any], repinned: Repinned) -> dict[str, Any]:
+    """The third place: merge.json's fingerprint, as the merge by run writes it of the rewritten snapshots."""
+    if document["fingerprint"] != repinned.original:
+        raise PackageError(f"{MERGE_PATH}: names another campaign fingerprint than its lease snapshots hold")
+    return {**document, "fingerprint": repinned.sha256}
 
 
 def _meta(data: bytes, where: str, scratch: Path, keys: tuple[str, ...]) -> dict[str, str]:
@@ -119,17 +149,19 @@ def _meta(data: bytes, where: str, scratch: Path, keys: tuple[str, ...]) -> dict
     return {key: rows[key] for key in keys}
 
 
-def _rewritten(scratch: Path, values: Mapping[str, str]) -> bytes:
-    """The scratch snapshot with the meta `values` set, vacuumed so that no old value remains in its pages."""
+def _rewritten(data: bytes, where: str, scratch: Path, values: Mapping[str, str]) -> bytes:
+    """The snapshot with the meta `values` set, vacuumed so that no old value remains in its pages."""
     path = scratch / "snapshot.sqlite"
+    path.write_bytes(data)
     connection = sqlite3.connect(path)
     try:
         for key, value in values.items():
-            connection.execute("UPDATE meta SET value=? WHERE key=?", (value, key))
+            if connection.execute("UPDATE meta SET value=? WHERE key=?", (value, key)).rowcount != 1:
+                raise PackageError(f"{where}: records no {key!r}; run the campaign with this core")
         connection.commit()
         connection.execute("VACUUM")
     finally:
         connection.close()
-    data = path.read_bytes()
+    rewritten = path.read_bytes()
     path.unlink()
-    return data
+    return rewritten

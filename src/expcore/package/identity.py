@@ -13,7 +13,8 @@ hash of the same code, which a reader can recompute, and drops every source:
 - each record's `code.commit`, and the head of the commit in `code.why`, become that record's pseudo-commit. The
   field is free text under the format and no seal covers it (`records.seal` pins prompts, configuration, tools and
   settings), so no record format changes, and every digest a record holds stays valid;
-- the campaign snapshot's fingerprint and the replay check lose the environment's `sources`;
+- the campaign snapshot's fingerprint and the replay check lose the environment's `sources`; a batch merged by run
+  also re-pins the fingerprint's new hash where its merge binds it (`by_run.anonymise`);
 - the replay check is made again over the rewritten records, under the original check's declaration of side files
   (which pair as before: a side file's hash is not a commit), so the claim that they replay is a fresh one, keeping
   only the time of the original check, since the archive must not depend on when it was built (K06);
@@ -334,8 +335,9 @@ def anonymise_identity(
     check: Mapping[str, Any],
     env: Mapping[str, Any],
     parent: Path | None,
-) -> tuple[dict[str, bytes], dict[str, Any], Mapping[str, Any]]:
-    """Return the files with a tree-hash identity and no source, the new code identity and the environment kept."""
+) -> tuple[dict[str, bytes], dict[str, Any], Mapping[str, Any], by_run.Repinned | None]:
+    """Return the files with a tree-hash identity and no source, the new code identity, the environment kept and, for
+    a batch merged by run, the campaign fingerprint's hash as it was and as the package re-pins it (`by_run`)."""
     refuse_labelled_versions(env)
     verify_inputs(files, check)
     verify_merged_inputs(files, check)
@@ -348,8 +350,9 @@ def anonymise_identity(
     with tempfile.TemporaryDirectory(prefix=".anonymise-", dir=parent) as scratch:
         where = Path(scratch)
         swaps: dict[str, str] = {}
+        repinned = None
         if MERGE_KEY in check and is_by_run(result[MERGE_PATH]):  # merge.json is the check's, `verify_merged_inputs`
-            swaps = by_run.anonymise(result, where)
+            swaps, repinned = by_run.anonymise(result, where)
         elif MERGE_KEY in check:
             swaps = _anonymised_shards(result, where)
         else:
@@ -359,7 +362,7 @@ def anonymise_identity(
         result[STAMP] = stamp_bytes(result, root, scope, code["commit"], str(check.get("checked_at")), where)
         _outputs(result, str(original["commit"]), code["commit"], where / "stage", swaps)
     del result[STAMP]  # written with every package's generated files
-    return result, code, kept
+    return result, code, kept, repinned
 
 
 def study_commits(root: Path) -> set[str]:

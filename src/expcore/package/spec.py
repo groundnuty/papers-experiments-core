@@ -20,11 +20,10 @@ operator, whatever directory they were pulled into, and no anonymisation list co
 
 A batch merged by run (C45: its out/merge.json is `expcore-merge/2`, read with `campaign.merged_by_run`'s own
 parser) keeps each counted lease's snapshot at `out/leases/<lease id>/campaign-snapshot.sqlite`, which the analysis
-reads: exactly those paths of out/leases, the ones its merge.json lists as counted, are selectable (`MergedByRun`);
-every other path under out/leases stays never selected, and so does all of out/leases in a batch that is not merged by
-run. The merge's evidence (`out/evidence/<lease id>/campaign-snapshot.sqlite`, the stores of the leases that did not
-count, never analysed) stays listed in merge.json by its SHA-256 and is never selected but for what
-`packaged_evidence` lets in. The rule is the batch's own: nothing but its merge.json decides it.
+reads, and the merge's evidence at `out/evidence/<lease id>/campaign-snapshot.sqlite` (the stores of the leases that
+did not count, which a declared sensitivity reads). Exactly the snapshots its merge.json lists are selectable there
+(`MergedByRun`); every other path under out/leases or out/evidence stays never selected, and so does all of out/leases
+in a batch that is not merged by run. The rule is the batch's own: nothing but its merge.json decides it.
 
 A selected symbolic link is refused, since it could point out of the study.
 The names the build writes at the package root (`GENERATED`) cannot be selected, nor can the other names GNU Make
@@ -111,7 +110,7 @@ class PackageSpec:
 class MergedByRun:
     """What a package holds of a batch merged by run (C45) beside its records, by path relative to the study, as its
     merge.json (`document`, read and validated) names it: merge.json itself, the ledger snapshot, each counted lease's
-    snapshot in plan order, and the evidence snapshots `packaged_evidence` lets in."""
+    snapshot in plan order, and the snapshot of each evidence lease that left a store, in lease order."""
 
     document: Mapping[str, Any]
     ledger: str
@@ -125,9 +124,9 @@ class MergedByRun:
 
     def snapshots(self) -> list[tuple[str, str]]:
         """Each lease store's snapshot the package holds with the SHA-256 merge.json names for it: each counted
-        lease's in plan order, then each packaged evidence lease's."""
+        lease's, then each evidence lease's."""
         hashes = [entry["snapshot_sha256"] for entry in self.document["leases"]]
-        hashes += [entry["snapshot_sha256"] for entry in packaged_evidence(self.document)]
+        hashes += [entry["snapshot_sha256"] for entry in _stored(self.document["evidence"])]
         return list(zip((*self.counted, *self.evidence), hashes, strict=True))
 
     def named(self) -> list[tuple[str, str]]:
@@ -135,12 +134,9 @@ class MergedByRun:
         return [(self.ledger, self.document["ledger_sha256"]), *self.snapshots()]
 
 
-def packaged_evidence(document: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    """The evidence entries of a merge by run's merge.json whose snapshots a package holds: none. Every evidence lease
-    stays listed in merge.json with its snapshot's SHA-256, and this is the one place that decides whether its snapshot
-    goes in too: selection, the files the build requires, the hashes it verifies and the anonymised rewrite all ask
-    it. An entry with no snapshot (a lease that left no store) can never be packaged."""
-    return []
+def _stored(evidence: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The evidence leases that left a store, whose snapshot the batch keeps (a lease that left none has no hash)."""
+    return [entry for entry in evidence if entry["snapshot_sha256"] is not None]
 
 
 def merged_by_run(root: Path) -> MergedByRun | None:
@@ -166,11 +162,8 @@ def by_run_files(raw: bytes) -> MergedByRun:
     except MergeRefused as error:
         raise PackageError(str(error)) from None
     counted = tuple(f"out/{snapshot_rel(LEASES_DIR, entry['lease_id'])}" for entry in document["leases"])
-    evidence = packaged_evidence(document)
-    if any(entry.get("snapshot_sha256") is None for entry in evidence):
-        raise PackageError(f"{MERGE_PATH}: an evidence lease to package left no snapshot")
-    held = tuple(f"out/{snapshot_rel(EVIDENCE_DIR, entry['lease_id'])}" for entry in evidence)
-    return MergedByRun(document, f"out/{LEDGER_SNAPSHOT}", counted, held)
+    evidence = tuple(f"out/{snapshot_rel(EVIDENCE_DIR, entry['lease_id'])}" for entry in _stored(document["evidence"]))
+    return MergedByRun(document, f"out/{LEDGER_SNAPSHOT}", counted, evidence)
 
 
 def _check_pattern(source: Path, pattern: object) -> str:
@@ -250,8 +243,8 @@ def pattern_regex(pattern: str) -> re.Pattern[str]:
 
 def never_selected(rel: str, merged: MergedByRun | None = None) -> bool:
     """Tell whether a path is left out whatever the patterns say: caches, version control, the live campaign, the
-    local logs, an HPC campaign's private evidence, and, in a batch merged by run (`merged`), the merge's evidence but
-    what `packaged_evidence` lets in. A counted lease's snapshot that `merged` lists is not the live campaign's."""
+    local logs, an HPC campaign's private evidence, and, in a batch merged by run (`merged`), any path under out/leases
+    or out/evidence but the snapshots its merge.json lists, which are not the live campaign's."""
     parts = rel.split("/")
     if SKIPPED_PARTS.intersection(parts) or os.path.splitext(rel)[1] in SKIPPED_SUFFIXES:
         return True

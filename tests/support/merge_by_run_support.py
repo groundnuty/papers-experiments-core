@@ -234,25 +234,34 @@ def build_fleet(base: Path, env: dict[str, str]) -> Fleet:
     return fleet
 
 
-def small_fleet(base: Path, env: dict[str, str]) -> Fleet:
+def small_fleet(base: Path, env: dict[str, str], *, superseded: bool = False) -> Fleet:
     """A fleet with only what a package of a batch merged by run needs: every run counted at a healthy federation, and
-    one lease that expired and left nothing behind (`fed-z`), listed as evidence with no snapshot; the ledger is closed
-    at the end."""
+    one lease that expired and left nothing behind (`fed-z`), listed as evidence with no snapshot. With `superseded`,
+    `fed-x` also takes a lease that expires, and its node's completion, read once every run is counted, is superseded:
+    its store is evidence the merge must be given. The ledger is closed at the end."""
     sha = fingerprint_sha256(campaign_fingerprint(by_run_study(base, "template")))
     clock = FakeClock()
     ledger, path = _new_ledger(base, sha, clock)
     fleet = Fleet(base, env, path, sha)
+    late = ("fed-z", "fed-x") if superseded else ("fed-z",)
     try:
-        vanished = ledger.issue("fed-z")
-        assert isinstance(vanished, Lease), vanished
-        ledger.mark_sent(vanished.lease_id)
-        clock.now += 400.0  # no heartbeat since it was sent: a read of its site expires it
+        leases = {label: ledger.issue(label) for label in late}
+        for lease in leases.values():
+            assert isinstance(lease, Lease), lease
+            ledger.mark_sent(lease.lease_id)
+        clock.now += 400.0  # no heartbeat since they were sent: a read of their site expires them
         ledger.observe_site(DOOMED["fed-z"], SiteReading())
-        ledger.prove_ended("fed-z", "terminal")
+        for label in late:
+            ledger.prove_ended(label, "terminal")
         _lease_every_run(fleet, ledger)
+        if superseded:
+            lx = leases["fed-x"]
+            fleet.stores[lx.lease_id] = run_lease(base, env, lx, sha)
+            assert complete(ledger, lx, fleet.stores[lx.lease_id], DOOMED["fed-x"]) == "superseded"
+            fleet.superseded = lx.lease_id
     finally:
         ledger.close()
-    fleet.vanished = vanished.lease_id
+    fleet.vanished = leases["fed-z"].lease_id
     return fleet
 
 
