@@ -211,6 +211,45 @@ def test_the_close_counts_one_failed_poll_for_its_final_poll_whatever_it_finds()
     assert (before, poll.failed, poll.polls) == (0, 1, 3)
 
 
+def test_a_judged_process_is_judged_even_when_its_table_no_longer_holds_the_runs_mount():
+    """The run's mount finds a cell; it does not keep a proved one in view: a later table with the host's `/proc`
+    fails."""
+    proc = node(cell_process(500, mnt_ns=COPY_NS))
+    poll, proofs = polled(proc, **SEEN)
+    proc.procs[500].mountinfo = table(("0:70", "/", "/", "overlay"), (HOST_PROC[0], "/", "/hostproc", "proc"))
+    poll.poll()
+    assert [(ok, problems) for _, ok, problems, _ in proofs] == [(True, []), (False, [MP.HOST_PROC_IN_CELL])]
+
+
+def test_a_process_not_judged_before_is_not_judged_without_the_runs_mount():
+    _, proofs = polled(node(cell_process(500, mountinfo=table(("0:70", "/", "/", "overlay")))), **SEEN)
+    assert proofs == []
+
+
+def test_a_pending_process_whose_start_time_could_not_be_read_once_is_no_failed_poll_when_proved():
+    """A transient refusal at the end of a poll takes the pending process for gone; seen again, it is the same process:
+    reads of the look (the start, its check) pass and the third, at the poll's end, fails."""
+    proc = node(building(500, ns=None))
+    proc.procs[500].stat_fails = [False, False, True]
+    poll, proofs = polled(proc, **SEEN)
+    proc.procs[500].ns = "pid:[4026532100]"
+    pivoted(proc, 500)
+    for _ in range(3):
+        poll.poll()
+    del proc.procs[500]
+    for _ in range(3):
+        poll.poll()
+    assert (poll.failed, [ok for _, ok, _, _ in proofs]) == (0, [True])
+
+
+def test_a_pid_taken_by_another_process_during_a_look_binds_nothing_of_the_first():
+    """The look read the first process's table; the pid was then another's: its namespace is not the table's."""
+    proc = node(cell_process(500))
+    proc.procs[500].starts = [1500, 9999]  # the start read first, the one read after the link
+    poll, proofs = polled(proc, **SEEN)
+    assert (proofs, poll.failed) == ([], 0)
+
+
 def test_without_the_hosts_root_and_namespace_a_copy_is_judged_as_it_was():
     """Nothing says the cell is still being built when the watcher could not read the host's own root and namespace."""
     _, proofs = polled(node(building(500)))

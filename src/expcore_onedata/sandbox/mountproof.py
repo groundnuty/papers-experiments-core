@@ -303,8 +303,12 @@ class CellPoll:
                 self._emit(CLOSE, False, [CELL_ALIVE_AT_CLOSE], cell, None)
 
     def _key(self, pid: int, seen: Seen) -> Any:
-        """A process's namespace: its PID namespace link, as last read when it cannot be read now, else the process."""
+        """A process's namespace: its PID namespace link (as last read, when it cannot be read now), else the process.
+        None when another process has the pid since the look began: the start time is read again after the link, the
+        look's last read, so nothing read is then taken for this process's."""
         link = self._namespace(pid)
+        if self._started(pid) != seen[1]:
+            return None
         if link is not None:
             self._ns[seen] = link
         return self._ns.get(seen, seen)
@@ -343,17 +347,19 @@ class CellPoll:
         look finds a problem not written yet; a failed one for a process of the node's namespace holding the run's
         mount elsewhere."""
         ours = [m for m in mounts if self._host.fuse_dev is not None and m["dev"] == self._host.fuse_dev]
-        if not ours:
-            return
+        seen = (pid, started)
+        if not ours and seen not in self._judged:
+            return  # the run's mount finds a cell; it does not keep a judged one in view
         cell = {"pid": pid, "start_time": started, "nspid_depth": len(values)}
         if len(values) <= self._host.depth:
             if any(m["mountpoint"] != self._host.mountpoint for m in ours) and (pid, started) not in self.cells:
                 self.cells[(pid, started)] = len(values)
                 self._emit(HOST_PROCESS, False, [SAME_PID_NAMESPACE], cell, {"process": self._view(pid, mounts)})
             return
-        seen = (pid, started)
-        self.cells[seen] = len(values)
         key = self._key(pid, seen)
+        if key is None:
+            return
+        self.cells[seen] = len(values)
         if seen not in self._judged and self._being_built(pid, mounts):
             self._building.add(key, seen, key not in self._proved)
             return

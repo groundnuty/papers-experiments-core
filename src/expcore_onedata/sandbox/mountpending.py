@@ -31,7 +31,9 @@ class Pending:
             self._sets.setdefault(key, set()).add(seen)
 
     def drop(self, seen: Seen) -> None:
-        """A process is no longer pending anywhere; a namespace left with none goes, uncounted."""
+        """A process is no longer pending anywhere, nor lost under its own key (taken for gone, then seen again); a
+        namespace left with none goes, uncounted."""
+        self._vanished.discard(seen)
         for key, members in list(self._sets.items()):
             members.discard(seen)
             if not members:

@@ -52,6 +52,8 @@ class P:
     unreadable_mounts: bool = False
     mnt_ns: str | None = None  # `ns/mnt`; None is a link that cannot be read
     root: str | None = None  # `root`; None likewise
+    stat_fails: list[bool] = field(default_factory=list)  # one entry per `stat` read: True refuses that read
+    starts: list[int] = field(default_factory=list)  # one start time per `stat` read, the last repeated: a reused pid
 
 
 @dataclass
@@ -80,7 +82,10 @@ class FakeProc:
     def read(self, path: str) -> str:
         proc, what = self._proc(path)
         if what == "stat":
-            return f"{proc.pid} (a (b) c) S 1 " + " ".join(["0"] * 17) + f" {proc.start} 0 0\n"
+            if proc.stat_fails and proc.stat_fails.pop(0):
+                raise PermissionError(path)
+            start = proc.starts.pop(0) if len(proc.starts) > 1 else (proc.starts[0] if proc.starts else proc.start)
+            return f"{proc.pid} (a (b) c) S 1 " + " ".join(["0"] * 17) + f" {start} 0 0\n"
         if what == "status":
             ns, uid = "\t".join(str(v) for v in proc.nspid), "\t".join([str(proc.uid)] * 4)
             return f"Name:\tx\nUid:\t{uid}\nTracerPid:\t{proc.tracer}\nNSpid:\t{ns}\n"
