@@ -9,7 +9,8 @@ timeout), when its key is refused, or when the sandbox or a tool server crashes 
 code. The campaign decides whether to re-run the attempt.
 
 Never an InfraError: agent-code exceptions (non-zero exit codes), turn, time or token caps, report outcomes, slowness,
-and a context that outgrew the model's window (`ContextOverflow`).
+and a context that outgrew the model's window (`ContextOverflow`). The one exception to slowness is declared: a model
+request that outlasts the study's bound on one request is the endpoint's failure (`ModelRequestTimedOut`, B21).
 
 The kinds form a closed vocabulary: the core's eight, plus whatever a platform registers once at import time with
 `register_infra_kind`, for the whole process, and while a study is loaded or run, what it declares in its study.toml
@@ -358,7 +359,8 @@ class RequestAbandoned(Exception):
 
     The read timeout is never shorter than the run's time cap, and a request that went out is never resent.
     The loop ends the run at its time cap. This is not an InfraError, because slowness is never infrastructure;
-    the usage of the abandoned request is unknown and recorded as such.
+    the usage of the abandoned request is unknown and recorded as such. A study that wants a request that hangs to be
+    the endpoint's failure declares a shorter bound on one request (`ModelRequestTimedOut`, B21).
     """
 
 
@@ -448,6 +450,22 @@ class CallTimedOut(InfraError):
     def __init__(self, tool: str, bound_s: float):
         super().__init__("knowledge", f"the tool server did not answer a call to {tool!r} within {bound_s:g} s")
         self.tool = tool
+        self.bound_s = bound_s
+
+
+class ModelRequestTimedOut(InfraError):
+    """A model request outlasted the study's declared bound on one request (`[agent] model_request_bound_s`, B21) with no
+    reply: infrastructure of kind `endpoint`.
+
+    The adapter gives the request up at the bound and never resends it (B03), and it is the abandoned request of the
+    record (`abandoned_request.reason` is `request_bound`, with the bound on its prompt, B19). The loop arms the bound
+    only while it is shorter than both the agent's time left and the ceiling left, so its expiry is never the moment of
+    the loop's own cut. `bound_s` is what the detail says, and the detail says nothing else, so a replay that raises
+    the recorded failure ends the attempt alike.
+    """
+
+    def __init__(self, bound_s: float):
+        super().__init__("endpoint", f"the model endpoint did not answer a request within {bound_s:g} s; not resent")
         self.bound_s = bound_s
 
 

@@ -1,0 +1,274 @@
+{
+ "schema_version": "expcore-record/3",
+ "run_key": "task=task-a|model=model-a|seed=0",
+ "factors": {
+  "task": "task-a",
+  "model": "model-a",
+  "seed": 0
+ },
+ "attempt": 1,
+ "treatment_kinds": [],
+ "route": {
+  "backend": "openai_compat",
+  "model": "vendor/teasel-1",
+  "base_url": "https://llm.example.invalid/v1",
+  "sdk_versions": {
+   "openai": "3.46.0"
+  },
+  "seed": 7,
+  "seed_honoured": true,
+  "retries": 0,
+  "retry_events": [],
+  "read_timeouts": 0,
+  "abandoned_request": {
+   "reason": "request_bound",
+   "usage": "unknown",
+   "prompt_bound_tokens": 455,
+   "prompt_bound_by": "bytes",
+   "reply_max_tokens": 4096,
+   "window_tokens": 1000000,
+   "bound_checked": 0,
+   "bound_exceeded": 0,
+   "bound_unreported": 0,
+   "bound_overlapped": 0
+  },
+  "rate_limited_429": 0,
+  "usage_seen": {
+   "responses": 1,
+   "input": 120,
+   "output": 30,
+   "missing": 0
+  },
+  "served_model_ids": [
+   "vendor/teasel-1"
+  ],
+  "system_fingerprints": [],
+  "served_settings": {
+   "temperature": "not reported",
+   "top_p": "not reported",
+   "reasoning_effort": "not reported",
+   "enable_thinking": "not reported",
+   "thinking": "not reported"
+  },
+  "other_reply_fields": {},
+  "reasoning_content_seen": false,
+  "settings_note": "requested; most servers don't report them. reasoning_content_seen=true shows a reasoning/thinking mode took effect; false does not show it did not",
+  "thinking": {
+   "calls": 1,
+   "calls_with_thinking": 0,
+   "thinking_tokens": null,
+   "thinking_tokens_note": "None = the API does not report them separately (inside output tokens)"
+  },
+  "settings_sent_sha256": "2d93d0d45e0bf1f90bccb53581d51515ea1d996bdea80c01f8e2e30e42a389dd",
+  "settings": {
+   "2d93d0d45e0bf1f90bccb53581d51515ea1d996bdea80c01f8e2e30e42a389dd": {
+    "model": "vendor/teasel-1",
+    "seed": 7,
+    "max_tokens": 4096,
+    "tool_choice": "auto"
+   }
+  }
+ },
+ "prompt": {
+  "system": {
+   "text": "be brief",
+   "sha256": "b0d336336bae9756708102764ccc977778d8c408df38d7050d69f9e4d22c9a43",
+   "template_sha256": null,
+   "slots": null
+  },
+  "user": {
+   "text": "do the task",
+   "sha256": "abe1e9e3f801509e9c0712b32eb6f7b1bfd3a910e1c38eaa578c884790dc08e8",
+   "template_sha256": null,
+   "slots": null
+  },
+  "tools_sha256": "6e461b33a1f6a6e9b3ea348cd1e5c576c514bb6084d69697d3caed19e873c811"
+ },
+ "tools": [
+  {
+   "name": "look",
+   "description": "The look tool.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "x": {
+      "type": "string"
+     }
+    }
+   },
+   "terminal": false
+  }
+ ],
+ "agent_config": {
+  "limits": {
+   "max_tool_rounds": 10,
+   "time_cap_s": 300.0,
+   "token_budget": 100000,
+   "output_cap_chars": 200,
+   "max_output_tokens": 4096
+  },
+  "malformed_policy": "report",
+  "ceiling_s": 900.0,
+  "ceiling_kind": "ceiling",
+  "min_call_s": 1.0,
+  "ceiling_factor": 3.0,
+  "cleanup_deadline_s": 10.0,
+  "model_request_bound_s": 2.0,
+  "terminal_tools": []
+ },
+ "agent_config_sha256": "00a0238eecd5bbdf0c28571dc9325eb26f8c9ed95b9f2b6f60b455beda4a5b7b",
+ "code": {
+  "commit": "cccccccccccccccccccccccccccccccccccccccc",
+  "dirty": false,
+  "source": "git",
+  "stale": false,
+  "why": null,
+  "tree_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+ },
+ "core_version": "0.1.0",
+ "transcript": [
+  {
+   "index": 0,
+   "neutral": {
+    "text": "",
+    "reasoning": null,
+    "tool_calls": [
+     {
+      "id": "call_0",
+      "name": "look",
+      "arguments": {},
+      "parse_error": null,
+      "raw_arguments": null
+     }
+    ]
+   },
+   "native": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_0",
+      "type": "function",
+      "function": {
+       "name": "look",
+       "arguments": "{}"
+      }
+     }
+    ]
+   },
+   "tool_messages": [
+    {
+     "role": "tool",
+     "tool_call_id": "call_0",
+     "content": "a few lines"
+    }
+   ],
+   "request_sha256": "f86f4da3c86618770cf5929aaba0accd8bd097e6421f5f69ad7ec16f2fb3edc3",
+   "settings_sha256": "2d93d0d45e0bf1f90bccb53581d51515ea1d996bdea80c01f8e2e30e42a389dd",
+   "stop_reason": "tool_calls",
+   "usage": {
+    "input_tokens": 120,
+    "output_tokens": 30,
+    "uncached_input_tokens": null,
+    "cache_creation_input_tokens": null,
+    "cache_read_input_tokens": null,
+    "extra": {},
+    "extra_cut": 0
+   },
+   "latency_s": 0.012929539196193218,
+   "served_model": "vendor/teasel-1",
+   "system_fingerprint": null,
+   "retries": [],
+   "waits_left_open": 0,
+   "infra_wait_by_kind": {}
+  }
+ ],
+ "failed_request": {
+  "kind": "infra",
+  "infra_kind": "endpoint",
+  "detail": "the model endpoint did not answer a request within 2 s; not resent",
+  "status": null,
+  "pattern": null,
+  "error_type": null,
+  "settings_sha256": "2d93d0d45e0bf1f90bccb53581d51515ea1d996bdea80c01f8e2e30e42a389dd",
+  "request_sha256": "8cc0c6bd39bf32e66028e95268a0d365284f54e25dc957efed47a202956022a0"
+ },
+ "tool_calls": [
+  {
+   "turn": 0,
+   "round": 1,
+   "call_id": "call_0",
+   "name": "look",
+   "arguments": {},
+   "status": "ok",
+   "text": "a few lines",
+   "raw_text": "a few lines",
+   "raw_chars": 11,
+   "truncated": false,
+   "error_class": null,
+   "raw_arguments": null,
+   "infra_wait_s": 0.0,
+   "started_s": 0.0,
+   "ended_s": 0.0,
+   "detail": "",
+   "source_truncated": null,
+   "waits_left_open": 0,
+   "terminal": false,
+   "infra_wait_by_kind": {},
+   "rendering_verified": true,
+   "elapsed_s": 0.0
+  }
+ ],
+ "clock": [
+  [
+   "start",
+   1000.0
+  ],
+  [
+   "before_model",
+   1000.0
+  ],
+  [
+   "before_tool",
+   1000.0
+  ],
+  [
+   "after_tool",
+   1000.0
+  ],
+  [
+   "before_model",
+   1000.0
+  ],
+  [
+   "end",
+   1002.0
+  ]
+ ],
+ "outcome": {
+  "name": "infrastructure",
+  "detail": "the model endpoint did not answer a request within 2 s; not resent",
+  "infra_kind": "endpoint",
+  "error_type": null,
+  "defect": null,
+  "treatment": false
+ },
+ "totals": {
+  "rounds": 1,
+  "malformed_calls": 0,
+  "malformed_events": [],
+  "tokens_used": 150,
+  "usage_incomplete": true,
+  "agent_s": 2.0,
+  "elapsed_s": 2.0,
+  "infra_wait_s": 0.0,
+  "infra_wait_by_kind": {},
+  "cleanup_s": 0.0,
+  "cleanup_timed_out": false,
+  "abandoned_threads": 0,
+  "final_text": null
+ },
+ "instruments": {},
+ "scores": {},
+ "redacted_paths": []
+}

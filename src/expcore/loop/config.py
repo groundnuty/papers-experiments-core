@@ -15,7 +15,7 @@ from typing import Any
 
 from expcore.config.models import Limits
 from expcore.errors import infra_kinds
-from expcore.loop.timer import AgentTimer, CleanupWaiter
+from expcore.loop.timer import AgentTimer, CleanupWaiter, Tick
 
 MALFORMED_POLICIES = ("report", "end")
 MIN_CALL_S = 1.0  # a tool call does not start with less time left than this (L05)
@@ -25,7 +25,7 @@ CEILING_FACTOR = (
 CLEANUP_DEADLINE_S = 10.0  # how long the loop waits for a cancelled call to stop before it gives up on it
 CEILING_KIND = "ceiling"  # the infrastructure kind of an attempt that passes the ceiling with the agent under its cap
 # the settings a study may leave undeclared: each is left out of the configuration's values then, never a null
-OPTIONAL_BOUNDS = ("tool_server_call_bound_s", "code_cell_bound_s")
+OPTIONAL_BOUNDS = ("tool_server_call_bound_s", "code_cell_bound_s", "model_request_bound_s")
 
 
 def config_sha256_of(values: Mapping[str, Any]) -> str:
@@ -77,6 +77,15 @@ class AgentConfig:
       default, hands the code tool the agent's time left. It is recorded and hashed as `tool_server_call_bound_s` is,
       with the names of the tools it reached (`code_cell_tools`, added to the record by the loop), and an undeclared
       one is not written at all.
+    - `model_request_bound_s`: an optional bound on one model request (B21). Before each model step the loop hands it
+      to the backend (`request_bound_for`) while it is strictly shorter than both the agent's time left and the
+      ceiling left, and the core's adapters then send each request of the step under it. A request with no reply by
+      the bound is given up, never resent (B03), and ends the attempt as `endpoint` infrastructure, which the campaign
+      charges and runs again, instead of hanging until the agent's time cap and being scored as the agent's. At or
+      past the time left nothing is armed, and the loop's own cut ends the step as without the key. A backend of a
+      study's own is bounded only if it takes the bound (`bound_requests`). None, the default, leaves every request
+      bounded by the agent's time alone. It is recorded and hashed as the other bounds are, with no list of tools
+      beside it, and an undeclared one is not written at all.
     """
 
     limits: Limits
@@ -88,6 +97,7 @@ class AgentConfig:
     cleanup_deadline_s: float = CLEANUP_DEADLINE_S
     tool_server_call_bound_s: float | None = None
     code_cell_bound_s: float | None = None
+    model_request_bound_s: float | None = None
 
     def __post_init__(self) -> None:
         """Refuse caps that cannot work and an unknown policy, and settle the ceiling and the kind it ends as."""
@@ -159,12 +169,27 @@ class AgentConfig:
         """
         return AgentTimer(self.limits.time_cap_s, clock=clock, ceiling_s=self.ceiling_s, cleanup_waiter=cleanup_waiter)
 
+    def request_bound_for(self, tick: Tick) -> float | None:
+        """The bound on each request of the model step that starts after `tick`, or None (B21).
+
+        The declared `model_request_bound_s` when it is strictly shorter than both the agent's time left and the ceiling
+        left at that reading: then its expiry is the first deadline, and never the moment of the loop's own cut. At or
+        past either, None: the step is watched as without the key, and the cut it ends at is the agent's time cap or
+        the ceiling. No clock is read here, so a replay arms nothing it did not.
+        """
+        declared = self.model_request_bound_s
+        if declared is None or not declared < tick.remaining_s:
+            return None
+        if tick.ceiling_left_s is not None and not declared < tick.ceiling_left_s:
+            return None
+        return declared
+
     def as_dict(self) -> dict[str, Any]:
         """Return every value as the record keeps it.
 
-        `tool_server_call_bound_s` and `code_cell_bound_s` are left out when they are not declared, never written as a
-        null: an optional setting that was never given leaves the record, the hash and the campaign's caps as they were
-        before the setting existed (L17, L18).
+        `tool_server_call_bound_s`, `code_cell_bound_s` and `model_request_bound_s` are left out when they are not
+        declared, never written as a null: an optional setting that was never given leaves the record, the hash and the
+        campaign's caps as they were before the setting existed (L17, L18, B21).
         """
         values = dataclasses.asdict(self)
         for name in OPTIONAL_BOUNDS:

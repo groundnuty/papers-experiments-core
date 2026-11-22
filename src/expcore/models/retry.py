@@ -9,6 +9,8 @@ same shape is treated like the SDK's own. What each class of error means for a r
 - 429, 408, 409, 5xx, a timeout before a reply, a connection error: transient, retried with capped exponential
   backoff. Jitter only lengthens a delay, and a `Retry-After` is never shortened: the wait is at least the server's.
 - a read timeout (the request went out and the reply is slow): never resent; `RequestAbandoned`.
+- a send the study's bound on one request gave up (B21): the adapter abandons it and raises `ModelRequestTimedOut`,
+  which has no status, so it is passed on unchanged and never resent.
 - 401 and 403: `key_rejected` after one request. The SDK's text can echo part of a key, so it is never kept.
 - 400 or 413 whose code or message names the context: `ContextOverflow`, the agent's outcome, not retried. A 413
   that does not (a body-size limit, a tokens-per-minute limit) is an ordinary request error, as a 400 would be.

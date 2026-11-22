@@ -20,6 +20,9 @@ The file is validated when it is loaded, with messages that name the file and th
     tool_server_call_bound_s = 300   # optional: the longest one call to a tool server may take, in seconds (L17)
     code_cell_bound_s = 3600      # optional: the longest one code cell may run, in seconds; past it the cell is killed,
                                   # the agent is told, and the run goes on (L18)
+    model_request_bound_s = 3600  # optional: the longest one model request may wait for its reply, in seconds; past
+                                  # it the request is given up, not resent, and the attempt is endpoint infrastructure
+                                  # (B21)
 
     [scheduler]                   # optional: every key of `SchedulerConfig` that is a number, a flag or a kind
     max_attempts = 3
@@ -95,7 +98,8 @@ _TOP_KEYS = (
 )
 _AGENT_KEYS = ("max_tool_rounds", "time_cap_s", "token_budget", "output_cap_chars", "max_output_tokens")
 _CEILING_KEYS = ("ceiling_s", "ceiling_factor")  # optional, and at most one of them
-_BOUND_KEYS = ("tool_server_call_bound_s", "code_cell_bound_s")  # optional, a number of seconds each (L17, L18)
+# optional, a number of seconds each (L17, L18, B21)
+_BOUND_KEYS = ("tool_server_call_bound_s", "code_cell_bound_s", "model_request_bound_s")
 # The key the per-call bound had before its scope was fixed (L17): it capped every tool call, the code tool's too, which
 # is not what it was for. It is refused with the new name and the reason, never read as the new key.
 RENAMED_BOUND = "tool_call_bound_s"

@@ -92,6 +92,13 @@ class RecordingBackend:
         self.inner.begin(system, user, tools)
         self._known = len(self.inner.transcript())
 
+    def bound_requests(self, seconds: float | None) -> None:
+        """Hand the bound on each request of the next step to the inner backend, when it takes one (B21). A request it
+        gives up at the bound raises `ModelRequestTimedOut`, recorded as any infrastructure failure of a request."""
+        hand = getattr(self.inner, "bound_requests", None)
+        if hand is not None:
+            hand(seconds)
+
     def _settings(self) -> dict[str, Any]:
         """Return the settings of the latest request, as plain values."""
         return plain(self.inner.info().get("settings_sent", {}))

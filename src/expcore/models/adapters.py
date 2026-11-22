@@ -25,7 +25,9 @@ turn as `usage_extra`, recorded only.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import functools
 import inspect
 import json
 import time
@@ -33,7 +35,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 from expcore.config.models import ClientSettings, Limits, ModelSpec
-from expcore.errors import InfraError
+from expcore.errors import InfraError, ModelRequestTimedOut
 from expcore.models.fleetheaders import clean_deployment_id, random_session_id
 from expcore.models.request_bound import PromptBound
 from expcore.models.retry import Retrier, RetryPolicy, SupportsUniform
@@ -47,6 +49,8 @@ REPLY_CAP_PROBE_TOKENS = 16
 REPLY_CAP_PROMPT = "Count from 1 to 500, one number per line, and write nothing else."
 # Stop reasons that mean the reply was cut at the output limit: OpenAI-compatible "length", Anthropic "max_tokens".
 OUTPUT_LIMIT_STOPS = frozenset({"length", "max_tokens"})
+# The reason an abandoned request carries when the study's bound on one request gave it up (B21).
+REQUEST_BOUND = "request_bound"
 
 
 @dataclasses.dataclass
@@ -200,6 +204,7 @@ class _SdkBackend:
         self.usage = UsageTally()
         self.served = Served()
         self._sent: dict[str, Any] = {}  # the settings of the latest request, taken from the request itself
+        self._request_bound_s: float | None = None  # the bound on each request of the step, as the loop handed it (B21)
 
     def _remember_sent(self, request: dict[str, Any]) -> None:
         """Keep the settings of the request about to go out, tell the served-model check which ones they are, and bound
@@ -208,13 +213,37 @@ class _SdkBackend:
         self.served.expect(requested_from_sent(self._sent))
         self._bound.sent(request)
 
+    def bound_requests(self, seconds: float | None) -> None:
+        """Bound each request of the steps that follow to `seconds`, or lift the bound with None (B21). The loop calls it
+        before every step of a run that declares `model_request_bound_s`, with the bound while it is shorter than both
+        the agent's time left and the ceiling left (`AgentConfig.request_bound_for`)."""
+        self._request_bound_s = seconds
+
     async def _send[T](self, send: Callable[[], Awaitable[T]]) -> tuple[T, tuple[dict[str, Any], ...]]:
-        """Send through the retrier; a request that ends with no reply is no longer the one in flight (B19)."""
+        """Send through the retrier; a request that ends with no reply is no longer the one in flight (B19). Under a
+        request bound each send, a resend too, is bounded inside the retrier (`_bounded`), so the retrier never sees a
+        cancel of its own and never resends a request given up at the bound."""
+        bound_s = self._request_bound_s
+        bounded = send if bound_s is None else functools.partial(self._bounded, send, bound_s)
         try:
-            return await self.retrier.call(send)
+            return await self.retrier.call(bounded)
         except BaseException:
             self._bound.gave_up()
             raise
+
+    async def _bounded[T](self, send: Callable[[], Awaitable[T]], bound_s: float) -> T:
+        """One send under the request bound (B21). With no reply by the bound the request is given up: the retrier keeps
+        it as the abandoned request, with the bound on its prompt read while it is still the one in flight (B19), and
+        `ModelRequestTimedOut`, which the retrier does not classify, goes on unretried (B03). A `TimeoutError` the send
+        raised itself, before the bound, goes on as it came."""
+        try:
+            async with asyncio.timeout(bound_s) as scope:
+                return await send()
+        except TimeoutError:
+            if not scope.expired():
+                raise
+            self.retrier.abandon(REQUEST_BOUND)
+            raise ModelRequestTimedOut(bound_s) from None
 
     @property
     def requests_sent(self) -> int:
