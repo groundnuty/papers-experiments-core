@@ -24,7 +24,6 @@ from link_support import (
     three_providers,
 )
 
-from expcore.campaign import prerun
 from expcore.config.loading import ConfigError
 from expcore_onedata import linkcheck
 from expcore_onedata.client import OnezoneClient, OutOfScope
@@ -453,22 +452,6 @@ def test_o35_a_pair_whose_fetch_failed_is_stuck_and_not_untested(fake, config, c
         ("providers[0]", "providers[1]")
     ]
     assert (state.stuck, state.untested, state.heals) == (True, False, True)
-
-
-def test_o35_a_check_that_fails_on_a_link_notes_the_next_start_at_risk(fake, config, client, ticker):
-    """O35: a call that fails on a provider link notes `prerun.NEXT_START_AT_RISK` in the try's note, so a post-run
-    check that failed so lets the run's next start go uncharged should it fail before the agent's first turn
-    (`expcore.campaign.start_after_check`); a call whose links pass notes nothing."""
-    issuer = TokenIssuer(client, config, clock=lambda: 1_800_000_000.0)
-    health = PlatformHealth(config, client, issuer, monotonic=ticker.clock, sleep=ticker.sleep)
-    with prerun.opened() as note:
-        assert health().ok
-    assert prerun.NEXT_START_AT_RISK not in note
-    fake.links[(ALPHA_ID, BETA_ID)] = "fail"
-    ticker.sleep(config.link_check.every_s)
-    with prerun.opened() as note:
-        assert not health().ok
-    assert note[prerun.NEXT_START_AT_RISK] is True
 
 
 def test_o35_a_provider_that_lists_no_blocks_is_not_a_holder(fake, config, client, ticker):

@@ -54,9 +54,7 @@ mid-campaign, closes the gate, sets the run whose check found it aside as infras
 the same way. With `[faults]` and a declared `heal`, a stuck pair the check finds (an untested pair counts as one,
 `fault_matrix.PairState.heals`) is healed by the fault gate around it, between runs and under its own exclusive
 admission (`fault_gate_heal`), and the call answers healthy only once the check passes again; `gate_heal` holds the
-latest such heal's record. A call that fails on a link notes `prerun.NEXT_START_AT_RISK` in the try's note, so a
-post-run check that failed so lets the run's next start, should it fail before the agent's first turn, go uncharged
-(`expcore.campaign.start_after_check`). A federation with no pair (every space supported
+latest such heal's record. A federation with no pair (every space supported
 by the local provider alone) has nothing to check; one
 with pairs and no `[link_check]` always fails. `links` holds the last report: each pair's seconds and bytes and the
 transfers the check made. `monotonic` and `sleep` are its clock and its pauses, a test's `Ticker`. The check writes
@@ -411,9 +409,6 @@ class PlatformHealth:
             return Health(False, "the link check has not answered yet, so no run is admitted")
         if report.ok:
             return verdict
-        # a link that does not transfer, or could not be tested, can fail the next start on the federation before the
-        # agent's first turn: a post-run check that answers it marks that start (`expcore.campaign.start_after_check`)
-        prerun.note(prerun.NEXT_START_AT_RISK, True)
         if self._links_passed:
             return Health(False, f"a provider link stopped transferring during the campaign: {report.detail}")
         return Health(False, f"no run is admitted until every provider link transfers: {report.detail}")

@@ -68,11 +68,15 @@ def test_o35_an_untested_pair_at_the_health_check_is_healed_as_a_stuck_link_with
     an untested pair was left unhealed and the next start on the federation failed."""
     federation = Federation()
     federation.stuck, federation.untested = set(), {(READER, CRASHED)}
+    federation.ping_s = 1.0  # the clock moves between the checks before the sequence and its restarts
     gate, federation, check, settings = gate_of(tmp_path, federation, heal="all_links")
     reading = healed(gate, federation)
     assert reading.ok is True, reading.detail
     assert acted(federation, "restart_link") == [("restart_link", label) for label in EVERY]
     restarts = [at for verb, _, at in federation.actions if verb == "restart_link"]
+    reads = [at for _, at in federation.reads]
+    assert not [at for at in reads if restarts[0] <= at < restarts[-1] + 30]  # nothing read inside the settle
+    assert [at for at in reads if at >= restarts[-1] + 30]  # the heal's fresh read comes after it
     assert InjectionJournal(settings.journal).read_drain() >= restarts[-1] + 30
     assert check.runs == 3  # the check that found the untested pair, the heal's own after it, and the next one
     trigger = {(pair["reader"], pair["source"]): pair for pair in gate.last_heal["trigger"]["pairs"]}

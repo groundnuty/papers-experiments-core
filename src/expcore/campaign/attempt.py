@@ -25,8 +25,8 @@ The order is fixed, and each step is decided by what a kill at that point must l
    names the attempt, and reads as ended the moment the store has the result;
 6. the post-run health check, an instrument's refusal (or a fault injector's reading in the record that its restore was
    not verified, O11) and the served-identity check, which can turn the result into infrastructure (C11, C31, C16).
-   Before them, a start that failed right after the run's previous attempt's post-run check found the platform's links
-   failing is set aside uncharged (`start_after_check`), and a failed post-run check of this attempt that says so marks
+   Before them, a start that failed before the agent's first turn right after the run's previous attempt's post-run
+   check failed is set aside uncharged, once (`start_after_check`), and a failed post-run check of this attempt marks
    the run's next attempt;
 7. the **outcome marker**, then the **store's record** of the result, in this order, with the unit's and the
    harness-error bookkeeping in the same transaction as the result (C04, C15, C10), so a kill cannot keep the result and
@@ -80,6 +80,7 @@ from expcore.campaign.no_request import settle_unsent
 from expcore.campaign.session_bind import bind_session
 from expcore.campaign.settings import SchedulerConfig
 from expcore.campaign.start_after_check import EVENT as SPARED_EVENT
+from expcore.campaign.start_after_check import REASON as SPARED_REASON
 from expcore.campaign.start_after_check import RiskedStarts, spared
 from expcore.campaign.start_diagnostic import WITHHELD_ERROR, snapshot_of
 from expcore.campaign.store import Store
@@ -144,7 +145,7 @@ class Parts:
 
 class AttemptRunner:
     """Runs attempts; safe to call from several worker threads, because all its state is in the store and its parts,
-    but for the runs whose next start a failed post-run check put at risk (`risked`, under a lock of its own)."""
+    but for the runs whose last attempt's post-run check failed (`risked`, under a lock of its own)."""
 
     def __init__(self, parts: Parts):
         self.p = parts
@@ -339,7 +340,7 @@ class AttemptRunner:
         # so an attempt whose usage turns out unknown is charged that bound; the guard takes unknown as yes, which
         # checks more, never less.
         decided = p.reserved_capped(key)
-        at_risk = self.risked.take(key)  # the previous attempt's post-run check put this start at risk
+        at_risk = self.risked.take(key)  # the run's previous attempt's post-run check failed
         begun, run_dir = self._begin(row, lease, admission=admission, reserved_capped=decided)
         bind_session(backend, p.store, key, begun.number, p.lease_id)  # B20: the opaque id of this attempt, if sent
         live = contextlib.nullcontext() if p.campaign is None else liveness.running(p.campaign, begun.id)
@@ -390,7 +391,7 @@ class AttemptRunner:
                 result, unsent = self._settle_failure(result, guard, backend, begun.id)
                 if result.outcome.defect is not None:  # the attempt keeps the class and stack hash, the log the rest
                     defects(error, result.outcome.defect)
-            covered = spared(result, p.settings.health_kind, p.settings.identity_kind) if at_risk else None
+            covered = spared(result, p.settings.health_kind, recorded=record is not None) if at_risk else None
             result = result if covered is None else covered  # the executor's own failure, before any judgment of it
             result, risks_next = self._post_run(result, model, key, begun)
             result, moved = self._judge(result, record, model, key)
@@ -403,10 +404,7 @@ class AttemptRunner:
                 if unsent:  # the row and the marker say `measured`; this says why (C05)
                     p.store.event(p.stamp(), ZERO_EVENT, model, f"{key}: {ZERO_REASON}; charged 0, basis measured")
                 if covered is not None:
-                    text = (
-                        f"{key}: {covered.outcome.infra_kind} before the agent's first turn, right after the run's "
-                        "previous attempt's post-run check found the platform's links failing; set aside uncharged"
-                    )
+                    text = f"{key}: {covered.outcome.infra_kind} before the agent's first turn; {SPARED_REASON}"
                     p.store.event(p.stamp(), SPARED_EVENT, model, text)
                 if mix is not None:
                     p.store.record_deployments(begun.id, mix)
@@ -429,7 +427,7 @@ class AttemptRunner:
                     )
 
             status = self._finish(begun, run_dir, key, result, bookkeeping)
-            if risks_next and covered is None and status == "pending":  # never twice in a row: a run cannot loop
+            if risks_next and covered is None and status == "pending":  # never two in a row: a run cannot loop
                 self.risked.mark(key)
             defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
             return p.settings.retry_delay_s if status == "pending" else 0.0
@@ -495,21 +493,18 @@ class AttemptRunner:
         return row["calls_sent"], row["calls_usage"], row["topup_usd"]
 
     def _post_run(self, result: AttemptResult, model: str, key: str, begun: BegunAttempt) -> tuple[AttemptResult, bool]:
-        """Apply the post-run health check (C11) to a result, and say whether it failed, not deferred, with the next
-        start at risk (`prerun.NEXT_START_AT_RISK`, `start_after_check`). The check is told the attempt it judges
-        (`CheckContext`): the run, the number and the id of the row `begun` made."""
+        """Apply the post-run health check (C11) to a result, and say whether it failed and was not deferred, which
+        covers the run's next start (`start_after_check`). The check is told the attempt it judges (`CheckContext`):
+        the run, the number and the id of the row `begun` made."""
         p = self.p
         if p.health is None:
             return result, False
         note = prerun.current()
         if note is not None:
             note.pop(prerun.HEALTH_READING, None)  # only a check made from here on leaves the post-run reading
-            note.pop(prerun.NEXT_START_AT_RISK, None)  # and only it puts the next start at risk
             note[prerun.EXECUTOR_RETURNED] = True  # nothing of the run is in progress now: no leftover is its own work
         health, outage = p.health.after_run(key, attempt=begun.number, attempt_id=begun.id)
-        risks = (
-            not health.ok and not health.deferred and note is not None and note.get(prerun.NEXT_START_AT_RISK) is True
-        )
+        risks = not health.ok and not health.deferred
         result = self._keep_reading(result, note, model, key)
         if health.deferred:  # it verified nothing: no result is scored on it, treatment included (C11)
             result = unverified(result, health.detail)

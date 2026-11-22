@@ -1,34 +1,39 @@
 # Provenance: new
-"""A start that failed right after a post-run check found the platform's links failing costs its run no attempt.
+"""A start that failed right after a failed post-run check costs its run no attempt, once.
 
-**What it covers.** A platform's post-run check can find something that leaves the platform unfit for the next start:
-a provider link that does not transfer, or one the check could not even test (the Onedata link check, O35). The check
-says so by noting `prerun.NEXT_START_AT_RISK` in the try's note; it is noted for nothing else. Seen live in a running
-campaign: a post-run check failed a provider pair as untested, and the run's next attempt, a minute or so later,
-failed before the agent's first turn because the start state it induces on the federation did not verify in time. It
-was charged, so one more such failure would have exhausted the run for a failure the run never caused.
+**Why.** A failed post-run health check is the platform saying it was unhealthy at the end of the run's previous
+attempt. The next attempt starts on that platform, and an infrastructure failure of it before the agent's first turn
+cannot be the agent's doing: the agent never met the run. Seen live in a running campaign: a post-run check failed a
+provider pair as untested, and the run's next attempt, a minute or so later, failed before the agent's first turn
+because the start state it induces on the federation did not verify in time. It was charged, so one more such failure
+would have exhausted the run for a fault the run never caused.
 
-**The rule.** The run's next attempt in this process after an attempt whose post-run check failed (not deferred) with
-`NEXT_START_AT_RISK` noted is the one it covers (`RiskedStarts`). It is set aside uncharged when, and only when, it
-ends as a charged infrastructure failure before the agent's first turn (`model_turns == 0`), of a kind that is neither
-the core's own (`expcore.errors.CORE_KINDS`: the model's endpoint and key, the budget, the sandbox, the tool server, a
-kill, the ceiling, integrity, verification) nor the campaign's health or identity kind: what is left is a failure of the
-start a study or a platform makes on the platform (inducing the run's start state, a platform's own start), which is
-what a failing link spoils. The attempt is then kept as one an outage overlapped (`outage_kind` set to the campaign's
-health kind, `outage_discarded`), as a post-run failure another attempt left already is (`expcore.campaign.attempt`).
+**The rule.** After an attempt whose post-run check failed and was not deferred (`RiskedStarts.mark`), the run's next
+attempt in this process is covered. It is set aside uncharged when, and only when, the executor's own result is a
+charged infrastructure failure before the agent's first turn, whatever its kind (`spared`): with a record, one with no
+completed turn (`model_turns == 0`); with none (the executor raised, and `model_turns` is then a default, not a count),
+one whose usage is known to be no request (`turn_usage == ()`: its complete call log held none, `no_request`, or a
+first-turn refusal sent none). An executor that raised with requests in its log, or kept no call log (a campaign with
+no budget), is charged as before. The
+attempt is then kept as one an outage overlapped (`outage_kind` set to the campaign's health kind, `outage_discarded`),
+as a post-run failure another attempt left already is (`expcore.campaign.attempt`), and its outcome's detail says why
+it was not charged, first (`REASON`): the row's `detail`, the marker and the export all carry it. An event of kind
+`EVENT` is written in the result's transaction too.
 
-**Why it is narrow.**
+**The bound: one uncharged attempt per failed post-run check.**
 - *Once.* The mark is taken by the run's next attempt whatever it ends in: a pre-run check that finds an outage, a
-  scored result, or this start. A start covered by the rule never marks the run again, even when its own post-run check
-  fails on a link too, so of two consecutive attempts at least one is charged and a run can never loop uncharged on a
-  link that keeps failing.
-- *Only after a link.* A post-run check that failed on anything else (a space, an injection), or was deferred, marks
-  nothing. A platform that notes nothing leaves every charge as it was.
-- *Only before the agent's first turn.* The agent never met the run, so nothing it did is in question; a failure after
-  a turn is charged as always.
+  scored result, or a start failure. A start set aside by this rule never marks the run again, even when its own
+  post-run check fails too, so the failure after it is charged: of two consecutive attempts at least one is charged,
+  and a run can never loop uncharged on a platform that keeps failing its checks.
+- *Only after a failed check.* A post-run check that passed, or was deferred (it verified nothing and found nothing
+  failing), marks nothing.
+- *Only before the agent's first turn.* A failure after a completed turn is charged as always.
+- *Only the executor's own failure.* The rule looks at the result before the post-run check and the instruments judge
+  it, so this attempt's own post-run failure, an instrument's refusal and the endpoint's identity are charged as before.
 - *In this process.* The mark lives in memory: a restart in between forgets it and the start is charged, as before.
-  The decision itself is carried on the result (`outage_kind`), in its marker and its row, so a result committed from
-  its marker after a restart is classified the same (`attempts.classify`), and no record field is added.
+  The decision itself is carried on the result (`outage_kind`, `detail`), in its marker and its row, so a result
+  committed from its marker after a restart is classified the same (`attempts.classify`), and no field is added to the
+  marker, the store or the record.
 """
 
 import dataclasses
@@ -36,20 +41,20 @@ import threading
 
 from expcore.campaign.attempts import classify
 from expcore.campaign.markers import AttemptResult
-from expcore.errors import CORE_KINDS
 
-EVENT = "start_spared_after_link_failure"  # the store's event for a start this rule set aside
+EVENT = "start_spared_after_failed_check"  # the store's event for a start this rule set aside
+REASON = "set aside uncharged: the run's previous attempt's post-run health check failed"  # the detail's lead
 
 
 class RiskedStarts:
-    """The runs whose next attempt follows a post-run check that put it at risk; safe from several worker threads."""
+    """The runs whose next attempt follows a failed post-run check; safe from several worker threads."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._runs: set[str] = set()
 
     def mark(self, run_key: str) -> None:
-        """The run's latest attempt ended with a failed post-run check that noted the next start at risk."""
+        """The run's latest attempt ended with a failed, not deferred, post-run check."""
         with self._lock:
             self._runs.add(run_key)
 
@@ -61,16 +66,17 @@ class RiskedStarts:
             return found
 
 
-def spared(result: AttemptResult, health_kind: str, identity_kind: str) -> AttemptResult | None:
-    """The result set aside uncharged, as an outage overlapped it, when the rule covers it (see the module docstring),
-    else None: a charged infrastructure failure before the agent's first turn, of a kind that is a study's or a
-    platform's start and not the core's own, the health kind or the identity kind."""
+def spared(result: AttemptResult, health_kind: str, *, recorded: bool) -> AttemptResult | None:
+    """The executor's result set aside uncharged, as an outage overlapped it, with `REASON` leading its detail, when
+    the rule covers it (a charged infrastructure failure before the agent's first turn); else None. `recorded`: the
+    executor returned a record, so `model_turns` counts its completed turns; without one only a usage known to be no
+    request (`turn_usage == ()`) shows that no turn was taken."""
     if result.model_turns != 0 or result.outage_kind is not None:
         return None
+    if not recorded and result.turn_usage != ():
+        return None
     state, charged, _ = classify(result, result.treatment_kinds, result.treatment_targets)
-    kind = result.outcome.infra_kind
-    if state != "infra_fail" or not charged or kind is None:
+    if state != "infra_fail" or not charged:
         return None
-    if kind in CORE_KINDS or kind in (health_kind, identity_kind):
-        return None
-    return dataclasses.replace(result, outage_kind=health_kind)
+    outcome = dataclasses.replace(result.outcome, detail=f"{REASON}; {result.outcome.detail}")
+    return dataclasses.replace(result, outcome=outcome, outage_kind=health_kind)

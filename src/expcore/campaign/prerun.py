@@ -24,12 +24,6 @@ taken for the post-run check's, and a check that notes none leaves none.
 
 Before the post-run check the runner also notes `EXECUTOR_RETURNED`: once the executor has returned nothing of the run
 is in progress, so a platform's check never explains a state as the run's own work in progress (the fault gate, O90).
-
-A platform's check notes `NEXT_START_AT_RISK` (True) when the failure it answers is one that can make the next start
-on the platform fail before the agent's first turn: the Onedata check notes it for a provider link that does not
-transfer or could not be tested, and for nothing else. The runner clears it before the post-run check, like the
-reading, and reads it after a failed, not deferred, post-run check: the run's next attempt is then covered by
-`expcore.campaign.start_after_check`.
 """
 
 import contextlib
@@ -44,7 +38,6 @@ HEALTH_READING = "health_reading"  # the key a platform's check notes its struct
 EXECUTOR_RETURNED = (
     "executor_returned"  # set by the attempt runner before the post-run check: the executor has returned
 )
-NEXT_START_AT_RISK = "next_start_at_risk"  # a platform's check: its failure can fail the next start (a provider link)
 READING_MAX_BYTES = 16_384  # the most a reading's JSON text may be for the attempt to keep it
 READING_MAX_DEPTH = 16  # the deepest a reading may nest (a platform's reading is a shallow object)
 READING_MAX_NODES = 4_096  # the most values a reading may hold, walked before anything is serialised
