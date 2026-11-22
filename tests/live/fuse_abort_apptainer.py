@@ -38,6 +38,7 @@ import contextlib
 import hashlib
 import json
 import math
+import re
 import shutil
 import signal
 import subprocess
@@ -89,16 +90,22 @@ def wait_seen(files: Any, provider: str, file_id: str, timeout_s: float = SEEN_S
 
 
 def sha_of(stdout: str) -> str | None:
-    """The SHA-256 a local-read cell printed, None when it printed none."""
-    line = next((x for x in stdout.splitlines() if x.startswith("sha256 ")), None)
-    return line.split()[1] if line else None
+    """The SHA-256 a local-read cell printed, None when no line is exactly `sha256 <64 hex digits>`: nothing else of a
+    cell's output ever reaches the facts."""
+    found = re.search(r"^sha256 ([0-9a-f]{64})$", stdout, re.MULTILINE)
+    return found.group(1) if found else None
 
 
 def mount_facts(box: Any) -> dict[str, Any]:
-    """What a direct sandbox's metadata says of its mount: its remounts, and whether any generation was aborted."""
+    """What a direct sandbox's metadata says of its mount: its remounts, and whether it is shown untouched by any abort
+    (`aborted`: False only for exactly one generation whose own `abort` is recorded as None; None when that is not
+    shown)."""
     mount = (box.metadata() or {}).get("mount") or {}
-    generations = mount.get("generations") or []
-    return {"remounts": mount.get("remounts"), "aborted": any(g.get("abort") for g in generations)}
+    generations = mount.get("generations")
+    aborted: bool | None = None
+    if isinstance(generations, list) and generations and all(isinstance(g, dict) and "abort" in g for g in generations):
+        aborted = any(g["abort"] for g in generations)
+    return {"remounts": mount.get("remounts"), "aborted": aborted}
 
 
 def write_study(
@@ -181,7 +188,9 @@ def record_checks(text: str | None) -> tuple[bool, bool]:
     return valid, replayed
 
 
-def negative(box: Any, owner_path: str, rest: str, bound_s: float, local_held: int | None) -> dict[str, Any]:
+def negative(
+    box: Any, owner_path: str, expected: tuple[str, str], bound_s: float, local_held: int | None
+) -> dict[str, Any]:
     """N's cell under the driver's own outage (P12): what its deadline and its next cell showed, as a summary
     (`fuse_proof.negative_summary`); the raw deadline, which names the space, never leaves this function."""
     done = box.exec(FP.owner_read(owner_path), bound_s)
@@ -191,9 +200,10 @@ def negative(box: Any, owner_path: str, rest: str, bound_s: float, local_held: i
         next_cell = "ran"
     except InfraError as refused:
         next_cell = refused.kind
+    pending = bool(getattr(done, "restore_pending", False))
     return FP.negative_summary(
-        deadlines[-1] if deadlines else None, rest=rest, restore_pending=bool(getattr(done, "restore_pending", False)),
-        next_cell=next_cell, local_held_before=local_held,
+        deadlines[-1] if deadlines else None, expected=expected, restore_pending=pending, next_cell=next_cell,
+        local_held_before=local_held,
     )  # fmt: skip
 
 
@@ -329,7 +339,7 @@ def run_proof(
         record, text = registered_record(study)
         if record is not None:
             facts["registered"] = FP.record_facts(
-                record, rest=rest_of[REGISTERED_FILE], bound_s=bound_s, local_sha256=local_sha
+                record, expected=(world.space_name, rest_of[REGISTERED_FILE]), bound_s=bound_s, local_sha256=local_sha
             )
         facts["record_valid"], facts["replayed"] = record_checks(text)
         reads.append(sha_of(control.exec(FP.local_read(local_path, space_root), 60).stdout))
@@ -347,7 +357,8 @@ def run_proof(
         injector = world.injector(world.target)  # kept for the teardown: a cut in its clear is cleared again there
         with injector.session({"run_key": "fuse-proof-negative-outage", "attempt": 1}):
             mark("negative_outage")
-            facts["negative"] = negative(unregistered, negative_path, rest_of[NEGATIVE_FILE], bound_s, negative_held)
+            expected = (world.space_name, rest_of[NEGATIVE_FILE])
+            facts["negative"] = negative(unregistered, negative_path, expected, bound_s, negative_held)
             reads.append(sha_of(control.exec(FP.local_read(local_path, space_root), 60).stdout))
         mark("negative_restored")
         facts["control"] = {"reads": reads, **mount_facts(control)}

@@ -301,9 +301,63 @@ def test_o97_a_survivors_file_and_another_survivors_call_are_never_joined():
             {"comm": "b", "state": "D", "tasks": [{"state": "D", "wchan": "w", "syscall": {"nr": 0, "fd": 3}}]},
         ],
     }
-    assert FP.deadline_facts(deadline, "f/x.bin")["blocked_on_expected"] is False
-    deadline["survivors"][1]["waits_on"] = [{"mount": "data", "path": "f/x.bin"}]
-    assert FP.deadline_facts(deadline, "f/x.bin")["blocked_on_expected"] is True
+    expected = ("s", "f/x.bin")
+    deadline["survivors"][0]["waits_on"] = [{"mount": "data", "space": "s", "path": "f/x.bin"}]
+    assert FP.deadline_facts(deadline, expected)["blocked_on_expected"] is False
+    deadline["survivors"][1]["waits_on"] = [{"mount": "data", "space": "s", "path": "f/x.bin"}]
+    assert FP.deadline_facts(deadline, expected)["blocked_on_expected"] is True
+
+
+def test_o97_the_expected_file_is_matched_by_its_space_and_by_the_descriptor_the_task_waits_on():
+    """O97 (Codex, round 2): the same path in another space, or the expected file held on another descriptor than the
+    one the task reads, is no wait on the expected file."""
+    task = {"state": "D", "wchan": "w", "syscall": {"nr": 0, "fd": 3}}
+
+    def deadline(*waits):
+        return {"steps": [], "survivors": [{"state": "D", "tasks": [task], "waits_on": list(waits)}]}
+
+    expected = ("s", "f/x.bin")
+    assert (
+        FP.deadline_facts(deadline({"mount": "data", "space": "t", "path": "f/x.bin"}), expected)["blocked_on_expected"]
+        is False
+    )
+    assert (
+        FP.deadline_facts(deadline({"mount": "data", "space": "s", "path": "f/x.bin", "fd": 9}), expected)[
+            "blocked_on_expected"
+        ]
+        is False
+    )
+    assert (
+        FP.deadline_facts(deadline({"mount": "data", "space": "s", "path": "f/x.bin", "fd": 3}), expected)[
+            "blocked_on_expected"
+        ]
+        is True
+    )
+
+
+def test_o97_an_abort_counts_only_when_its_very_next_step_is_ended():
+    """O97 (Codex, round 2): a step that raised between the abort and the end means a fallback made the cell gone."""
+    assert FP.deadline_facts({"steps": [{"step": "abort"}, {"step": "ended"}]}, None)["ended_after_abort"] is True
+    raised = [{"step": "abort"}, {"step": "raised"}, {"step": "ended"}]
+    assert FP.deadline_facts({"steps": raised}, None)["ended_after_abort"] is False
+
+
+def test_o97_a_control_or_target_the_facts_cannot_vouch_for_fails(proof):
+    """O97 (Codex, round 2): no local digest, an abort fact that is not exactly False, or a target that is no provider
+    label each fails its check; a cell's output is never taken for a digest unless it is one."""
+    import copy
+
+    def without(change):
+        facts = copy.deepcopy(proof)
+        change(facts)
+        return FP.problems(facts)
+
+    assert any(p.startswith("P7:") for p in without(lambda f: f.pop("local_sha256")))
+    assert any(p.startswith("P7:") for p in without(lambda f: f["control"].update(aborted=None)))
+    assert any(p.startswith("P11:") for p in without(lambda f: f.pop("target")))
+    driver = load_driver()
+    assert driver.sha_of("sha256 /data/a-space/a-file\n") is None
+    assert driver.sha_of("listed 2\nsha256 " + "a" * 64 + "\n") == "a" * 64
 
 
 def test_o97_a_seeding_that_fails_part_way_leaves_nothing_behind(tmp_path, monkeypatch):

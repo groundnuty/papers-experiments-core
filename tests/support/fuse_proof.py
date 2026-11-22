@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from expcore.errors import TARGET_LABEL
 from expcore.mountguard.flags import verdict_of
 
 BOUND_S = 30.0  # the study's limit on one code cell: well under oneclient's 120 s provider timeout
@@ -72,11 +73,22 @@ def script(owner: str, local: str, root: str, *, second_cycle: bool, owner_reads
 
 
 # ------------------------------------------------------------------------------------------------ reading a record
-def _waits_on(survivor: Mapping[str, Any], rest: str | None) -> bool:
-    """Whether a survivor's recorded wait names the file `rest` (its path below its space) on the data mount: the
-    survivor's own `waits_on`, since a recorded task keeps no blocking object of its own."""
-    waits = [w for w in survivor.get("waits_on") or [] if isinstance(w, Mapping)]
-    return rest is not None and any(w.get("mount") == "data" and w.get("path") == rest for w in waits)
+def _waits_on(survivor: Mapping[str, Any], expected: tuple[str, str] | None, fd: Any) -> bool:
+    """Whether a survivor's recorded wait names the expected file, `(space, path below it)`, on the data mount, and,
+    for a task that waits in a call on a descriptor, on that descriptor: the survivor's own `waits_on` (a recorded task
+    keeps no blocking object of its own), whose fallback lists every FUSE descriptor the process holds, each with its
+    own. The space is compared here and never kept."""
+    if expected is None:
+        return False
+    space, rest = expected
+    return any(
+        isinstance(w, Mapping)
+        and w.get("mount") == "data"
+        and w.get("space") == space
+        and w.get("path") == rest
+        and (fd is None or w.get("fd") is None or w.get("fd") == fd)
+        for w in survivor.get("waits_on") or []
+    )
 
 
 def _d_tasks(survivor: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -92,9 +104,21 @@ def _call_known(task: Mapping[str, Any]) -> bool:
     return listed and (bool(task.get("wchan")) or (isinstance(syscall, Mapping) and syscall.get("fd") is not None))
 
 
-def deadline_facts(deadline: Mapping[str, Any] | None, rest: str | None) -> dict[str, Any] | None:
+def _fd_of(task: Mapping[str, Any]) -> Any:
+    syscall = task.get("syscall")
+    return syscall.get("fd") if isinstance(syscall, Mapping) else None
+
+
+def _ended_after_abort(names: Sequence[Any]) -> bool:
+    """Whether the step right after the abort is `ended`: the abort itself freed every process, never a fallback after
+    a step that raised."""
+    return "abort" in names and names.index("abort") + 1 < len(names) and names[names.index("abort") + 1] == "ended"
+
+
+def deadline_facts(deadline: Mapping[str, Any] | None, expected: tuple[str, str] | None) -> dict[str, Any] | None:
     """What a call's `cell_deadline` shows, as the checks read it: steps, outcomes and timings, the attribution, and,
-    per survivor, whether one survivor in D both names the expected file (`rest`) and says what it waits in. No space
+    per survivor, whether one survivor in D both names the expected file (`expected`: its space and its path below it)
+    and says what it waits in. No space
     name, no path and no text of the record is kept: only labels, counts, numbers and booleans."""
     if not isinstance(deadline, Mapping):
         return None
@@ -121,13 +145,16 @@ def deadline_facts(deadline: Mapping[str, Any] | None, rest: str | None) -> dict
         "task_states": [t.get("state") for s in survivors for t in s.get("tasks") or [] if isinstance(t, Mapping)],
         # one survivor carries both: a task in D whose call is known, and a wait on the expected file (never one
         # survivor's file joined with another's call)
-        "blocked_on_expected": any(_waits_on(s, rest) and any(_call_known(t) for t in _d_tasks(s)) for s in survivors),
+        "blocked_on_expected": any(
+            _call_known(t) and _waits_on(s, expected, _fd_of(t)) for s in survivors for t in _d_tasks(s)
+        ),
+        "ended_after_abort": _ended_after_abort([s.get("step") for s in steps]),
         "attribution": {k: attribution.get(k) for k in ("verdict", "why", "target", "space_holder")},
     }
 
 
 def call_facts(
-    call: Mapping[str, Any], *, rest: str | None, bound_s: float, local_sha256: str | None
+    call: Mapping[str, Any], *, expected: tuple[str, str] | None, bound_s: float, local_sha256: str | None
 ) -> dict[str, Any]:
     """One tool call of a record, as the checks read it: the two things its text must say, as booleans (that it was
     told as the bound's timeout, and that it printed the local file's digest), never the text itself."""
@@ -138,12 +165,12 @@ def call_facts(
         "timeout_told": f"the code ran past its {bound_s:g} s limit and was killed" in text,
         "local_sha_read": local_sha256 is not None and f"sha256 {local_sha256}" in text,
         "paused_s": (call.get("infra_wait_by_kind") or {}).get("sandbox_lifecycle", 0.0),
-        "deadline": deadline_facts(call.get("cell_deadline"), rest),
+        "deadline": deadline_facts(call.get("cell_deadline"), expected),
     }
 
 
 def record_facts(
-    record: Mapping[str, Any], *, rest: str | None, bound_s: float, local_sha256: str | None
+    record: Mapping[str, Any], *, expected: tuple[str, str] | None, bound_s: float, local_sha256: str | None
 ) -> dict[str, Any]:
     """What the registered attempt's record shows, as the checks read it (`rest`: the registered file's path below its
     space, which a survivor must be shown to wait on)."""
@@ -154,7 +181,8 @@ def record_facts(
         "outcome": outcome.get("name"),
         "infra_kind": outcome.get("infra_kind"),
         "calls": [
-            call_facts(c, rest=rest, bound_s=bound_s, local_sha256=local_sha256) for c in record.get("tool_calls") or []
+            call_facts(c, expected=expected, bound_s=bound_s, local_sha256=local_sha256)
+            for c in record.get("tool_calls") or []
         ],
         "guard_verdict": verdict_of(guard) if isinstance(guard, Mapping) else None,
         "guard_generations": len(generations) if isinstance(generations, list) else (1 if guard else 0),
@@ -162,16 +190,17 @@ def record_facts(
 
 
 def negative_summary(
-    deadline: Mapping[str, Any] | None, *, rest: str | None, restore_pending: bool, next_cell: str | None,
+    deadline: Mapping[str, Any] | None, *, expected: tuple[str, str] | None, restore_pending: bool,
+    next_cell: str | None,
     local_held_before: int | None,
 ) -> dict[str, Any]:  # fmt: skip
     """What the unregistered sandbox's cell showed (P12), kept in place of its raw deadline: no name or path."""
-    facts = deadline_facts(deadline, rest)
+    facts = deadline_facts(deadline, expected)
     return {
         "blocked": facts is not None,
         "outcome": None if facts is None else facts["outcome"],
         "abort_ok": None if facts is None else facts["abort_ok"],
-        "ended": facts is not None and "ended" in facts["steps"],
+        "ended": facts is not None and facts["ended_after_abort"],
         "blocked_on_expected": facts is not None and facts["blocked_on_expected"],
         "verdict": None if facts is None else facts["attribution"]["verdict"],
         "why": None if facts is None else facts["attribution"]["why"],
@@ -188,8 +217,8 @@ def _blocked(deadline: Mapping[str, Any] | None, *, generation: int) -> list[str
         return ["path not exercised: the call has no cell_deadline (the read did not block past the bound)"]
     found = []
     steps = deadline["steps"]
-    if not ("kill" in steps and "survived" in steps and "abort" in steps and "ended" in steps):
-        found.append(f"the escalation's steps are {steps}, not kill, survived, abort, ended")
+    if not ("kill" in steps and "survived" in steps and deadline["ended_after_abort"]):
+        found.append(f"the escalation's steps are {steps}, not kill, survived, then abort straight to ended")
     if not (isinstance(deadline["survived_left"], int) and deadline["survived_left"] >= 1):
         found.append("no survivor of the kill was recorded")
     if "D" not in deadline["survived_states"] and "D" not in deadline["task_states"]:
@@ -220,6 +249,8 @@ def _attributed(deadline: Mapping[str, Any] | None, target: str | None) -> list[
     """P11: the verdict is the agent's, on the held-down holder's space."""
     if deadline is None:
         return ["path not exercised: no cell_deadline to read the attribution from"]
+    if not isinstance(target, str) or not TARGET_LABEL.fullmatch(target):
+        return [f"the proof's target {target!r} is no provider label: nothing to compare the attribution with"]
     want = {"verdict": "agent", "why": "blocked_on_held_down_holder", "target": target, "space_holder": target}
     return [] if deadline["attribution"] == want else [f"the attribution is {deadline['attribution']}, not {want}"]
 
@@ -237,12 +268,12 @@ def control_problems(result: Mapping[str, Any], local_sha256: str | None = None)
     reads = result.get("reads") or []
     if len(reads) < 3 or len(set(reads)) != 1 or reads[0] is None:
         found.append(f"its local reads were {reads}: not three equal ones")
-    elif local_sha256 is not None and reads[0] != local_sha256:
-        found.append("its local reads are not the local file's digest")
+    elif local_sha256 is None or reads[0] != local_sha256:
+        found.append("its local reads are not the local file's digest (or that digest is not known)")
     if result.get("remounts") != 0:
         found.append(f"its mount was remounted {result.get('remounts')} time(s)")
-    if result.get("aborted") not in (None, False):
-        found.append("its mount was aborted")
+    if result.get("aborted") is not False:
+        found.append(f"its mount is not shown untouched by any abort (aborted: {result.get('aborted')})")
     return found
 
 
