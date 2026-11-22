@@ -61,6 +61,55 @@ def test_o35_a_stuck_pair_at_the_health_check_is_healed_by_all_links_and_the_gat
     assert gate.last_heal["outcome"] == "healed"
 
 
+def test_o35_an_untested_pair_at_the_health_check_is_healed_as_a_stuck_link_with_its_settle(tmp_path):
+    """O35: the gate's own link check finds a pair it could not test (its probe could not be made ready) and no fetch
+    failed: the gate heals it as it heals a stuck link, every provider's link restarted once, the settle written to the
+    federation's drain record before any read, and opens once its own check passes. Seen live in a running campaign:
+    an untested pair was left unhealed and the next start on the federation failed."""
+    federation = Federation()
+    federation.stuck, federation.untested = set(), {(READER, CRASHED)}
+    gate, federation, check, settings = gate_of(tmp_path, federation, heal="all_links")
+    reading = healed(gate, federation)
+    assert reading.ok is True, reading.detail
+    assert acted(federation, "restart_link") == [("restart_link", label) for label in EVERY]
+    restarts = [at for verb, _, at in federation.actions if verb == "restart_link"]
+    assert InjectionJournal(settings.journal).read_drain() >= restarts[-1] + 30
+    assert check.runs == 3  # the check that found the untested pair, the heal's own after it, and the next one
+    trigger = {(pair["reader"], pair["source"]): pair for pair in gate.last_heal["trigger"]["pairs"]}
+    assert trigger[(READER, CRASHED)]["untested"] is True  # the heal's record says why it ran
+    assert "untested" not in trigger[(CRASHED, READER)]
+    assert gate.last_heal["outcome"] == "healed"
+
+
+def test_o35_an_untested_pair_at_the_health_check_holds_the_run_uncharged_while_it_is_healed(tmp_path):
+    """O35: through the core's gate, the run whose pre-run check finds the untested pair is deferred, not charged as
+    the outage's one attempt, and goes once the heal has mended it."""
+    federation = Federation()
+    federation.stuck, federation.untested = set(), {(READER, CRASHED)}
+    gate, federation, _, _ = gate_of(tmp_path, federation, heal="all_links")
+    core, store, key = core_gate(tmp_path, gate, timeout_s=5)
+    assert core.before_run(key).verdict == DEFER
+    assert core.closed is False
+    assert gate.wait_for_heal(10)
+    federation.clock.sleep(600)
+    assert core.before_run(key).verdict == GO
+    assert store.q("SELECT COUNT(*) FROM attempts")[0][0] == 0
+
+
+def test_o35_with_the_heal_off_an_untested_pair_still_fails_closed_and_charged(tmp_path):
+    """O35: with `[faults] heal = "off"` a pair the check could not test fails the check closed, as before: the run
+    that found it is the outage's one attempt, and nothing is acted on."""
+    federation = Federation()
+    federation.stuck, federation.untested = set(), {(READER, CRASHED)}
+    gate, federation, _, settings = gate_of(tmp_path, federation, heal="off")
+    reading = gate()
+    assert (reading.ok, reading.deferred, reading.charge) == (False, False, True)
+    core, _, key = core_gate(tmp_path, gate, timeout_s=5)
+    assert core.before_run(key).verdict == FOUND
+    assert acted(federation, *ANY_ACTION) == []
+    assert heal_lines(settings) == []
+
+
 def test_o35_a_heal_longer_than_the_health_timeout_that_mends_the_pair_charges_no_run(tmp_path):
     """O35: the heal outlasts the core's wait for a check (`health_timeout_s`); the check that found the stuck pair
     answers the uncharged deferral at once and the heal runs on, so the run is deferred, not charged, the gate stays
@@ -648,10 +697,16 @@ def test_o35_the_gate_heal_runs_through_the_platforms_standard_health_check(tmp_
 
 
 def report_of(federation: Federation) -> LinkReport:
-    """The link check's report of the federation's pairs: a stuck pair's fetch failed, naming the remedy."""
+    """The link check's report of the federation's pairs: a stuck pair's fetch failed, naming the remedy; an untested
+    pair says it was not tested; a misread pair names neither."""
     pairs = tuple(
         PairResult(
-            pair.reader, pair.source, pair.ok, 0.1, remedy=None if pair.ok else REMEDY.format(reader=pair.reader)
+            pair.reader,
+            pair.source,
+            pair.ok,
+            0.1,
+            remedy=REMEDY.format(reader=pair.reader) if pair.stuck else None,
+            untested=pair.untested,
         )
         for pair in federation.matrix().pairs
     )
@@ -662,15 +717,15 @@ def report_of(federation: Federation) -> LinkReport:
 # --- it acts only on stuck pairs ---------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("found", ["every pair passing", "an untested pair", "a space that fails first"])
+@pytest.mark.parametrize("found", ["every pair passing", "a misread pair", "a space that fails first"])
 def test_o35_the_gate_heals_nothing_unless_its_own_check_finds_a_stuck_pair(tmp_path, found):
-    """O35: the heal is never routine. A check whose pairs pass, one whose only failure is a pair that was not tested
-    (no fetch failed, so no stuck link), and a check that fails before its link check (the space) while an earlier
-    report shows a stuck pair, start no heal: nothing is pinged, restarted or read by a heal, and nothing is
+    """O35: the heal is never routine. A check whose pairs pass, one whose only failure is a pair read with bytes other
+    than the probe's (it transferred, so no stuck link), and a check that fails before its link check (the space) while
+    an earlier report shows a stuck pair, start no heal: nothing is pinged, restarted or read by a heal, and nothing is
     recorded."""
     federation = Federation()
     federation.stuck = set() if found != "a space that fails first" else {(READER, CRASHED)}
-    federation.untested = {(READER, CRASHED)} if found == "an untested pair" else set()
+    federation.misread = {(READER, CRASHED)} if found == "a misread pair" else set()
     gate, federation, check, settings = gate_of(tmp_path, federation, heal="all_links")
     if found == "a space that fails first":
         check.report = check.made = federation.matrix()  # a stuck pair an earlier call found, left untaken
@@ -841,12 +896,12 @@ def test_o35_a_pass_another_check_made_before_the_heal_never_opens_the_gate(tmp_
 
 
 def test_o35_the_gate_heals_nothing_when_the_heals_fresh_matrix_shows_no_stuck_pair(tmp_path):
-    """O35: the gate's check found a stuck pair, but by the heal's own fresh read it passes and only an untested pair
-    fails: no link fetch failed, so nothing is pinged or restarted and the gate stays closed."""
+    """O35: the gate's check found a stuck pair, but by the heal's own fresh read it passes and only a misread pair
+    fails: no fetch failed and every pair was tested, so nothing is pinged or restarted and the gate stays closed."""
     federation = Federation()
 
     def recovered():
-        federation.stuck, federation.untested = set(), {(SECOND, OTHER)}
+        federation.stuck, federation.misread = set(), {(SECOND, OTHER)}
 
     federation.on_read = recovered
     gate, federation, _, _ = gate_of(tmp_path, federation, heal="all_links")
@@ -854,6 +909,23 @@ def test_o35_the_gate_heals_nothing_when_the_heals_fresh_matrix_shows_no_stuck_p
     assert reading.ok is False
     assert acted(federation, "ping", "restart_link", "stop", "start") == []
     assert "no pair failed a fetch" in gate.last_heal["why"]
+
+
+def test_o35_the_heal_acts_on_a_pair_its_fresh_matrix_finds_untested(tmp_path):
+    """O35: the gate's check found a stuck pair; by the heal's own fresh read that pair passes but another could not be
+    tested: the heal goes on and heals it as a stuck link, and the gate opens once its own check passes."""
+    federation = Federation()
+
+    def moved():
+        if (READER, CRASHED) in federation.stuck:
+            federation.stuck, federation.untested = set(), {(SECOND, OTHER)}
+
+    federation.on_read = moved
+    gate, federation, _, _ = gate_of(tmp_path, federation, heal="all_links")
+    reading = healed(gate, federation)
+    assert reading.ok is True, reading.detail
+    assert acted(federation, "restart_link") == [("restart_link", label) for label in EVERY]
+    assert gate.last_heal["outcome"] == "healed"
 
 
 def test_o35_the_latch_is_read_again_once_the_heals_admission_is_held(tmp_path):

@@ -39,7 +39,8 @@ was lost, or a reused injector, is still an unsettled injection there.
 **It heals stuck pairs its own link check found (O35, `fault_gate_heal`).** Given the link report the rest of the check
 made in the calling thread (`links`), a way to make it check the links again (`relink`) and the providers' services
 (`labels`), as `PlatformHealth` gives them, a check that holds no run's admission and whose own all-pairs link check, in
-this call, found a stuck pair heals it with `[faults] heal`: it lets its shared hold go, takes the federation
+this call, found a stuck pair (a failed fetch, or a pair it could not test: `fault_matrix.PairState.heals`) heals it
+with `[faults] heal`: it lets its shared hold go, takes the federation
 exclusively (`RECOVERY`), waiting at most `health_wait_s` for every shared holder and for the drain record, and failing
 closed, uncharged, as the hold `federation_busy` when either outlasts it, and hands the admission to the restore's heal,
 with no provider restored, **in the background** (`_heal_on`). The check that began it, and every check while it runs,
@@ -364,7 +365,7 @@ class FaultGate:
                 verdict, made = self._judged(self._noted())
             finally:
                 shared.close()
-            stuck = made is not None and not verdict.ok and any(pair.stuck for pair in made.pairs)
+            stuck = made is not None and not verdict.ok and any(pair.heals for pair in made.pairs)  # untested too
             return self._heal(verdict, made) if stuck and made is not None else verdict
         except RestoreSettling as settling:  # a recovered container restart settles before its gate and pairs
             return self._operator(Health(False, settling.detail, deferred=True, charge=False))
