@@ -96,7 +96,15 @@ from expcore_onedata.config import PlatformConfig
 from expcore_onedata.credentials import Principal
 from expcore_onedata.fault_drain import SessionTicket
 from expcore_onedata.sandbox import fedwindow, gatelog, infrafacts, kinds
-from expcore_onedata.sandbox.api import DataPathMode, Endpoint, ReadOnlyInput, SandboxError, SandboxSpec, StartRefused
+from expcore_onedata.sandbox.api import (
+    DataPathMode,
+    Endpoint,
+    ReadOnlyInput,
+    SandboxError,
+    SandboxSpec,
+    SandboxStartFailed,
+    StartRefused,
+)
 from expcore_onedata.sandbox.apptainer.runs import ApptainerProbe
 from expcore_onedata.sandbox.apptainer.sandbox import ApptainerSandbox
 from expcore_onedata.sandbox.gatepolicy import PAGED
@@ -579,6 +587,11 @@ class SandboxPlatform:
     ) -> AsyncIterator[DockerSandbox]:
         """Start the sandbox of a run and yield it; stop it, verified, on leaving.
 
+        A start that fails with a `SandboxError` after it began making things raises `SandboxStartFailed` once what it
+        made is stopped: infrastructure of the core's kind `sandbox` (charged and run again), and still a
+        `SandboxError`. The start comes before the body, so before any turn of the agent. `StartRefused` and any
+        other exception of the start are raised as they were.
+
         `inputs` are the run's read-only inputs (`ReadOnlyInput`): files the study supplies, such as scripts the agent
         may run but not change, which the executor passes, from the run's condition or its own, as the platform was
         built with them (`read_only_inputs`, from `inputs.declare`): any other is refused, as is a run with inputs and
@@ -708,7 +721,12 @@ class SandboxPlatform:
                 started = asyncio.ensure_future(asyncio.to_thread(self._begin, sandbox, ended, share))
                 started.add_done_callback(lambda _: ended())  # a task that never got to run has no thread to end
                 started.add_done_callback(lambda _: share.never_ran())
-                await asyncio.shield(started)
+                try:
+                    await asyncio.shield(started)
+                except StartRefused:  # refused before anything existed: as it was
+                    raise
+                except SandboxError as failed:  # the start failed, before any turn: infrastructure, not a defect
+                    raise SandboxStartFailed(failed) from failed
                 if inputs_record is not None:
                     inputs_record.attach(sandbox.read_only_inputs)
         except BaseException:
