@@ -18,7 +18,13 @@ from expcore.campaign.executor import failure_result
 from expcore.campaign.factors import FactorSchema
 from expcore.campaign.lease import LeasePool
 from expcore.errors import InfraError
-from expcore_onedata.sandbox.api import DataPathMode, SandboxError, SandboxStartFailed, StartRefused
+from expcore_onedata.sandbox.api import (
+    DataPathMode,
+    SandboxError,
+    SandboxIntegrityError,
+    SandboxStartFailed,
+    StartRefused,
+)
 from expcore_onedata.sandbox.hostops import CmdResult, MountTableError, fuse_mounts, parse_mountinfo
 from expcore_onedata.sandbox.oneclient_build import version_of
 from expcore_onedata.sandbox.provider import SandboxPlatform, SandboxProbe
@@ -626,17 +632,36 @@ def test_o15_a_start_that_failed_is_stopped_again_by_the_launch_and_the_error_is
     assert stage.platform.sandbox_probe().resource_gone(lease.key, {}) is True
 
 
-def test_a_start_that_failed_is_infrastructure_of_kind_sandbox_and_still_a_sandbox_error(stage, tmp_path):
-    """A start that failed after it began making things raises `SandboxStartFailed`, once the launch has stopped what
-    it made: infrastructure of the core's kind `sandbox`, and still a `SandboxError` for the platform's own callers."""
-    stage.host.exec_handler = lambda container, argv, stdin: CmdResult(0, "WRITABLE\n")
+def test_a_start_that_failed_is_infrastructure_of_kind_sandbox_and_still_a_sandbox_error(stage, tmp_path, monkeypatch):
+    """A start that failed after it had made its containers (a probe of the start that did not answer) raises
+    `SandboxStartFailed`, once the launch has stopped what it made: infrastructure of the core's kind `sandbox`, and
+    still a `SandboxError` for the platform's own callers."""
+
+    def probe_did_not_answer(_sandbox):
+        raise SandboxError("a probe of the start did not answer in time")
+
+    monkeypatch.setattr(DockerSandbox, "_verify_read_only", probe_did_not_answer)
     lease = lease_pool(stage, tmp_path).acquire(GROUP, run_key="run-1")
     with pytest.raises(SandboxStartFailed) as caught:
         run_launch(stage, "via-gate", lease)
     assert isinstance(caught.value, InfraError)
     assert isinstance(caught.value, SandboxError)
     assert caught.value.kind == "sandbox"
-    assert "not read-only" in caught.value.detail
+    assert "did not answer in time" in caught.value.detail
+    assert nothing_of_the_sandbox_is_left(stage)
+    assert stage.platform.sandbox_probe().resource_gone(lease.key, {}) is True
+
+
+def test_a_start_whose_read_only_probe_wrote_is_an_integrity_breach_left_as_it_was(stage, tmp_path):
+    """A failed integrity check of the start (the agent's root was writable) is no transient failure: it is raised as
+    `SandboxIntegrityError`, never as infrastructure, so it keeps its old path and is not run again, and the launch
+    still stops what the start made."""
+    stage.host.exec_handler = lambda container, argv, stdin: CmdResult(0, "WRITABLE\n")
+    lease = lease_pool(stage, tmp_path).acquire(GROUP, run_key="run-1")
+    with pytest.raises(SandboxIntegrityError, match="not read-only") as caught:
+        run_launch(stage, "via-gate", lease)
+    assert not isinstance(caught.value, InfraError)
+    assert failure_result(caught.value, ended_utc=LATER, wall_s=1.0).outcome.name == "harness_defect"
     assert nothing_of_the_sandbox_is_left(stage)
 
 

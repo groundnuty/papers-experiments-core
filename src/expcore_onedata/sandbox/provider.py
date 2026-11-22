@@ -101,6 +101,7 @@ from expcore_onedata.sandbox.api import (
     Endpoint,
     ReadOnlyInput,
     SandboxError,
+    SandboxIntegrityError,
     SandboxSpec,
     SandboxStartFailed,
     StartRefused,
@@ -589,8 +590,9 @@ class SandboxPlatform:
 
         A start that fails with a `SandboxError` after it began making things raises `SandboxStartFailed` once what it
         made is stopped: infrastructure of the core's kind `sandbox` (charged and run again), and still a
-        `SandboxError`. The start comes before the body, so before any turn of the agent. `StartRefused` and any
-        other exception of the start are raised as they were.
+        `SandboxError`. The start comes before the body, so before any turn of the agent. `StartRefused`, a failed
+        integrity or contract check (`SandboxIntegrityError`) and any other exception of the start are raised as they
+        were.
 
         `inputs` are the run's read-only inputs (`ReadOnlyInput`): files the study supplies, such as scripts the agent
         may run but not change, which the executor passes, from the run's condition or its own, as the platform was
@@ -723,7 +725,7 @@ class SandboxPlatform:
                 started.add_done_callback(lambda _: share.never_ran())
                 try:
                     await asyncio.shield(started)
-                except StartRefused:  # refused before anything existed: as it was
+                except (StartRefused, SandboxIntegrityError):  # a refusal, or a breach that stops the run: as it was
                     raise
                 except SandboxError as failed:  # the start failed, before any turn: infrastructure, not a defect
                     raise SandboxStartFailed(failed) from failed

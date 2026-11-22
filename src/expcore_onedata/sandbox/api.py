@@ -42,12 +42,24 @@ class SandboxStartFailed(InfraError, SandboxError):
     the start), and the attempt ended as a harness error, which ends the run. The start comes before the run's body, so
     before any turn of the agent: nothing the agent or the harness's own logic did is in question, only whether the
     platform could bring the sandbox up. It is still a `SandboxError`, so the platform's own callers that catch one are
-    unchanged. A refusal before anything existed (`StartRefused`), an exception that is no `SandboxError` (a bug of the
-    harness), and a `SandboxError` raised after the start, in the run's body or its teardown, are left as they were.
+    unchanged. A refusal before anything existed (`StartRefused`), a failed integrity or contract check
+    (`SandboxIntegrityError`), an exception that is no `SandboxError` (a bug of the harness), and a `SandboxError`
+    raised after the start, in the run's body or its teardown, are left as they were.
     """
 
     def __init__(self, cause: SandboxError) -> None:
         super().__init__("sandbox", f"the sandbox did not start: {cause}"[:600])
+
+
+class SandboxIntegrityError(SandboxError):
+    """The sandbox is not what was declared, pinned or promised: an integrity or contract check failed. Examples are a
+    read-only probe that wrote, an input or pinned file whose content changed, and a helper of the harness that named
+    a token file outside the run's directory.
+
+    It is never the transient failure `SandboxStartFailed` stands for: running the attempt again would charge the run
+    for a breach that stops it, or hide one that a restored file made pass. So a start that raises it keeps its old
+    path, as any `SandboxError` did before (`SandboxPlatform.launch`).
+    """
 
 
 class DataPathMode(StrEnum):
