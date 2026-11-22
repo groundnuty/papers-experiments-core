@@ -47,7 +47,8 @@ def test_c42_a_lease_whose_archive_never_verified_costs_at_least_one_attempt_and
 
 
 @pytest.mark.parametrize(
-    ("state", "charged", "expected"), [("infra_fail", 1, 1), ("infra_fail", 2, 2), ("harness_error", 0, 0)]
+    ("state", "charged", "expected"),
+    [("infra_fail", 1, 1), ("infra_fail", 2, 2), ("harness_error", 0, 0), ("outage_discarded", 0, 0)],
 )
 def test_c42_a_completion_read_after_the_loss_was_counted_replaces_it_with_its_own_charged_attempts(
     tmp_path, state, charged, expected

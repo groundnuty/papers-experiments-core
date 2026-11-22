@@ -1,9 +1,10 @@
 """A start that failed right after a failed post-run check costs its run no attempt, once.
 
-After an attempt whose post-run check failed and was not deferred, the run's next attempt, should the executor's own
-result be a charged infrastructure failure before the agent's first turn, is set aside as one an outage overlapped,
-uncharged, its detail led by why (`expcore.campaign.start_after_check`); the failure after it is charged again. Seen
-live in a running campaign: such a start was charged, and the run came within one failure of being exhausted.
+After a charged attempt whose post-run check failed and was not deferred, the run's next attempt, should the
+executor's own result be a charged infrastructure failure before the agent's first turn, is set aside as one an outage
+overlapped, uncharged, its detail led by why (`expcore.campaign.start_after_check`); the failure after it is charged
+again. Seen live in a running campaign: such a start was charged, and the run came within one failure of being
+exhausted.
 """
 
 import asyncio
