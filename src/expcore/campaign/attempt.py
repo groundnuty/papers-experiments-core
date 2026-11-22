@@ -444,7 +444,9 @@ class AttemptRunner:
                     )
 
             status = self._finish(begun, run_dir, key, result, bookkeeping)
-            if risks_next and covered is None and status == "pending":  # never two in a row: a run cannot loop
+            # Never two in a row, and only after a charged attempt: every spare then follows an attempt that cost its
+            # run one, so a platform that keeps failing its checks cannot make attempts free, and a run cannot loop.
+            if risks_next and covered is None and status == "pending" and classify(result, kinds, targets).charged:
                 self.risked.mark(key)
             defects.raise_failure()  # only now, with the record, the marker and the store written: a loud stop (C17)
             return p.settings.retry_delay_s if status == "pending" else 0.0

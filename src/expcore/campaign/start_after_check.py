@@ -11,10 +11,11 @@ post-run link check, and its third attempt's pre-run check failed at once (a fai
 mend), which was charged as the outage's one attempt, and the run was exhausted. Nothing of that attempt ran, and the
 fault was the one the previous attempt had already left.
 
-**The rule.** After an attempt whose post-run check failed and was not deferred (`RiskedStarts.mark`), the run's next
-attempt in this process is covered. It is set aside uncharged in either of two cases. (1) The run's pre-run health
-check finds an outage (`AttemptRunner._charge_outage`): the attempt is the outage's one, nothing was run, and it is set
-aside as it is, `spared` with the same decision, its detail led by `REASON`. The gate is told beforehand
+**The rule.** After an attempt whose post-run check failed, was not deferred, and which was itself charged
+(`RiskedStarts.mark`), the run's next attempt in this process is covered. It is set aside uncharged in either of two
+cases. (1) The run's pre-run health check finds an outage (`AttemptRunner._charge_outage`): the attempt is the
+outage's one, nothing was run, and it is set aside as it is, `spared` with the same decision, its detail led by
+`REASON`. The gate is told beforehand
 (`HealthGate.before_run(covered=...)`, with `RiskedStarts.marked`, which takes nothing), so the outage's record and the
 `health_gate_closed` event say no run was charged, as the run's own row does, and the report's hold section agrees.
 (2) The attempt starts, and the executor's own result is a charged infrastructure failure before the agent's first
@@ -43,14 +44,16 @@ in the result's transaction too.
   its attempts and reaches its limit. A pre-run outage set aside this way never ran a post-run check, so it marks
   nothing either: the next pre-run outage, and the next start failure, are charged, whichever of the two the mark was
   spent on.
+- *Only after a charged attempt.* A post-run check that fails and charges no one (`Health.charge`), or that fails while
+  the gate is closed, discards its attempt uncharged: that attempt marks nothing, so every spare follows an attempt
+  that cost its run one, and a platform that alternates such answers with chargeable pre-run failures cannot make
+  attempts free. Together with the bound above, a run spends at least one charged attempt for each one spared and
+  reaches its limit.
 - *The gate stays closed.* A pre-run outage closes the health gate (`HealthGate._close`), whether it is spared or not,
-  and a run that has not passed its pre-run check yet is held until the dispatcher's own check passes, so sparing it
-  opens no loop of free attempts of its own. What the rule leaves as it was: a post-run check that charges no one
-  (`Health.charge`), or that fails while the gate is closed, discards its attempt uncharged and still marks the run,
-  so a platform that alternates such answers with chargeable pre-run failures can make attempts free, as it could with
-  the start rule; and a worker already past its own pre-run check when another run's check closes the gate still starts.
-  The spare event is written in the result's transaction, so a result committed from its marker after a kill has the
-  row's detail and no event.
+  and a run that has not passed its pre-run check yet is held until the dispatcher's own check passes. A worker already
+  past its own pre-run check when another run's check closes the gate still starts, as it always did. The spare event
+  is written in the result's transaction, so a result committed from its marker after a kill has the row's detail and
+  no event.
 - *Only after a failed check.* A post-run check that passed, or was deferred (it verified nothing and found nothing
   failing), marks nothing.
 - *Only before the agent's first turn.* A failure after a completed turn is charged as always.
@@ -84,7 +87,7 @@ class RiskedStarts:
         self._runs: set[str] = set()
 
     def mark(self, run_key: str) -> None:
-        """The run's latest attempt ended with a failed, not deferred, post-run check."""
+        """The run's latest attempt, which was charged, ended with a failed, not deferred, post-run check."""
         with self._lock:
             self._runs.add(run_key)
 
