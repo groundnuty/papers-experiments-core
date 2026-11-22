@@ -336,6 +336,38 @@ def test_l18_a_cell_limit_that_cannot_work_is_refused_naming_the_table_and_the_k
     refused(tmp_path, text, *fragments)
 
 
+def test_b21_model_request_bound_s_is_optional_and_enters_the_caps_only_when_declared(tmp_path):
+    """B21: `[agent] model_request_bound_s` is read as seconds. Undeclared, the loop's caps in the fingerprint are what
+    they were before the key existed, so a campaign stamped without it keeps its fingerprint; declared, they differ, so
+    only a campaign stamped with it gets it. It is independent of the two tool bounds."""
+    plain = load(tmp_path)
+    assert plain.agent.model_request_bound_s is None
+    assert "model_request_bound_s" not in plain.caps()["agent"]
+    declared = load(
+        tmp_path, VALID.replace("max_output_tokens = 256", "max_output_tokens = 256\nmodel_request_bound_s = 3600")
+    )
+    assert declared.agent.model_request_bound_s == 3600.0
+    assert declared.caps()["agent"]["model_request_bound_s"] == 3600.0
+    assert "tool_server_call_bound_s" not in declared.caps()["agent"]
+    assert "code_cell_bound_s" not in declared.caps()["agent"]
+    assert declared.caps() != plain.caps()
+
+
+@pytest.mark.parametrize(
+    ("value", "fragments"),
+    [
+        ("0", ("[agent]", "model_request_bound_s", "positive")),
+        ("-5", ("[agent]", "model_request_bound_s", "positive")),
+        ("inf", ("[agent]", "model_request_bound_s", "finite")),
+        ('"3600"', ("[agent]", "model_request_bound_s", "must be a float")),
+    ],
+)
+def test_b21_a_request_bound_that_cannot_work_is_refused_naming_the_table_and_the_key(tmp_path, value, fragments):
+    """B21: refused at load, naming the file, the table and the key."""
+    text = VALID.replace("max_output_tokens = 256", f"max_output_tokens = 256\nmodel_request_bound_s = {value}")
+    refused(tmp_path, text, *fragments)
+
+
 def test_l18_the_old_key_that_capped_every_call_stays_refused_beside_the_cell_limit(tmp_path):
     """L18: `tool_call_bound_s` capped every tool call and is not revived by the new key: declaring both is refused with
     the old key named, as L17 does."""

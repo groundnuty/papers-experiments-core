@@ -16,6 +16,7 @@ which differs between interpreter versions (R07).
 """
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -91,6 +92,14 @@ class RecordingBackend:
         """Start the conversation on the inner backend."""
         self.inner.begin(system, user, tools)
         self._known = len(self.inner.transcript())
+
+    @property
+    def bound_requests(self) -> Callable[[float | None], None] | None:
+        """The inner backend's `bound_requests`, or None when it has none (B21): the loop hands the bound on each
+        request of a step straight to it, and a declared bound refuses a backend without it, so the wrapper is judged by
+        what it wraps. A request given up at the bound raises `ModelRequestTimedOut`, recorded as any infrastructure
+        failure."""
+        return getattr(self.inner, "bound_requests", None)
 
     def _settings(self) -> dict[str, Any]:
         """Return the settings of the latest request, as plain values."""

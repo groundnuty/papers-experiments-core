@@ -581,3 +581,30 @@ def test_o97_the_fifteenth_fixture_pins_a_cell_deadline_of_a_restored_mount_and_
         held = load_record(earlier)
         assert all("cell_deadline" not in call for call in held.tool_calls)
         assert replay_record(held).dumps().encode("utf-8") == earlier.read_bytes()
+
+
+def test_b21_the_sixteenth_fixture_pins_a_declared_model_request_bound_and_the_fifteen_before_it_hold_none():
+    """B21 and R03: the sixteenth merge point adds `agent_config.model_request_bound_s`, the study's optional bound on
+    one model request, which a study that declares none leaves out, with no list beside it. Its fixture, written by the
+    code of that merge through the core's OpenAI-compatible adapter against a fake client, on the record tests' fake
+    clock, declares a bound of 2 s: one turn and one tool call were answered, the next request was taken and never
+    answered, and the bound gave it up after 2 s on the clock, as `endpoint` infrastructure and the route's abandoned
+    request of reason `request_bound`. It validates and replays to its own bytes (the parametrized tests above); none of
+    the fifteen before it holds the key, and none is filled in with one."""
+    sixteenth = [p for p in FIXTURES if p.name.startswith("16-")]
+    assert [p.name for p in sixteenth] == ["16-model-request-bound.json"]
+    record = load_record(sixteenth[0])
+    assert record.agent_config["model_request_bound_s"] == 2.0
+    assert list(record.agent_config)[-2:] == ["model_request_bound_s", "terminal_tools"]
+    assert (record.outcome["name"], record.outcome["infra_kind"]) == ("infrastructure", "endpoint")
+    failed = record.failed_request
+    assert (failed["kind"], failed["infra_kind"]) == ("infra", "endpoint")
+    assert failed["detail"] == "the model endpoint did not answer a request within 2 s; not resent"
+    assert record.route["abandoned_request"]["reason"] == "request_bound"
+    assert record.clock[-2:] == [["before_model", 1000.0], ["end", 1002.0]]
+    assert record.totals["usage_incomplete"] is True
+    assert replay_record(record).dumps().encode("utf-8") == sixteenth[0].read_bytes()
+    for earlier in FIXTURES[:15]:
+        held = load_record(earlier)
+        assert "model_request_bound_s" not in held.agent_config
+        assert replay_record(held).dumps().encode("utf-8") == earlier.read_bytes()

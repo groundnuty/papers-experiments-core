@@ -15,6 +15,9 @@ reads it. A study's scorer prices it with `expcore.campaign.abandoned_bound`.
 - A read timeout is never resent (B03), and the client's read timeout is at least the run's time cap plus 60 s
   (`_read_timeout_s`), so it fires only when the run's time is gone. A cancel while the retrier waits to resend has no
   request in flight and abandons nothing (`Retrier.call`); only a cancel inside the send does.
+- A send the study's bound on one request gave up (B21, reason `request_bound`) is never resent either. The bound runs
+  inside the send the retrier makes, so its entry is made while that request is still the one in flight, and a wait
+  to resend is never under it.
 - An entry made with no request in flight (`abandon` after a reply, an admission probe) is bounded by W.
 
 **The bound on its prompt, P.** Let request k be the last whose reply reported both counts: `in_k`, the whole prompt
