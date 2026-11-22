@@ -6,7 +6,8 @@
 2. require what the package's own check needs: the study's configuration and plugin, every file the code identity
    covers, every input of the replay check (records, outcome markers, the snapshot of the store, and the side files
    study.toml declares) with the check itself, and the four outputs (`export.json`, `scores.json`, `analysis.json`,
-   `report.md`);
+   `report.md`); for a merged batch, merge.json and the snapshots the analysis reads: each shard's, or for a batch
+   merged by run the ledger's and each counted lease's (`by_run`);
 3. refuse a check made under code that is not a clean commit, outputs made by another core version, and a check that
    records no environment, one whose core was dirty or unknown (`provenance.core_check`), or another one than the
    build's (`provenance.environment`, in the form the check holds the core in); warn about every other included
@@ -55,6 +56,7 @@ from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from expcore.campaign.by_run_layout import is_by_run
 from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
 from expcore.campaign.merge import SHARDS_DIR, MergeRefused, read_merge
 from expcore.campaign.shard import MERGE_FILE
@@ -83,6 +85,7 @@ from expcore.package.spec import (
     WHEELS_DIR,
     PackageError,
     PackageSpec,
+    by_run_files,
     load_spec,
     select,
 )
@@ -133,12 +136,15 @@ def _read_json(files: Mapping[str, bytes], path: str, what: str) -> dict:
 
 def _snapshot_files(check: Mapping[str, object], files: Mapping[str, bytes]) -> set[str]:
     """The snapshot of the campaign store the analysis reads: one in the batch, or, for a merged batch (the check
-    names a merge), merge.json and the snapshot of each shard it lists, which the package must hold as well."""
+    names a merge), merge.json and the snapshot of each shard it lists, which the package must hold as well. A batch
+    merged by run (C45) needs merge.json, the ledger snapshot and each counted lease's snapshot (`spec.MergedByRun`)."""
     if MERGE_KEY not in check:
         return {f"{OUT_DIR}/{RUNS_DIR}/{SNAPSHOT_FILE}"}
     merge = f"{OUT_DIR}/{MERGE_FILE}"
     if merge not in files:
         return {merge}
+    if is_by_run(files[merge]):
+        return set(by_run_files(files[merge]).files)
     try:
         shards = read_merge(files[merge], merge)["shards"]
     except MergeRefused as error:

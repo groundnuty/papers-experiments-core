@@ -1,5 +1,7 @@
 """The inclusion list of a replication package: only what it names goes in, and a list that names nothing fails."""
 
+import json
+
 import pytest
 
 from expcore.campaign.defect_log import write_defect
@@ -257,3 +259,66 @@ def test_k03_an_opaque_entry_that_is_not_one_included_file_with_a_hash_and_a_rea
     """K03: an attestation names exactly one file the package includes, its full SHA-256 and a reason."""
     with pytest.raises(PackageError, match=why):
         select(tree, opaque_spec(tree, entry.format(h="ab" * 32)))
+
+
+def by_run_merge(counted: int, evidence: int) -> str:
+    """The text of an expcore-merge/2 merge.json as its parser reads it: one counted lease, one evidence lease."""
+    document = {
+        "schema": "expcore-merge/2",
+        "fingerprint": "f" * 64,
+        "rule": "lease",
+        "environment_identity": {},
+        "ledger_sha256": "e" * 64,
+        "runs": 1,
+        "leases": [{"lease_id": counted, "run_key": "run-one", "snapshot_sha256": "a" * 64}],
+        "evidence": [{"lease_id": evidence, "run_key": "run-one", "snapshot_sha256": "b" * 64, "reason": "lost"}],
+        "exhausted": [],
+        "spend": {},
+    }
+    return json.dumps(document, indent=1, sort_keys=True) + "\n"
+
+
+LEASE_FILES = {
+    "out/leases/3/campaign-snapshot.sqlite": "",  # the counted lease's snapshot
+    "out/leases/3/notes.txt": "",  # beside it, but no snapshot merge.json names
+    "out/leases/9/campaign-snapshot.sqlite": "",  # a lease merge.json does not list
+    "out/evidence/5/campaign-snapshot.sqlite": "",  # the evidence lease's snapshot
+    "out/ledger-snapshot.sqlite": "",
+}
+
+
+def test_c67_a_batch_merged_by_run_selects_its_counted_snapshots_and_never_its_evidence(tree):
+    """C67: in a batch whose merge.json is a merge by run, the counted lease's snapshot it lists is selectable, with
+    merge.json and the ledger snapshot; the rest of out/leases (a file beside the snapshot, a lease it does not list,
+    the live campaign's lease files) and the evidence it lists by hash are never selected, whatever the patterns say."""
+    write(tree, {**LEASE_FILES, "out/merge.json": by_run_merge(3, 5)})
+    for pattern in ("out", "out/**", "**/*"):
+        chosen = select(tree, spec_with(tree, ["study.toml", pattern]))
+        assert [
+            path for path in chosen if path.startswith(("out/leases", "out/evidence", "out/ledger", "out/merge"))
+        ] == [
+            "out/leases/3/campaign-snapshot.sqlite",
+            "out/ledger-snapshot.sqlite",
+            "out/merge.json",
+        ], pattern
+    with pytest.raises(PackageError, match="selects no file"):
+        select(tree, spec_with(tree, ["study.toml", "out/evidence"]))
+
+
+@pytest.mark.parametrize("merge", [None, '{"schema": "expcore-merge/1"}\n'], ids=["unmerged", "merge-of-shards"])
+def test_c67_a_batch_not_merged_by_run_never_selects_out_leases(tree, merge):
+    """C67: without a merge by run's merge.json (an unmerged batch, a merge of shards), out/leases is the live
+    campaign's and nothing under it is selected, a path that has a lease snapshot's form included."""
+    write(tree, LEASE_FILES | ({} if merge is None else {"out/merge.json": merge}))
+    chosen = select(tree, spec_with(tree, ["study.toml", "out"]))
+    assert not [path for path in chosen if path.startswith("out/leases")]
+    with pytest.raises(PackageError, match="selects no file"):
+        select(tree, spec_with(tree, ["study.toml", "out/leases"]))
+
+
+def test_c67_a_merge_by_run_its_own_parser_refuses_is_refused_naming_merge_json(tree):
+    """C67: merge.json of the by-run schema that its parser refuses (no counted lease) refuses the selection."""
+    document = json.loads(by_run_merge(3, 5)) | {"leases": []}
+    write(tree, {"out/merge.json": json.dumps(document)})
+    with pytest.raises(PackageError, match=r"out/merge\.json: its lists of leases are not each lease once"):
+        select(tree, spec_with(tree, ["study.toml", "out"]))

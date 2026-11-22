@@ -8,7 +8,8 @@ hash of the same code, which a reader can recompute, and drops every source:
 - first, every file of the batch must be exactly the bytes the original replay check hashed, and no other input may
   have appeared: a record changed after the check would otherwise be given a pseudo-commit and pass under the
   original check's time. A merged batch's merge.json must be the bytes the check names, and each shard's snapshot the
-  bytes merge.json names (`verify_merged_inputs`, which every build makes, plain or anonymised);
+  bytes merge.json names (`verify_merged_inputs`, which every build makes, plain or anonymised); a batch merged by run
+  (`expcore-merge/2`) is routed by its schema to `package.by_run`, which holds its ledger and lease snapshots so;
 - each record's `code.commit`, and the head of the commit in `code.why`, become that record's pseudo-commit. The
   field is free text under the format and no seal covers it (`records.seal` pins prompts, configuration, tools and
   settings), so no record format changes, and every digest a record holds stays valid;
@@ -49,6 +50,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from expcore.campaign.by_run_layout import is_by_run
 from expcore.campaign.export import EXPORT_FINGERPRINT, export_text, fingerprint_entry
 from expcore.campaign.merge import CHECK_KEY as MERGE_KEY
 from expcore.campaign.merge import MergeRefused, ShardFacts, facts_of_bytes, merge_document, merge_text, read_merge
@@ -56,6 +58,7 @@ from expcore.campaign.merged import snapshot_rel
 from expcore.campaign.resume import FINGERPRINT_KEY
 from expcore.campaign.shard import MERGE_FILE
 from expcore.campaign.snapshot import SNAPSHOT_FILE
+from expcore.package import by_run
 from expcore.package.spec import PackageError
 from expcore.package.views import streams, views
 from expcore.provenance import environment
@@ -144,7 +147,8 @@ def verify_inputs(files: Mapping[str, bytes], check: Mapping[str, Any]) -> None:
 
 def verify_merged_inputs(files: Mapping[str, bytes], check: Mapping[str, Any]) -> None:
     """Refuse a merged batch whose merge.json is not the bytes the replay check hashed, or one of whose shard snapshots
-    is not the bytes merge.json names, naming the first; nothing to do for a batch that is not merged.
+    is not the bytes merge.json names, naming the first; nothing to do for a batch that is not merged. A batch merged
+    by run (its merge.json's schema says so) has its ledger and lease snapshots held so by `by_run.verify_inputs`.
 
     The check hashes neither as an input of the batch, so this is what binds them before a build reads or rewrites them:
     an anonymised build rewrites both and makes the check again, which would otherwise vouch for edited bytes."""
@@ -156,6 +160,9 @@ def verify_merged_inputs(files: Mapping[str, bytes], check: Mapping[str, Any]) -
     if raw is None or not isinstance(expected, str) or hashlib.sha256(raw).hexdigest() != expected:
         state = "is missing, though" if raw is None else "differs from"
         raise PackageError(f"{MERGE_PATH} {state} what the replay check hashed; run `python -m expcore check` again")
+    if is_by_run(raw):
+        by_run.verify_inputs(files, raw)
+        return
     try:
         document = read_merge(raw, MERGE_PATH)
     except MergeRefused as error:
@@ -341,7 +348,9 @@ def anonymise_identity(
     with tempfile.TemporaryDirectory(prefix=".anonymise-", dir=parent) as scratch:
         where = Path(scratch)
         swaps: dict[str, str] = {}
-        if MERGE_KEY in check:
+        if MERGE_KEY in check and is_by_run(result[MERGE_PATH]):  # merge.json is the check's, `verify_merged_inputs`
+            swaps = by_run.anonymise(result, where)
+        elif MERGE_KEY in check:
             swaps = _anonymised_shards(result, where)
         else:
             snapshot = f"{BATCH}/{SNAPSHOT_FILE}"

@@ -234,6 +234,28 @@ def build_fleet(base: Path, env: dict[str, str]) -> Fleet:
     return fleet
 
 
+def small_fleet(base: Path, env: dict[str, str]) -> Fleet:
+    """A fleet with only what a package of a batch merged by run needs: every run counted at a healthy federation, and
+    one lease that expired and left nothing behind (`fed-z`), listed as evidence with no snapshot; the ledger is closed
+    at the end."""
+    sha = fingerprint_sha256(campaign_fingerprint(by_run_study(base, "template")))
+    clock = FakeClock()
+    ledger, path = _new_ledger(base, sha, clock)
+    fleet = Fleet(base, env, path, sha)
+    try:
+        vanished = ledger.issue("fed-z")
+        assert isinstance(vanished, Lease), vanished
+        ledger.mark_sent(vanished.lease_id)
+        clock.now += 400.0  # no heartbeat since it was sent: a read of its site expires it
+        ledger.observe_site(DOOMED["fed-z"], SiteReading())
+        ledger.prove_ended("fed-z", "terminal")
+        _lease_every_run(fleet, ledger)
+    finally:
+        ledger.close()
+    fleet.vanished = vanished.lease_id
+    return fleet
+
+
 def _exhaust_a_run(ledger: Ledger, clock: FakeClock, sha: str) -> tuple[str, tuple[int, ...]]:
     """Lose leases to fresh federations at site-b (each sent, never heard from, its job proven ended) until a run is
     exhausted by the losses, then settle every loss at no spend and one attempt, so the run is final; the runs lost
