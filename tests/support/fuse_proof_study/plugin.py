@@ -76,6 +76,7 @@ class ProofExecutor:
                 SETTINGS["local_path"],
                 SETTINGS["root_path"],
                 second_cycle=outage and SETTINGS["second_cycle"],
+                owner_reads=outage,  # the control never reads the owner-only file: it would give the local a copy
             )
         )
         user = self.template.render({"TASK": request.identity.factors["task"]}, study_run=True)

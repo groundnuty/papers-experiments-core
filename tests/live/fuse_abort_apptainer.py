@@ -10,16 +10,20 @@ agent job, with the federation up and its relay serving:
 the agent's local one (the target). The plan is `e2e/fuse-abort-helios-proof-plan.private.md`, and the pass list is
 `tests/support/fuse_proof.py` (P1 to P12). In order:
 
-1. **Seed** through the platform: a directory, a file written through the target alone (the local provider holds none
-   of it) and a local file. **K**, the control sandbox (direct, no injection), reads the local file.
-2. **P12**: **N**, an unregistered sandbox (direct, outside any attempt), reads the owner-only file while the driver's
-   own injector holds the target down: the read blocks, the bound kills it, the survivor is aborted, and the verdict is
-   infrastructure (`no_injection_in_effect`); N's next cell is refused as `cell_unkillable`. The owner is restored. K
-   reads again.
-3. The **gap**: the session drain and three minutes more, so the next outage's peers are not in their backoff.
-4. **S**, the registered attempt, through the campaign (`python -m expcore run`) of a minimal study written into
+1. **Seed** through the platform: a directory, two files written through the target alone (the local provider holds
+   none of either: one for the registered attempt, one for the negative, never shared, since a fetch that ends after
+   its restore gives the local provider a copy) and a local file. **K**, the control sandbox (direct, no injection),
+   reads the local file. The local provider must hold no byte of the registered file, or the proof stops there.
+2. **S**, the registered attempt, through the campaign (`python -m expcore run`) of a minimal study written into
    OUT_DIR from `tests/support/fuse_proof_study/`: the platform's launch and the run's own injector inside the attempt.
-   K reads a third time.
+   It comes first, so a refusal at the campaign's start costs a minute, not an outage. Its control condition reads the
+   local file only. K reads again.
+3. The **gap**: the run's clear has waited out the session drain (320 s, past the link heal's three minutes); `--gap-s`
+   adds to it.
+4. **P12**: **N**, an unregistered sandbox (direct, outside any attempt), reads its own owner-only file while the
+   driver's own injector holds the target down: the read blocks, the bound kills it, the survivor is aborted, and the
+   verdict is infrastructure (`no_injection_in_effect`); N's next cell is refused as `cell_unkillable`. The owner is
+   restored. K reads a third time.
 5. K and N are stopped, the seeded files removed, the record validated and replayed, and the facts written to
    `OUT_DIR/facts.json`: outcomes, counts, seconds, labels and hashes; never a token, a host or a configured path.
 
@@ -33,6 +37,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import shutil
 import signal
 import subprocess
@@ -63,7 +68,13 @@ OWNER_BYTES = bytes(range(256)) * 64  # 16 KiB: one file the target alone holds
 LOCAL_BYTES = b"the local file of the O97 proof\n"
 SEEN_S = 300.0
 STAMP = "f" * 40  # the stamped commit of the minimal study: it is written here, never committed
-GAP_S = 500.0  # session_drain_s (320 s) and three minutes more
+GAP_S = 60.0  # beyond the session drain the run's clear waits out (320 s): the link heal's 3 min are inside it
+REGISTERED_FILE = "owner-registered.bin"  # the registered attempt's owner-only file
+NEGATIVE_FILE = "owner-negative.bin"  # the unregistered sandbox's: never the same file
+
+
+class ProofStopped(Exception):
+    """A stop of the proof's own, before anything it could not show: the facts say why, the teardown still runs."""
 
 
 def wait_seen(files: Any, provider: str, file_id: str, timeout_s: float = SEEN_S) -> bool:
@@ -100,9 +111,17 @@ def write_study(
     for name in ("models.toml", "preregistration.toml", "prompt.txt", "plugin.py"):
         shutil.copyfile(TEMPLATE / name, study / name)
     platforms = '["expcore_onedata.sandbox.kinds"]' if platform is not None else "[]"
+    max_defer = max_defer_s_for(platform)
     if platform is not None:
         shutil.copyfile(platform, study / "platform.toml")
-    fills = {"@TARGET@": target, "@BOUND_S@": f"{bound_s:g}", "@TIME_CAP_S@": str(time_cap_s), "@PLATFORMS@": platforms}
+        settings = {**settings, "platform": str(study / "platform.toml")}  # the run reads the file its study points at
+    fills = {
+        "@TARGET@": target,
+        "@BOUND_S@": f"{bound_s:g}",
+        "@TIME_CAP_S@": str(time_cap_s),
+        "@PLATFORMS@": platforms,
+        "@MAX_DEFER_S@": f"{max_defer:g}",
+    }
     for name in ("study.toml", "campaign.toml"):
         text = (TEMPLATE / f"{name}.in").read_text(encoding="utf-8")
         for key, value in fills.items():
@@ -111,6 +130,26 @@ def write_study(
     (study / "fuse_proof.json").write_text(json.dumps(settings, indent=1), encoding="utf-8")
     write_stamp(study, STAMP, load_study(study).scope)
     return study
+
+
+RECHECK_S, POLL_S, HEALTH_TIMEOUT_S = 5.0, 0.2, 900.0  # the template's [scheduler] values the deferral is counted with
+
+
+def max_defer_s_for(platform: Path | None) -> float:
+    """The campaign's `max_defer_s`: what the platform declares of its health check's longest deferral, read from its
+    own file as the core reads it (`[study] platforms`), with the template's waits added as the core adds them
+    (`SchedulerConfig.deferral_needed`), and two minutes more; the core's default 3,600 s when that is more."""
+    from expcore.campaign.settings import SchedulerConfig
+
+    if platform is None:
+        return 3600.0
+    from expcore_onedata.sandbox.kinds import declared_deferral_from_config
+
+    bound = declared_deferral_from_config(platform)
+    if bound is None:
+        return 3600.0
+    scheduler = SchedulerConfig(recheck_s=RECHECK_S, poll_interval_s=POLL_S, health_timeout_s=HEALTH_TIMEOUT_S)
+    return float(max(3600, math.ceil(scheduler.deferral_needed(bound)[0]) + 120))
 
 
 def registered_record(study: Path) -> tuple[dict[str, Any] | None, str | None]:
@@ -192,6 +231,7 @@ def run_proof(
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     """The proof's sequence (the module's docstring) over `world`; the facts, with `problems`."""
+    out.mkdir(parents=True, exist_ok=True)  # the facts are written there however the proof ends
     facts: dict[str, Any] = {"bound_s": bound_s, "target": world.target, "second_cycle": second_cycle, "times": {}}
     began = time.monotonic()
 
@@ -204,16 +244,21 @@ def run_proof(
     root = files.root(local, world.space_id)
     top = files.make(local, root, folder, "DIR")
     seeded = wait_seen(files, owner_provider, top)
-    owner = files.make(owner_provider, top, "owner-only.bin", "REG")
-    files.write(owner_provider, owner, 0, OWNER_BYTES)
-    seeded = seeded and wait_seen(files, local, owner)
+    # one owner-only file per outage: a read of one whose fetch ends after its restore gives the local provider a copy,
+    # so the registered read and the negative's never share a file
+    owners: dict[str, str] = {}
+    for name in (REGISTERED_FILE, NEGATIVE_FILE):
+        owners[name] = files.make(owner_provider, top, name, "REG")
+        files.write(owner_provider, owners[name], 0, OWNER_BYTES)
+        seeded = seeded and wait_seen(files, local, owners[name])
     here = files.make(local, top, "local.bin", "REG")
     files.write(local, here, 0, LOCAL_BYTES)
     seeded = seeded and wait_seen(files, owner_provider, here)
     space_root = f"{world.mount_path}/{world.space_name}"
-    owner_path, local_path = f"{space_root}/{folder}/owner-only.bin", f"{space_root}/{folder}/local.bin"
-    world.owner_path = owner_path
-    facts.update(seeded=seeded, owner_rest=f"{folder}/owner-only.bin")
+    path_of = {name: f"{space_root}/{folder}/{name}" for name in owners}
+    owner_path, negative_path = path_of[REGISTERED_FILE], path_of[NEGATIVE_FILE]
+    local_path = f"{space_root}/{folder}/local.bin"
+    facts.update(seeded=seeded, owner_rest=f"{folder}/{REGISTERED_FILE}")
     facts["local_sha256"] = hashlib.sha256(LOCAL_BYTES if settings_world != "fake" else _fake_local()).hexdigest()
     mark("seeded")
     control = unregistered = None
@@ -222,17 +267,11 @@ def run_proof(
         reads: list[str | None] = [sha_of(control.exec(FP.local_read(local_path, space_root), 60).stdout)]
         mark("control_up")
 
-        unregistered = world.direct("fuse-proof-negative")
-        injector = world.injector(world.target)
-        with injector.session({"run_key": "fuse-proof-negative-outage", "attempt": 1}):
-            mark("negative_outage")
-            facts["negative"] = negative(world, injector, unregistered, owner_path, bound_s)
-            reads.append(sha_of(control.exec(FP.local_read(local_path, space_root), 60).stdout))
-        mark("negative_restored")
-        facts["negative_problems"] = FP.negative_problems(facts["negative"])
-        facts["negative"]["deadline"] = None  # its record is checked above; the facts keep the verdict only
-        sleep(gap_s)
-        mark("gap_done")
+        # the registered read must reach the owner: the local provider holds no byte of its file, or nothing blocks
+        held = world.local_held(owners[REGISTERED_FILE])
+        facts["local_held_before"] = held
+        if held != 0:
+            raise ProofStopped(f"the local provider holds {held} byte(s) of the registered file: nothing would block")
 
         study_settings = {
             "support": str(SUPPORT),
@@ -254,8 +293,24 @@ def run_proof(
         facts["registered"] = FP.record_facts(record) if record is not None else {}
         facts["record_valid"], facts["replayed"] = record_checks(text)
         reads.append(sha_of(control.exec(FP.local_read(local_path, space_root), 60).stdout))
+        if record is None:
+            raise ProofStopped(f"the campaign wrote no registered record (exit {facts['campaign_exit']})")
+
+        sleep(gap_s)  # the run's clear waited out the session drain already: this only adds to it
+        mark("gap_done")
+        unregistered = world.direct("fuse-proof-negative")
+        injector = world.injector(world.target)
+        with injector.session({"run_key": "fuse-proof-negative-outage", "attempt": 1}):
+            mark("negative_outage")
+            facts["negative"] = negative(world, injector, unregistered, negative_path, bound_s)
+            reads.append(sha_of(control.exec(FP.local_read(local_path, space_root), 60).stdout))
+        mark("negative_restored")
+        facts["negative_problems"] = FP.negative_problems(facts["negative"])
+        facts["negative"]["deadline"] = None  # its record is checked above; the facts keep the verdict only
         facts["control"] = {"reads": reads, **mount_facts(control)}
         facts["control_problems"] = FP.control_problems(facts["control"])
+    except ProofStopped as stopped:  # a stop of the proof's own: the teardown runs, and the facts say why
+        facts["stopped"] = str(stopped)
     except BaseException as error:  # a cut (the file-count watcher's SIGINT) or a failure: the teardown still runs
         facts["cut"] = type(error).__name__
         raise
@@ -264,7 +319,8 @@ def run_proof(
         facts["scans"] = "not_run"  # the facts are scanned on the host they are pulled to
         mark("done")
         cut = [f"the proof was cut ({facts['cut']}): nothing after it was shown"] if "cut" in facts else []
-        facts["problems"] = FP.problems(facts) + cut
+        stopped = [f"the proof stopped: {facts['stopped']}"] if "stopped" in facts else []
+        facts["problems"] = FP.problems(facts) + cut + stopped
         (out / "facts.json").write_text(json.dumps(facts, indent=1, default=str), encoding="utf-8")
     return facts
 

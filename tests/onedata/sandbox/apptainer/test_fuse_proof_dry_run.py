@@ -152,3 +152,30 @@ def test_o97_a_direct_sandbox_takes_the_platforms_own_token_and_spec_with_nothin
     }
     assert made.held_down() == frozenset()
     assert dataclasses.replace(made, held_down=None).run_key == "fuse-proof-control"
+
+
+def test_o97_a_registered_file_the_local_provider_already_holds_stops_the_proof_before_any_outage(
+    tmp_path, monkeypatch
+):
+    """O97: a read of the owner-only file with its owner up gives the local provider a copy, and the registered read is
+    then served locally and never blocks: the proof stops before the campaign, and says so, rather than run 40 minutes
+    to "path not exercised"."""
+    world = fuse_proof_fake.FakeWorld(tmp_path / "world")
+    world.install(monkeypatch)
+    world.federation.replicated.add("/data/orchard/fuse-proof/owner-registered.bin")
+    campaigns = []
+    facts = load_driver().run_proof(
+        world, tmp_path / "out", bound_s=BOUND_S, time_cap_s=120, gap_s=0.0, second_cycle=True,
+        run_campaign=lambda study: campaigns.append(study) or 0, settings_world="fake",
+    )  # fmt: skip
+    assert campaigns == []
+    assert facts["local_held_before"] == len(fuse_proof_fake.OWNER_BYTES)
+    assert any("the proof stopped: the local provider holds" in p for p in facts["problems"])
+    assert facts["teardown_problems"] == []
+
+
+def test_o97_the_control_condition_never_reads_the_owner_only_file():
+    """O97: the campaign's control run reads the local file alone, so it never hands the local provider a copy of the
+    file the registered run must find only on its owner."""
+    control = FP.script("/data/s/owner.bin", "/data/s/local.bin", "/data/s", second_cycle=True, owner_reads=False)
+    assert not any(FP.OWNER_MARK in call[1]["code"] for turn in control if isinstance(turn, list) for call in turn)

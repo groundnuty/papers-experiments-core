@@ -22,12 +22,13 @@ from expcore.plugin import NO_WAITS
 from expcore_onedata import fault_relay
 from expcore_onedata import linkrecord as LR
 from expcore_onedata.admission import fault_settings_of, run_admission
-from expcore_onedata.client import MappedTransport, OnezoneClient
+from expcore_onedata.client import MappedTransport, OnezoneClient, PlatformError
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_serves import provider_serves
 from expcore_onedata.fault_settings import hpc_driver
 from expcore_onedata.faults import FaultInjector
 from expcore_onedata.health import PlatformHealth
+from expcore_onedata.placement import held_bytes, provider_blocks
 from expcore_onedata.sandbox.api import DataPathMode, SandboxSpec
 from expcore_onedata.sandbox.apptainer.hostmount import host_mount_factory
 from expcore_onedata.sandbox.apptainer.node import LocalNode
@@ -134,6 +135,15 @@ class LiveWorld:
 
     def files(self) -> SpaceFiles:
         return space_files(self.config)
+
+    def local_held(self, file_id: str) -> int | None:
+        """How many bytes of a file the agent's local provider holds, by its own block map (`/distribution` read
+        through it, as the link check reads one); None when that cannot be told: unknown is never zero."""
+        try:
+            answer = self.client.get(f"/data/{file_id}/distribution", provider=self.local_name)
+            return held_bytes(provider_blocks(answer, self.config.providers[self.local_name].id or ""))
+        except (PlatformError, ValueError):
+            return None
 
     def provider_of(self, label: str) -> str:
         """A provider's configured name from its label, for the platform's own REST calls; never recorded."""

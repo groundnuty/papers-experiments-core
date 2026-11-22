@@ -57,9 +57,13 @@ def local_read(path: str, root: str) -> str:
     )
 
 
-def script(owner: str, local: str, root: str, *, second_cycle: bool) -> list[Any]:
+def script(owner: str, local: str, root: str, *, second_cycle: bool, owner_reads: bool = True) -> list[Any]:
     """The stub's turns: the owner-only read, the local read, with `second_cycle` the owner-only read again (a second
-    abort and restore, P6), then the final text."""
+    abort and restore, P6), then the final text. Without `owner_reads` (the control condition, every provider up) the
+    local read alone: a read of the owner-only file with its owner up would give the local provider a copy of it, and
+    the registered read would then be served locally and never block."""
+    if not owner_reads:
+        return [[(TOOL, {"code": local_read(local, root)})], FINAL]
     turns: list[Any] = [[(TOOL, {"code": owner_read(owner)})], [(TOOL, {"code": local_read(local, root)})]]
     if second_cycle:
         turns.append([(TOOL, {"code": owner_read(owner)})])

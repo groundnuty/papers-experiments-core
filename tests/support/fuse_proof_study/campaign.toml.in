@@ -1,5 +1,6 @@
 # One seed and one stub model: two runs, the registered outage and its control. @BOUND_S@ is the limit on one cell
 # (30 s live; short in the offline dry run) and @TIME_CAP_S@ the agent's time cap, far above it.
+# @MAX_DEFER_S@ is filled by the driver (`max_defer_s_for`).
 order_seed = 20261122
 seeds = [1]
 models = ["proof-stub"]
@@ -19,6 +20,9 @@ retry_delay_s = 0
 poll_interval_s = 0.2
 recheck_s = 5
 health_timeout_s = 900
+# at least what the platform's own deferral needs with this campaign's waits (the driver computes it from the
+# platform file live: the heal of every link over five providers declares more than the core's default 3,600 s)
+max_defer_s = @MAX_DEFER_S@
 lease_timeout_s = 30
 health_kind = "sandbox"
 identity_kind = "endpoint"

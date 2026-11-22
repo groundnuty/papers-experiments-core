@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import hashlib
+import re
 import threading
 from collections.abc import AsyncIterator, Iterator, Mapping
 from pathlib import Path
@@ -40,13 +41,16 @@ TARGET = "providers[1]"
 SPACE = "orchard"
 HOLDERS = {SPACE: TARGET, "meadow": "providers[2]"}
 LOCAL_BYTES = b"the local file of the dry run\n"
+OWNER_BYTES = bytes(range(256)) * 64
 
 
 class FakeFederation:
-    """What the fake injector changes and the fake nodes read: whether the owner is down."""
+    """What the fake injector changes and the fake nodes read: whether the owner is down, and which owner-only files
+    the local provider holds a copy of (one read with the owner up made it)."""
 
     def __init__(self) -> None:
         self.owner_down = False
+        self.replicated: set[str] = set()
         self.lock = threading.Lock()
 
 
@@ -202,16 +206,20 @@ class FakeWorld:
         if FP.OWNER_MARK in program or FP.LOCAL_MARK in program:
             held.node.cell()  # the guard's watcher proves the agent's cell, as a real watcher does
         if FP.OWNER_MARK in program:
+            path = owner_path_of(program)
             with self.federation.lock:
                 down = self.federation.owner_down
-            if down:
-                return self._stuck(held, cell)
+                if not down:  # a read with the owner up gives the local provider a copy of the file
+                    self.federation.replicated.add(path)
+                local = path in self.federation.replicated
+            if down and not local:
+                return self._stuck(held, cell, path)
             return CmdResult(0, "read 4096\n")
         if FP.LOCAL_MARK in program:
             return CmdResult(0, f"listed 2\nsha256 {hashlib.sha256(LOCAL_BYTES).hexdigest()}\n")
         return held.node.default_cell(cell)
 
-    def _stuck(self, held: Boxed, cell: Any) -> Any:
+    def _stuck(self, held: Boxed, cell: Any, path: str) -> Any:
         """The owner-only read waits in the kernel on the run's live FUSE connection, until the abort frees it."""
         node = held.node
         node.reader = cell.procs[1]
@@ -219,7 +227,7 @@ class FakeWorld:
         table = MOUNTS.replace(DATA_DEVICE, device or DATA_DEVICE)
         process = node.survivor_proc.process(node.reader.pid, start=node.reader.start, mounts=table)
         process.task(node.reader.pid, syscall=syscall_text(0, 3, 0x7F10, 0x1000), wchan="request_wait_answer")
-        process.fd(3, self.owner_path or f"{self.mount_path}/{SPACE}/fuse-proof/owner-only.bin", mnt_id=DATA_MOUNT)
+        process.fd(3, path, mnt_id=DATA_MOUNT)
         fusectl_tree(held.root, device or fusectl_device(node), waiting=1)
         return node.stuck(cell)
 
@@ -262,6 +270,15 @@ class FakeWorld:
     def files(self) -> FakeFiles:
         return FakeFiles()
 
+    def local_held(self, file_id: str) -> int:
+        """The local provider's bytes of a seeded file: all of an owner-only file it holds a copy of, else none."""
+        with self.federation.lock:
+            return (
+                len(OWNER_BYTES)
+                if any(p.endswith(file_id.rsplit("/", 1)[-1]) for p in self.federation.replicated)
+                else 0
+            )
+
     def provider_of(self, label: str) -> str:
         return label
 
@@ -273,6 +290,12 @@ class FakeWorld:
 
     def close(self) -> None:
         return None
+
+
+def owner_path_of(program: str) -> str:
+    """The path an owner-only read's cell opens (`fuse_proof.owner_read`): the text its `open` names."""
+    match = re.search(r"with open\((['\"])(.*?)\1, 'rb'\)", program)
+    return match.group(2) if match else ""
 
 
 def fusectl_device(node: ReaderNode) -> str:
