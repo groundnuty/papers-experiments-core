@@ -27,6 +27,13 @@ journalled as done. Whatever breaks after the stop command (the wait, the journa
 the provider back at once and fails `start` as `injector_failure`, a kind no condition may declare, so the attempt is
 set aside and run again; the reading shows the failed injection and the clear that followed.
 
+**An owner stop needs a mirror asked first (O98).** Op-worker asks the holders of a file's blocks in the order of their
+provider ids and does not retry another after a disconnected one, so taking down the provider that holds a space's data
+fails its reads over to a mirror only when some mirror's id sorts below the owner's (`expcore_onedata.failover`). Before
+anything is locked or journalled, `start` re-checks that from the platform's ids for every space the target holds and
+another provider supports; when it does not hold, or an id is not known, nothing is taken down and `start` fails as
+`injector_failure`, naming spaces and providers by label. A target that holds no space with a mirror is unchanged.
+
 **Clear (O11).** `clear` brings the provider back and counts a restore only when the provider runs with an identity
 other than the one read before the injection (`ComposeDriver`: the container's id and start time). Readiness alone is
 not a restore, and a provider back with the same identity is a failed restore. The start is tried a bounded number of
@@ -324,7 +331,7 @@ from expcore.campaign import liveness
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError, uncharged_kinds
 from expcore.records.injections import FAULT_NAMESPACE
-from expcore_onedata import fault_owner
+from expcore_onedata import failover, fault_owner
 from expcore_onedata.admission import (
     INJECTOR,
     Admission,
@@ -459,6 +466,7 @@ class FaultInjector:
         if service is None:
             raise FaultRefused(f"{settings.file}: [faults.services]: no service is declared for {target}")
         self.target, self._service, self._driver = target, service, driver
+        self._config, self._owner_name = config, names[target]  # the platform's ids, read again before an owner stop
         self._clock, self._sleep = clock, sleep
         labels = {config.provider_label(name): service for name, service in settings.services.items()}
         # holds no reference to the injector: a dropped injector's locks go when its last reference does (no cycle)
@@ -655,8 +663,21 @@ class FaultInjector:
                 "a pair failing): no injection"
             )
 
+    def _require_failover_order(self) -> None:
+        """Refuse an owner stop whose mirrors would not be asked first (O98), with nothing locked, journalled or
+        stopped: for every space whose data provider is the target and that has a mirror, a mirror's provider id must
+        sort below the owner's, from the platform's ids as this injector holds them, or op-worker asks the stopped owner
+        first and every read waits on it (`expcore_onedata.failover`). A target that owns no space with a mirror is no
+        owner stop, and this reads nothing of it and records nothing. A platform whose ids are not known for such a
+        space is refused as well: the order is never assumed. A pass changes no step and no snapshot."""
+        try:
+            failover.admit(self._config, (self._owner_name,))
+        except failover.FailoverError as error:
+            raise self._fail(f"{error}; nothing is taken down") from None
+
     def _inject(self) -> None:
         """The second half of `start`: lock the target, journal the injection, stop it and see it down."""
+        self._require_failover_order()
         self._lock = self._journal.try_lock(self.target)
         if self._lock is None:
             raise self._fail(f"{self.target} is held by another run's fault injector")

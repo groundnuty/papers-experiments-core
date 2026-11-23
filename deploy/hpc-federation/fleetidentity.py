@@ -38,6 +38,16 @@ fleet's shard settings, `fleetplan.read_settings`).
 - `fleetidentity.py read --fleet DIR --member fed-k --settings FILE`: `read_identity` run on a site's login node, its
   one JSON line printed (exit 1 when there is none). The controller runs it there through the transport for an ssh
   site, whose fleet, root and manifest's Python are on the login node and not on this host.
+- **The failover order (O98).** A member whose root holds `failover-order.json` (written by `up` only when its layout
+  declares an owner outage and the order held, `hpcfailover`) has its line carry one more key, `failover`:
+  `{"admission": "passed", "spaces": [...]}` with each space's position label, owner and mirror labels, the labels in
+  the order of their provider ids and `mirror_first`, or `{"admission": "unreadable"}` for a record that cannot be read
+  as that. The key is **only in that line**: it is in no value of the tuple above, which the join compares across
+  members (the campaign fingerprint, the environment identity a lease store pins, the platform fingerprint), nor in
+  `render-identity.json`, which a shard's step compares key by key, since the order differs from one member to the
+  next by chance and would make interchangeable members differ. A member with no such record prints the line it
+  always did, and `said_identity` reads the three values it needs by name, so a controller that does not know the key
+  ignores it.
 """
 
 import argparse
@@ -45,6 +55,7 @@ import atexit
 import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -70,6 +81,12 @@ PROGRAM = (
     "                  'platform': platform}, sort_keys=True))\n"
 )
 TIMEOUT_S = 600.0
+# The failover record's name and version (`expcore_onedata.failover`, which `hpcfailover` writes it with): this module
+# runs on a login node where the core may not import, so it keeps its own copy of both and a test compares them.
+FAILOVER_FILE = "failover-order.json"
+FAILOVER_VERSION = "expcore-failover-order/1"
+FAILOVER_KEYS = {"space", "owner", "mirrors", "order", "mirror_first"}
+FAILOVER_LABEL = re.compile(r"(spaces|providers)\[[0-9]{1,4}\]")  # a position, never a name
 
 
 def _modules() -> Any:
@@ -297,6 +314,41 @@ def locator(evidence: Path, transport: Any = None) -> Callable[[Any, Any], Optio
     return locate
 
 
+def failover_space_ok(space: Any) -> bool:
+    """Whether one space of a failover record is position labels alone, with a mirror first in its order."""
+    if not isinstance(space, dict) or set(space) != FAILOVER_KEYS or space["mirror_first"] is not True:
+        return False
+    owner, mirrors, order = space["owner"], space["mirrors"], space["order"]
+    if not isinstance(mirrors, list) or not isinstance(order, list) or not order:
+        return False
+    labels = [space["space"], owner, *mirrors, *order]
+    if not all(isinstance(label, str) and FAILOVER_LABEL.fullmatch(label) for label in labels):
+        return False
+    return sorted(order) == sorted([owner, *mirrors]) and order[0] != owner
+
+
+def failover_reading(root: Path) -> Optional[dict]:
+    """What the root's `failover-order.json` says, for the read's line (O98): None when the root holds none (a member
+    whose layout declares no owner outage), `{"admission": "passed", "spaces": [...]}` for a record of this version
+    whose every space is labels alone, and `{"admission": "unreadable"}` for any other. A record is never trusted to
+    be harmless: a space that holds anything but position labels, or an `order` that is not its supporters', is
+    unreadable, so no name or id an edited file holds is ever printed."""
+    try:
+        text = (root / FAILOVER_FILE).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError):
+        return {"admission": "unreadable"}
+    try:
+        record = json.loads(text)
+        spaces = record["spaces"]
+        if record["version"] == FAILOVER_VERSION and isinstance(spaces, list) and all(map(failover_space_ok, spaces)):
+            return {"admission": "passed", "spaces": spaces}
+    except (ValueError, KeyError, TypeError):
+        pass
+    return {"admission": "unreadable"}
+
+
 def main(argv: Optional[Sequence[str]] = None, runner: Callable[..., Any] = subprocess.run) -> int:
     """`read`: this login node's `read_identity` as one JSON line, for the controller of an ssh site."""
     found = argparse.ArgumentParser(prog="fleetidentity.py", description=__doc__.split("\n\n")[0])
@@ -307,7 +359,15 @@ def main(argv: Optional[Sequence[str]] = None, runner: Callable[..., Any] = subp
     got = read_identity(Path(args.fleet), args.member, Path(args.settings), runner)
     if got is None:
         return 1
-    print(json.dumps({"fingerprint": got[0], "environment": dict(got[1]), "platform": got[2]}, sort_keys=True))
+    line = {"fingerprint": got[0], "environment": dict(got[1]), "platform": got[2]}
+    _, fleetrecord = _modules()
+    try:
+        reading = failover_reading(fleetrecord.root_of(Path(args.fleet), args.member))
+    except (fleetrecord.FleetError, OSError, ValueError):
+        reading = None  # the identity above was read through the same root: this adds nothing, and takes nothing away
+    if reading is not None:
+        line["failover"] = reading
+    print(json.dumps(line, sort_keys=True))
     return 0
 
 

@@ -703,8 +703,21 @@ section 3).
 - **The layout** is a `deploy/compose-federation` layout (its providers, spaces, principals, probe space and platform
   template) with an `[hpc]` table of sizes, which Compose ignores: the held job's `--time`, each service step's cores
   and memory, every node's control reserve, `stop_seconds`, `step_launch_wait_s` (what a control step may wait to
-  start, 240 s by default), and where the core's phase runs (`core = "login"` or `"step"`). `layouts/pilot-shape.toml` has the pilot's shape with invented names: a zone, five providers, four data
+  start, 240 s by default), where the core's phase runs (`core = "login"` or `"step"`), and the providers a study's owner outage takes down (`outage_targets`, below). `layouts/pilot-shape.toml` has the pilot's shape with invented names: a zone, five providers, four data
   spaces and the probe space; its link check covers ten ordered pairs.
+- **The failover order of an owner outage** (O98, `hpcfailover.py`). Taking down the provider that holds a space's data
+  fails the space's reads over to a mirror only when a mirror's provider id sorts below the owner's: op-worker asks the
+  holders of a file's blocks in the order of their ids and does not retry another after a disconnected one, and ids are
+  random at registration. A layout whose study takes providers down says which, `[hpc] outage_targets = ["<provider>",
+  ...]` (distinct providers of the layout, by name; none by default, and then `up` is what it always was). The core's
+  phase, right after `platform.toml` is written and before the link check, then requires of every space of the rendered
+  file whose data provider (`holder`) is one of them and that has a mirror that some mirror's id sorts below the
+  owner's; a member where it does not hold fails `up` (`failover order: ... refuse this member`, spaces and providers by
+  position label, never a name or an id) and the fleet replaces it, and one where it does has `failover-order.json` in
+  its root (each space's position, its owner's and mirrors' labels, the labels in the order of their ids, `mirror_first`;
+  kept in the root evidence, printed as `failover` in `fleetidentity.py read`'s line, and in no value the join compares
+  and not in `render-identity.json`, which the order, differing by chance from member to member, would break). The
+  fault injector checks again from the platform's own holders and ids before it stops the owner.
 - **The agent's node** (M5), when `[hpc] sandbox` declares it or the layout's platform template declares the
   Apptainer sandbox's limits, is held at its own shape: by default (`sandbox_placement = "het"`) as component 1 of a
   heterogeneous job, every step there with `--het-group=1` and every step on a service node with `--het-group=0`
@@ -973,7 +986,7 @@ python3 -I deploy/hpc-federation/shards.py verify-copy <local dir>/archives.sha2
 | `<label>.out.tar` | the shard's `out/`, which the merge reads | the results |
 | `<label>.out.json` | the archive's manifest (its SHA-256, the exit status, the post-run record) | what the archive is |
 | `<label>/journals/*` (every file) | a spend journal per step (`expcore run --spend-journal`) | what a step killed outright spent, which `--resume` counts as `lost_in_kill`: nowhere else |
-| `<label>.root.tar` | the federation's **root evidence**: the state (`hpc-federation.json`), `platform.toml`, `facts.json`, `link-check.json`, `render-identity.json`, `day0-wiring.toml`, `ingest-evidence.json` (a study's `ingest run --out <root>/ingest-evidence.json`: the id map the study reads back), `shard-claim.json` and `shard-claim.lock` (the study's pre-step guard: who held the root), `data-manifests/*.json` (what each space's data identity was made from), `shard-steps/*.json` (which steps ran), the **whole `fault-journal/` directory** (its journals, the holder and drain records, the lock files, read as they are and never locked) and the fault relay's `late-steps.jsonl` and request, taken and answer files (those present). **An allow-list: never `secrets/`, a file holding a token, key or password, the CA, or the relay's heartbeat and lock** | what `down` removes with the root, and the study's post-check and the facts read: nowhere else once the root is gone |
+| `<label>.root.tar` | the federation's **root evidence**: the state (`hpc-federation.json`), `platform.toml`, `facts.json`, `link-check.json`, `render-identity.json`, `failover-order.json` (only for a layout that declares `outage_targets`, labels alone), `day0-wiring.toml`, `ingest-evidence.json` (a study's `ingest run --out <root>/ingest-evidence.json`: the id map the study reads back), `shard-claim.json` and `shard-claim.lock` (the study's pre-step guard: who held the root), `data-manifests/*.json` (what each space's data identity was made from), `shard-steps/*.json` (which steps ran), the **whole `fault-journal/` directory** (its journals, the holder and drain records, the lock files, read as they are and never locked) and the fault relay's `late-steps.jsonl` and request, taken and answer files (those present). **An allow-list: never `secrets/`, a file holding a token, key or password, the CA, or the relay's heartbeat and lock** | what `down` removes with the root, and the study's post-check and the facts read: nowhere else once the root is gone |
 | `<label>.root.json` | the root archive's manifest (its SHA-256 and size, and each file's name, size and SHA-256) | what the root archive is |
 | `<label>/pass-env.json`, **when there is one** | the shard's first-step `pass_env` names and values (a site path of the study's artifacts) | what the first step was given, which the archive's `out/` does not hold |
 | `<label>/snapshots/snap-N/*`, **only when newer than the archive** | the newest snapshot that verifies, when a step resumed from the archive was killed before it archived | the runs that step reached, which the archive lacks and the merge does not see; `collect` warns when it lists one, and `collect --run` refuses |

@@ -41,6 +41,11 @@ real addresses (DESIGN.md, sections 5 and 6).
   drifts unseen. The template declares `holder`, the one setting the core has no default for (`up` refuses one that
   does not, before anything is submitted); the render writes every other setting at the core's default, read from
   `PlacementSettings`' fields, beside what the template declared.
+- **The failover order** (O98, `hpcfailover`): with `[hpc] outage_targets` declared in the layout, right after the
+  platform file is written and before the link check, every space the rendered file holds for one of those providers
+  and that has a mirror must have a mirror whose provider id sorts below the owner's, or `up` fails and the member is
+  replaced; the passing order is written as `failover-order.json` (labels only). Nothing is declared in a layout that
+  does not name `outage_targets`, and `up` is then what it was.
 - **The link check** is `fedlinks.check_after_up`: the platform layer's own, through the rendered file, writing
   `link-check.json` in the root through `expcore_onedata.linkrecord`.
 """
@@ -54,6 +59,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import hpcdata
+import hpcfailover
 import hpcidentity
 import hpcimport
 import hpcnames
@@ -449,6 +455,7 @@ def core_phase(
         filled = {**values, "hpc_direct_storages": direct_storages_value(layout, boot, env),
                   **hpcdata.values(manifests)}  # fmt: skip
         written = write_facts(layout, boot, filled)
+        admitted = hpcfailover.admit(layout)  # O98: with an owner outage declared, a mirror is asked first, or up fails
         if layout.spec.platform_template is not None:
             hpcdata.check_rendered(
                 layout, manifests
@@ -460,7 +467,7 @@ def core_phase(
         checked = links(layout, dict(boot.ids.spaces))
     finally:
         client.close()
-    return f"{written}\n{held}\n{checked}"
+    return f"{written}\n{admitted}\n{held}\n{checked}" if admitted else f"{written}\n{held}\n{checked}"
 
 
 READINGS_KEYS = ("os.id", "os.version_id", "glibc", "kernel")

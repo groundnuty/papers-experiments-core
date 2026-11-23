@@ -61,6 +61,7 @@ for _path in (HERE, REPO / "deploy" / "compose-federation"):  # python -I leaves
         sys.path.insert(0, str(_path))
 
 import hpcexclude  # noqa: E402
+import hpcfailover  # noqa: E402
 from fedlayout import Layout, checked_root  # noqa: E402
 from fedspec import DEFAULT_LAYOUT, LayoutError, Spec, load_spec  # noqa: E402
 from hpcdriver import CORE_MISMATCH, TIMEOUTS, CoreMismatch, Driver  # noqa: E402
@@ -134,6 +135,8 @@ def make_driver(
     spec = load_spec(layout_path)
     layout = root_layout(root, spec)
     settings = load_settings(spec.hpc, agent_limits(spec.platform_template) if agent else None)
+    if agent:  # an outage declared for a provider the layout lacks fails up here, not after its providers registered
+        hpcfailover.declared(spec)  # (O98)
     slurm = Slurm(runner or Runner())
     store = StateStore(layout.root)
     command = [sys.executable, "-I", "-B", str(HERE / "hpcfed.py"), "--layout", str(layout_path), "--root",

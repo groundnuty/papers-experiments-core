@@ -317,8 +317,14 @@ provider = { cpus = 4, memory = "10g" }  # each provider's service step (posix s
 control = { cpus = 1, memory = "1g" }    # the control reserve on every node (mint, deliver, teardown, status, exec)
 sandbox = { cpus = 8, memory = "17g" }   # optional: the agent's node S and its step's size (M5; section 8)
 sandbox_placement = "het"                # S as component 1 of a heterogeneous job, or "separate" (section 1)
+# outage_targets = ["<provider>"]        # optional: the providers a study's owner outage takes down (O98, below)
 ```
 
+- **`outage_targets`** (optional; O98, `hpcfailover.py`) names the providers, by the layout's names, whose outage a
+  study declares. For each space the rendered `platform.toml` holds with one of them as its data provider and a mirror,
+  the core's phase requires, before the link check, that some mirror's provider id sorts below the owner's (op-worker
+  asks the holders of a file's blocks in that order and does not retry another), else `up` fails and the member is
+  replaced; the passing order is written as `failover-order.json`, labels only. A layout without the key is unchanged.
 - **A service step** runs `srun --exact -c <cpus> --mem=<memory>`. tmpfs counts against the memory of the cgroup that
   writes it, so the rootfs and the storage are inside the service step's memory.
 - **A control step** (a token's mint or delivery, a teardown, M4's status and exec) runs `srun --exact -c 1
