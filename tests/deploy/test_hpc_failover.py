@@ -281,3 +281,27 @@ def test_o98_a_disagreement_over_a_space_no_declared_provider_owns_or_holds_refu
     (space,) = json.loads((root / FILE).read_text(encoding="utf-8"))["spaces"]
     assert (space["space"], space["owner"], space["mirrors"]) == ("spaces[3]", "providers[4]", ["providers[0]"])
     assert space["order"] == ["providers[0]", "providers[4]"]
+
+
+# -- no fingerprint holds the declaration or the record ---------------------------------------------------------------
+
+
+def test_o98_declaring_outage_targets_changes_neither_the_rendered_platform_nor_the_render_identity(
+    hpc, tmp_path, make_ca
+):
+    """O98: the render identity is the template's hash, the rendered platform's fingerprint and the pins, which a shard
+    compares with the one its plan expects. The layout's `outage_targets` and the record the admission writes are in
+    none of them: two roots of one layout and one set of ids, one declaring the outage and one not, render the same
+    platform file (but for the root's own path) and have the same render identity byte for byte."""
+    texts = {}
+    one_ca = make_ca(tmp_path / "shared-ca")  # the CA bundle's hash is in the fingerprint: one bundle for both roots
+    for name, line in (("declared", DECLARED), ("plain", None)):
+        root, layout = core_root(hpc, tmp_path / name, lambda directory: one_ca, line)
+        run_core(hpc, layout, MIRROR_FIRST, [])
+        platform = (root / "platform.toml").read_text(encoding="utf-8").replace(str(root), "<root>")
+        texts[name] = (platform, (root / "render-identity.json").read_bytes(), (root / FILE).exists())
+    assert texts["declared"][2] is True
+    assert texts["plain"][2] is False
+    assert texts["declared"][0] == texts["plain"][0]
+    assert texts["declared"][1] == texts["plain"][1]
+    assert b"failover" not in texts["declared"][1]
