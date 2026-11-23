@@ -233,3 +233,51 @@ def test_o98_the_record_is_evidence_up_writes_like_the_render_identity(hpc):
     assert FILE in evidence.EVIDENCE_FILES
     assert evidence.kind_of(FILE) == evidence.UP
     assert FILE not in evidence.REQUIRED
+
+
+# -- the file's data provider is the layout's owner --------------------------------------------------------------------
+
+
+def with_alpha_held_by(hpc, tmp_path, make_ca, line, holder):
+    """A root whose platform template names `holder` as the data provider of the first space, which the layout gives
+    to larch: the one thing the layout and the rendered file can disagree on."""
+    root, layout = core_root(hpc, tmp_path, make_ca, line)
+    template = layout.spec.platform_template
+    text = template.read_text(encoding="utf-8")
+    assert text.count('holder = "larch"') == 1
+    template.write_text(text.replace('holder = "larch"', f'holder = "{holder}"', 1), encoding="utf-8")
+    return root, layout
+
+
+@pytest.mark.parametrize("line", [DECLARED, 'outage_targets = ["aspen"]'])
+def test_o98_a_space_whose_data_provider_in_the_file_is_not_the_layouts_owner_is_refused_not_left_out(
+    hpc, tmp_path, make_ca, line
+):
+    """O98: the scope is read from the file's `holder`, so a template that gives alpha-space to aspen while the layout
+    gives it to larch must not drop the space from scope in silence: with larch declared the space is the declared
+    owner's, with aspen declared it is the file's, and either way `up` is refused naming the space by label, with no
+    record, whatever the ids are (the mirrors here sort first)."""
+    root, layout = with_alpha_held_by(hpc, tmp_path, make_ca, line, "aspen")
+    events = []
+    with pytest.raises(RuntimeError) as refused:
+        run_core(hpc, layout, MIRROR_FIRST, events)
+    text = str(refused.value)
+    assert text.startswith("failover order: spaces[0]: the platform file's data provider is not the layout's owner")
+    assert text.endswith("refuse this member")
+    for hidden in ("larch", "aspen", "rowan", "alpha-space"):
+        assert hidden not in text
+    assert "links" not in events
+    assert not (root / FILE).exists()
+
+
+def test_o98_a_disagreement_over_a_space_no_declared_provider_owns_or_holds_refuses_nothing(hpc, tmp_path, make_ca):
+    """O98: with hazel declared, the spaces of the others are none of the declaration's: alpha-space, whose file says
+    aspen and layout says larch, is neither hazel's nor held by it, so nothing is refused for it; the one space hazel
+    owns (delta-space, spaces[3]) is checked and recorded alone."""
+    root, layout = with_alpha_held_by(hpc, tmp_path, make_ca, 'outage_targets = ["hazel"]', "aspen")
+    events = []
+    run_core(hpc, layout, LARCH_FIRST, events)
+    assert events == ["steps", "links"]
+    (space,) = json.loads((root / FILE).read_text(encoding="utf-8"))["spaces"]
+    assert (space["space"], space["owner"], space["mirrors"]) == ("spaces[3]", "providers[4]", ["providers[0]"])
+    assert space["order"] == ["providers[0]", "providers[4]"]

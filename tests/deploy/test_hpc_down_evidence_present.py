@@ -508,6 +508,7 @@ UP_PATH = (
     "deploy/hpc-federation/hpcdriver.py",
     "deploy/hpc-federation/hpcboot.py",
     "deploy/hpc-federation/hpcdata.py",
+    "deploy/hpc-federation/hpcfailover.py",
     "deploy/hpc-federation/hpcimport.py",
     "deploy/hpc-federation/hpcidentity.py",
     "deploy/hpc-federation/hpcnames.py",

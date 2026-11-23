@@ -18,11 +18,13 @@ supporter. A layout that declares none, or whose declared providers hold no spac
 labels in the order of their ids, and `mirror_first: true`. Labels only: no provider's name, no space's name, no id. It
 is evidence like `render-identity.json` (`hpcevidence.UP_FILES`), and the identity read reports it (`fleetidentity.py`).
 A space that fails refuses the member, naming the spaces and providers by label, and removes a record an earlier run of
-the phase left.
+the phase left. The scope is read from the rendered file's data provider (`holder`) of each space, which nothing else
+ties to the layout's owner, so a space of a declared owner whose file names another provider, or one whose file names a
+declared provider and the layout another owner, is refused too (`holders_differ`), never left out of scope in silence.
 """
 
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import hpcsettings
 from fedfacts import write_private
@@ -34,6 +36,27 @@ def declared(spec: Any) -> Tuple[str, ...]:
     """The providers the layout declares an owner outage for (`[hpc] outage_targets`), checked against the layout's own
     providers; SettingsError when the key is malformed or names one the layout lacks. Empty: no outage declared."""
     return hpcsettings.outage_targets(spec.hpc, [provider.name for provider in spec.providers])
+
+
+def holders_differ(spec: Any, config: Any, owners: Tuple[str, ...]) -> List[str]:
+    """The position labels of the spaces whose data provider in the rendered platform file is not the owner the layout
+    declares, among those an owner outage reaches by either: the layout's owner is declared, or the file's data provider
+    is. The failover check reads the file's `holder`, the layout says who owns the space, and nothing else ties the two,
+    so a space where they differ is refused rather than left out of scope with no word. A layout space the file does not
+    hold (the link check's probe space) or one with no mirror is skipped."""
+    holders = config.space_holders()
+    targets = {config.provider_label(name) for name in owners if name in config.providers}
+    entries = {entry.space.name: entry for entry in config.spaces}
+    found = []
+    for space in spec.spaces:
+        entry = entries.get(space.name)
+        if entry is None or not space.mirrors:
+            continue
+        held = holders.get(space.name)
+        owner = config.provider_label(space.owner) if space.owner in config.providers else None
+        if (space.owner in owners or held in targets) and held != owner:
+            found.append(entry.position)
+    return found
 
 
 def admit(layout: Any) -> Optional[str]:
@@ -52,8 +75,16 @@ def admit(layout: Any) -> Optional[str]:
         raise RuntimeError(
             "failover order: the layout declares outage targets and no platform file to read the ids from"
         )
+    config = load_platform(layout.platform)
+    differing = holders_differ(layout.spec, config, owners)
+    if differing:
+        path.unlink(missing_ok=True)
+        where = "; ".join(
+            f"{label}: the platform file's data provider is not the layout's owner" for label in differing
+        )
+        raise RuntimeError(f"failover order: {where}, so the order of the owner's outage cannot be checked; {REFUSAL}")
     try:
-        found = failover.admit(load_platform(layout.platform), owners)
+        found = failover.admit(config, owners)
     except failover.FailoverError as error:
         path.unlink(missing_ok=True)  # a record of an earlier run of the phase is no longer true of this one
         raise RuntimeError(f"{error}; {REFUSAL}") from None

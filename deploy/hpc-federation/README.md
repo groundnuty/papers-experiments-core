@@ -712,7 +712,7 @@ section 3).
   ...]` (distinct providers of the layout, by name; none by default, and then `up` is what it always was). The core's
   phase, right after `platform.toml` is written and before the link check, then requires of every space of the rendered
   file whose data provider (`holder`) is one of them and that has a mirror that some mirror's id sorts below the
-  owner's; a member where it does not hold fails `up` (`failover order: ... refuse this member`, spaces and providers by
+  owner's (a space whose `holder` in the file is not the layout's owner is refused too, since nothing else ties the two); a member where it does not hold fails `up` (`failover order: ... refuse this member`, spaces and providers by
   position label, never a name or an id) and the fleet replaces it, and one where it does has `failover-order.json` in
   its root (each space's position, its owner's and mirrors' labels, the labels in the order of their ids, `mirror_first`;
   kept in the root evidence, printed as `failover` in `fleetidentity.py read`'s line, and in no value the join compares
