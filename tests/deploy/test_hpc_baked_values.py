@@ -157,3 +157,130 @@ def test_prep_and_the_checks_use_the_hash_comparison():
     assert 'no_baked "$R/volumes"' in checks
     assert 'no_baked "$CB"' in checks
     assert "grep -rlF" not in patch + checks
+
+
+# -- O98: a restore does not read the provider's storage ---------------------------------------------------------------
+
+
+def baked_pruned(top: Path, *options: str) -> subprocess.CompletedProcess:
+    argv = [sys.executable, "-I", str(BAKED), *options, str(top), *ENTRIES]
+    return subprocess.run(argv, capture_output=True, timeout=60, check=False)
+
+
+def volumes(tmp_path: Path) -> Path:
+    """A provider's /volumes as the rootfs holds it: the persistence and its backup, the posix storage, and an imported
+    tree's mountpoint, all real directories."""
+    top = tmp_path / "volumes"
+    for name in ("persistence", "persistence_backup", "posix", "import/shared-tree", "import/second-tree"):
+        (top / name).mkdir(parents=True)
+    return top
+
+
+def test_o98_the_posix_storage_and_each_import_mountpoint_are_left_out_of_the_scan_and_nothing_else_is(tmp_path):
+    """O98: a value in the study's data under volumes/posix, or under an import entry, is not read (a tmpfs storage is
+    the provider's whole data, ten minutes a restore); the same value in the persistence, its backup, a file beside
+    them is found, so the scan of the Couchbase state stays whole."""
+    top = volumes(tmp_path)
+    (top / "posix" / "data.bin").write_bytes(STAND_IN)
+    (top / "posix" / "deep" / "er").mkdir(parents=True)
+    (top / "posix" / "deep" / "er" / "more.bin").write_bytes(STAND_IN)
+    (top / "import" / "shared-tree" / "file").write_bytes(STAND_IN)
+    (top / "import" / "second-tree" / "file").write_bytes(STAND_IN)
+    assert baked(top).returncode == 1  # without the prune, as before: the data is read
+    result = baked_pruned(top, "--prune", "posix", "--prune-each", "import")
+    assert (result.returncode, result.stdout) == (0, b""), result.stderr
+    for kept in ("persistence/cookie", "persistence_backup/etc/cookie", "loose"):
+        (top / kept).parent.mkdir(parents=True, exist_ok=True)
+        (top / kept).write_bytes(STAND_IN)
+        found = baked_pruned(top, "--prune", "posix", "--prune-each", "import")
+        assert found.returncode == 1, kept
+        assert found.stdout.decode().splitlines() == [str(top / kept)]
+        (top / kept).unlink()
+
+
+def test_o98_an_entry_directly_below_import_is_pruned_but_import_itself_is_not_a_prune_path_of_its_own(tmp_path):
+    """O98: `--prune-each import` leaves out what is below `import`, a file as much as a mountpoint, and nothing of its
+    parent; `--prune posix` leaves out `posix` and not a directory of that name elsewhere."""
+    top = volumes(tmp_path)
+    (top / "import" / "a-plain-file").write_bytes(STAND_IN)
+    (top / "persistence" / "posix").mkdir()
+    (top / "persistence" / "posix" / "cookie").write_bytes(STAND_IN)
+    found = baked_pruned(top, "--prune", "posix", "--prune-each", "import")
+    assert found.returncode == 1
+    assert found.stdout.decode().splitlines() == [str(top / "persistence" / "posix" / "cookie")]
+
+
+def test_o98_a_prune_path_that_is_not_there_prunes_nothing_a_zone_has_no_storage(tmp_path):
+    """O98: a zone has no posix and no import: the paths are missing, which is nothing to prune and no error."""
+    (tmp_path / "persistence").mkdir()
+    (tmp_path / "persistence" / "clean").write_bytes(b"fresh\n")
+    assert baked_pruned(tmp_path, "--prune", "posix", "--prune-each", "import").returncode == 0
+    (tmp_path / "persistence" / "cookie").write_bytes(STAND_IN)
+    assert baked_pruned(tmp_path, "--prune", "posix", "--prune-each", "import").returncode == 1
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--prune", "posix"),
+        ("--prune-each", "import"),
+        ("--prune", "import/shared-tree"),
+        ("--prune-each", "import/shared-tree"),
+    ],
+)
+def test_o98_a_prune_path_that_is_a_link_is_refused_and_nothing_is_scanned_as_pruned(tmp_path, options):
+    """O98: a link where a prune path is, or an entry below a `--prune-each` path, is an error (exit 2): what it stands
+    for is not known to be what was meant, so the scan fails closed rather than leave it out."""
+    top = tmp_path / "volumes"
+    (top / "persistence").mkdir(parents=True)
+    (top / "persistence" / "cookie").write_bytes(STAND_IN)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (top / "import").mkdir()
+    for target in ("posix",):
+        (top / target).symlink_to(elsewhere, target_is_directory=True)
+    (top / "import" / "shared-tree").symlink_to(elsewhere, target_is_directory=True)
+    result = baked_pruned(top, *options)
+    assert result.returncode == 2, result.stdout
+    assert b"link" in result.stderr
+
+
+def test_o98_a_link_among_the_parents_of_a_prune_path_is_refused_too(tmp_path):
+    """O98: a prune path below a link is no path of the tree: `lstat` of the whole would follow the link out of it."""
+    top = tmp_path / "volumes"
+    outside = tmp_path / "outside"
+    (outside / "posix").mkdir(parents=True)
+    top.mkdir()
+    (top / "linked").symlink_to(outside, target_is_directory=True)
+    assert baked_pruned(top, "--prune", "linked/posix").returncode == 2
+
+
+def test_o98_a_prune_option_that_is_no_plain_relative_path_or_has_no_value_is_an_error(tmp_path):
+    """O98: an absolute path, `..`, an empty one, an unknown option and an option with no value fail the scan closed."""
+    for options in (("--prune", "/etc"), ("--prune", "../elsewhere"), ("--prune", ""), ("--prune-each", "a//b"),
+                    ("--unknown", "x"), ("--prune",)):  # fmt: skip
+        assert baked_pruned(tmp_path, *options).returncode == 2, options
+
+
+def test_o98_a_prune_each_path_that_is_a_file_is_an_error(tmp_path):
+    """O98: `--prune-each` names a directory whose entries are left out; a file there is no such directory."""
+    (tmp_path / "import").write_bytes(b"not a directory")
+    assert baked_pruned(tmp_path, "--prune-each", "import").returncode == 2
+
+
+def test_o98_lib_sh_passes_the_options_before_the_directory_and_the_restore_check_prunes_the_storage(tmp_path):
+    """O98: `no_baked <dir> --prune posix --prune-each import` scans the rest of the directory; check-defaults.sh's
+    /volumes check is that call, and prep's, and the live check's, keep the whole scan."""
+    top = volumes(tmp_path)
+    (top / "posix" / "data.bin").write_bytes(STAND_IN)
+    override = f"BAKED_CB_SHA256=({' '.join(ENTRIES)}); no_baked"
+    assert lib(override, str(top)).returncode == 1
+    assert lib(override, str(top), "--prune", "posix", "--prune-each", "import").returncode == 0
+    (top / "persistence" / "cookie").write_bytes(STAND_IN)
+    assert lib(override, str(top), "--prune", "posix", "--prune-each", "import").returncode == 1
+    checks = (BUNDLE / "check-defaults.sh").read_text(encoding="utf-8")
+    patch = (BUNDLE / "patch.sh").read_text(encoding="utf-8")
+    assert 'no_baked "$R/volumes" --prune posix --prune-each import' in checks
+    assert 'no_baked "$CB"' in checks
+    assert 'no_baked "$R/volumes" || die' in patch  # prep scans the rootfs whole, before any storage exists
+    assert "--prune" not in patch

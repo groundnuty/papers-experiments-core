@@ -66,7 +66,10 @@ overlay_ok() {  # our overlay holds the current administrator, and no other pane
   [[ -z $other ]]
 }
 check "onepanel's Couchbase administrator comes from our 0600 overlay only" overlay_ok
-check "no shipped Couchbase cookie or memcached password under /volumes" no_baked "$R/volumes"
+# Not under volumes/posix nor volumes/import/*: the provider's storage and the imported trees hold the study's data, which
+# the images never ship, and with tmpfs storage a restore would read all of it, ten minutes of pure Python (O98). The
+# Couchbase state, persistence and the backup, is under the rest of /volumes and is scanned whole.
+check "no shipped Couchbase cookie or memcached password under /volumes" no_baked "$R/volumes" --prune posix --prune-each import
 preload_ok() { [[ $(<"$R/etc/ld.so.preload") == /usr/local/lib/hpcop-portshim.so ]]; }
 check "ld.so.preload loads only the shim" preload_ok
 if [[ $COMP == op && -e $S/registration-token ]]; then check "registration token is a 0600 file" secret_file "$S/registration-token"; fi

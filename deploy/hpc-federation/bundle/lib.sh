@@ -28,10 +28,13 @@ BAKED_CB_SHA256=(
   32:e94d95a40c6b86d8fe3608a5300eb5e634756b109b38eb72608ea5fcb1826c50
 )
 # True when no regular file under <dir> holds one of them (anywhere in a run of alphanumerics, as grep -F would find
-# it); false when one does or the scan fails. The files holding one are named on stderr, never the value.
-no_baked() {  # <dir>
-  local out p rc=0
-  out=$("$HPCOP_PY" -I -B "$HPCOP_BUNDLE/baked.py" "$1" "${BAKED_CB_SHA256[@]}") || rc=$?
+# it); false when one does or the scan fails. The files holding one are named on stderr, never the value. Options after
+# <dir> go to baked.py before it: `--prune REL` and `--prune-each REL` leave a path of <dir>, or each entry below it,
+# out of the walk (a link there fails the scan), so a restore does not read a provider's whole posix storage.
+no_baked() {  # <dir> [<baked.py option>...]
+  local dir=$1 out p rc=0
+  shift
+  out=$("$HPCOP_PY" -I -B "$HPCOP_BUNDLE/baked.py" "$@" "$dir" "${BAKED_CB_SHA256[@]}") || rc=$?
   if [[ -n $out ]]; then
     while IFS= read -r p; do printf 'hpcop: a shipped Couchbase value is in %s\n' "$p" >&2; done <<<"$out"
   fi
