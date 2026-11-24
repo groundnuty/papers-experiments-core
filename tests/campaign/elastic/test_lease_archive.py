@@ -163,6 +163,15 @@ def test_a_store_that_appears_twice_is_ambiguous_and_refused(tmp_path):
     _refused(path, sha, 4, "more than once")
 
 
+def test_a_file_that_is_not_the_lease_archive_is_refused_for_that_before_what_it_holds(tmp_path):
+    """A store twice in a tar whose hash is not the completion's is refused by the hash (condition 3), not by the
+    duplicate (condition 4): what an archive holds is said only of one that is the lease's."""
+    path = tmp_path / "twice.tar"
+    data = _store_bytes(tmp_path)
+    _tar_with(path, [("out/state.sqlite", data), ("out/state.sqlite", data)])
+    _refused(path, "0" * 64, 3, "not the archive the ledger verified")
+
+
 def test_a_store_that_is_a_link_or_a_directory_in_the_tar_is_refused(tmp_path):
     path = tmp_path / "linked.tar"
     with tarfile.open(path, "w") as tar:
@@ -287,10 +296,18 @@ def test_a_zstd_archive_is_refused_when_no_zstd_program_is_found(tmp_path, monke
     _refused(packed, sha, 3, "no zstd program")
 
 
-def test_a_zstd_stream_the_program_cannot_decompress_is_refused_with_its_exit_status(tmp_path, monkeypatch):
+def test_a_zstd_program_that_gives_nothing_leaves_a_tar_that_cannot_be_read_and_is_refused(tmp_path, monkeypatch):
     install_stand_in_zstd(tmp_path / "bin", monkeypatch, exit_status=1)
     archive, sha = make_archive(tmp_path, RUN)
-    _refused(fake_zstd_archive(archive), sha, 3, "")
+    _refused(fake_zstd_archive(archive), sha, 3, "not a readable tar")
+
+
+def test_a_zstd_program_that_fails_after_its_output_is_refused_with_its_exit_status_and_message(tmp_path, monkeypatch):
+    """The whole tar came through and hashes right, yet the program said it failed: the archive is not trusted."""
+    install_stand_in_zstd(tmp_path / "bin", monkeypatch, exit_status=3, after_output=True)
+    archive, sha = make_archive(tmp_path, RUN)
+    refusal = _refused(fake_zstd_archive(archive), sha, 3, "zstd could not decompress it (exit 3)")
+    assert "stand-in zstd: corrupt input" in str(refusal)
 
 
 def test_zstd_is_chosen_by_what_the_file_holds_and_not_by_its_name(tmp_path, monkeypatch):

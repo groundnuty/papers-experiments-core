@@ -101,13 +101,17 @@ def fake_zstd_archive(tar: Path, name: str | None = None) -> Path:
     return target
 
 
-def install_stand_in_zstd(bin_dir: Path, monkeypatch, *, exit_status: int = 0) -> None:
-    """Put a `zstd` first on PATH that drops the magic and passes the rest through (or exits `exit_status` with a
-    message), so the reading of a compressed archive is tested whether or not the machine has the real program."""
+def install_stand_in_zstd(bin_dir: Path, monkeypatch, *, exit_status: int = 0, after_output: bool = False) -> None:
+    """Put a `zstd` first on PATH that drops the magic and passes the rest through, so the reading of a compressed
+    archive is tested whether or not the machine has the real program. With `exit_status` it exits so with a message:
+    before any output, or with `after_output` after passing the whole tar through (a stream that fails at its end)."""
     bin_dir.mkdir(parents=True, exist_ok=True)
     script = bin_dir / "zstd"
-    if exit_status:
-        script.write_text(f"#!/bin/sh\necho 'stand-in zstd: corrupt input' >&2\nexit {exit_status}\n", encoding="utf-8")
+    failing = f"echo 'stand-in zstd: corrupt input' >&2\nexit {exit_status}\n"
+    if exit_status and after_output:
+        script.write_text(f"#!/bin/sh\ntail -c +5\n{failing}", encoding="utf-8")
+    elif exit_status:
+        script.write_text(f"#!/bin/sh\n{failing}", encoding="utf-8")
     else:
         script.write_text("#!/bin/sh\nexec tail -c +5\n", encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IXUSR)

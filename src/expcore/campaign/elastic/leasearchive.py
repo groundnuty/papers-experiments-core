@@ -123,39 +123,42 @@ def _open_regular(path: Path) -> BinaryIO:
     return os.fdopen(fd, "rb")
 
 
-def _scan(source: BinaryIO, work: Path) -> tuple[str, set[str]]:
+def _scan(source: BinaryIO, work: Path) -> tuple[str, set[str], str | None]:
     """Read the tar in `source` to its end, copying the store's files into `work`; return the SHA-256 of every byte
-    read and the names copied."""
+    read, the names copied, and what is wrong with the store's members, if anything (a name twice, a member that is
+    not a regular file, one too large). That is said only after the hash is judged: a file that is not the lease's
+    archive is refused for that, whatever else it holds."""
     hashed = _Hashed(source)
     seen: set[str] = set()
+    problem: str | None = None
     try:
         with tarfile.open(fileobj=hashed, mode="r|") as tar:
             for member in tar:
                 name = posixpath.normpath(member.name)
-                if name not in _COPIES:
+                if name not in _COPIES or problem is not None:
                     continue
                 if name in seen:
-                    raise refused(4, "attempt rows", f"the archive holds {name} more than once")
-                if not member.isreg():
-                    raise refused(4, "attempt rows", f"{name} in the archive is not a regular file")
-                if member.size > MAX_STORE_BYTES:
-                    raise refused(4, "attempt rows", f"{name} in the archive is {member.size} bytes: not a lease store")
-                source_file = tar.extractfile(member)
-                if source_file is None:
-                    raise refused(4, "attempt rows", f"{name} in the archive cannot be read")
-                with source_file, open(work / _COPIES[name], "xb") as sink:
-                    shutil.copyfileobj(source_file, sink, CHUNK)
-                if (work / _COPIES[name]).stat().st_size != member.size:
-                    raise refused(3, "archive", f"{name} is cut short: the archive is not whole")
-                seen.add(name)
+                    problem = f"the archive holds {name} more than once"
+                elif not member.isreg():
+                    problem = f"{name} in the archive is not a regular file"
+                elif member.size > MAX_STORE_BYTES:
+                    problem = f"{name} in the archive is {member.size} bytes: not a lease store"
+                elif (source_file := tar.extractfile(member)) is None:
+                    problem = f"{name} in the archive cannot be read"
+                else:
+                    with source_file, open(work / _COPIES[name], "xb") as sink:
+                        shutil.copyfileobj(source_file, sink, CHUNK)
+                    if (work / _COPIES[name]).stat().st_size != member.size:
+                        raise refused(3, "archive", f"{name} is cut short: the archive is not whole")
+                    seen.add(name)
         while hashed.read(CHUNK):  # the end of the file, past the tar's own end marker: the hash covers all of it
             pass
     except (tarfile.TarError, EOFError) as error:
         raise refused(3, "archive", f"it is not a readable tar ({type(error).__name__}: {error})") from None
-    return hashed.digest.hexdigest(), seen
+    return hashed.digest.hexdigest(), seen, problem
 
 
-def _scan_zstd(source: BinaryIO, work: Path) -> tuple[str, set[str]]:
+def _scan_zstd(source: BinaryIO, work: Path) -> tuple[str, set[str], str | None]:
     """`_scan` of the plain tar inside a zstd stream: decompressed by the `zstd` program reading `source` itself."""
     program = shutil.which("zstd")
     if program is None:
@@ -238,7 +241,7 @@ def read_evidence(path: Path, run_key: str, recorded_sha256: str) -> ArchiveEvid
         compressed = os.pread(handle.fileno(), len(ZSTD_MAGIC), 0) == ZSTD_MAGIC
         with tempfile.TemporaryDirectory(prefix="expcore-reopen-") as scratch:
             work = Path(scratch)
-            digest, copied = (_scan_zstd if compressed else _scan)(handle, work)
+            digest, copied, problem = (_scan_zstd if compressed else _scan)(handle, work)
             if digest != recorded_sha256:
                 raise refused(
                     3,
@@ -247,6 +250,8 @@ def read_evidence(path: Path, run_key: str, recorded_sha256: str) -> ArchiveEvid
                     "archive the ledger verified"
                     + (" (a zstd archive is hashed as the tar it holds)" if compressed else ""),
                 )
+            if problem is not None:
+                raise refused(4, "attempt rows", problem)
             if STORE not in copied:
                 raise refused(4, "attempt rows", f"the archive holds no {STORE}")
             rows = _attempt_rows(work / _COPIES[STORE], run_key)
