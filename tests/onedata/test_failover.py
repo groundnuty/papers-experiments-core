@@ -237,3 +237,38 @@ def test_o98_a_record_that_is_not_what_was_written_is_not_read(tmp_path, changed
         failover.read_record(json.dumps(document))
     with pytest.raises(failover.FailoverError):
         failover.read_record("not json")
+
+
+def written_record(tmp_path, spaces):
+    config = platform(tmp_path, ids("id-0300", "id-0100", "id-0200"), spaces)
+    return failover.record_text(failover.admit(config, [OWNER]))
+
+
+def test_o98_a_record_of_several_spaces_is_read_and_one_of_none_is_not(tmp_path):
+    """O98: what the writer produces for two spaces in scope is read; the same record with its spaces taken out is the
+    record of an admission that writes none, which no run produces and no reader takes for a pass."""
+    text = written_record(tmp_path, [ALL_THREE, ALL_THREE])
+    assert [space["space"] for space in failover.read_record(text)["spaces"]] == ["spaces[0]", "spaces[1]"]
+    document = json.loads(text)
+    document["spaces"] = []
+    with pytest.raises(failover.FailoverError):
+        failover.read_record(json.dumps(document))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda d: d.update(extra=1),
+        lambda d: d["spaces"].append(dict(d["spaces"][0])),  # one space label twice
+        lambda d: d["spaces"][0].update(mirrors=["providers[1]", "providers[1]"]),
+        lambda d: d["spaces"][0].update(space="providers[0]"),  # a label of the wrong kind
+        lambda d: d["spaces"][0].update(owner="spaces[0]"),
+    ],
+)
+def test_o98_a_record_with_a_repeated_or_misplaced_label_or_a_key_the_writer_never_writes_is_not_read(tmp_path, mutate):
+    """O98: the reader takes what the writer produces and nothing else: no extra key, no label twice, no label of one
+    kind where the other belongs."""
+    document = json.loads(written_record(tmp_path, [ALL_THREE]))
+    mutate(document)
+    with pytest.raises(failover.FailoverError):
+        failover.read_record(json.dumps(document))

@@ -26,18 +26,23 @@ written: the order is told by labels alone.
 
 **The record.** `record_text` is the content of `failover-order.json` in a federation's root, which `up` writes once
 the order holds, only for the spaces in scope (`hpcfailover` in deploy/hpc-federation). The injector (`faults`) does not
-read it: it checks again, from the platform's current ids, before it takes the owner down.
+read it: it checks again, from the ids and holders its configuration was loaded with, before it admits the federation
+or takes the owner down.
 """
 
 import json
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import Any
 
 from expcore_onedata.config import PlatformConfig
 
 FILE = "failover-order.json"  # in the federation's root; written only when a space is in scope and its order holds
 VERSION = "expcore-failover-order/1"
+SPACE_LABEL = re.compile(r"spaces\[(0|[1-9][0-9]{0,3})\]")  # a position in the platform's spaces, never a name
+PROVIDER_LABEL = re.compile(r"providers\[(0|[1-9][0-9]{0,3})\]")  # a position in its providers, never a name
 FIRST_IS_OWNER = "the owner's provider id sorts before every mirror's, so op-worker would ask the stopped owner first"
 
 
@@ -143,27 +148,54 @@ def record_text(found: Sequence[SpaceOrder]) -> str:
 
 
 def read_record(text: str) -> dict[str, Any]:
-    """The record as `record_text` wrote it, checked: its version, and each space's labels, order and `mirror_first`
-    (which must say a mirror is first, as only such a record is ever written). FailoverError for anything else."""
+    """The record as `record_text` wrote it, checked: exactly its two keys and its version, at least one space (an
+    admission with none writes no record), and each space's labels, order and `mirror_first` (which must say a mirror is
+    first, as only such a record is ever written), the spaces by ascending position. The login node's reader of the same
+    file (`fleetidentity.failover_record_ok`) refuses the same records. FailoverError for anything else."""
     try:
-        document = json.loads(text)
-    except ValueError:
+        document = json.loads(text, object_pairs_hook=_once)
+    except (ValueError, RecursionError):
         raise FailoverError("failover order: the record is no JSON") from None
     spaces = document.get("spaces") if isinstance(document, dict) else None
-    if not isinstance(document, dict) or document.get("version") != VERSION or not isinstance(spaces, list):
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"version", "spaces"}
+        or document["version"] != VERSION
+        or not isinstance(spaces, list)
+        or not spaces
+    ):
         raise FailoverError("failover order: the record is not of this version")
     for space in spaces:
         if not _well_formed(space):
             raise FailoverError("failover order: a space of the record is malformed")
+    positions = [int(str(space["space"])[len("spaces[") : -1]) for space in spaces]  # each label was checked above
+    if any(before >= after for before, after in pairwise(positions)):
+        raise FailoverError("failover order: the spaces of the record are not in the platform's order")
     return document
+
+
+def _once(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """A JSON object read with no key twice: what a reader that keeps the last would see is not what the file says."""
+    found = dict(pairs)
+    if len(found) != len(pairs):
+        raise ValueError("a key twice")
+    return found
 
 
 def _well_formed(space: Any) -> bool:
     if not isinstance(space, dict) or set(space) != {"space", "owner", "mirrors", "order", "mirror_first"}:
         return False
-    owner, mirrors, order = space["owner"], space["mirrors"], space["order"]
-    if not isinstance(space["space"], str) or not isinstance(owner, str):
+    label, owner, mirrors, order = space["space"], space["owner"], space["mirrors"], space["order"]
+    if not isinstance(label, str) or not SPACE_LABEL.fullmatch(label) or not isinstance(owner, str):
         return False
-    if not all(isinstance(label, list) and all(isinstance(item, str) for item in label) for label in (mirrors, order)):
+    if not isinstance(mirrors, list) or not mirrors or not isinstance(order, list):
         return False
-    return sorted(order) == sorted([owner, *mirrors]) and space["mirror_first"] is True and order[0] != owner
+    supporters = [owner, *mirrors]
+    if not all(isinstance(item, str) and PROVIDER_LABEL.fullmatch(item) for item in [*supporters, *order]):
+        return False
+    return (
+        len(set(supporters)) == len(supporters)
+        and sorted(order) == sorted(supporters)
+        and space["mirror_first"] is True
+        and order[0] != owner
+    )

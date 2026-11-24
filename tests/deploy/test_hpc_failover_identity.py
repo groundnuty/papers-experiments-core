@@ -3,6 +3,7 @@ record `up` writes for a layout that declares an owner outage (deploy/hpc-federa
 it always was otherwise. The order is in no value the join compares across members and not in the render identity. The
 interpreter and the transport are stand-ins; nothing reaches a cluster."""
 
+import copy
 import json
 import subprocess
 from types import SimpleNamespace
@@ -151,3 +152,104 @@ def test_o98_the_order_is_in_no_value_the_join_compares_and_not_in_the_render_id
 
     assert not any("failover" in key for key in hpcidentity.KEYS)
     assert "failover" not in deploy.fleetidentity.PROGRAM  # what the manifest's Python prints is the three values
+
+
+# -- a record that is not exactly what the writer produces is never `passed` -----------------------------------------
+
+
+def edited(change):
+    """The record `PASSED` after `change` (a function of the document), as the text of a file."""
+    document = copy.deepcopy(PASSED)
+    change(document)
+    return json.dumps(document)
+
+
+def second_space(document, **changes):
+    """Add a second space to the record, consistent in itself, with `changes` applied to it."""
+    other = {
+        "space": "spaces[2]",
+        "owner": "providers[3]",
+        "mirrors": ["providers[0]"],
+        "order": ["providers[0]", "providers[3]"],
+        "mirror_first": True,
+    }
+    document["spaces"].append({**other, **changes})
+
+
+def reversed_spaces(document):
+    second_space(document)
+    document["spaces"].reverse()
+
+
+MALFORMED = {
+    "no space at all": lambda d: d.update(spaces=[]),
+    "a key of the top level the writer never writes": lambda d: d.update(note="invented"),
+    "no version": lambda d: d.pop("version"),
+    "one space label twice": lambda d: second_space(d, space="spaces[0]"),
+    "spaces out of the platform's order": reversed_spaces,
+    "a mirror twice": lambda d: d["spaces"][0].update(
+        mirrors=["providers[0]", "providers[0]"], order=["providers[0]", "providers[0]", "providers[1]"]
+    ),
+    "the owner among its own mirrors": lambda d: d["spaces"][0].update(
+        mirrors=["providers[1]", "providers[0]"], order=["providers[0]", "providers[1]", "providers[1]"]
+    ),
+    "a provider label where the space is": lambda d: d["spaces"][0].update(space="providers[0]"),
+    "a space label where the owner is": lambda d: d["spaces"][0].update(
+        owner="spaces[1]", order=["providers[2]", "providers[0]", "spaces[1]"]
+    ),
+    "a space label among the mirrors": lambda d: d["spaces"][0].update(
+        mirrors=["providers[0]", "spaces[2]"], order=["spaces[2]", "providers[0]", "providers[1]"]
+    ),
+    "a space label in the order": lambda d: d["spaces"][0].update(order=["spaces[2]", "providers[0]", "providers[1]"]),
+    "a label with a leading zero": lambda d: d["spaces"][0].update(space="spaces[00]"),
+    "no mirror": lambda d: d["spaces"][0].update(mirrors=[], order=["providers[1]"]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(MALFORMED))
+def test_o98_a_record_that_is_not_exactly_what_the_writer_produces_is_unreadable_never_passed(deploy, tmp_path, name):
+    """O98: the reader reports `passed` for a record the writer could have written and for nothing else: no spaces
+    (the writer writes none for an empty admission), a label twice, a label of the wrong kind in any field, a mirror
+    that is the owner, spaces out of order, a key the writer never writes, all are `unreadable`."""
+    root, _ = member_root(deploy, tmp_path)
+    (root / FILE).write_text(edited(MALFORMED[name]), encoding="utf-8")
+    assert deploy.fleetidentity.failover_reading(root) == {"admission": "unreadable"}
+
+
+def test_o98_a_key_given_twice_in_the_record_is_unreadable(deploy, tmp_path):
+    """O98: a JSON object with a key twice reads as the last of them in a loader that does not look: the record's own
+    reader does, so that what is printed is what the file says in every reader."""
+    root, _ = member_root(deploy, tmp_path)
+    twice = json.dumps(PASSED).replace('"mirror_first": true', '"mirror_first": false, "mirror_first": true')
+    assert twice != json.dumps(PASSED)
+    (root / FILE).write_text(twice, encoding="utf-8")
+    assert deploy.fleetidentity.failover_reading(root) == {"admission": "unreadable"}
+
+
+def test_o98_a_record_with_no_space_prints_unreadable_in_the_line_not_a_passed_admission(deploy, tmp_path, capsys):
+    """O98: `{"admission": "passed", "spaces": []}` said an admission passed that wrote no record; the line says
+    `unreadable`."""
+    root, words = member_root(deploy, tmp_path)
+    (root / FILE).write_text(edited(MALFORMED["no space at all"]), encoding="utf-8")
+    assert json.loads(printed_line(deploy, words, capsys))["failover"] == {"admission": "unreadable"}
+
+
+def test_o98_a_record_of_several_spaces_in_the_platforms_order_is_passed(deploy, tmp_path):
+    """O98: what the writer produces for several spaces (their positions ascending, one mirror or more each) is read."""
+    root, _ = member_root(deploy, tmp_path)
+    (root / FILE).write_text(edited(second_space), encoding="utf-8")
+    reading = deploy.fleetidentity.failover_reading(root)
+    assert reading["admission"] == "passed"
+    assert [space["space"] for space in reading["spaces"]] == ["spaces[0]", "spaces[2]"]
+
+
+@pytest.mark.parametrize("name", sorted(MALFORMED))
+def test_o98_the_cores_reader_and_the_login_nodes_agree_on_what_is_malformed(deploy, tmp_path, name):
+    """O98: `failover.read_record` (the core's) refuses exactly the records `fleetidentity` (which runs where the core
+    may not import) reports as unreadable, so the two readers of one file never disagree."""
+    text = edited(MALFORMED[name])
+    with pytest.raises(failover.FailoverError):
+        failover.read_record(text)
+    root, _ = member_root(deploy, tmp_path)
+    (root / FILE).write_text(text, encoding="utf-8")
+    assert deploy.fleetidentity.failover_reading(root) == {"admission": "unreadable"}

@@ -41,8 +41,10 @@ fleet's shard settings, `fleetplan.read_settings`).
 - **The failover order (O98).** A member whose root holds `failover-order.json` (written by `up` only when its layout
   declares an owner outage and the order held, `hpcfailover`) has its line carry one more key, `failover`:
   `{"admission": "passed", "spaces": [...]}` with each space's position label, owner and mirror labels, the labels in
-  the order of their provider ids and `mirror_first`, or `{"admission": "unreadable"}` for a record that cannot be read
-  as that. The key is **only in that line**: it is in no value of the tuple above, which the join compares across
+  the order of their provider ids and `mirror_first`, or `{"admission": "unreadable"}` for a record that is not exactly
+  what the writer produces (no space, a label twice or of the wrong kind in a field, a mirror that is the owner, spaces
+  out of order, another key, a key twice, or text that is no such record at all). The key is **only in that line**: it
+  is in no value of the tuple above, which the join compares across
   members (the campaign fingerprint, the environment identity a lease store pins, the platform fingerprint), nor in
   `render-identity.json`, which a shard's step compares key by key, since the order differs from one member to the
   next by chance and would make interchangeable members differ. A member with no such record prints the line it
@@ -85,8 +87,10 @@ TIMEOUT_S = 600.0
 # runs on a login node where the core may not import, so it keeps its own copy of both and a test compares them.
 FAILOVER_FILE = "failover-order.json"
 FAILOVER_VERSION = "expcore-failover-order/1"
+FAILOVER_TOP = {"version", "spaces"}
 FAILOVER_KEYS = {"space", "owner", "mirrors", "order", "mirror_first"}
-FAILOVER_LABEL = re.compile(r"(spaces|providers)\[[0-9]{1,4}\]")  # a position, never a name
+FAILOVER_SPACE = re.compile(r"spaces\[(0|[1-9][0-9]{0,3})\]")  # a position in the platform's spaces, never a name
+FAILOVER_PROVIDER = re.compile(r"providers\[(0|[1-9][0-9]{0,3})\]")  # a position in its providers, never a name
 
 
 def _modules() -> Any:
@@ -315,24 +319,51 @@ def locator(evidence: Path, transport: Any = None) -> Callable[[Any, Any], Optio
 
 
 def failover_space_ok(space: Any) -> bool:
-    """Whether one space of a failover record is position labels alone, with a mirror first in its order."""
+    """Whether one space of a failover record is exactly what `expcore_onedata.failover` writes: its position label
+    (`spaces[i]`), an owner and at least one mirror, each a distinct provider label (`providers[i]`), their labels in
+    `order` (every one once, a mirror first) and `mirror_first` true. No other key, and no label of the other kind in a
+    field."""
     if not isinstance(space, dict) or set(space) != FAILOVER_KEYS or space["mirror_first"] is not True:
         return False
-    owner, mirrors, order = space["owner"], space["mirrors"], space["order"]
-    if not isinstance(mirrors, list) or not isinstance(order, list) or not order:
+    label, owner, mirrors, order = space["space"], space["owner"], space["mirrors"], space["order"]
+    if not isinstance(mirrors, list) or not mirrors or not isinstance(order, list):
         return False
-    labels = [space["space"], owner, *mirrors, *order]
-    if not all(isinstance(label, str) and FAILOVER_LABEL.fullmatch(label) for label in labels):
+    if not isinstance(label, str) or not FAILOVER_SPACE.fullmatch(label):
         return False
-    return sorted(order) == sorted([owner, *mirrors]) and order[0] != owner
+    supporters = [owner, *mirrors]
+    if not all(isinstance(item, str) and FAILOVER_PROVIDER.fullmatch(item) for item in [*supporters, *order]):
+        return False
+    return len(set(supporters)) == len(supporters) and sorted(order) == sorted(supporters) and order[0] != owner
+
+
+def failover_once(pairs: Any) -> dict:
+    """A JSON object read with no key twice: what a reader that keeps the last would print is not what the file says."""
+    found = dict(pairs)
+    if len(found) != len(pairs):
+        raise ValueError("a key twice")
+    return found
+
+
+def failover_record_ok(record: Any) -> bool:
+    """Whether `record` is exactly what the writer produces: its two keys, this version, and at least one space (the
+    writer writes no record for an admission with none), each as `failover_space_ok` says, their positions ascending
+    (the platform's order of spaces, so no label is there twice)."""
+    if not isinstance(record, dict) or set(record) != FAILOVER_TOP or record["version"] != FAILOVER_VERSION:
+        return False
+    spaces = record["spaces"]
+    if not isinstance(spaces, list) or not spaces or not all(map(failover_space_ok, spaces)):
+        return False
+    positions = [int(space["space"][len("spaces[") : -1]) for space in spaces]  # each label was checked above
+    return all(before < after for before, after in zip(positions, positions[1:]))
 
 
 def failover_reading(root: Path) -> Optional[dict]:
     """What the root's `failover-order.json` says, for the read's line (O98): None when the root holds none (a member
-    whose layout declares no owner outage), `{"admission": "passed", "spaces": [...]}` for a record of this version
-    whose every space is labels alone, and `{"admission": "unreadable"}` for any other. A record is never trusted to
-    be harmless: a space that holds anything but position labels, or an `order` that is not its supporters', is
-    unreadable, so no name or id an edited file holds is ever printed."""
+    whose layout declares no owner outage), `{"admission": "passed", "spaces": [...]}` for a record that is exactly what
+    `up` writes (`failover_record_ok`), and `{"admission": "unreadable"}` for any other, which is how a malformed record
+    is reported and never as passed. A record is never trusted to be harmless: a space that holds anything but position
+    labels, or an `order` that is not its supporters', is unreadable, so no name or id an edited file holds is ever
+    printed."""
     try:
         text = (root / FAILOVER_FILE).read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -340,12 +371,11 @@ def failover_reading(root: Path) -> Optional[dict]:
     except (OSError, UnicodeDecodeError):
         return {"admission": "unreadable"}
     try:
-        record = json.loads(text)
-        spaces = record["spaces"]
-        if record["version"] == FAILOVER_VERSION and isinstance(spaces, list) and all(map(failover_space_ok, spaces)):
-            return {"admission": "passed", "spaces": spaces}
-    except (ValueError, KeyError, TypeError):
-        pass
+        record = json.loads(text, object_pairs_hook=failover_once)
+    except (ValueError, RecursionError):
+        return {"admission": "unreadable"}
+    if failover_record_ok(record):
+        return {"admission": "passed", "spaces": record["spaces"]}
     return {"admission": "unreadable"}
 
 
