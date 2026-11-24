@@ -730,8 +730,9 @@ section 3).
   that is exactly what `up` writes (at least one space, no label twice or of the wrong kind in a field, orders that one
   order of the providers gives, no other key) and `unreadable` for any other. The fault injector checks again from the
   platform's own holders and ids, as it was built with them, before it admits, recovers or stops anything for an owner;
-  with the root's record it takes the mirrors of the spaces the record lists from it (strictly: an unreadable record, or
-  one whose labels do not resolve in the platform file, refuses the stop), and without one every supporter counts.
+  with the root's record it takes the mirrors of the spaces the record lists from it (strictly: an unreadable record,
+  one whose labels do not resolve in the platform file, or one that does not list a space the owner holds and another
+  provider supports, refuses the stop), and without one every supporter counts.
 - **The agent's node** (M5), when `[hpc] sandbox` declares it or the layout's platform template declares the
   Apptainer sandbox's limits, is held at its own shape: by default (`sandbox_placement = "het"`) as component 1 of a
   heterogeneous job, every step there with `--het-group=1` and every step on a service node with `--het-group=0`

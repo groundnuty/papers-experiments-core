@@ -38,8 +38,9 @@ holds no space with a mirror is unchanged, and reads nothing the injector did no
 holds `failover-order.json` (an HPC member's, written by `up` for the mirrors its layout declares) has that check made
 over each listed space's declared mirrors, read from the record, strictly, against the platform's current ids, and
 another provider that merely supports the space, and may hold none of its blocks, does not count as a mirror; a record
-that cannot be read, or whose labels do not resolve in the platform file, fails the start the same way. Without a record
-(a Compose federation) every supporter counts, as before.
+that cannot be read, or whose labels do not resolve in the platform file, or that does not list a space the target holds
+and another provider supports, fails the start the same way. Without a record (a Compose federation) every supporter
+counts, as before.
 
 **Clear (O11).** `clear` brings the provider back and counts a restore only when the provider runs with an identity
 other than the one read before the injection (`ComposeDriver`: the container's id and start time). Readiness alone is

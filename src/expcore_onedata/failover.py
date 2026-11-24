@@ -38,9 +38,10 @@ the order holds, only for the spaces in scope (`hpcfailover` in deploy/hpc-feder
 The injector (`faults`) checks again, from the ids and holders its configuration was loaded with, before it admits the
 federation or takes the owner down. A root that holds the record is an HPC member's, and `admit_stop` then takes each
 space's mirrors from it, read strictly (`read_record`; a record that is unreadable, or whose labels do not resolve in
-the platform file, is `FailoverError`: the order is never assumed) and against the platform's current ids; a root with
-none (a Compose federation, a test) is checked as before, over every supporter. A record only ever narrows the mirrors,
-so it never makes the check more lenient than the check without one.
+the platform file, is `FailoverError`: the order is never assumed) and against the platform's current ids. A space the
+owner holds that another provider supports and that the record does not list is `FailoverError` too: no mirror was
+declared for it, and counting every supporter there would let one that holds nothing (the local provider) pass the stop.
+A root with none (a Compose federation, a test) is checked as before, over every supporter.
 """
 
 import json
@@ -192,16 +193,25 @@ def admit_stop(config: PlatformConfig, owner: str, root: Path) -> tuple[SpaceOrd
     """The check before a stop of the provider `owner` (a name in `config`), which the injector makes from the ids and
     holders it was built with: `admit` over the mirrors of the federation's root. A root that holds the record
     `failover-order.json` (an HPC member's, written by `up`) gives each space it lists the mirrors it declares, read
-    strictly and against the platform's current ids; every other space, and every space of a root with none, is over
-    all its supporters. Nothing of `root` is read unless `owner` holds a space that another provider supports (a stop of
-    anything else is no owner stop). FailoverError when the record is unreadable or any space of it does not resolve in
-    the platform file, or the order is not known; FailoverRefused when the order does not hold."""
+    strictly and against the platform's current ids, and must list every space `owner` holds that another provider
+    supports; every space of a root with none is over all its supporters. Nothing of `root` is read unless `owner` holds
+    a space that another provider supports (a stop of anything else is no owner stop). FailoverError when the record is
+    unreadable, any space of it does not resolve in the platform file, it does not list such a space of `owner`, or the
+    order is not known; FailoverRefused when the order does not hold."""
     if owner not in config.providers:
         return admit(config, (owner,))  # FailoverError: it is no provider of the platform
-    if not any(others for _, _, others in _held_by(config, {config.provider_label(owner)})):
+    supported = [entry.position for entry, _, others in _held_by(config, {config.provider_label(owner)}) if others]
+    if not supported:
         return ()
     record = _record_in(root)
-    declared = None if record is None else _recorded_mirrors(config, owner, record)
+    if record is None:
+        return admit(config, (owner,))
+    declared = _recorded_mirrors(config, owner, record)
+    unlisted = [position for position in supported if position not in declared]
+    if unlisted:
+        raise FailoverError(
+            f"failover order: {', '.join(unlisted)}: the record declares no mirror of this space, so no order is told"
+        )
     return admit(config, (owner,), declared)
 
 

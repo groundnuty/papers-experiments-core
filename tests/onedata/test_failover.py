@@ -388,15 +388,24 @@ def test_o98_with_a_record_a_stop_takes_each_listed_spaces_mirrors_from_it_again
     assert (found.mirrors, found.order) == ((LABEL[MIRROR_TWO],), (LABEL[MIRROR_TWO], LABEL[OWNER]))
 
 
-def test_o98_a_space_the_record_does_not_list_is_checked_over_every_supporter_so_a_record_never_loosens_the_check(
-    tmp_path,
-):
-    """O98: the record lists spaces[0] only. Its mirrors decide it (refused: the owner sorts below the one mirror), and
-    spaces[1], which the owner holds as well, counts all its supporters (it would pass: the local provider sorts
-    below the owner), so a record narrows the check of the spaces it lists and loosens none."""
-    with pytest.raises(failover.FailoverRefused) as refused:
-        stop_of(tmp_path, RECORD_OF_MIRROR_TWO, spaces=(ALL_THREE, ALL_THREE))
-    assert [failed.space for failed in refused.value.failed] == ["spaces[0]"]
+def test_o98_with_a_record_a_supported_space_of_the_owner_it_does_not_list_refuses_the_stop(tmp_path):
+    """O98, the review of #548: the record lists spaces[0] only, and its declared mirror sorts below the owner, so that
+    space passes. spaces[1], which the owner holds as well and the others support, has no declared mirror: counted over
+    every supporter it would pass on the local provider, which may hold none of its blocks, so the stop is refused."""
+    with pytest.raises(failover.FailoverError, match="spaces\\[1\\]: the record declares no mirror") as refused:
+        stop_of(tmp_path, RECORD_OF_MIRROR_TWO, ids("id-0200", "id-0100", "id-0150"), spaces=(ALL_THREE, ALL_THREE))
+    assert not isinstance(refused.value, failover.FailoverRefused)
+
+
+def test_o98_with_a_record_a_space_another_provider_holds_needs_no_entry(tmp_path):
+    """O98: spaces[1] is held by mirror-two, not by the owner the stop takes down, so the record need not list it."""
+    (found,) = stop_of(
+        tmp_path,
+        RECORD_OF_MIRROR_TWO,
+        ids("id-0200", "id-0100", "id-0150"),
+        spaces=(ALL_THREE, ((OWNER, MIRROR_ONE, MIRROR_TWO), MIRROR_TWO)),
+    )
+    assert (found.space, found.mirrors) == ("spaces[0]", (LABEL[MIRROR_TWO],))
 
 
 @pytest.mark.parametrize(
