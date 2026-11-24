@@ -17,17 +17,15 @@ left out. A REL that is not there prunes nothing (a zone has no storage); one th
 is a link, or an entry under --prune-each that is a link, is an error, never pruned: what a link stands for is not
 known to be what was meant. (Python 3.8 runs this on the images: no annotations, no new syntax.)
 
-A file the walk listed that is gone when it is read is not an error: a live Couchbase compacts its bucket files, so
-data/<bucket>/N.couch.K is replaced by N.couch.K+1 between the listing and the read. The directory is listed again
-(after the walk, up to RELIST_PASSES times) and every regular file in it that was not read in its current form is read,
-a name that came back included; the prune rules and the handling of links are the walk's. A file with no replacement
-holds nothing. Only FileNotFoundError on a file is tolerated: another error on it, or a directory gone mid-walk, still
-fails the scan, and so does a directory that still loses a listed file on the last listing (it is never passed). The
-listing reads files only: a directory that appeared since the walk listed its parent is not walked, as before.
+A pass over the tree that finds a file or directory gone (FileNotFoundError at any step: a live Couchbase compacts its
+bucket files, so data/<bucket>/N.couch.K is replaced by N.couch.K+1 between the listing and the read) is discarded
+whole, what it found with it, and the scan starts again from the top after RETRY_PAUSE_S, in SCAN_PASSES passes at most.
+Only a pass that ends with no error decides, so every file it listed was read, as it always was. A tree that loses a
+file on every pass is an error. Any other error on a file or a directory fails at once, with no new pass.
 
 Exit 0 when no file holds one; 1 when one does, with one line per such file on stdout (its path, never the value);
-2 on an error (a file or its metadata that cannot be read, a directory that will not hold still, a prune path that is a
-link, bad arguments), so a caller that tests for 0 fails closed.
+2 on an error (a file or its metadata that cannot be read, a tree that did not hold still for SCAN_PASSES passes, a
+prune path that is a link, bad arguments), so a caller that tests for 0 fails closed.
 """
 
 import hashlib
@@ -36,8 +34,10 @@ import os
 import re
 import stat
 import sys
+import time
 
-RELIST_PASSES = 5  # listings of a directory that lost a listed file, before it counts as one that will not hold still
+SCAN_PASSES = 5  # passes over the tree in all, while a pass loses a file it listed, before the tree is an error
+RETRY_PAUSE_S = 2.0  # seconds between a discarded pass and the next, for a compaction in progress to finish
 RUN = re.compile(rb"[A-Za-z0-9]+")
 ENTRY = re.compile(r"^([1-9][0-9]*):([0-9a-f]{64})$")
 
@@ -114,81 +114,51 @@ def pruned(top, prune, prune_each):
     return skip
 
 
-def stamp(st):
-    """What tells one form of a file from another: a replacement of the same name or a rewritten file differs (ctime, so
-    a rewrite that restores the modification time and the size differs too)."""
-    return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
-
-
-def read_entry(path, wanted, found, done, walked):
-    """Read the entry at path when it is a regular file not read in its current form (`done` maps path to the stamp of
-    what was read; it and `found` are accumulators, updated in place). False when the entry is gone at its lstat or at
-    its open: FileNotFoundError and nothing else, so the caller can list its directory again; True otherwise. A
-    directory is an error when `walked` (os.walk listed it as a file, so it was never walked) and left alone when not.
-    lstat, not os.path.isfile: an error must fail the scan, never skip the file as not regular."""
-    try:
-        st = os.lstat(path)
-        if stat.S_ISDIR(st.st_mode):
-            if walked:
-                raise OSError("could not walk the directory %s" % path)
-        elif stat.S_ISREG(st.st_mode) and done.get(path) != stamp(st):
-            if file_holds(path, wanted) and path not in found:
-                found.append(path)
-            done[path] = stamp(st)
-    except FileNotFoundError:
-        return False
-    return True
-
-
-def settled(directory, done, skip, wanted, found):
-    """List `directory` again and read each regular file in it that `done` does not hold in its current form: a
-    replacement, or a vanished name that is back. True when no entry the listing named was gone by its turn, so
-    everything present at this listing was read. An entry of `skip` stays out, and a link is not followed."""
-    whole = True
-    for name in sorted(os.listdir(directory)):
-        path = os.path.join(directory, name)
-        if path not in skip and not read_entry(path, wanted, found, done, False):
-            whole = False
-    return whole
-
-
-def relist(unsettled, skip, wanted, found):
-    """List again each directory of `unsettled` ({directory: what was read in it}) until a listing of it loses no file,
-    at most RELIST_PASSES times. OSError naming the directories that lost a listed file on the last listing too: a
-    directory that will not hold still is never passed."""
-    for _ in range(RELIST_PASSES):
-        unsettled = {d: done for d, done in unsettled.items() if not settled(d, done, skip, wanted, found)}
-        if not unsettled:
-            return
-    raise OSError(
-        "a directory does not hold still: a file listed in it was gone before it was read, on each of %d listings: %s"
-        % (RELIST_PASSES, ", ".join(sorted(unsettled)))
-    )
-
-
 def scan(top, wanted, prune=(), prune_each=()):
     """The regular files under top that hold a wanted value, but what `prune` and `prune_each` leave out. Raises
-    OSError on one that cannot be read, on a prune path that is a link, and on a directory that keeps losing a file."""
+    OSError on one that cannot be read, or on a prune path that is a link. FileNotFoundError, which a file or
+    directory gone after it was listed raises, is for `scan_whole` to meet: a pass that raised it decides nothing."""
     if not stat.S_ISDIR(os.lstat(top).st_mode):  # raises when top cannot be stat'ed; a link to a directory is refused
         raise OSError("not a directory: %s" % top)
     skip = pruned(top, prune, prune_each)
-    found = []
-    unsettled = {}  # directory -> what was read in it, for each that lost a file listed before it was read
+    found, seen = [], set()  # found keeps its order; seen answers the membership test
 
     def fail(err):
         raise err
 
     for root, dirs, files in os.walk(top, onerror=fail):
         dirs[:] = [name for name in dirs if os.path.join(root, name) not in skip]  # in place: the walk goes no further
-        done, whole = {}, True
         for name in sorted(files):
             path = os.path.join(root, name)
-            if path not in skip and not read_entry(path, wanted, found, done, True):
-                whole = False
-        if not whole:
-            unsettled[root] = done
-    relist(unsettled, skip, wanted, found)
+            if path in skip:
+                continue
+            # lstat, not os.path.isfile: an error must fail the scan, never skip the file as not regular.
+            mode = os.lstat(path).st_mode
+            if stat.S_ISDIR(mode):  # os.walk could not tell it was a directory, so it was never walked
+                raise OSError("could not walk the directory %s" % path)
+            if stat.S_ISREG(mode) and path not in seen and file_holds(path, wanted):
+                seen.add(path)
+                found.append(path)
     return found
+
+
+def scan_whole(top, wanted, prune=(), prune_each=()):
+    """`scan` as a whole pass that decides: one that raised FileNotFoundError (a listed file or directory gone before it
+    was read) is discarded with everything it found, and `scan` runs again from the top after RETRY_PAUSE_S, in
+    SCAN_PASSES passes at most. Every other OSError ends it at once, and so does a DIR that is not there at all: that is
+    no compaction. OSError saying so when every pass was discarded: a tree that did not hold still is never passed."""
+    os.lstat(top)  # a missing top is one error now, not SCAN_PASSES passes of the same
+    for number in range(1, SCAN_PASSES + 1):
+        try:
+            return scan(top, wanted, prune, prune_each)
+        except FileNotFoundError as err:
+            last = err
+        if number < SCAN_PASSES:
+            time.sleep(RETRY_PAUSE_S)
+    raise OSError(
+        "the tree did not hold still for %d passes: each lost a file or directory it had listed (the last: %s)"
+        % (SCAN_PASSES, last)
+    )
 
 
 def options(argv):
@@ -212,7 +182,7 @@ def main(argv):
         sys.stderr.write("usage: baked.py [--prune REL]... [--prune-each REL]... DIR LENGTH:SHA256...\n")
         return 2
     try:
-        found = scan(rest[0], parse(rest[1:]), prune, prune_each)
+        found = scan_whole(rest[0], parse(rest[1:]), prune, prune_each)
     except (OSError, ValueError) as err:
         sys.stderr.write("baked.py: %s\n" % err)
         return 2
