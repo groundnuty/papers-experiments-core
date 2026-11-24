@@ -45,6 +45,7 @@ CORE_MISMATCH = 97  # the exit status of a core step whose interpreter imports a
 TIMEOUTS = {
     "queue": 1800.0,  # the held job's start
     "service": 1800.0,  # a service's verdict, from its step's launch
+    "listed": 120.0,  # squeue listing a service's step, from its log saying it is ready (the id is recorded then)
     "step": 600.0,  # a control step: node facts, a token's mint and delivery, an export, a check
     "core": 5400.0,  # the core's phase as a step: the bootstrap, the baseline and the link check
     "cancel": 300.0,  # the held job leaving the queue after its cancel
@@ -906,15 +907,20 @@ class Driver(Down):
 
     def wait_log(self, service: str, wanted: str) -> str:
         """The service's log once it holds `wanted`; fail on a failure line, when its step (or its client, before the
-        step was ever listed) is gone, or at the bound."""
+        step was ever listed) is gone, or at the bound. A log that is ready before squeue lists the step (a busy login
+        node lists it late) leaves the step's id unrecorded, so the id is waited for, within `timeouts["listed"]`
+        (`record_listed_id`), before the log is returned: a stopped service's reading finds its step by that id."""
         state = self.store.read()
         record = state["services"][service]
         name, log = record["step"]["name"], Path(record["log"])
         client = state.get("clients", {}).get(name)
         deadline, seen, absent = self.clock() + self.timeouts["service"], False, 0
+        recorded = record["step"].get("id") is not None  # an earlier wait of this launch recorded it
         while True:
             text = log.read_text(encoding="utf-8", errors="replace") if log.is_file() else ""
             if wanted in text:
+                if not (seen or recorded):
+                    self.record_listed_id(service, name)
                 return text
             failed = [line for line in FAILED if line in text]
             if failed:
@@ -931,6 +937,29 @@ class Driver(Down):
                 raise StepGone(f"{service}'s step ended before its log said '{wanted}'")
             if self.clock() >= deadline:
                 raise RuntimeError(f"{service} did not say '{wanted}' within {self.timeouts['service']:.0f} s")
+            self.sleep(self.poll_s)
+
+    def record_listed_id(self, service: str, name: str) -> None:
+        """Record the id squeue lists the service's step under, which its log (already ready) did not wait for: asked
+        every `poll_s`, at most `timeouts["listed"]`. The service IS ready, so a step never listed in the bound, or a
+        squeue that fails meanwhile (`SlurmError`: busy login nodes time out), fails nothing: the id stays None, and
+        that is said once, with the error's type and never its text."""
+        deadline, failure = self.clock() + self.timeouts["listed"], None
+        while True:
+            try:
+                listed = self.launcher.listed(name)
+            except SlurmError as error:
+                listed, failure = None, type(error).__name__
+            if listed is not None:
+                self.set(lambda s, i=listed: s["services"][service]["step"].update(id=i))
+                return
+            if self.clock() >= deadline:
+                because = f"; a squeue read failed ({failure})" if failure else ""
+                self.say(
+                    f"{service}: its log says it is ready, but squeue did not list its step within "
+                    f"{self.timeouts['listed']:.0f} s{because}; its step id is not recorded"
+                )
+                return
             self.sleep(self.poll_s)
 
     def await_start(self, service: str, wanted: str, argv: Sequence[str]) -> str:
