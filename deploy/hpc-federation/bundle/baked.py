@@ -23,6 +23,11 @@ whole, what it found with it, and the scan starts again from the top after RETRY
 Only a pass that ends with no error decides, so every file it listed was read, as it always was. A tree that loses a
 file on every pass is an error. Any other error on a file or a directory fails at once, with no new pass.
 
+A new pass must walk the tree the first one did, so a retry can never certify an empty mount point that a dropped volume
+left behind. The root's identity (st_dev, st_ino) is read once before the first pass and again before every new pass and
+before a pass decides: a root that changed or went is an error. Each pass also records the devices of the directories it
+walked, and a filesystem walked by a discarded pass and not by the deciding one is an error too.
+
 Exit 0 when no file holds one; 1 when one does, with one line per such file on stdout (its path, never the value);
 2 on an error (a file or its metadata that cannot be read, a tree that did not hold still for SCAN_PASSES passes, a
 prune path that is a link, bad arguments), so a caller that tests for 0 fails closed.
@@ -114,10 +119,12 @@ def pruned(top, prune, prune_each):
     return skip
 
 
-def scan(top, wanted, prune=(), prune_each=()):
+def scan(top, wanted, prune=(), prune_each=(), devices=None):
     """The regular files under top that hold a wanted value, but what `prune` and `prune_each` leave out. Raises
     OSError on one that cannot be read, or on a prune path that is a link. FileNotFoundError, which a file or
-    directory gone after it was listed raises, is for `scan_whole` to meet: a pass that raised it decides nothing."""
+    directory gone after it was listed raises, is for `scan_whole` to meet: a pass that raised it decides nothing.
+    When `devices` is a set, the st_dev of each directory the walk yields is added to it as it goes, so that a pass
+    that raised leaves the devices it had walked."""
     if not stat.S_ISDIR(os.lstat(top).st_mode):  # raises when top cannot be stat'ed; a link to a directory is refused
         raise OSError("not a directory: %s" % top)
     skip = pruned(top, prune, prune_each)
@@ -127,6 +134,8 @@ def scan(top, wanted, prune=(), prune_each=()):
         raise err
 
     for root, dirs, files in os.walk(top, onerror=fail):
+        if devices is not None:
+            devices.add(os.lstat(root).st_dev)  # FileNotFoundError here discards the pass, as for any other step
         dirs[:] = [name for name in dirs if os.path.join(root, name) not in skip]  # in place: the walk goes no further
         for name in sorted(files):
             path = os.path.join(root, name)
@@ -142,19 +151,49 @@ def scan(top, wanted, prune=(), prune_each=()):
     return found
 
 
+def same_root(top, root):
+    """OSError unless top is still the directory whose (st_dev, st_ino) is `root`. An lstat that fails (top gone) raises
+    as it does. A link is itself, never what it points to."""
+    info = os.lstat(top)
+    if (info.st_dev, info.st_ino) != root:
+        raise OSError("the root of the scanned tree changed between passes: %s" % top)
+
+
+def devices_kept(walked, devices):
+    """OSError when a device in `walked` (what the discarded passes walked) is not in `devices` (what the pass that
+    decides walked): a filesystem under the tree was detached. Only device numbers are named."""
+    dropped = sorted(walked - devices)
+    if dropped:
+        raise OSError(
+            "a filesystem walked by an earlier pass was not walked by the pass that decides (device %s)"
+            % ", ".join(str(number) for number in dropped)
+        )
+
+
 def scan_whole(top, wanted, prune=(), prune_each=()):
     """`scan` as a whole pass that decides: one that raised FileNotFoundError (a listed file or directory gone before it
     was read) is discarded with everything it found, and `scan` runs again from the top after RETRY_PAUSE_S, in
     SCAN_PASSES passes at most. Every other OSError ends it at once, and so does a DIR that is not there at all: that is
-    no compaction. OSError saying so when every pass was discarded: a tree that did not hold still is never passed."""
-    os.lstat(top)  # a missing top is one error now, not SCAN_PASSES passes of the same
+    no compaction. OSError saying so when every pass was discarded: a tree that did not hold still is never passed. It
+    is no pass either when the root changed or a filesystem the discarded passes walked is gone from the deciding one
+    (`same_root`, `devices_kept`): a dropped volume leaves an empty mount point, with the value on the volume."""
+    info = os.lstat(top)  # a missing top is one error now, not SCAN_PASSES passes of the same
+    root = (info.st_dev, info.st_ino)
+    walked = set()  # the devices of every discarded pass, the part of a pass that raised included
     for number in range(1, SCAN_PASSES + 1):
+        devices = set()
         try:
-            return scan(top, wanted, prune, prune_each)
+            found = scan(top, wanted, prune, prune_each, devices)
         except FileNotFoundError as err:
             last = err
+            walked |= devices
+        else:
+            same_root(top, root)
+            devices_kept(walked, devices)
+            return found
         if number < SCAN_PASSES:
             time.sleep(RETRY_PAUSE_S)
+            same_root(top, root)
     raise OSError(
         "the tree did not hold still for %d passes: each lost a file or directory it had listed (the last: %s)"
         % (SCAN_PASSES, last)
