@@ -712,12 +712,22 @@ section 3).
   ...]` (distinct providers of the layout, by name; none by default, and then `up` is what it always was). The core's
   phase, right after `platform.toml` is written and before the link check, then requires of every space of the rendered
   file whose data provider (`holder`) is one of them and that has a mirror that some mirror's id sorts below the
-  owner's (a space whose `holder` in the file is not the layout's owner is refused too, since nothing else ties the two); a member where it does not hold fails `up` (`failover order: ... refuse this member`, spaces and providers by
-  position label, never a name or an id) and the fleet replaces it, and one where it does has `failover-order.json` in
-  its root (each space's position, its owner's and mirrors' labels, the labels in the order of their ids, `mirror_first`;
-  kept in the root evidence, printed as `failover` in `fleetidentity.py read`'s line, and in no value the join compares
-  and not in `render-identity.json`, which the order, differing by chance from member to member, would break). The
-  fault injector checks again from the platform's own holders and ids before it stops the owner.
+  owner's. The file is tied to the layout through the ids the bootstrap gave out, as the support check ties its sets,
+  and not through names: a space of the file is the layout's by its id and a provider of the file is the layout's by its
+  id, whatever the template calls them, and a space whose `holder` in the file is not the layout's owner, or a space of
+  a declared owner that the file does not hold at all, is refused too (the link check's probe space, which the file
+  holds under `[link_check]`, is the one exception), since nothing else ties the two. A member where it does not hold
+  fails `up` (`failover order: ... refuse this member`, spaces and providers by position label, never a name or an id)
+  and the fleet replaces it, and one where it does has `failover-order.json` in its root (each space's position, its
+  owner's and mirrors' labels, the labels in the order of their ids, `mirror_first`; published whole by a private
+  draft renamed over the file, kept in the root evidence, printed as `failover` in `fleetidentity.py read`'s line, and
+  in no value the join compares and not in `render-identity.json`, which the order, differing by chance from member to
+  member, would break). The record of an earlier run is removed before `up` replaces the platform file, whether the
+  layout declares an outage or not, so one that fails before the admission, or whose layout no longer declares the
+  outage, leaves none; the line's `failover` is `passed` only for a record that is exactly what `up` writes (at least
+  one space, no label twice or of the wrong kind in a field, no other key) and `unreadable` for any other. The fault
+  injector checks again from the platform's own holders and ids, as it was built with them, before it admits, recovers
+  or stops anything for an owner.
 - **The agent's node** (M5), when `[hpc] sandbox` declares it or the layout's platform template declares the
   Apptainer sandbox's limits, is held at its own shape: by default (`sandbox_placement = "het"`) as component 1 of a
   heterogeneous job, every step there with `--het-group=1` and every step on a service node with `--het-group=0`
