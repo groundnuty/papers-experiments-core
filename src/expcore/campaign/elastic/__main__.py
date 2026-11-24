@@ -58,10 +58,25 @@
   the reason and actor in its `drain` event. Refused for a federation the ledger does not hold, one already drained or
   proven ended, one past its recorded job end, and, writing nothing, while a live controller does not say it honours
   operator writes, as `pause` is.
+- `reopen-run LEDGER --lease N --archive PATH --reason TEXT --actor NAME [--dry-run]`: put one run that a study-plugin
+  defect ended as `harness_error` back to `pending`, with its evidence. The run's only real attempt was one the model
+  API refused (`key_rejected`, uncharged); it ran again under the same attempt number, and the plugin's instrument
+  failed at its start with a `LedgerError`, which the core treats as terminal. It is refused, writing nothing and naming
+  the condition, unless: lease N is `counted` and the latest lease of its run; the run is `harness_error`; PATH (a
+  plain `.tar`, or a `.tar.zst`, which is hashed as the tar it holds and needs the `zstd` program) is a regular file,
+  never a link, whose SHA-256 is the one lease N's completion names; its `out/state.sqlite` holds attempt rows of the
+  run that are all uncharged, include one `key_rejected` and end with a `harness_error` whose detail starts with
+  `LedgerError`; no lease of the run is in flight or expired with its holder not proven ended; and the run has a
+  charged attempt left (it is below `max_attempts`). The change is the run's state and one `operator_reopen` event (the
+  run, the lease, the archive's hash, the attempt rows' summary, the reason and the actor): its charged count stays, so
+  its next lease takes it as its `attempt_base`. The archive is read before the write lock is taken, and every ledger
+  condition is decided again under it. `--dry-run` decides every condition and writes nothing. A second call is refused
+  (the run is no longer `harness_error`). Written as `pause` is, beside a running controller, and refused while one
+  does not say it honours operator writes.
 
-`status`, `raise-ceiling`, `set-cap`, `declare`, `pause`, `resume` and `drain` work on the ledger file under its own
-write lock and not the dispatcher's, so they run while a dispatcher holds the ledger, and the dispatcher's next lease
-reads a raise, a cap, a declaration, a pause or a drain. Exit status: 0
+`status`, `raise-ceiling`, `set-cap`, `declare`, `pause`, `resume`, `drain` and `reopen-run` work on the ledger file
+under its own write lock and not the dispatcher's, so they run while a dispatcher holds the ledger, and the
+dispatcher's next lease reads a raise, a cap, a declaration, a pause, a drain or a reopened run. Exit status: 0
 done, 1 refused by the ledger (or, for `create`, by the study: not loadable, or code that is not known), 2 a usage
 error or a file that is not a ledger.
 """
@@ -86,6 +101,7 @@ from expcore.campaign.elastic.grants import set_in_file as set_grants_in_file
 from expcore.campaign.elastic.ledger import Ledger
 from expcore.campaign.elastic.pauses import pause_in_file, resume_in_file
 from expcore.campaign.elastic.records import LedgerError, Status
+from expcore.campaign.elastic.reopenrun import described, reopen_in_file
 from expcore.campaign.elastic.views import LedgerReader
 
 
@@ -400,6 +416,33 @@ def _drain(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reopen_run(args: argparse.Namespace) -> int:
+    done = reopen_in_file(args.ledger, args.lease, args.archive, args.reason, args.actor, dry_run=args.dry_run)
+    for line in described(done):
+        print(line)
+    if done.event_seq is None:
+        print("dry run: every condition holds, and nothing was written")
+    elif done.controller == AWARE:
+        print("the controller that holds the ledger leases the run from its next issue")
+    elif done.controller == NONE:
+        print("no controller holds this ledger: the next one to open it leases the run")
+    else:
+        print("warning: could not tell whether a controller holds this ledger: the run is pending; a controller "
+              "older than the operator's pause would only read it at its next tick", file=sys.stderr)  # fmt: skip
+    return 0
+
+
+def _lease_number(text: str) -> int:
+    """A lease id as typed: a whole number from 1."""
+    try:
+        value = int(text.strip())
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"a lease is a whole number from 1, got {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"a lease is a whole number from 1, got {text!r}")
+    return value
+
+
 def _cap_of(text: str) -> int:
     """A cap as typed: a whole number from 1."""
     try:
@@ -502,6 +545,22 @@ def _parser() -> argparse.ArgumentParser:
     draining.add_argument("--label", required=True, help="the federation's label in the ledger (<site>-<member>)")
     draining.add_argument("--reason", required=True, help="why it is drained, recorded")
     draining.add_argument("--actor", required=True, help="who drains it (an operator or an agent), recorded")
+    reopening = commands.add_parser(
+        "reopen-run", help="put a run a study-plugin defect ended as harness_error back to pending, with its evidence"
+    )
+    reopening.add_argument("ledger", type=Path, help="the ledger file (out/ledger.sqlite)")
+    reopening.add_argument(
+        "--lease", required=True, type=_lease_number, help="the run's latest lease, which is counted"
+    )
+    reopening.add_argument(
+        "--archive",
+        required=True,
+        type=Path,
+        help="that lease's archive: a .tar, or a .tar.zst (read as the tar it holds)",
+    )
+    reopening.add_argument("--reason", required=True, help="why it is reopened, recorded")
+    reopening.add_argument("--actor", required=True, help="who reopens it (an operator or an agent), recorded")
+    reopening.add_argument("--dry-run", action="store_true", help="decide every condition and write nothing")
     return parser
 
 
@@ -529,6 +588,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "pause": _pause,
         "resume": _resume,
         "drain": _drain,
+        "reopen-run": _reopen_run,
     }
     try:
         return commands[args.command](args)
