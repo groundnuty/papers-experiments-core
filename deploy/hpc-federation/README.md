@@ -706,22 +706,26 @@ section 3).
   start, 240 s by default), where the core's phase runs (`core = "login"` or `"step"`), and the providers a study's owner outage takes down (`outage_targets`, below). `layouts/pilot-shape.toml` has the pilot's shape with invented names: a zone, five providers, four data
   spaces and the probe space; its link check covers ten ordered pairs.
 - **The failover order of an owner outage** (O98, `hpcfailover.py`). Taking down the provider that holds a space's data
-  fails the space's reads over to a mirror only when a mirror's provider id sorts below the owner's: op-worker asks the
-  holders of a file's blocks in the order of their ids and does not retry another after a disconnected one, and ids are
+  fails the space's reads over to another holder only when a holder's provider id sorts below the owner's: op-worker asks
+  the holders of a file's blocks in the order of their ids and does not retry another after a disconnected one, and ids are
   random at registration. A layout whose study takes providers down says which, `[hpc] outage_targets = ["<provider>",
   ...]` (distinct providers of the layout, by name; none by default, and then `up` is what it always was). The core's
   phase, right after `platform.toml` is written and before the link check, then requires of every space of the rendered
-  file whose data provider (`holder`) is one of them and that has a mirror that some mirror's id sorts below the
-  owner's. The mirrors are the layout's declared ones (`mirrors` of the space): another provider the file lists as a
-  supporter, which may hold none of the space's blocks, is ignored, a declared mirror the file does not list refuses
-  the member, and a space the layout gives no mirror is out of scope. The file is tied to the layout through the ids the bootstrap gave out, as the support check ties its sets,
+  file whose data provider (`holder`) is one of them and that another provider supports that it declares its failover
+  holders (`failover` in its `[[spaces]]` entry of the platform template: the providers holding the space's whole
+  replica) and that some holder's id sorts below the owner's. Only the declared holders are ordered with the owner:
+  another provider the file lists as a supporter, the agent's local provider in particular, holds none of the space's
+  blocks (it is evicted at every reset) and is ignored, and the loader refuses a `failover` that names the local
+  provider, the space's data provider or a provider that does not support it. A space of a declared owner that another
+  provider supports and that declares none refuses the member (`declares no failover holder`), and the layout's own
+  `mirrors` play no part. The declaration is in the platform file, so in the campaign fingerprint. The file is tied to the layout through the ids the bootstrap gave out, as the support check ties its sets,
   and not through names: a space of the file is the layout's by its id and a provider of the file is the layout's by its
   id, whatever the template calls them, and a space whose `holder` in the file is not the layout's owner, or a space of
   a declared owner that the file does not hold at all, is refused too (the link check's probe space, which the file
   holds under `[link_check]`, is the one exception), since nothing else ties the two. A member where it does not hold
   fails `up` (`failover order: ... refuse this member`, spaces and providers by position label, never a name or an id)
   and the fleet replaces it, and one where it does has `failover-order.json` in its root (each space's position, its
-  owner's and mirrors' labels, the labels in the order of their ids, `mirror_first`; published whole by a private
+  owner's and failover holders' (`mirrors`) labels, the labels in the order of their ids, `mirror_first`; published whole by a private
   draft renamed over the file, kept in the root evidence, printed as `failover` in `fleetidentity.py read`'s line, and
   in no value the join compares and not in `render-identity.json`, which the order, differing by chance from member to
   member, would break). The record of an earlier run is removed first thing in the core's phase, whether the layout
@@ -729,10 +733,10 @@ section 3).
   say), or whose layout no longer declares the outage, leaves none; the line's `failover` is `passed` only for a record
   that is exactly what `up` writes (at least one space, no label twice or of the wrong kind in a field, orders that one
   order of the providers gives, no other key) and `unreadable` for any other. The fault injector checks again from the
-  platform's own holders and ids, as it was built with them, before it admits, recovers or stops anything for an owner;
-  with the root's record it takes the mirrors of the spaces the record lists from it (strictly: an unreadable record,
-  one whose labels do not resolve in the platform file, or one that does not list a space the owner holds and another
-  provider supports, refuses the stop), and without one every supporter counts.
+  platform's own holders, ids and declared failover holders, as it was built with them, before it admits, recovers or
+  stops anything for an owner, and reads no record: where some space declares failover holders, a space the owner holds
+  that another provider supports and that declares none refuses the stop, and where none does nothing is checked, as
+  before this check.
 - **The agent's node** (M5), when `[hpc] sandbox` declares it or the layout's platform template declares the
   Apptainer sandbox's limits, is held at its own shape: by default (`sandbox_placement = "het"`) as component 1 of a
   heterogeneous job, every step there with `--het-group=1` and every step on a service node with `--het-group=0`

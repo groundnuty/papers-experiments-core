@@ -43,10 +43,11 @@ real addresses (DESIGN.md, sections 5 and 6).
   `PlacementSettings`' fields, beside what the template declared.
 - **The failover order** (O98, `hpcfailover`): with `[hpc] outage_targets` declared in the layout, right after the
   platform file is written and before the link check, every space the rendered file holds for one of those providers
-  and that has a mirror must have a mirror whose provider id sorts below the owner's, or `up` fails and the member is
-  replaced; the passing order is written as `failover-order.json` (labels only). The file's spaces and providers are
-  matched to the layout's through the bootstrap's ids, the order is over the owner and the layout's declared mirrors
-  alone (another supporter of the space is ignored), and the record of an earlier run is removed first thing in this
+  and that another provider supports must declare its failover holders (`failover` in its `[[spaces]]` entry), one of
+  whose provider ids sorts below the owner's, or `up` fails and the member is replaced; the passing order is written as
+  `failover-order.json` (labels only). The file's spaces and providers are matched to the layout's through the
+  bootstrap's ids, the order is over the owner and the declared holders alone (another supporter of the space, the
+  agent's local provider in particular, is ignored), and the record of an earlier run is removed first thing in this
   phase. Nothing is declared in a layout that does not name `outage_targets`, and `up` is then what it was.
 - **The link check** is `fedlinks.check_after_up`: the platform layer's own, through the rendered file, writing
   `link-check.json` in the root through `expcore_onedata.linkrecord`.

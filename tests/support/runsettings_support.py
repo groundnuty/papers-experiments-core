@@ -430,6 +430,8 @@ IN = {
     "spaces.*.import.shared": edit("apptainer", platform("readonly = true, shared = false",
                                                          "readonly = true, shared = true")),
     "spaces.*.data_manifest": edit("apptainer", platform("data-manifests/beta.json", "data-manifests/other.json")),
+    "spaces.*.failover": edit("apptainer", platform('holder = "larch"\ntokens',
+                                                    'holder = "larch"\nfailover = ["hazel"]\ntokens')),
     "tokens.margin_s": edit("docker", platform("margin_s = 3000", "margin_s = 3001")),
     "tokens.max_excess_s": edit("docker", platform("max_excess_s = 600", "max_excess_s = 601")),
     "tokens.mint_headroom_s": edit("docker", platform("mint_headroom_s = 300", "mint_headroom_s = 299")),

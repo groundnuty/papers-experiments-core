@@ -1,38 +1,40 @@
 """The failover order of a federation's owner-outage spaces, admitted at the end of `up` (O98).
 
-Taking down the provider that holds a space's data (an owner outage) fails the space's reads over to a mirror only when
-some mirror's provider id sorts below the owner's: op-worker asks the holders of a file's blocks in the order of their
-ids and does not retry another after a disconnected one (`expcore_onedata.failover`). Ids are random at registration,
-so it is a property of one member, found out only once its providers have registered. `up` therefore checks it where the
-ids first exist, in the core's phase, right after `platform.toml` is written and before the link check, and a member
-where it does not hold fails `up`, so that the fleet replaces it.
+Taking down the provider that holds a space's data (an owner outage) fails the space's reads over to another holder only
+when some holder's provider id sorts below the owner's: op-worker asks the holders of a file's blocks in the order of
+their ids and does not retry another after a disconnected one (`expcore_onedata.failover`). Ids are random at
+registration, so it is a property of one member, found out only once its providers have registered. `up` therefore
+checks it where the ids first exist, in the core's phase, right after `platform.toml` is written and before the link
+check, and a member where it does not hold fails `up`, so that the fleet replaces it.
 
 **Scope.** Only the providers a layout declares an owner outage for: `[hpc] outage_targets = ["<provider>", ...]`, the
 providers the study's `provider_outage` conditions take down, by the names the layout gives them. The spaces in scope
 are those the rendered platform file holds with one of them as the data provider (`holder`) and another provider as a
-supporter. A layout that declares none, or whose declared providers hold no space with a mirror, has nothing in scope:
-`admit` then returns None, writes nothing and says nothing, and `up` is what it was.
+supporter. A layout that declares none, or whose declared providers hold no space another provider supports, has
+nothing in scope: `admit` then returns None, writes nothing and says nothing, and `up` is what it was.
 
-**Which providers are mirrors.** The layout says: a space's `mirrors` (`fedspec.Space.mirrors`) are the providers the
-study designates to hold its replicas, and the order is told over the owner and those alone. Another provider the
-rendered file lists as supporting the space (the agent's local provider, say) is ignored, since it may hold no block of
-the space's files and is then no replica to read from: counting it would let an owner whose id sorts above such a
-provider pass, and op-worker, choosing between the owner and the one mirror that holds the data, would ask the stopped
-owner first. The declared mirrors are matched to the file's providers through the bootstrap's ids, as the rest is
-(`declared_mirrors`); a space the layout gives no mirror, or does not know, is out of scope, as `holders_differ` skips
-it, and is never ordered over every supporter.
+**Which providers count as mirrors.** The platform file says, and the layout does not: a `[[spaces]]` entry's `failover`
+lists the providers that hold the space's whole replica and that its reads fail over to (`expcore_onedata.spaces`), and
+the order is told over the owner and those alone. Another provider the file lists as supporting the space (the agent's
+local provider, say) is ignored, since it supports every space and holds none of its blocks, being evicted at every
+reset: counting it would let an owner whose id sorts above such a provider pass, and op-worker, choosing between the
+owner and the one provider that holds the data, would ask the stopped owner first. The declaration is part of the
+campaign fingerprint, as it is in the file. A space of a declared owner that another provider supports and that declares
+no `failover` refuses the member ("declares no failover holder"), never left out of scope in silence or ordered over
+every supporter; the layout's own `mirrors` play no part in it.
 
 **What is written.** When something is in scope and every space passes, `failover-order.json` in the root
-(`expcore_onedata.failover`): per space in scope its position label, its owner's and declared mirrors' provider labels,
-the labels in the order of their ids, and `mirror_first: true`. Labels only: no provider's name, no space's name, no id.
-It is evidence like `render-identity.json` (`hpcevidence.UP_FILES`), and the identity read reports it
-(`fleetidentity.py`); the fault injector reads it too, taking each space's mirrors from it (`failover.admit_stop`). A
-space that fails refuses the member, naming the spaces and providers by label, and removes a record an earlier run of
-the phase left. The record of an earlier run is removed first thing in the core's phase (`invalidate`, called by
-`hpcboot.core_phase` before anything that can raise, with an outage declared or not), so a run that fails at any point
-before it reaches the admission (a declared manifest it cannot load, say), or whose layout no longer declares the
-outage, never leaves a record the identity read would report as passed. The record is published by a private draft in
-the root, fsynced and renamed over the file (`publish_private`), so a full filesystem leaves no partial record.
+(`expcore_onedata.failover`): per space in scope its position label, its owner's and failover holders' (`mirrors`)
+provider labels, the labels in the order of their ids, and `mirror_first: true`. Labels only: no provider's name, no
+space's name, no id. It is evidence like `render-identity.json` (`hpcevidence.UP_FILES`), and the identity read reports
+it (`fleetidentity.py`); the fault injector does not read it: it checks again from the platform file's own declarations
+(`failover.admit_stop`). A space that fails refuses the member, naming the spaces and providers by label, and removes a
+record an earlier run of the phase left. The record of an earlier run is removed first thing in the core's phase
+(`invalidate`, called by `hpcboot.core_phase` before anything that can raise, with an outage declared or not), so a run
+that fails at any point before it reaches the admission (a declared manifest it cannot load, say), or whose layout no
+longer declares the outage, never leaves a record the identity read would report as passed. The record is published by a
+private draft in the root, fsynced and renamed over the file (`publish_private`), so a full filesystem leaves no partial
+record.
 
 The scope is read from the rendered file's data provider (`holder`) of each space, which nothing else ties to the
 layout's owner, so the file is tied to the layout through the ids the bootstrap gave out, as the support check
@@ -48,7 +50,7 @@ import contextlib
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import hpcsettings
 
@@ -123,44 +125,14 @@ def holders_differ(spec: Any, config: Any, ids: Any, owners: Tuple[str, ...]) ->
     return differing, omitted
 
 
-def declared_mirrors(spec: Any, config: Any, ids: Any, owners: Tuple[str, ...]) -> Dict[str, Tuple[str, ...]]:
-    """The mirrors the layout declares for every space of the rendered file that a declared owner holds, by the file's
-    position label of the space to the file's labels of its providers, for `failover.orders`' `declared`: the
-    order is over the owner and these alone, and a provider that merely supports the space is ignored. A file space
-    whose layout space has no mirror, or that is no layout space at all, is listed with none (out of scope: nothing is
-    designated to serve it, as `holders_differ` skips a layout space with no mirror), so that no space a declared
-    owner holds is ever ordered over every supporter. The probe space, which the file does not hold as a `[[spaces]]`
-    entry, is not in it. The file's spaces and providers are matched to the layout's through the bootstrap's ids,
-    never names. FailoverError, naming the space by label, when a declared mirror is no provider of the file."""
-    from expcore_onedata import failover
-
-    label_of = {provider.id: config.provider_label(name) for name, provider in config.providers.items()}
-    targets = {label_of[ids.providers[name]] for name in owners if ids.providers[name] in label_of}
-    layout_space = {ids.spaces[space.name]: space for space in spec.spaces if space.name != spec.probe_space}
-    holders = config.space_holders()
-    found: Dict[str, Tuple[str, ...]] = {}
-    for entry in config.spaces:
-        if holders.get(entry.space.name) not in targets:
-            continue
-        space = layout_space.get(entry.space.id)
-        mirrors = space.mirrors if space is not None else ()
-        labels = tuple(label_of[ids.providers[name]] for name in mirrors if ids.providers[name] in label_of)
-        if len(labels) != len(mirrors):
-            raise failover.FailoverError(
-                f"failover order: {entry.position}: {len(mirrors) - len(labels)} declared mirror(s) are no "
-                "provider of the platform file, so no order is told"
-            )
-        found[entry.position] = labels
-    return found
-
-
 def admit(layout: Any, ids: Any) -> Optional[str]:
     """The failover-order admission of the member `layout` describes, once its platform file is rendered: None when no
     space is in scope (nothing is read, written or said), else the sentence `up` prints after writing the record. `ids`
     are the bootstrap's (`providers` and `spaces`, by the layout's names), through which the file is tied to the layout.
-    RuntimeError, naming spaces and providers by label, when a space's owner would be asked before every mirror, or
-    when an id is not known, or when the file's spaces and owners are not the layout's, or when owners are declared and
-    the layout has no platform file to read the ids from."""
+    RuntimeError, naming spaces and providers by label, when a space's owner would be asked before every failover
+    holder, or when a space of a declared owner that another provider supports declares none, or when an id is not
+    known, or when the file's spaces and owners are not the layout's, or when owners are declared and the layout has no
+    platform file to read the ids from."""
     owners = declared(layout.spec)
     if not owners:
         return None
@@ -183,7 +155,8 @@ def admit(layout: Any, ids: Any) -> Optional[str]:
     named = {provider.id: name for name, provider in config.providers.items()}  # the file's names, by id
     try:
         sought = tuple(named[ids.providers[name]] for name in owners if ids.providers[name] in named)  # the owners'
-        found = failover.admit(config, sought, declared_mirrors(layout.spec, config, ids, owners))
+        failover.require_declared(config, sought)  # a space with no `failover` is no ground to admit the member
+        found = failover.admit(config, sought)
     except failover.FailoverError as error:
         invalidate(layout.root)  # a record of an earlier run of the phase is no longer true of this one
         raise RuntimeError(f"{error}; {REFUSAL}") from None

@@ -321,13 +321,16 @@ sandbox_placement = "het"                # S as component 1 of a heterogeneous j
 ```
 
 - **`outage_targets`** (optional; O98, `hpcfailover.py`) names the providers, by the layout's names, whose outage a
-  study declares. For each space the rendered `platform.toml` holds with one of them as its data provider and a mirror,
-  the core's phase requires, before the link check, that some mirror's provider id sorts below the owner's (op-worker
-  asks the holders of a file's blocks in that order and does not retry another), else `up` fails and the member is
-  replaced; the passing order is written as `failover-order.json`, labels only, by a private draft renamed over the
-  file. The mirrors are the layout's declared ones (`mirrors` of the space), and only they are ordered with the owner:
-  another provider the file lists as supporting the space may hold none of its blocks, and counting it would pass an
-  owner whose stop stalls. The file's spaces and providers are matched to the layout's through the bootstrap's ids, not
+  study declares. For each space the rendered `platform.toml` holds with one of them as its data provider and another
+  provider as a supporter, the core's phase requires, before the link check, that the space declares its failover holders
+  (`failover` in its `[[spaces]]` entry: the providers holding its whole replica) and that some holder's provider id
+  sorts below the owner's (op-worker asks the holders of a file's blocks in that order and does not retry another), else
+  `up` fails and the member is replaced; the passing order is written as `failover-order.json`, labels only, by a private
+  draft renamed over the file. The holders are the file's declared ones, in the campaign fingerprint, and only they are
+  ordered with the owner: another provider the file lists as supporting the space, the agent's local provider in
+  particular, holds none of its blocks (it is evicted at every reset), and counting it would pass an owner whose stop
+  stalls; the loader refuses a declaration that names the local provider or the data provider, and the layout's own
+  `mirrors` play no part. The file's spaces and providers are matched to the layout's through the bootstrap's ids, not
   names (the probe space is the one exception), and a record of an earlier run is removed first thing in the core's
   phase. A layout without the key is unchanged.
 - **A service step** runs `srun --exact -c <cpus> --mem=<memory>`. tmpfs counts against the memory of the cgroup that

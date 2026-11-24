@@ -1,55 +1,54 @@
 # Provenance: new
-"""Whether a mirror is asked before the owner of a space, when the owner is taken down (O98).
+"""Whether a failover holder is asked before the owner of a space, when the owner is taken down (O98).
 
-An owner outage takes down the provider that holds a space's data, for the whole run, and the space's mirrors are meant
-to serve its reads meanwhile. They do so only when op-worker asks a mirror first. Its replica finder sorts the holders
-of a file's blocks by provider id, bytewise, and the first holder takes every block it holds, without asking whether it
-is connected; a disconnected error is thrown back and never retried on another holder. Provider ids are random at
-registration, so a read fails over to a mirror only when some mirror's id sorts below the owner's, and otherwise every
-read waits on the stopped owner. That order is a fact of one federation that the harness can read, so it is checked
-and never assumed.
+An owner outage takes down the provider that holds a space's data, for the whole run, and the providers that hold the
+space's replica are meant to serve its reads meanwhile. They do so only when op-worker asks one of them first. Its
+replica finder sorts the holders of a file's blocks by provider id, bytewise, and the first holder takes every block it
+holds, without asking whether it is connected; a disconnected error is thrown back and never retried on another holder.
+Provider ids are random at registration, so a read fails over to another holder only when some holder's id sorts below
+the owner's, and otherwise every read waits on the stopped owner. That order is a fact of one federation that the
+harness can read, so it is checked and never assumed.
 
 **What is in scope.** Only the spaces whose data provider (`holder`, `PlatformConfig.space_holders`) is one of the
-providers a declared owner outage takes down, and that another provider supports. A federation with no declared owner
-outage has nothing in scope: `orders` gives the empty tuple, and a caller then does nothing, writes nothing and says
-nothing. A provider that holds no space, or one that only mirrors, is no owner, and its outage is not checked.
+providers a declared owner outage takes down, and that declare their failover holders (below). A federation with no
+declared owner outage has nothing in scope: `orders` gives the empty tuple, and a caller then does nothing, writes
+nothing and says nothing. A provider that holds no space, or one that only supports, is no owner, and its outage is not
+checked. A space that declares no failover holder is out of scope of `orders`: nothing says where its reads go.
 
-**What holds.** The owner of a space and its mirrors are ordered by id as bytes (UTF-8, no case folding), as Erlang
-compares binaries. `SpaceOrder.mirror_first` holds when the first of them is a mirror, so with several mirrors it holds
-when any one of them sorts below the owner. A supporter whose id is unknown, or two with one id, gives no order: that is
-`FailoverError`, never a pass. Two ids are never equal on a platform the loader accepted (`[providers]` refuses a
-repeated id), so there are no ties to break.
+**Which providers count.** A supporter is never assumed to hold blocks. The agent's local provider supports every space
+(the platform's `local`) and holds none of its data, since it is evicted at every reset: it would sort first, change
+nothing for the failover, and let an owner stop that stalls pass. Only the providers the platform file declares as the
+space's `failover` holders count (`StudySpace.failover`, in `spaces.py`: the providers holding the space's whole
+replica, each a supporter, never the owner and never the local provider), and the order is over the owner and those
+alone, whatever else supports the space. The declaration is in the platform file, so the campaign fingerprint holds it
+(the digest of the entry): a member with another declaration is another experiment. The one-space form `[space]`
+cannot declare one and is out of scope. `require_declared` is the fail-closed half: a space an owner holds that another
+provider supports and that declares none is `FailoverError`, so that a platform which declares failover holders for some
+spaces cannot leave another of the owner's spaces unchecked in silence.
 
-**Which providers are mirrors.** A mirror is a provider the study designates to hold the space's replicas, and op-worker
-asks only the holders of a file's blocks: a provider that supports the space and holds nothing (the agent's local
-provider, say) sorts first and changes nothing for the failover, so counting it would pass an owner stop that stalls.
-Where the caller knows the designated mirrors (`orders`' `declared`, by space and provider label: `up` has the layout's
-`Space.mirrors`, and the record lists them), the order is over the owner and those mirrors alone and every other
-supporter is ignored; a declared mirror that is no other supporter of the space in the file, or one declared twice, is
-`FailoverError`. A space `declared` lists with no mirror is out of scope. Where it knows none (a Compose federation, a
-test), every supporter other than the owner counts, as it always did.
+**What holds.** The owner of a space and its failover holders are ordered by id as bytes (UTF-8, no case folding), as
+Erlang compares binaries. `SpaceOrder.mirror_first` holds when the first of them is a failover holder, so with several
+it holds when any one of them sorts below the owner. A provider whose id is unknown, or two with one id, gives no order:
+that is `FailoverError`, never a pass. Two ids are never equal on a platform the loader accepted (`[providers]` refuses
+a repeated id), so there are no ties to break.
 
 **Names (O12).** A space is named by its position, `spaces[i]`, and a provider by its position in the platform file,
 `providers[i]`, in every message and in the record. No provider's name, no space's name or label and no id is ever
 written: the order is told by labels alone.
 
 **The record.** `record_text` is the content of `failover-order.json` in a federation's root, which `up` writes once
-the order holds, only for the spaces in scope (`hpcfailover` in deploy/hpc-federation), its `mirrors` the declared ones.
-The injector (`faults`) checks again, from the ids and holders its configuration was loaded with, before it admits the
-federation or takes the owner down. A root that holds the record is an HPC member's, and `admit_stop` then takes each
-space's mirrors from it, read strictly (`read_record`; a record that is unreadable, or whose labels do not resolve in
-the platform file, is `FailoverError`: the order is never assumed) and against the platform's current ids. A space the
-owner holds that another provider supports and that the record does not list is `FailoverError` too: no mirror was
-declared for it, and counting every supporter there would let one that holds nothing (the local provider) pass the stop.
-A root with none (a Compose federation, a test) is checked as before, over every supporter.
+the order holds, only for the spaces in scope (`hpcfailover` in deploy/hpc-federation); its `mirrors` are the spaces'
+failover holders. It is evidence of what `up` admitted, which the login node's identity read reports
+(`fleetidentity.py`), and nothing decides by it: the injector (`faults`) checks again, with `admit_stop`, from the
+platform file's ids, holders and failover declarations as its configuration was loaded, before it admits the federation
+or takes the owner down, and reads no record, since the platform file is the authority and is fingerprinted.
 """
 
 import json
 import re
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
-from pathlib import Path
 from typing import Any
 
 from expcore_onedata.config import PlatformConfig
@@ -63,11 +62,12 @@ FIRST_IS_OWNER = "the owner's provider id sorts before every mirror's, so op-wor
 
 
 class FailoverError(ValueError):
-    """The order of a space's supporters cannot be told, or does not hold. The message holds labels only."""
+    """The order of a space's owner and failover holders cannot be told, or does not hold. Messages hold labels only."""
 
 
 class FailoverRefused(FailoverError):
-    """The first supporter of at least one space in scope, by provider id, is its owner. `failed` are those spaces."""
+    """The first of the owner and the failover holders of at least one space in scope, by provider id, is the owner.
+    `failed` are those spaces."""
 
     def __init__(self, failed: Sequence["SpaceOrder"]) -> None:
         self.failed = tuple(failed)
@@ -76,8 +76,8 @@ class FailoverRefused(FailoverError):
 
 @dataclass(frozen=True)
 class SpaceOrder:
-    """One space in scope: its position label, its owner's and its mirrors' provider labels, and every supporter's
-    label in the order op-worker asks them (provider id, bytewise)."""
+    """One space in scope: its position label, its owner's and its failover holders' provider labels (`mirrors`), and
+    the labels of the owner and those holders in the order op-worker asks them (provider id, bytewise)."""
 
     space: str
     owner: str
@@ -120,18 +120,13 @@ def ordered(ids: dict[str, str | None]) -> tuple[str, ...]:
     return tuple(sorted(keys, key=keys.__getitem__))
 
 
-def orders(
-    config: PlatformConfig, owners: Iterable[str], declared: Mapping[str, Sequence[str]] | None = None
-) -> tuple[SpaceOrder, ...]:
+def orders(config: PlatformConfig, owners: Iterable[str]) -> tuple[SpaceOrder, ...]:
     """The order of every space in scope, in the platform's order of spaces: a space whose data provider is one of
-    `owners` (provider names of this platform, the providers an owner outage takes down) and that another provider
-    supports. Empty when `owners` is empty or none of them holds a space with a mirror.
-
-    `declared` maps a space's position label to the labels of the providers declared its mirrors (see "Which providers
-    are mirrors"): a space it lists is ordered over its owner and those mirrors alone, whatever else supports it, and is
-    out of scope when it lists none; a space it does not list is ordered over every other supporter. None: every space
-    is. FailoverError when an owner is no provider of the platform, when a declared mirror is no other supporter of its
-    space in the file (or is declared twice), or when an id of a provider ordered is not known."""
+    `owners` (provider names of this platform, the providers an owner outage takes down) and that declares its failover
+    holders (`StudySpace.failover`; see "Which providers count"), ordered over the owner and those holders alone, in the
+    file's order of the space's providers. Empty when `owners` is empty or none of them holds such a space.
+    FailoverError when an owner is no provider of the platform, when a declared holder is no other supporter of its
+    space (a platform built in code; the loader refuses it), or when an id of a provider ordered is not known."""
     taken = tuple(owners)
     if not taken:
         return ()
@@ -142,11 +137,10 @@ def orders(
     ids = {config.provider_label(name): provider.id for name, provider in config.providers.items()}
     found = []
     for entry, owner, others in _held_by(config, targets):
-        wanted = None if declared is None else declared.get(entry.position)
-        mirrors = others if wanted is None else _declared_mirrors(entry.position, others, wanted)
-        if mirrors:
+        if entry.failover:
+            holders = _failover_holders(config, entry, others)
             found.append(
-                SpaceOrder(entry.position, owner, mirrors, ordered({label: ids[label] for label in (owner, *mirrors)}))
+                SpaceOrder(entry.position, owner, holders, ordered({label: ids[label] for label in (owner, *holders)}))
             )
     return tuple(found)
 
@@ -165,93 +159,58 @@ def _held_by(config: PlatformConfig, targets: set[str]) -> Iterator[tuple[StudyS
             )
 
 
-def _declared_mirrors(position: str, others: Sequence[str], wanted: Sequence[str]) -> tuple[str, ...]:
-    """The providers among `others` (a space's other supporters) that are declared its mirrors (`wanted`), in the file's
-    order. FailoverError when a declared mirror is not one of `others`, or is declared twice: no order is guessed."""
-    kept = tuple(label for label in others if label in wanted)
-    if len(kept) != len(wanted):
+def _failover_holders(config: PlatformConfig, entry: StudySpace, others: Sequence[str]) -> tuple[str, ...]:
+    """The labels of the providers `entry` declares to hold its replica, in the file's order of its providers.
+    FailoverError when one is no other supporter of the space (the loader refuses that; a platform built in code may
+    not): no order is guessed."""
+    declared = {config.provider_label(name) for name in entry.failover if name in config.providers}
+    holders = tuple(label for label in others if label in declared)
+    if len(holders) != len(entry.failover):
         raise FailoverError(
-            f"failover order: {position}: a declared mirror is no other supporter of the space in the platform file, "
-            "or is declared twice, so no order is told"
+            f"failover order: {entry.position}: a declared failover holder is no other supporter of the space in the "
+            "platform file, so no order is told"
         )
-    return kept
+    return holders
 
 
-def admit(
-    config: PlatformConfig, owners: Iterable[str], declared: Mapping[str, Sequence[str]] | None = None
-) -> tuple[SpaceOrder, ...]:
-    """`orders`, refused unless a mirror is asked first in every space in scope: the spaces in scope with their order,
-    which is empty when none is. FailoverRefused names every space that fails, FailoverError one that has no order."""
-    found = orders(config, owners, declared)
+def require_declared(config: PlatformConfig, owners: Iterable[str]) -> None:
+    """FailoverError unless every space that one of `owners` (provider names of this platform) holds and another
+    provider supports declares its failover holders: nothing else says where such a space's reads go when its data
+    provider is down, and counting its supporters would count the local provider, which holds nothing. The message names
+    the spaces by position. Nothing for owners that hold no such space."""
+    targets = {config.provider_label(name) for name in owners if name in config.providers}
+    missing = [entry.position for entry, _, others in _held_by(config, targets) if others and not entry.failover]
+    if missing:
+        raise FailoverError(
+            f"failover order: {', '.join(missing)}: declares no failover holder, so the order of the owner's outage "
+            "cannot be told"
+        )
+
+
+def admit(config: PlatformConfig, owners: Iterable[str]) -> tuple[SpaceOrder, ...]:
+    """`orders`, refused unless a failover holder is asked first in every space in scope: the spaces in scope with their
+    order, which is empty when none is. FailoverRefused names every space that fails, FailoverError one that has no
+    order."""
+    found = orders(config, owners)
     failed = [order for order in found if not order.mirror_first]
     if failed:
         raise FailoverRefused(failed)
     return found
 
 
-def admit_stop(config: PlatformConfig, owner: str, root: Path) -> tuple[SpaceOrder, ...]:
-    """The check before a stop of the provider `owner` (a name in `config`), which the injector makes from the ids and
-    holders it was built with: `admit` over the mirrors of the federation's root. A root that holds the record
-    `failover-order.json` (an HPC member's, written by `up`) gives each space it lists the mirrors it declares, read
-    strictly and against the platform's current ids, and must list every space `owner` holds that another provider
-    supports; every space of a root with none is over all its supporters. Nothing of `root` is read unless `owner` holds
-    a space that another provider supports (a stop of anything else is no owner stop). FailoverError when the record is
-    unreadable, any space of it does not resolve in the platform file, it does not list such a space of `owner`, or the
-    order is not known; FailoverRefused when the order does not hold."""
+def admit_stop(config: PlatformConfig, owner: str) -> tuple[SpaceOrder, ...]:
+    """The check before a stop of the provider `owner` (a name in `config`), which the injector makes from the ids,
+    holders and failover declarations it was built with, its platform file's, which is fingerprinted: `admit` over
+    `owner`. A platform that declares failover holders for no space has nothing in scope, as before O98, and nothing is
+    checked. Where any space declares them, a space `owner` holds that another provider supports and that declares none
+    is refused (`require_declared`): the stop of a provider that holds no such space is no owner stop. FailoverError
+    when `owner` is no provider of the platform, when such a space declares none, or when an order is not known;
+    FailoverRefused when the order does not hold."""
     if owner not in config.providers:
         return admit(config, (owner,))  # FailoverError: it is no provider of the platform
-    supported = [entry.position for entry, _, others in _held_by(config, {config.provider_label(owner)}) if others]
-    if not supported:
-        return ()
-    record = _record_in(root)
-    if record is None:
-        return admit(config, (owner,))
-    declared = _recorded_mirrors(config, owner, record)
-    unlisted = [position for position in supported if position not in declared]
-    if unlisted:
-        raise FailoverError(
-            f"failover order: {', '.join(unlisted)}: the record declares no mirror of this space, so no order is told"
-        )
-    return admit(config, (owner,), declared)
-
-
-def _record_in(root: Path) -> dict[str, Any] | None:
-    """The record `up` left in `root`, read as `read_record` reads it; None when there is none. FailoverError for one
-    that cannot be read, however it fails: a record that might say something else is no ground to take a stop on."""
-    try:
-        raw = (root / FILE).read_bytes()
-    except FileNotFoundError:
-        return None
-    except OSError:
-        raise FailoverError("failover order: the record cannot be read, so no order is told") from None
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        raise FailoverError("failover order: the record is no JSON") from None
-    return read_record(text)
-
-
-def _recorded_mirrors(config: PlatformConfig, owner: str, record: dict[str, Any]) -> dict[str, tuple[str, ...]]:
-    """The mirrors the record declares for each of its spaces that `owner` holds. Every space of the record is resolved
-    in the platform file first, whoever holds it, since one that does not resolve shows the record is not of this
-    platform file (an earlier one's, or another's): FailoverError for a position the file has no space at, a data
-    provider other than the record's owner, or a provider label that is none of the file's providers."""
-    target = config.provider_label(owner)
-    labels = {config.provider_label(name) for name in config.providers}
-    entries = {entry.position: entry for entry in config.spaces}
-    holders = config.space_holders()
-    found = {}
-    for space in record["spaces"]:
-        entry = entries.get(space["space"])
-        held = holders.get(entry.space.name) if entry is not None else None
-        if held != space["owner"] or any(label not in labels for label in (space["owner"], *space["mirrors"])):
-            raise FailoverError(
-                f"failover order: {space['space']} of the record does not resolve in the platform file, so no order "
-                "is told"
-            )
-        if space["owner"] == target:
-            found[space["space"]] = tuple(space["mirrors"])
-    return found
+    if any(entry.failover for entry in config.spaces):
+        require_declared(config, (owner,))
+    return admit(config, (owner,))
 
 
 def record_text(found: Sequence[SpaceOrder]) -> str:

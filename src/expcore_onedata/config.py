@@ -341,13 +341,13 @@ class PlatformConfig:
         It is the TLS setting by its mode, with the bundle's SHA-256 under ca_file, never a path or a value, and the
         lifetime rule of the run's tokens (`tokens`). Whenever the `[[spaces]]` form is used (one entry or several), it
         holds each entry's SHA-256 in the file's order (`StudySpace.digest`), so a resume under another set, order,
-        support, data provider or token planes is refused. An entry that declares its data (`data_manifest`) is there
-        by its declared identity and its data's content hash, without its Onezone id: a space is the same experimental
-        condition across federations when its declared identity and its data identity match (C06); one that does not is
-        there with its id, as it always was. The one-space form holds its support set and its local provider by label
-        and its prefixes by their SHA-256 (`support`), its data identity (`space_data`) when `[space]` declares
-        `data_manifest`, and `storage_import` with its `readonly` (and `shared`, when true: O59) when it declares an
-        imported storage (O41).
+        support, data provider, token planes or failover holders (O98) is refused. An entry that declares its data
+        (`data_manifest`) is there by its declared identity and its data's content hash, without its Onezone id: a space
+        is the same experimental condition across federations when its declared identity and its data identity match
+        (C06); one that does not is there with its id, as it always was. The one-space form holds its support set and
+        its local provider by label and its prefixes by their SHA-256 (`support`), its data identity (`space_data`) when
+        `[space]` declares `data_manifest`, and `storage_import` with its `readonly` (and `shared`, when true: O59) when
+        it declares an imported storage (O41).
 
         With a `[sandbox]`, it also holds every level of the data path with its kind, a REST level's listing mode and a
         mount level's I/O mode (O21, O36), the caps of the tables of the bytes served when `[sandbox.served_bytes]` is

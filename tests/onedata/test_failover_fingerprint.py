@@ -1,8 +1,10 @@
-"""O98: the failover order is in no fingerprint. The record `up` writes in a federation's root (`failover-order.json`),
-and the order it holds, leave the platform's fingerprint (`PlatformConfig.fingerprint`), its hash of the file, the
-campaign fingerprint a study takes from it and the identity a member joins with exactly as they were, as the provider
-ids are left out today: the order differs from one member to the next by chance, so a fingerprint that held it would
-make interchangeable members two experiments.
+"""O98: the failover order is in no fingerprint, and the declaration of the failover holders is. The record `up`
+writes in a federation's root (`failover-order.json`), and the order it holds, leave the platform's fingerprint
+(`PlatformConfig.fingerprint`), its hash of the file, the campaign fingerprint a study takes from it and the identity a
+member joins with exactly as they were, as the provider ids are left out today: the order differs from one member to the
+next by chance, so a fingerprint that held it would make interchangeable members two experiments. What a space declares
+as `failover` is in the platform file and so in the entry's digest, and with it in the campaign fingerprint: another
+declaration is another experiment.
 
 Every name and id is invented. The study is a copy of the tiny example whose plugin takes its platform half from the
 `platform.toml` beside it, as a study's plugin does on a shard's copy; each copy is stamped after it is made."""
@@ -38,8 +40,9 @@ def admin(monkeypatch):
     monkeypatch.setenv(ADMIN_ENV, "admin-credential-value")
 
 
-def in_scope_root(directory: Path, ids=IDS) -> Path:
-    """A federation root holding an in-scope platform: one space the owner holds and two mirrors support."""
+def in_scope_root(directory: Path, ids=IDS, failover=(MIRROR_TWO,)) -> Path:
+    """A federation root holding an in-scope platform: one space the owner holds, the local provider and a mirror
+    support, and that declares the mirror its failover holder (`failover`; none: the key is left out)."""
 
     def edit(data):
         data["providers"] = {name: {"url": f"https://{name}.test", "id": value} for name, value in ids.items()}
@@ -53,6 +56,7 @@ def in_scope_root(directory: Path, ids=IDS) -> Path:
                 "providers": [OWNER, MIRROR_ONE, MIRROR_TWO],
                 "local": MIRROR_ONE,
                 "holder": OWNER,
+                **({"failover": list(failover)} if failover else {}),
             }
         ]
 
@@ -108,12 +112,12 @@ def test_o98_the_platform_fingerprint_and_its_hash_are_the_same_with_and_without
 
 
 def test_o98_the_order_is_not_in_the_fingerprint_whichever_provider_the_ids_put_first(tmp_path):
-    """O98: two federations of one declared platform whose ids give two different orders have one platform fingerprint,
-    as two with other ids always had: the order is in neither."""
+    """O98: two federations of one declared platform whose ids give two different orders (a holder asked first, and the
+    owner) have one platform fingerprint, as two with other ids always had: the order is in neither."""
     first = in_scope_root(tmp_path / "first", {OWNER: "id-0300", MIRROR_ONE: "id-0100", MIRROR_TWO: "id-0200"})
-    second = in_scope_root(tmp_path / "second", {OWNER: "id-0300", MIRROR_ONE: "id-0200", MIRROR_TWO: "id-0100"})
+    second = in_scope_root(tmp_path / "second", {OWNER: "id-0200", MIRROR_ONE: "id-0100", MIRROR_TWO: "id-0300"})
     orders = [
-        failover.admit(load_platform(root / "platform.toml", require_secrets=False), [OWNER])[0].order
+        failover.orders(load_platform(root / "platform.toml", require_secrets=False), [OWNER])[0].order
         for root in (first, second)
     ]
     assert orders[0] != orders[1]
@@ -138,3 +142,15 @@ def test_o98_the_campaign_fingerprint_and_the_member_identity_are_the_same_with_
         == load_platform(bare / "platform.toml", require_secrets=False).fingerprint()
     )
     assert campaign_member_identity(plain) == campaign_member_identity(noted)
+
+
+def test_o98_the_declared_failover_holders_are_in_the_campaign_fingerprint_and_the_member_identity(tmp_path):
+    """O98: the declaration is in the platform file, so it is part of the experiment: the same platform with and without
+    `failover` on its space has two platform fingerprints, two campaign fingerprints and two member identities."""
+    plain = in_scope_root(tmp_path / "plain-root", failover=())
+    declared = in_scope_root(tmp_path / "declared-root")
+    studies = {name: study_over(tmp_path, name, root) for name, root in (("plain", plain), ("declared", declared))}
+    platforms = [load_platform(root / "platform.toml", require_secrets=False) for root in (plain, declared)]
+    assert platforms[0].fingerprint() != platforms[1].fingerprint()
+    assert campaign_fingerprint(studies["plain"]) != campaign_fingerprint(studies["declared"])
+    assert campaign_member_identity(studies["plain"]) != campaign_member_identity(studies["declared"])
