@@ -85,6 +85,12 @@ class DrainRefused(LedgerError):
     recorded job end, or one beside a controller that does not say it honours operator writes (C59)."""
 
 
+class ReopenRefused(LedgerError):
+    """An operator's reopening of a harness_error run that one of its conditions refuses: the lease or the run is not as
+    the evidence needs, the archive is not the lease's or shows other attempts, or a controller that does not say it
+    honours operator writes holds the ledger. The message names the condition; nothing was written."""
+
+
 def undeclared_values(values: Any) -> tuple[str | None, ...]:
     """What a completion or a return reports its run saw undeclared (C48): each a fingerprint, or None (a reply that
     carried none), once, never several joined; ValueError for any other form."""
