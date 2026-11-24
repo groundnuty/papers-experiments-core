@@ -5,16 +5,20 @@ is no owner.
 The platform has two providers, `alpha` (providers[0], local and the owner of the one space) and `beta` (providers[1],
 its mirror); their ids are the test's own. Every test runs against `FakeServices`; nothing contacts a deployment."""
 
+import gc
 import json
+import threading
 
 import pytest
 from fault_support import LOCAL_TARGET, OUTAGE_TARGET, SERVICES, FakeServices, faults_table, injector_for
 
 from expcore.errors import InfraError
+from expcore_onedata.admission import FederationLock
+from expcore_onedata.config import load_platform
 from expcore_onedata.fault_journal import JOURNAL
-from expcore_onedata.faults import INJECTOR_FAILURE
+from expcore_onedata.faults import INJECTOR_FAILURE, load_faults
 from expcore_onedata.testing import write_platform
-from expcore_onedata.testing.world import with_spaces
+from expcore_onedata.testing.world import with_placement, with_spaces
 
 RUN = {"run_key": "task=task-a|model=m1|seed=1", "attempt": 1, "factors": {}}
 
@@ -135,3 +139,119 @@ def test_o98_which_provider_holds_the_space_decides_which_stop_is_an_owner_stop(
             platform_of(owner_sorts_first, ("id-b-0200", "id-a-0100"), owns=False), refused, target=OUTAGE_TARGET
         ).start(RUN)
     assert stops_and_starts(refused) == []
+
+
+# -- the refusal comes before anything is taken, recovered or journalled -----------------------------------------------
+
+OTHER_RUN = {"run_key": "task=task-b|model=m1|seed=1", "attempt": 1}
+FAILOVER_SENTENCE = (
+    "the owner's provider id sorts before every mirror's, so op-worker would ask the stopped owner first"
+)
+
+
+def journal_bytes(tmp_path):
+    path = tmp_path / "fault-journal" / JOURNAL
+    return path.read_bytes() if path.exists() else b""
+
+
+def test_o98_a_refused_owner_stop_recovers_nothing_an_earlier_run_left_and_writes_no_line(tmp_path):
+    """O98: a crashed run left the mirror down and journalled. The owner stop that follows is refused for its order: it
+    must not restore that mirror or write a recovery line first, since nothing is locked, recovered, journalled or
+    stopped for a stop that is known to be invalid."""
+    platform = platform_of(tmp_path, OWNER_FIRST)
+    services = FakeServices()
+    crashed = injector_for(platform, services, target=OUTAGE_TARGET)
+    crashed.start(RUN)
+    del crashed  # dropped: its locks go, the open injection stays
+    gc.collect()
+    left = journal_bytes(tmp_path)
+    assert left
+    assert services.running(SERVICES["beta"]) is False
+    calls = list(services.calls)
+    with pytest.raises(InfraError) as refused:
+        injector_for(platform, services, target=LOCAL_TARGET).start(OTHER_RUN)
+    assert (refused.value.kind, refused.value.target) == (INJECTOR_FAILURE, LOCAL_TARGET)
+    assert FAILOVER_SENTENCE in refused.value.detail
+    assert services.calls == calls  # no start of the mirror, no observation, no stop
+    assert services.running(SERVICES["beta"]) is False
+    assert journal_bytes(tmp_path) == left
+
+
+def test_o98_a_refused_owner_stop_does_not_wait_for_a_federation_another_party_holds(tmp_path):
+    """O98: with the federation held exclusively elsewhere, an owner stop that would be refused is `injector_failure`
+    at once, not a wait for the admission that runs out as `federation_busy`: the order is read before the lock is."""
+    platform = platform_of(tmp_path, OWNER_FIRST)
+    config = load_platform(platform, require_secrets=False)
+    lock = FederationLock(load_faults(platform, config))
+    injector = injector_for(platform, FakeServices(), target=LOCAL_TARGET)
+    held, release = threading.Event(), threading.Event()
+
+    def hold_the_federation():  # another run's thread: this thread's own hold would be taken for the injector's run's
+        with lock.held(exclusive=True):
+            held.set()
+            release.wait(30)
+
+    other = threading.Thread(target=hold_the_federation)
+    other.start()
+    try:
+        assert held.wait(30)
+        with pytest.raises(InfraError) as refused:
+            injector.start(RUN)
+    finally:
+        release.set()
+        other.join(30)
+    assert refused.value.kind == INJECTOR_FAILURE
+    assert FAILOVER_SENTENCE in refused.value.detail
+
+
+def test_o98_a_prepared_block_refuses_an_owner_stop_before_it_admits_anything(tmp_path):
+    """O98: `prepared`, the two-halved start, refuses on entry, as `start` does: its body never runs, and the journal
+    and the services are as they were."""
+    services = FakeServices()
+    injector = injector_for(platform_of(tmp_path, OWNER_FIRST), services, target=LOCAL_TARGET)
+    with pytest.raises(InfraError, match="nothing is taken down"), injector.prepared(RUN):
+        raise AssertionError("the body of a refused block ran")
+    assert stops_and_starts(services) == []
+    assert journal_bytes(tmp_path) == b""
+
+
+# -- the holder is read once, with the ids ----------------------------------------------------------------------------
+
+
+def one_space_platform(tmp_path, ids, holder):
+    """The one-space form: both providers support the space, and `[placement]` names `holder` its data provider."""
+
+    def edit(data):
+        data["faults"] = faults_table()
+        data["support"] = {"providers": ["alpha", "beta"], "local": "alpha"}
+        data["providers"]["alpha"]["id"], data["providers"]["beta"]["id"] = ids
+        with_placement(data, holder=holder)
+
+    return write_platform(tmp_path, edit)
+
+
+def test_o98_a_mirror_stop_reads_nothing_of_the_platform_file_again(tmp_path):
+    """O98: the one-space form's holder came from reopening platform.toml, so a file that became unreadable after the
+    injector was built failed even the stop of a mirror. The holder is part of what was loaded with the ids: the mirror
+    goes down as it always did."""
+    platform = one_space_platform(tmp_path, OWNER_FIRST, "alpha")
+    services = FakeServices()
+    injector = injector_for(platform, services, target=OUTAGE_TARGET)
+    platform.unlink()
+    injector.start(RUN)
+    assert services.running(SERVICES["beta"]) is False
+    assert journal_events(tmp_path) == ["injecting", "stopping", "injected"]
+
+
+def test_o98_an_edit_of_the_holder_after_the_injector_was_built_does_not_pair_it_with_the_earlier_ids(tmp_path):
+    """O98: the injector holds the ids it was built with; a placement holder edited since is not read, so an owner stop
+    that was refused by the ids and holder it was built with stays refused (the edit makes beta the holder, which would
+    make the stop of alpha, a mirror then, no owner stop at all)."""
+    platform = one_space_platform(tmp_path, OWNER_FIRST, "alpha")
+    services = FakeServices()
+    injector = injector_for(platform, services, target=LOCAL_TARGET)
+    platform.write_text(platform.read_text(encoding="utf-8").replace('holder = "alpha"', 'holder = "beta"'), "utf-8")
+    with pytest.raises(InfraError) as refused:
+        injector.start(RUN)
+    assert FAILOVER_SENTENCE in refused.value.detail
+    assert stops_and_starts(services) == []
