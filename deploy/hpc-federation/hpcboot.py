@@ -44,8 +44,10 @@ real addresses (DESIGN.md, sections 5 and 6).
 - **The failover order** (O98, `hpcfailover`): with `[hpc] outage_targets` declared in the layout, right after the
   platform file is written and before the link check, every space the rendered file holds for one of those providers
   and that has a mirror must have a mirror whose provider id sorts below the owner's, or `up` fails and the member is
-  replaced; the passing order is written as `failover-order.json` (labels only). Nothing is declared in a layout that
-  does not name `outage_targets`, and `up` is then what it was.
+  replaced; the passing order is written as `failover-order.json` (labels only). The file's spaces and providers are
+  matched to the layout's through the bootstrap's ids, and the record of an earlier run is removed before the platform
+  file is replaced (`write_facts`). Nothing is declared in a layout that does not name `outage_targets`, and `up` is
+  then what it was.
 - **The link check** is `fedlinks.check_after_up`: the platform layer's own, through the rendered file, writing
   `link-check.json` in the root through `expcore_onedata.linkrecord`.
 """
@@ -330,7 +332,11 @@ def registered_of(facts: Mapping[str, Any]) -> Dict[str, str]:
 
 def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> str:
     """facts.json, and platform.toml from the layout's template with the HPC values, and the render identity of that
-    platform (O74): the template is read once, and what is hashed is the text that was rendered."""
+    platform (O74): the template is read once, and what is hashed is the text that was rendered.
+
+    The failover record of an earlier run of the phase is removed first (O98, `hpcfailover.invalidate`): it was of the
+    platform file this replaces, and a run that fails below, or whose layout declares no outage, must not leave it."""
+    hpcfailover.invalidate(layout.root)
     facts = facts_of(boot)
     registered = getattr(boot, "registered", None)
     if registered:  # O73: what each service reported as its domain; with the DNS check, which is advisory
@@ -455,7 +461,7 @@ def core_phase(
         filled = {**values, "hpc_direct_storages": direct_storages_value(layout, boot, env),
                   **hpcdata.values(manifests)}  # fmt: skip
         written = write_facts(layout, boot, filled)
-        admitted = hpcfailover.admit(layout)  # O98: with an owner outage declared, a mirror is asked first, or up fails
+        admitted = hpcfailover.admit(layout, boot.ids)  # O98: with an outage declared, a mirror is asked first
         if layout.spec.platform_template is not None:
             hpcdata.check_rendered(
                 layout, manifests

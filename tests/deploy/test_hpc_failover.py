@@ -8,19 +8,21 @@ reaches a cluster or a panel."""
 import json
 import os
 import stat
-from types import SimpleNamespace
 
 import pytest
-from hpc_fed_support import LAYOUT, PILOT_TEMPLATE, data_stand_in, hpc_on_path, pin_values, write_address_map
+from hpc_failover_support import (
+    DECLARED,
+    FILE,
+    LARCH_FIRST,
+    MIRROR_FIRST,
+    ONE_MIRROR_BELOW,
+    core_root,
+    layout_with,
+    run_core,
+)
+from hpc_fed_support import LAYOUT, hpc_on_path
 
 from expcore_onedata import failover
-
-FILE = "failover-order.json"
-DECLARED = 'outage_targets = ["larch"]'
-# larch holds alpha-space (mirrors aspen, rowan); every other provider's id is below or above it as the case says
-LARCH_FIRST = {"larch": "id-01", "aspen": "id-02", "rowan": "id-03", "alder": "id-04", "hazel": "id-05"}
-MIRROR_FIRST = {"larch": "id-03", "aspen": "id-02", "rowan": "id-01", "alder": "id-04", "hazel": "id-05"}
-ONE_MIRROR_BELOW = {"larch": "id-02", "aspen": "id-03", "rowan": "id-01", "alder": "id-04", "hazel": "id-05"}
 
 
 @pytest.fixture(scope="module")
@@ -35,68 +37,6 @@ def make_ca():
     if not tls.HAS_OPENSSL:
         pytest.skip("no openssl on this host")
     return tls.make_federation_ca
-
-
-def layout_with(folder, line):
-    """The pilot-shape layout with `line` added to its `[hpc]` table (none: as shipped), beside its template."""
-    folder.mkdir(parents=True, exist_ok=True)
-    text = LAYOUT.read_text(encoding="utf-8")
-    if line is not None:
-        assert text.count("\n[hpc]\n") == 1
-        text = text.replace("\n[hpc]\n", f"\n[hpc]\n{line}\n", 1)
-    (folder / LAYOUT.name).write_text(text, encoding="utf-8")
-    (folder / PILOT_TEMPLATE.name).write_text(PILOT_TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8")
-    return folder / LAYOUT.name
-
-
-def core_root(hpc, tmp_path, make_ca, line):
-    """A root holding what the core's phase needs of the services' bring-up, and the layout over it."""
-    import fedlayout
-    import fedspec
-
-    root = tmp_path / "root"
-    (root / "secrets" / "users").mkdir(parents=True)
-    (root / "ca").mkdir()
-    (root / "ca" / "federation-ca.pem").write_bytes(make_ca(tmp_path / "ca").ca.read_bytes())
-    spec = fedspec.load_spec(layout_with(tmp_path / "layout", line))
-    files = {"secrets/zone.passphrase": "A1b2C3d4E5f6G7h8", "secrets/admin.token": "an-admin-token"}
-    files.update({f"secrets/users/{p.name}.pass": "a-password" for p in spec.principals})
-    for name, value in files.items():
-        (root / name).write_text(value, encoding="utf-8")
-        os.chmod(root / name, 0o600)
-    hosts = {s.name: f"{s.name}.cluster.example.org" for s in spec.services}
-    layout = fedlayout.Layout(root, tmp_path, hpc.boot.hpc_spec(spec, hosts))
-    write_address_map(layout)
-    return root, layout
-
-
-def boot_with(layout, provider_ids):
-    ids = SimpleNamespace(
-        admin="uid-admin",
-        providers={p.name: provider_ids[p.name] for p in layout.spec.providers},
-        spaces={s.name: f"sid-{s.name}" for s in layout.spec.spaces},
-        users={p.name: f"uid-{p.name}" for p in layout.spec.principals},
-        scans={},
-        storages={},
-    )
-    return SimpleNamespace(layout=layout, ids=ids, spec=layout.spec)
-
-
-def run_core(hpc, layout, provider_ids, events):
-    options = {
-        "environ": {},
-        "rest": lambda ca, **kwargs: SimpleNamespace(close=lambda: None),
-        "bootstrap": lambda rest, lay, owner: boot_with(lay, provider_ids),
-        "steps": lambda boot: events.append("steps"),
-        "content": lambda boot: SimpleNamespace(reset=lambda timeout: None),
-        "links": lambda lay, spaces: events.append("links") or "link check passed",
-        "data": data_stand_in(),
-    }
-    values = {
-        **hpc.boot.hpc_values(["/venv/python", "hpcfed.py"], 690, 750, layout.root),
-        **pin_values(layout.root / "agent"),
-    }
-    return hpc.boot.core_phase(layout, (5001, 5002), values, **options)
 
 
 # -- the declaration --------------------------------------------------------------------------------------------------
