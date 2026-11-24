@@ -41,6 +41,14 @@ real addresses (DESIGN.md, sections 5 and 6).
   drifts unseen. The template declares `holder`, the one setting the core has no default for (`up` refuses one that
   does not, before anything is submitted); the render writes every other setting at the core's default, read from
   `PlacementSettings`' fields, beside what the template declared.
+- **The failover order** (O98, `hpcfailover`): with `[hpc] outage_targets` declared in the layout, right after the
+  platform file is written and before the link check, every space the rendered file holds for one of those providers
+  and that another provider supports must declare its failover holders (`failover` in its `[[spaces]]` entry), one of
+  whose provider ids sorts below the owner's, or `up` fails and the member is replaced; the passing order is written as
+  `failover-order.json` (labels only). The file's spaces and providers are matched to the layout's through the
+  bootstrap's ids, the order is over the owner and the declared holders alone (another supporter of the space, the
+  agent's local provider in particular, is ignored), and the record of an earlier run is removed first thing in this
+  phase. Nothing is declared in a layout that does not name `outage_targets`, and `up` is then what it was.
 - **The link check** is `fedlinks.check_after_up`: the platform layer's own, through the rendered file, writing
   `link-check.json` in the root through `expcore_onedata.linkrecord`.
 """
@@ -54,6 +62,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import hpcdata
+import hpcfailover
 import hpcidentity
 import hpcimport
 import hpcnames
@@ -426,7 +435,13 @@ def core_phase(
     (read back through `data`, O63; an ingested space's after the ingest, `verify_ingested`), and run the link check;
     return what up prints, or raise naming the step that failed. The
     services must be up, and the root must hold the zone's passphrase and the CA. `environ` is where the imports'
-    variables are read (this process's when None): a core step's own is an allowlist that carries none."""
+    variables are read (this process's when None): a core step's own is an allowlist that carries none.
+
+    The failover record of an earlier run of the phase is removed before anything else (O98, `hpcfailover.invalidate`):
+    it was of the platform file this run replaces, and the first of the things below that can raise (the zone's
+    passphrase, the bootstrap, a declared manifest) would otherwise leave it for the identity read to report as passed,
+    as would a layout that no longer declares an outage."""
+    hpcfailover.invalidate(layout.root)
     passphrase = layout.passphrase(layout.spec.zone.name)
     if not passphrase.is_file() or not layout.ca_pem.is_file():
         raise RuntimeError("the root holds no zone passphrase or no CA: the zone's export did not run")
@@ -449,6 +464,7 @@ def core_phase(
         filled = {**values, "hpc_direct_storages": direct_storages_value(layout, boot, env),
                   **hpcdata.values(manifests)}  # fmt: skip
         written = write_facts(layout, boot, filled)
+        admitted = hpcfailover.admit(layout, boot.ids)  # O98: with an outage declared, a mirror is asked first
         if layout.spec.platform_template is not None:
             hpcdata.check_rendered(
                 layout, manifests
@@ -460,7 +476,7 @@ def core_phase(
         checked = links(layout, dict(boot.ids.spaces))
     finally:
         client.close()
-    return f"{written}\n{held}\n{checked}"
+    return f"{written}\n{admitted}\n{held}\n{checked}" if admitted else f"{written}\n{held}\n{checked}"
 
 
 READINGS_KEYS = ("os.id", "os.version_id", "glibc", "kernel")

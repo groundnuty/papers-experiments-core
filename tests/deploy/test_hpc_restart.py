@@ -466,9 +466,25 @@ def test_o58_a_restart_clears_the_old_markers_before_starting_and_checks_before_
         "absent rootfs/root/service-ready.lock",
     ]
     assert not (restart.work / "stop-requested").exists()
-    assert f"check-defaults {restart.kind} --workdir {restart.work} --live" in restart.lines()
+    live = f"check-defaults {restart.kind} --workdir {restart.work} --live"  # a provider's carries `--restart` as well
+    assert any(line.startswith(live) for line in restart.lines())
     owner = (restart.work / "owner.pid").read_text(encoding="utf-8").split()
     assert owner == [str(proc.pid), node.start_tick(proc.pid)]
+    assert restart.stop().returncode == 0
+    assert proc.wait(timeout=60) == 0, proc.stdout
+
+
+@node.needs_pidfd
+def test_o98_only_a_providers_restart_asks_its_live_check_to_leave_the_storage_out_of_the_scan(restart):
+    """O98: finish.sh --restart runs the live default check of a provider with `--restart`, which leaves the provider's
+    storage out of its scan for the images' Couchbase values; the zone's finish-zone.sh --restart passes none, and
+    nothing else in the restart runs the check."""
+    proc = restart.start()
+    restart.wait_ready(proc)
+    suffix = " --restart" if restart.kind == "op" else ""
+    assert [line for line in restart.lines() if line.startswith("check-defaults")] == [
+        f"check-defaults {restart.kind} --workdir {restart.work} --live{suffix}"
+    ]
     assert restart.stop().returncode == 0
     assert proc.wait(timeout=60) == 0, proc.stdout
 
@@ -586,7 +602,8 @@ def test_o58_a_first_start_records_the_identity_it_verified(kind, tmp_path, hold
     (work / "rootfs" / "root" / "service-ready.lock").touch()
     (work / "run.log").write_text("Congratulations! New deployment\nhpcop: Couchbase guard passed\n", encoding="utf-8")
     (session.bundle / "check-defaults.sh").write_text(
-        f'#!/bin/bash\n[ -e "{work}/identity.json" ] && echo "identity early" >> "$FAKE_LOG"\nexit 0\n',
+        f'#!/bin/bash\n[ -e "{work}/identity.json" ] && echo "identity early" >> "$FAKE_LOG"\n'
+        'echo "check-defaults $*" >> "$FAKE_LOG"\nexit 0\n',
         encoding="utf-8",
     )
     service = node.spawn(processes)
@@ -608,3 +625,5 @@ def test_o58_a_first_start_records_the_identity_it_verified(kind, tmp_path, hold
     assert json.loads((work / "identity.json").read_text(encoding="utf-8")) == expected
     assert oct((work / "identity.json").stat().st_mode & 0o777) == "0o600"
     assert "identity early" not in session.lines()
+    assert f"check-defaults {kind} --workdir {work} --live" in session.lines()  # O98: a first start scans it all
+    assert not [line for line in session.lines() if "--restart" in line]

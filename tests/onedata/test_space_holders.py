@@ -71,3 +71,17 @@ def test_o97_the_map_is_a_plain_copy_each_time(tmp_path):
     config.space_holders().clear()
     assert len(config.space_holders()) == 2
     assert isinstance(config, PlatformConfig)
+
+
+def test_o98_the_holders_are_those_of_the_file_as_it_was_loaded_whatever_it_becomes_after(tmp_path):
+    """O98: the one-space form's holder is read with the rest of the file at load, never by reopening it: a file that
+    is edited or gone after the load changes nothing the configuration says, so a caller that pairs the holders with
+    the ids of that same load never pairs them with another file's."""
+    path = write_platform(tmp_path, lambda data: with_placement(data, holder="beta"))
+    config = load_platform(path)
+    held = config.space_holders()
+    assert held == {config.space.name: "providers[1]"}
+    path.write_text(path.read_text(encoding="utf-8").replace('holder = "beta"', 'holder = "alpha"'), "utf-8")
+    assert config.space_holders() == held
+    path.unlink()
+    assert config.space_holders() == held

@@ -11,7 +11,8 @@
 # --restart (restart.sh, hpcfed.py start) is the same proof for a service started again over its existing
 # deployment: wait_ready in its restart mode (that start prints no 'Congratulations! New'), the guard from the host
 # after the restart, no storage to add, the provider id and domain compared with identity.json (a change fails the
-# start), then the rotation and the live check as ever; identity.json is not rewritten.
+# start), then the rotation and the live check as ever (its scan for the images' Couchbase values leaves the provider's
+# storage out: `check-defaults.sh --restart`, O98); identity.json is not rewritten.
 # op_worker answers the domain from its Onezone connection, so /configuration can say null for a moment after the REST
 # listener answers: both starts wait for a domain that is neither null nor empty (wait_domain), inside the readiness
 # budget (HPCOP_READY_SECONDS, 1800 s), before anything is compared or recorded. A domain that stays null fails the
@@ -69,7 +70,11 @@ DOM=$(jsonget "$T/conf.json" domain) || die "op_worker's /configuration names no
 if (( RESTART )); then check_identity "$W" kind op providerId "$ID" domain "$DOM"; fi
 
 cb_rotate "$W" "$T"
-bash "$HPCOP_BUNDLE/check-defaults.sh" op --workdir "$W" --live
+if (( RESTART )); then   # a restart alone leaves the provider's storage out of the scan for the images' values (O98)
+  bash "$HPCOP_BUNDLE/check-defaults.sh" op --workdir "$W" --live --restart
+else
+  bash "$HPCOP_BUNDLE/check-defaults.sh" op --workdir "$W" --live
+fi
 if (( RESTART )); then
   say "OK provider $ID at $DOM, restarted over its existing deployment"
 else

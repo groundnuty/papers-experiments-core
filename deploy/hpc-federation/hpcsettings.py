@@ -11,7 +11,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional, Sequence, Tuple
 
 import tomllib
 from hpcslurm import valid_network
@@ -36,6 +36,7 @@ HPC_KEYS = (
     "control",
     "sandbox",
     "sandbox_placement",
+    "outage_targets",
 )
 SIZE_KEYS = ("cpus", "memory")
 CORE_PLACES = ("login", "step")  # where the bootstrap and the link check run (DESIGN.md, section 9)
@@ -280,6 +281,23 @@ def _sandbox(table: Mapping[str, Any], agent: Optional[AgentLimits]) -> Optional
     return declared
 
 
+def outage_targets(table: Optional[Mapping[str, Any]], providers: Optional[Sequence[str]] = None) -> Tuple[str, ...]:
+    """The providers a study's owner outage takes down, as the layout's `[hpc] outage_targets` names them (O98): the
+    scope of `up`'s failover-order admission (`hpcfailover`). Empty when the table or the key is absent, which declares
+    no outage and leaves `up` as it was. A list of distinct, non-empty provider names, each in `providers` when that is
+    given (the layout's own); SettingsError names the key, never a name."""
+    if not isinstance(table, Mapping) or "outage_targets" not in table:
+        return ()
+    found = table["outage_targets"]
+    if not isinstance(found, list) or not found or not all(isinstance(name, str) and name for name in found):
+        raise SettingsError("hpc.outage_targets: must be a list of provider names, each a non-empty string")
+    if len(set(found)) != len(found):
+        raise SettingsError("hpc.outage_targets: must name each provider once")
+    if providers is not None and any(name not in providers for name in found):
+        raise SettingsError("hpc.outage_targets: must name providers the layout declares")
+    return tuple(found)
+
+
 def load_settings(table: Optional[Mapping[str, Any]], agent: Optional[AgentLimits] = None) -> HpcSettings:
     """The `[hpc]` table of a layout (None: every default), checked, with the agent's limits when its platform template
     declares them (`agent_limits`); SettingsError names the key."""
@@ -289,6 +307,7 @@ def load_settings(table: Optional[Mapping[str, Any]], agent: Optional[AgentLimit
     unknown = sorted(set(table) - set(HPC_KEYS))
     if unknown:
         raise SettingsError(f"hpc.{unknown[0]}: is not a key of the [hpc] table")
+    outage_targets(table)  # the key's own shape; its names are the layout's to check (`hpcfailover.declared`)
     merged = {**DEFAULTS, **table}
     stop = merged["stop_seconds"]
     if isinstance(stop, bool) or not isinstance(stop, int) or not 30 <= stop <= 3600:

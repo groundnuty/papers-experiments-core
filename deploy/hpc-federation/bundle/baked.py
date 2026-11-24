@@ -4,13 +4,22 @@ Both images carry the same Couchbase state (two cookies and the memcached _admin
 check-defaults.sh checks that none of it is left or came back. The values are listed in lib.sh only as LENGTH:SHA256
 (BAKED_CB_SHA256), so no password-like literal sits in the bundle, and this script compares hashes at run time.
 
-  baked.py DIR LENGTH:SHA256...
+  baked.py [--prune REL]... [--prune-each REL]... DIR LENGTH:SHA256...
 
 DIR is walked without following links, and every regular file is read as bytes. The values are alphanumeric, so each
 maximal run of [A-Za-z0-9] in a file is a place one could sit, at any offset within the run: every window of each
 listed length in the run is hashed and compared. Binary files count as text does (Couchbase's config.dat is one).
+
+--prune REL leaves the entry at REL below DIR out of the walk, and --prune-each REL every entry directly below REL: a
+provider's storage (posix, import/*) holds the study's data, which the images never ship, and with a tmpfs storage it is
+the provider's whole data and takes minutes to read in pure Python. REL is a plain relative path of DIR. Nothing else is
+left out. A REL that is not there prunes nothing (a zone has no storage); one that is a link, or whose parent below DIR
+is a link, or an entry under --prune-each that is a link, is an error, never pruned: what a link stands for is not
+known to be what was meant. (Python 3.8 runs this on the images: no annotations, no new syntax.)
+
 Exit 0 when no file holds one; 1 when one does, with one line per such file on stdout (its path, never the value);
-2 on an error (a file or its metadata that cannot be read, bad arguments), so a caller that tests for 0 fails closed.
+2 on an error (a file or its metadata that cannot be read, a prune path that is a link, bad arguments), so a caller that
+tests for 0 fails closed.
 """
 
 import hashlib
@@ -56,18 +65,63 @@ def file_holds(path, wanted):
             return holds(data, wanted)
 
 
-def scan(top, wanted):
-    """The regular files under top that hold a wanted value. Raises OSError on one that cannot be read."""
+def below(top, rel):
+    """The path `rel` below top, or None when it is not there. OSError when rel is no plain relative path, or when it
+    or any directory on the way to it is a link: lstat on every component, so no link is followed."""
+    parts = rel.split("/")
+    if not rel or rel.startswith("/") or any(part in ("", ".", "..") for part in parts):
+        raise OSError("not a plain relative path: %r" % rel)
+    path = top
+    for part in parts:
+        path = os.path.join(path, part)
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(mode):
+            raise OSError("a prune path is a link: %s" % path)
+    return path
+
+
+def pruned(top, prune, prune_each):
+    """The paths left out of the walk: each of `prune` that is there, and each entry below each of `prune_each` that is
+    there. OSError as `below` says, for an entry that is a link, and for a `prune_each` that is not a directory."""
+    skip = set()
+    for rel in prune:
+        path = below(top, rel)
+        if path is not None:
+            skip.add(path)
+    for rel in prune_each:
+        path = below(top, rel)
+        if path is None:
+            continue
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            raise OSError("a prune-each path is not a directory: %s" % path)
+        for name in os.listdir(path):
+            entry = os.path.join(path, name)
+            if stat.S_ISLNK(os.lstat(entry).st_mode):
+                raise OSError("a prune path is a link: %s" % entry)
+            skip.add(entry)
+    return skip
+
+
+def scan(top, wanted, prune=(), prune_each=()):
+    """The regular files under top that hold a wanted value, but what `prune` and `prune_each` leave out. Raises
+    OSError on one that cannot be read, or on a prune path that is a link."""
     if not stat.S_ISDIR(os.lstat(top).st_mode):  # raises when top cannot be stat'ed; a link to a directory is refused
         raise OSError("not a directory: %s" % top)
+    skip = pruned(top, prune, prune_each)
     found = []
 
     def fail(err):
         raise err
 
-    for root, _dirs, files in os.walk(top, onerror=fail):
+    for root, dirs, files in os.walk(top, onerror=fail):
+        dirs[:] = [name for name in dirs if os.path.join(root, name) not in skip]  # in place: the walk goes no further
         for name in sorted(files):
             path = os.path.join(root, name)
+            if path in skip:
+                continue
             # lstat, not os.path.isfile: an error must fail the scan, never skip the file as not regular.
             mode = os.lstat(path).st_mode
             if stat.S_ISDIR(mode):  # os.walk could not tell it was a directory, so it was never walked
@@ -77,12 +131,28 @@ def scan(top, wanted):
     return found
 
 
+def options(argv):
+    """(prune, prune_each, the arguments left) from argv; ValueError for an option that is unknown or has no value."""
+    prune, prune_each, rest = [], [], list(argv)
+    while rest and rest[0].startswith("--"):
+        name = rest.pop(0)
+        if name not in ("--prune", "--prune-each") or not rest:
+            raise ValueError("unknown option, or one with no value: %s" % name)
+        (prune if name == "--prune" else prune_each).append(rest.pop(0))
+    return prune, prune_each, rest
+
+
 def main(argv):
-    if len(argv) < 2:
-        sys.stderr.write("usage: baked.py DIR LENGTH:SHA256...\n")
+    try:
+        prune, prune_each, rest = options(argv)
+    except ValueError as err:
+        sys.stderr.write("baked.py: %s\n" % err)
+        return 2
+    if len(rest) < 2:
+        sys.stderr.write("usage: baked.py [--prune REL]... [--prune-each REL]... DIR LENGTH:SHA256...\n")
         return 2
     try:
-        found = scan(argv[0], parse(argv[1:]))
+        found = scan(rest[0], parse(rest[1:]), prune, prune_each)
     except (OSError, ValueError) as err:
         sys.stderr.write("baked.py: %s\n" % err)
         return 2

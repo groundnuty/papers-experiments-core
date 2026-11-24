@@ -245,6 +245,9 @@ class PlatformConfig:
     addresses: AddressMap | None = field(default=None, repr=False, compare=False)
     addresses_file: Path | None = field(default=None, repr=False, compare=False)  # the map's file (O73): a Python tool
     addresses_resolver: Path | None = field(default=None, repr=False, compare=False)  # server reads it, by this shim
+    # `[placement] holder` as the file was loaded, which the one-space form's data provider is (`space_holders`, O97):
+    # the configuration's own, read with its ids, so what it says of a holder is never another read of the file (O98).
+    placement_holder: str | None = field(default=None, repr=False, compare=False)
 
     @property
     def probe_space(self) -> Space | None:
@@ -305,8 +308,9 @@ class PlatformConfig:
         """Each space's data provider, for the sandbox's attribution of a blocked read (O97): the space's name as the
         mount shows it (the first component under the mount) to its holder's label, `providers[i]`, never its name. An
         entry of `[[spaces]]` names its own `holder`, never `[placement]`'s (O09); the one-space form, which declares
-        none, has the data provider `[placement]` names, when it has the table. A space with no holder is left out, so
-        a block on it is never attributed to the agent."""
+        none, has the data provider `[placement]` names, when it has the table, as the file said when it was loaded
+        (never by reading it again, so a holder is always the one of the ids it is paired with: O98). A space with no
+        holder is left out, so a block on it is never attributed to the agent."""
         holders = {}
         for entry in self.spaces:
             name = entry.holder if entry.holder is not None else self._placement_holder(entry)
@@ -319,8 +323,7 @@ class PlatformConfig:
         without the table, or when it names no declared provider (that is refused where the table is loaded)."""
         if self.spaces_table or entry is not self.spaces[0]:
             return None
-        table = load_toml(self.file).get("placement")
-        name = table.get("holder") if isinstance(table, dict) else None
+        name = self.placement_holder
         return name if isinstance(name, str) and name in self.providers else None
 
     def provider_labels(self, names: Iterable[str]) -> str:
@@ -338,13 +341,13 @@ class PlatformConfig:
         It is the TLS setting by its mode, with the bundle's SHA-256 under ca_file, never a path or a value, and the
         lifetime rule of the run's tokens (`tokens`). Whenever the `[[spaces]]` form is used (one entry or several), it
         holds each entry's SHA-256 in the file's order (`StudySpace.digest`), so a resume under another set, order,
-        support, data provider or token planes is refused. An entry that declares its data (`data_manifest`) is there
-        by its declared identity and its data's content hash, without its Onezone id: a space is the same experimental
-        condition across federations when its declared identity and its data identity match (C06); one that does not is
-        there with its id, as it always was. The one-space form holds its support set and its local provider by label
-        and its prefixes by their SHA-256 (`support`), its data identity (`space_data`) when `[space]` declares
-        `data_manifest`, and `storage_import` with its `readonly` (and `shared`, when true: O59) when it declares an
-        imported storage (O41).
+        support, data provider, token planes or failover holders (O98) is refused. An entry that declares its data
+        (`data_manifest`) is there by its declared identity and its data's content hash, without its Onezone id: a space
+        is the same experimental condition across federations when its declared identity and its data identity match
+        (C06); one that does not is there with its id, as it always was. The one-space form holds its support set and
+        its local provider by label and its prefixes by their SHA-256 (`support`), its data identity (`space_data`) when
+        `[space]` declares `data_manifest`, and `storage_import` with its `readonly` (and `shared`, when true: O59) when
+        it declares an imported storage (O41).
 
         With a `[sandbox]`, it also holds every level of the data path with its kind, a REST level's listing mode and a
         mount level's I/O mode (O21, O36), the caps of the tables of the bytes served when `[sandbox.served_bytes]` is
@@ -653,6 +656,14 @@ def _toolserver(section: Section, base: Path, *, require_manifests: bool = True)
     )
 
 
+def _placement_holder_of(root: Section) -> str | None:
+    """The name `[placement] holder` gives, as the file just read says it: None when there is no such table or key, or
+    the value is no string (the table's own loading refuses what it must; `space_holders` takes a declared name)."""
+    table = root.data.get("placement")
+    name = table.get("holder") if isinstance(table, dict) else None
+    return name if isinstance(name, str) else None
+
+
 def load_platform(
     path: str | os.PathLike[str],
     *,
@@ -738,6 +749,7 @@ def load_platform(
         sha256=digest,
         tls=tls,
         link_check=load_link_check(root, providers, spaces),
+        placement_holder=_placement_holder_of(root),
         **_addresses(root, file),
     )
     if config.addresses_resolver is not None and config.toolserver is not None:

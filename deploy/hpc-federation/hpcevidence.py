@@ -89,7 +89,9 @@ SELF_REWRITTEN_FILES = (STATE, LINK_CHECK)
 # `UP_FILES` and `UP_TREES` are what `up` writes (and the federation rewrites), present in every root `up` finished, so
 # they say nothing of what ran; `RUN_FILES` and `RUN_TREES` (below) are what a run, a step or the operator leaves, and
 # are the evidence `down` refuses to remove uncollected. Every file of the allow-list is in exactly one of the two.
-UP_FILES = (STATE, LINK_CHECK, "platform.toml", "facts.json", "render-identity.json")
+# `failover-order.json` (O98, `hpcfailover`) is present only in a root whose layout declares an owner outage and whose
+# order passed: labels alone, written once by `up`.
+UP_FILES = (STATE, LINK_CHECK, "platform.toml", "facts.json", "render-identity.json", "failover-order.json")
 UP_TREES = ("data-manifests",)  # `hpcdata.data_manifests`: each non-imported space's manifest, written by `up`
 STEPS_KIND = "step records"
 JOURNAL_KIND = "the fault journal"

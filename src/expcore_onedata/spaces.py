@@ -16,6 +16,7 @@ holder = "<name>"               # this space's data provider, one of its provide
 tokens = ["data_path", "tool_server"]  # optional: the token planes whose caveats reach this space; both by default
 import = { readonly = true }    # optional: the data provider holds this space on an imported storage (below)
 data_manifest = "data.json"     # optional: the manifest of the data the space holds (below)
+failover = ["<name>", ...]      # optional: the providers holding the space's whole replica its reads fail over to (O98)
 ```
 
 Each entry is a `StudySpace`. The one-space form reads as the single space `spaces[0]` with the label `space`. A
@@ -25,6 +26,16 @@ entries (the agent is pinned to one, O03), an entry without its data provider or
 space, and a token plane scoped to no space. Whenever the `[[spaces]]` form is used, with one entry or several, its
 entries are in the campaign fingerprint (`PlatformConfig.fingerprint`); the one-space form's space is in it by its
 support, name and prefixes (`support`, `runsettings.support_record`).
+
+**The failover holders** (`failover`, in an entry of `[[spaces]]` only, never in `[space]`; O98). Taking down a space's
+data provider (an owner outage) fails the space's reads over to another provider only when that provider holds the
+space's blocks and its provider id sorts below the owner's (`failover.py`). A provider that merely supports the space
+is not such a holder: the agent's local provider supports every space, yet is evicted at every reset and holds none
+of its data. `failover` names the providers that hold the space's whole replica, so that the order is checked over the
+owner and these alone: a non-empty list of the entry's `providers`, each once, never the entry's `holder` (the provider
+taken down) and never its `local` provider (it holds no replica to fail over to). An entry without the key declares
+none, and the space is out of scope of the order check. The declaration is in the fingerprint, in the entry's digest,
+and only when it is made, so that the digest of every entry without the key is what it always was.
 
 **An imported storage** (`import`, in `[space]` or an entry of `[[spaces]]`; O41, `storageimport.py`). The space's data
 provider holds its files on a storage Onedata imported them from (25.0's storage import), not on one they were written
@@ -66,7 +77,7 @@ ONE_SPACE_LABEL = "space"  # the label of the one-space form's space: its table'
 LABEL = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 SPACE_KEYS = ("name", "id", "prefixes", "import", "data_manifest")
 SUPPORT_KEYS = ("providers", "local")
-SPACES_KEYS = ("label", *SPACE_KEYS, *SUPPORT_KEYS, "holder", "tokens")
+SPACES_KEYS = ("label", *SPACE_KEYS, *SUPPORT_KEYS, "holder", "tokens", "failover")
 
 
 @dataclass(frozen=True)
@@ -103,8 +114,8 @@ class ImportedStorage:
 @dataclass(frozen=True)
 class StudySpace:
     """One declared space: the label code names it by, the space, the providers that support it, its data provider
-    when it declares one, and the token planes whose caveats reach it. A message names it by `position`, never by its
-    label or its name."""
+    when it declares one, the token planes whose caveats reach it and the providers it declares to hold its replica
+    (`failover`, O98). A message names it by `position`, never by its label or its name."""
 
     label: str
     position: str  # `spaces[i]`, its place in the file
@@ -114,6 +125,8 @@ class StudySpace:
     tokens: tuple[str, ...] = PLANES
     imported: ImportedStorage | None = None  # None: a regular storage, the data written to it (O41)
     data: str | None = None  # the content hash of the data manifest it declares (`data_manifest`), None without one
+    # the providers holding its whole replica, which its reads fail over to when its data provider is down (O98)
+    failover: tuple[str, ...] = ()
 
     def digest(self) -> str:
         """The SHA-256 of everything that makes this the space it is, for the fingerprint: never a value itself. With a
@@ -141,6 +154,8 @@ class StudySpace:
         }
         if self.imported is not None:
             facts["import"] = self.imported.record()
+        if self.failover:  # only when declared, so no earlier entry's digest moves (O98)
+            facts["failover"] = list(self.failover)
         return facts
 
 
@@ -220,7 +235,32 @@ def _entry(entry: Section, position: str, providers: Collection[str]) -> StudySp
     if len(set(tokens)) != len(tokens) or any(plane not in PLANES for plane in tokens):
         raise entry.fail("tokens", f"must list token planes, each once; known: {', '.join(PLANES)}")
     data = parse_data(entry)
-    return StudySpace(label, position, parse_space(entry), support, holder, tuple(tokens), parse_import(entry), data)
+    failover = parse_failover(entry, support, holder)
+    return StudySpace(
+        label, position, parse_space(entry), support, holder, tuple(tokens), parse_import(entry), data, failover
+    )
+
+
+def parse_failover(entry: Section, support: Support, holder: str) -> tuple[str, ...]:
+    """The providers an entry of [[spaces]] declares to hold its whole replica, which its reads fail over to when its
+    data provider is taken down (`failover`, O98); the empty tuple without the key. A non-empty list of the entry's
+    providers, each once, neither its `holder` nor its `local` provider (evicted at every reset, it holds no replica).
+    """
+    if "failover" not in entry.data:
+        return ()
+    names = entry.strings("failover")
+    if not names or len(set(names)) != len(names):
+        raise entry.fail("failover", "must list at least one provider, each once")
+    if any(name not in support.providers for name in names):
+        raise entry.fail("failover", "must name providers that support the space")
+    if holder in names:
+        raise entry.fail("failover", "must not name the space's data provider, the one that is taken down")
+    if support.local in names:
+        raise entry.fail(
+            "failover",
+            "must not name the local provider: it is evicted at every reset, so it holds no replica to fail over to",
+        )
+    return names
 
 
 def parse_data(section: Section) -> str | None:

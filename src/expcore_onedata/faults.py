@@ -27,6 +27,21 @@ journalled as done. Whatever breaks after the stop command (the wait, the journa
 the provider back at once and fails `start` as `injector_failure`, a kind no condition may declare, so the attempt is
 set aside and run again; the reading shows the failed injection and the clear that followed.
 
+**An owner stop needs a failover holder asked first (O98).** Op-worker asks the holders of a file's blocks in the order
+of their provider ids and does not retry another after a disconnected one, so taking down the provider that holds a
+space's data fails its reads over to another holder only when some holder's id sorts below the owner's
+(`expcore_onedata.failover`). A provider that merely supports the space is no holder (the agent's local provider
+supports every space and holds none of its data, being evicted at every reset), so the platform file declares, for each
+space, the providers that hold its whole replica (`failover` in `[[spaces]]`, in the campaign fingerprint). Before
+anything else, before the federation is admitted, an earlier run's injection is recovered or anything is locked or
+journalled, `start` (and the entry of `prepared`) checks the order over the owner and those holders from the platform's
+ids, holders and declarations, as the injector was built with them, for every space the target holds that declares
+them; when it does not hold, or an id is not known, nothing is touched and `start` fails as `injector_failure`, naming
+spaces and providers by label. A platform that declares failover holders for no space is not checked, as before, and
+neither is a target that holds no space another provider supports. Where some space declares them, a space the target
+holds that another provider supports and that declares none fails the start the same way. Nothing of the federation's
+root is read: the platform file is the authority.
+
 **Clear (O11).** `clear` brings the provider back and counts a restore only when the provider runs with an identity
 other than the one read before the injection (`ComposeDriver`: the container's id and start time). Readiness alone is
 not a restore, and a provider back with the same identity is a failed restore. The start is tried a bounded number of
@@ -324,7 +339,7 @@ from expcore.campaign import liveness
 from expcore.config.loading import ConfigError
 from expcore.errors import InfraError, uncharged_kinds
 from expcore.records.injections import FAULT_NAMESPACE
-from expcore_onedata import fault_owner
+from expcore_onedata import failover, fault_owner
 from expcore_onedata.admission import (
     INJECTOR,
     Admission,
@@ -459,6 +474,7 @@ class FaultInjector:
         if service is None:
             raise FaultRefused(f"{settings.file}: [faults.services]: no service is declared for {target}")
         self.target, self._service, self._driver = target, service, driver
+        self._config, self._owner_name = config, names[target]  # its ids and holders as loaded: an owner stop's check
         self._clock, self._sleep = clock, sleep
         labels = {config.provider_label(name): service for name, service in settings.services.items()}
         # holds no reference to the injector: a dropped injector's locks go when its last reference does (no cycle)
@@ -575,8 +591,10 @@ class FaultInjector:
             give_up()
 
     def _prepare(self, identity: Mapping[str, Any]) -> None:
-        """The first half of `start`: everything before the target's lock."""
+        """The first half of `start`: everything before the target's lock. A stop that is known to be invalid is refused
+        first (`_require_failover_order`), so nothing is admitted, released, recovered, journalled or locked for it."""
         self._require_sanction()
+        self._require_failover_order()
         self._release_held()  # a hold of an earlier run of this injector never outlives that run's injection
         if self._pending is not None and not self._clear():  # an earlier start of this injector was never cleared
             raise self._fail(f"an earlier injection of {self.target} by this injector is still not cleared")
@@ -654,6 +672,22 @@ class FaultInjector:
                 "the federation's link epoch moved since this start's preparation (a heal began, or a link check found "
                 "a pair failing): no injection"
             )
+
+    def _require_failover_order(self) -> None:
+        """Refuse an owner stop whose failover holders would not be asked first (O98), before the federation is admitted,
+        an earlier injection is recovered or anything is locked, journalled or stopped: for every space whose data
+        provider is the target and that declares its failover holders (`failover` in the platform file), one holder's
+        provider id must sort below the owner's, from the ids, holders and declarations this injector was built with
+        (the configuration it was given, read nowhere again), or op-worker asks the stopped owner first and every read
+        waits on it (`expcore_onedata.failover`). A platform that declares failover holders for no space is not
+        checked, and neither is a target that owns no space another provider supports. Where some space declares them,
+        a space the target owns that another provider supports and that declares none is refused, and so is a platform
+        whose ids are not known for such a space: the order is never assumed (`failover.admit_stop`). Nothing of the
+        federation's root is read. A pass changes no step and no snapshot."""
+        try:
+            failover.admit_stop(self._config, self._owner_name)
+        except failover.FailoverError as error:
+            raise self._fail(f"{error}; nothing is taken down") from None
 
     def _inject(self) -> None:
         """The second half of `start`: lock the target, journal the injection, stop it and see it down."""
