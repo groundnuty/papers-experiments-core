@@ -59,20 +59,24 @@
   proven ended, one past its recorded job end, and, writing nothing, while a live controller does not say it honours
   operator writes, as `pause` is.
 - `reopen-run LEDGER --lease N --archive PATH --reason TEXT --actor NAME [--dry-run]`: put one run that a study-plugin
-  defect ended as `harness_error` back to `pending`, with its evidence. The run's only real attempt was one the model
-  API refused (`key_rejected`, uncharged); it ran again under the same attempt number, and the plugin's instrument
-  failed at its start with a `LedgerError`, which the core treats as terminal. It is refused, writing nothing and naming
-  the condition, unless: lease N is `counted` and the latest lease of its run; the run is `harness_error`; PATH (a
-  plain `.tar`, or a `.tar.zst`, which is hashed as the tar it holds and needs the `zstd` program) is a regular file,
+  defect ended as `harness_error` back to `pending`, with its evidence. An attempt of the run was set aside and charged
+  nothing (an uncharged infrastructure failure: the model API refused the key, `key_rejected`, or the budget held the
+  request, `budget_hold`); it ran again under the same attempt number, and the plugin's instrument failed at its start
+  with a `LedgerError`, which the core treats as terminal. It is refused, writing nothing and naming the condition,
+  unless: lease N is `counted`, the latest lease of its run, and charged nothing (its counted attempts and its
+  completion's `charged` are 0; an earlier lease of the run may have charged); the run is `harness_error`; PATH (a
+  plain `.tar`, or a `.tar.zst`, which is hashed as the tar it holds, read through the `zstd` program for at most ten
+  minutes and 8 GiB, and must end as a tar does, with nothing but zero bytes after its last member) is a regular file,
   never a link, whose SHA-256 is the one lease N's completion names; its `out/state.sqlite` holds attempt rows of the
-  run that are all uncharged, include one `key_rejected` and end with a `harness_error` whose detail starts with
-  `LedgerError`; no lease of the run is in flight or expired with its holder not proven ended; and the run has a
-  charged attempt left (it is below `max_attempts`). The change is the run's state and one `operator_reopen` event (the
-  run, the lease, the archive's hash, the attempt rows' summary, the reason and the actor): its charged count stays, so
-  its next lease takes it as its `attempt_base`. The archive is read before the write lock is taken, and every ledger
-  condition is decided again under it. `--dry-run` decides every condition and writes nothing. A second call is refused
-  (the run is no longer `harness_error`). Written as `pause` is, beside a running controller, and refused while one
-  does not say it honours operator writes.
+  run that are all uncharged, end with a `harness_error` whose detail starts with `LedgerError`, and hold before it an
+  `infra_fail` of an uncharged kind with that last row's attempt number; no lease of the run is in flight or expired
+  with its holder not proven ended; and the run has a charged attempt left (it is below `max_attempts`). The change is
+  the run's state and one `operator_reopen` event (the run, the lease, the archive's hash, the attempt rows' summary,
+  the reason and the actor): its charged count stays, so its next lease takes it as its `attempt_base`. The archive is
+  read before the write lock is taken, and every ledger condition, the completion's hash and the controller's
+  declaration are decided again under it. `--dry-run` decides every condition, again at its end, and writes nothing. A
+  second call is refused (the run is no longer `harness_error`). Written as `pause` is, beside a running controller,
+  and refused while one does not say it honours operator writes.
 
 `status`, `raise-ceiling`, `set-cap`, `declare`, `pause`, `resume`, `drain` and `reopen-run` work on the ledger file
 under its own write lock and not the dispatcher's, so they run while a dispatcher holds the ledger, and the

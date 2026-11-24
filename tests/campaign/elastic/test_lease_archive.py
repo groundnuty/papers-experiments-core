@@ -24,6 +24,7 @@ from reopen_support import (
     sha256_of,
 )
 
+from expcore.campaign.attempts import UNCHARGED_KINDS
 from expcore.campaign.elastic.leasearchive import AttemptRow, check_attempts, read_evidence
 from expcore.campaign.elastic.records import ReopenRefused
 
@@ -215,8 +216,12 @@ def test_a_store_with_no_row_of_the_run_is_refused(tmp_path):
     [
         ((REFUSED, Row(1, "harness_error", 1, None, LEDGER_ERROR)), "uncharged"),
         ((Row(1, "infra_fail", 1, "key_rejected", "x"), DEFECT), "uncharged"),
-        ((Row(1, "infra_fail", 0, "endpoint", "x"), DEFECT), "key_rejected"),
-        ((DEFECT,), "key_rejected"),
+        ((Row(1, "infra_fail", 0, "endpoint", "x"), DEFECT), "of an uncharged kind (budget_hold, key_rejected)"),
+        ((DEFECT,), "no earlier attempt of number 1"),
+        ((REFUSED, Row(2, "harness_error", 0, None, LEDGER_ERROR)), "no earlier attempt of number 2"),
+        ((Row(1, "interrupted", 0, "key_rejected", "x"), DEFECT), "no earlier attempt of number 1"),
+        ((Row(1, "infra_fail", 0, None, "x"), DEFECT), "no earlier attempt of number 1"),
+        ((REFUSED, Row(2, "interrupted", 0, None, None), Row(2, "harness_error", 0, None, LEDGER_ERROR)), "number 2"),
         ((REFUSED, Row(1, "infra_fail", 0, "endpoint", "x")), "not harness_error"),
         ((DEFECT, REFUSED), "not harness_error"),
         ((REFUSED, Row(1, "harness_error", 0, None, None)), "does not start with LedgerError"),
@@ -230,6 +235,21 @@ def test_attempt_rows_that_are_not_what_a_plugin_defect_leaves_are_refused(tmp_p
     that is not a harness error, and a detail that is missing or is not the plugin's LedgerError."""
     archive, sha = make_archive(tmp_path, RUN, rows)
     _refused(archive, sha, 4, phrase)
+
+
+@pytest.mark.parametrize("kind", sorted(UNCHARGED_KINDS))
+def test_an_earlier_attempt_of_any_uncharged_kind_of_the_core_is_the_one_run_again(tmp_path, kind):
+    """The harness error follows an attempt of its own number that was set aside, charged nothing, whatever the core's
+    reason for setting it aside (a refused key, a budget hold)."""
+    archive, sha = make_archive(tmp_path, RUN, (Row(1, "infra_fail", 0, kind, "x"), DEFECT))
+    assert [row.infra_kind for row in read_evidence(archive, RUN, sha).attempts] == [kind, None]
+
+
+def test_the_set_aside_attempt_that_counts_is_the_one_of_the_harness_errors_own_number(tmp_path):
+    """An earlier attempt number's set-aside row is not it, but one of the last number's, beside other rows, is."""
+    rows = (REFUSED, Row(2, "infra_fail", 0, "budget_hold", "x"), Row(2, "harness_error", 0, None, LEDGER_ERROR))
+    archive, sha = make_archive(tmp_path, RUN, rows)
+    assert [row.attempt for row in read_evidence(archive, RUN, sha).attempts] == [1, 2, 2]
 
 
 def test_a_charged_row_that_lives_only_in_the_wal_is_seen_and_refused(tmp_path):
@@ -249,7 +269,7 @@ def test_a_row_that_lives_only_in_the_wal_counts_when_it_is_the_defect(tmp_path)
     ("rows", "phrase"),
     [
         ([], "no attempt"),
-        ([AttemptRow(1, 1, "harness_error", None, 0, LEDGER_ERROR)], "key_rejected"),
+        ([AttemptRow(1, 1, "harness_error", None, 0, LEDGER_ERROR)], "no earlier attempt of number 1"),
         (
             [AttemptRow(1, 1, "infra_fail", "key_rejected", None, "x"), AttemptRow(2, 1, "harness_error", None, 0, "")],
             "charged None",

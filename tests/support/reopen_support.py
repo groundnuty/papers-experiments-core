@@ -1,10 +1,10 @@
 """A ledger in which a plugin defect ended a run as harness_error, and the synthetic archive of the lease that ended it.
 
 The shape is the one an operator reopens: lease 1 of the run ended infra_fail with one charged attempt; lease 2 ran
-the run again (its `attempt_base` is 1), and its store holds two attempts of one number, the first refused by the model
-API (`key_rejected`, uncharged) and the second, run again under the same number, a harness error whose detail starts
-with the plugin's `LedgerError`. The archive is built with the worker's own `_archive`, so it is the tar a worker writes
-(`out/` as `out`, a plain tar), whose SHA-256 the completion names. Names are invented.
+the run again (its `attempt_base` is 1), and its store holds two attempts of one number, the first set aside uncharged
+(refused by the model API, `key_rejected`) and the second, run again under the same number, a harness error whose
+detail starts with the plugin's `LedgerError`. The archive is built with the worker's own `_archive`, so it is the tar a
+worker writes (`out/` as `out`, a plain tar), whose SHA-256 the completion names. Names are invented.
 """
 
 import hashlib
@@ -16,14 +16,17 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
 from elastic_support import SITE, FakeClock, finish, join, leased, ledger_path, make, plan
 
 from expcore.campaign.elastic import Completion, Ledger, SiteReading
 from expcore.campaign.elastic import worker as elastic_worker
-from expcore.campaign.elastic.reopenrun import reopen_in_file
+from expcore.campaign.elastic.records import ReopenRefused
+from expcore.campaign.elastic.reopenrun import REOPEN, reopen_in_file
 
 FED = "site-a-fed-1"
 OTHER_RUN = "task=task-9|model=m1|condition=api-none"
+WHY = "the plugin's ledger refused the restart of an attempt the key had already refused"
 LEDGER_ERROR = "LedgerError 0123456789ab: the instrument could not record its start"
 REFUSED_DETAIL = "HTTP 403 PermissionDeniedError"
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
@@ -101,21 +104,27 @@ def fake_zstd_archive(tar: Path, name: str | None = None) -> Path:
     return target
 
 
+def install_zstd_script(bin_dir: Path, monkeypatch, body: str) -> None:
+    """Put a `zstd` first on PATH that is this shell script (it reads the archive, magic included, on its stdin)."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "zstd"
+    script.write_text(f"#!/bin/sh\n{body}", encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+
 def install_stand_in_zstd(bin_dir: Path, monkeypatch, *, exit_status: int = 0, after_output: bool = False) -> None:
     """Put a `zstd` first on PATH that drops the magic and passes the rest through, so the reading of a compressed
     archive is tested whether or not the machine has the real program. With `exit_status` it exits so with a message:
     before any output, or with `after_output` after passing the whole tar through (a stream that fails at its end)."""
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    script = bin_dir / "zstd"
     failing = f"echo 'stand-in zstd: corrupt input' >&2\nexit {exit_status}\n"
     if exit_status and after_output:
-        script.write_text(f"#!/bin/sh\ntail -c +5\n{failing}", encoding="utf-8")
+        body = f"tail -c +5\n{failing}"
     elif exit_status:
-        script.write_text(f"#!/bin/sh\n{failing}", encoding="utf-8")
+        body = failing
     else:
-        script.write_text("#!/bin/sh\nexec tail -c +5\n", encoding="utf-8")
-    script.chmod(script.stat().st_mode | stat.S_IXUSR)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+        body = "exec tail -c +5\n"
+    install_zstd_script(bin_dir, monkeypatch, body)
 
 
 def real_zstd_archive(tar: Path) -> Path:
@@ -138,10 +147,13 @@ class Incident:
     clock: FakeClock
 
 
-def incident(tmp_path: Path, rows=INCIDENT, *, wal_rows=(), state: str = "harness_error", tasks: int = 2) -> Incident:
+def incident(
+    tmp_path: Path, rows=INCIDENT, *, wal_rows=(), state: str = "harness_error", tasks: int = 2, charged: int = 0
+) -> Incident:
     """Build the ledger and the archive: lease 1 of the first run ends infra_fail charging one attempt, lease 2 takes
-    the run on (attempt base 1) and ends as `state` with a completion that names the archive of `rows`. The ledger is
-    closed, as it is when no controller holds it."""
+    the run on (attempt base 1) and ends as `state` with a completion that names the archive of `rows` and says it
+    `charged` attempts (none, as a lease that was set aside and run again charges). The ledger is closed, as it is when
+    no controller holds it."""
     ledger, clock = make(tmp_path, runs=plan(tasks=tasks, conditions=("api-none",)))
     join(ledger, clock, FED)
     first = leased(ledger, FED)
@@ -149,7 +161,7 @@ def incident(tmp_path: Path, rows=INCIDENT, *, wal_rows=(), state: str = "harnes
     second = leased(ledger, FED)
     assert (second.run_key, second.attempt_base) == (first.run_key, 1)
     archive, sha = make_archive(tmp_path, second.run_key, rows, wal_rows=wal_rows)
-    reading = Completion(lease_id=second.lease_id, state=state, charged=0, spend_usd=0.1, archive_sha256=sha)
+    reading = Completion(lease_id=second.lease_id, state=state, charged=charged, spend_usd=0.1, archive_sha256=sha)
     ledger.observe_site(SITE, SiteReading(completions=(reading,)))
     assert ledger.verify_archive(second.lease_id, sha) == "counted"
     ledger.close()
@@ -190,3 +202,40 @@ def sql(path: Path, statement: str, *args) -> None:
 
 def sha256_of(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def reopen_found(found: Incident, **changes):
+    """The command on the incident (`lease`, `archive` and `dry_run` may be changed), with the incident's clock."""
+    arguments = {"lease": found.lease_id, "archive": found.archive, "dry_run": False}
+    arguments.update(changes)
+    return reopen_in_file(
+        found.path,
+        arguments["lease"],
+        arguments["archive"],
+        WHY,
+        "op-1",
+        dry_run=arguments["dry_run"],
+        clock=found.clock,
+    )
+
+
+def assert_refused(found: Incident, number: int, phrase: str, **changes) -> str:
+    """The command is refused naming condition `number`, and every table is as it was."""
+    before = dump(found.path)
+    with pytest.raises(ReopenRefused) as refusal:
+        reopen_found(found, **changes)
+    message = str(refusal.value)
+    assert message.startswith(f"condition {number} ("), message
+    assert phrase in message, message
+    assert dump(found.path) == before
+    return message
+
+
+def events_of(path: Path) -> list[sqlite3.Row]:
+    """The `operator_reopen` events of the ledger file, in order."""
+    db = sqlite3.connect(path)
+    db.row_factory = sqlite3.Row
+    try:
+        return db.execute("SELECT * FROM events WHERE kind=? ORDER BY seq", (REOPEN,)).fetchall()
+    finally:
+        db.close()

@@ -5,7 +5,6 @@ accepted, and must leave every table of the ledger, `sqlite_sequence` included, 
 import json
 import shutil
 import sqlite3
-from pathlib import Path
 
 import pytest
 from elastic_support import assert_invariants, leased
@@ -14,7 +13,7 @@ from reopen_support import (
     FED,
     LEDGER_ERROR,
     REFUSED,
-    Incident,
+    WHY,
     Row,
     dump,
     fake_zstd_archive,
@@ -25,51 +24,17 @@ from reopen_support import (
     real_zstd_archive,
     sql,
 )
+from reopen_support import assert_refused as _refused
+from reopen_support import events_of as _events
+from reopen_support import reopen_found as _reopen
 
 from expcore.campaign.elastic import reopenrun as module
 from expcore.campaign.elastic.__main__ import main
 from expcore.campaign.elastic.awareness import AWARE, NONE
 from expcore.campaign.elastic.records import ReopenRefused
-from expcore.campaign.elastic.reopenrun import REOPEN, reopen_in_file
 from expcore.campaign.lock import DispatchLock
 
-WHY = "the plugin's ledger refused the restart of an attempt the key had already refused"
 needs_zstd = pytest.mark.skipif(shutil.which("zstd") is None, reason="the zstd program is not installed")
-
-
-def _reopen(found: Incident, **changes):
-    arguments = {"lease": found.lease_id, "archive": found.archive, "dry_run": False}
-    arguments.update(changes)
-    return reopen_in_file(
-        found.path,
-        arguments["lease"],
-        arguments["archive"],
-        WHY,
-        "op-1",
-        dry_run=arguments["dry_run"],
-        clock=found.clock,
-    )
-
-
-def _refused(found: Incident, number: int, phrase: str, **changes) -> str:
-    """The command is refused naming condition `number`, and every table is as it was."""
-    before = dump(found.path)
-    with pytest.raises(ReopenRefused) as refusal:
-        _reopen(found, **changes)
-    message = str(refusal.value)
-    assert message.startswith(f"condition {number} ("), message
-    assert phrase in message, message
-    assert dump(found.path) == before
-    return message
-
-
-def _events(path: Path) -> list[sqlite3.Row]:
-    db = sqlite3.connect(path)
-    db.row_factory = sqlite3.Row
-    try:
-        return db.execute("SELECT * FROM events WHERE kind=? ORDER BY seq", (REOPEN,)).fetchall()
-    finally:
-        db.close()
 
 
 def test_a_harness_error_run_goes_back_to_pending_and_only_its_state_and_one_event_change(tmp_path):
@@ -155,6 +120,17 @@ def test_the_attempt_rows_are_read_with_the_wal_the_archive_holds(tmp_path):
     _refused(charged, 4, "uncharged")
 
 
+def test_a_run_whose_set_aside_attempt_was_a_budget_hold_is_reopened_and_the_event_shows_its_kind(tmp_path):
+    """Any uncharged infrastructure kind of the core is the earlier attempt, not only a refused key."""
+    found = incident(tmp_path, (Row(1, "infra_fail", 0, "budget_hold", "the campaign did not pay"), DEFECT))
+    _reopen(found)
+    (event,) = _events(found.path)
+    assert [(row["state"], row["infra_kind"]) for row in json.loads(event["detail"])["attempts"]] == [
+        ("infra_fail", "budget_hold"),
+        ("harness_error", None),
+    ]
+
+
 def test_a_lease_the_ledger_never_issued_is_refused(tmp_path):
     _refused(incident(tmp_path), 1, "has no lease 99", lease=99)
 
@@ -235,11 +211,12 @@ def test_a_path_that_is_not_a_regular_file_is_refused(tmp_path, kind):
     ("rows", "wal_rows", "phrase"),
     [
         ((REFUSED, Row(1, "harness_error", 1, None, LEDGER_ERROR)), (), "uncharged"),
-        ((Row(1, "infra_fail", 0, "endpoint", "x"), DEFECT), (), "no attempt ended infra_fail of kind key_rejected"),
+        ((Row(1, "infra_fail", 0, "endpoint", "x"), DEFECT), (), "of an uncharged kind (budget_hold, key_rejected)"),
         ((REFUSED, Row(1, "infra_fail", 0, "endpoint", "x")), (), "not harness_error"),
         ((REFUSED, Row(1, "harness_error", 0, None, "ValueError 0123456789ab: boom")), (), "does not start with"),
         ((REFUSED, Row(1, "harness_error", 0, None, None)), (), "does not start with"),
         ((REFUSED, DEFECT), (Row(2, "infra_fail", 1, "endpoint", "x"),), "uncharged"),
+        ((REFUSED, Row(2, "harness_error", 0, None, LEDGER_ERROR)), (), "no earlier attempt of number 2"),
     ],
 )
 def test_attempt_rows_that_are_not_what_a_plugin_defect_leaves_are_refused(tmp_path, rows, wal_rows, phrase):

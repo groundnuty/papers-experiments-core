@@ -9,8 +9,13 @@ file, and nothing of it is extracted but the store:
 
 - the file is opened once, never through a symbolic link, and must be a regular file (`fstat` of the open descriptor, so
   the file that is hashed is the file that is read). It is hashed to its end, whatever the tar says of its own length;
+- the tar must end as a tar does: after its last member nothing but zero bytes, at least the two blocks of the end
+  marker. Python's `tarfile` takes a header it cannot parse after a good member for the end of the archive, so without
+  this a damaged or forged tail could hide a member (the `-wal`) behind it and the main file would be judged alone;
 - a zstd stream is decompressed by the `zstd` program fed that same descriptor (the standard library has no zstd
-  before Python 3.14, and the core imports nothing else); with no such program, or if it fails, the archive is refused;
+  before Python 3.14, and the core imports nothing else); with no such program, or if it fails, the archive is refused.
+  The decompression is bounded: it is killed and the archive refused after `ZSTD_DEADLINE_S` seconds or
+  `MAX_DECOMPRESSED_BYTES` decompressed bytes, whichever comes first;
 - of the tar only `out/state.sqlite` and, when the live store left one, `out/state.sqlite-wal` are copied, into a
   private temporary directory, and only as plain files that appear once. No member is ever extracted by its name;
 - the store is opened read-only on that copy. The `-wal` goes with it, because a store in WAL mode can hold its newest
@@ -31,10 +36,12 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from expcore.campaign.attempts import UNCHARGED_KINDS
 from expcore.campaign.elastic.records import ReopenRefused
 
 STORE = "out/state.sqlite"
@@ -43,7 +50,9 @@ _COPIES = {STORE: "state.sqlite", WAL: "state.sqlite-wal"}  # what of the archiv
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 MAX_STORE_BYTES = 2 << 30  # a lease store holds one run's attempts: a member past this is not one
 CHUNK = 1 << 20
-ZSTD_WAIT_S = 60.0
+BLOCK = 512  # a tar's block; its end marker is two blocks of zeros
+ZSTD_DEADLINE_S = 600.0  # the whole decompression, from the program's start to its exit
+MAX_DECOMPRESSED_BYTES = 8 << 30  # a lease's `out/` is far smaller; a stream past this is not an archive of one
 FORMS = ("tar", "tar.zst")
 # The exception a harness error's detail starts with is the class name and no more: `Store.finish_attempt` writes
 # `<class> <12 hex of the stack>: <message>`. A class that only begins with it (`LedgerErrorX`) is another defect.
@@ -89,12 +98,16 @@ class ArchiveEvidence:
 
 
 class _Hashed(io.RawIOBase):
-    """A raw reader that hashes every byte read through it."""
+    """A raw reader that hashes every byte read through it, counts them (refusing the archive past `limit`, if one is
+    given) and remembers where the last non-zero byte ended."""
 
-    def __init__(self, source: BinaryIO) -> None:
+    def __init__(self, source: BinaryIO, limit: int | None = None) -> None:
         super().__init__()
         self._source = source
+        self._limit = limit
         self.digest = hashlib.sha256()
+        self.total = 0
+        self.nonzero_end = 0  # the offset just past the last byte that is not zero: everything after it is zero
 
     def readable(self) -> bool:
         return True
@@ -102,7 +115,13 @@ class _Hashed(io.RawIOBase):
     def readinto(self, buffer: Any) -> int:
         count = self._source.readinto(buffer) or 0
         if count:
-            self.digest.update(memoryview(buffer)[:count])
+            data = bytes(memoryview(buffer)[:count])
+            self.digest.update(data)
+            if kept := len(data.rstrip(b"\0")):
+                self.nonzero_end = self.total + kept
+            self.total += count
+            if self._limit is not None and self.total > self._limit:
+                raise refused(3, "archive", f"it decompresses to more than {self._limit} bytes: not a lease's archive")
         return count
 
 
@@ -123,65 +142,95 @@ def _open_regular(path: Path) -> BinaryIO:
     return os.fdopen(fd, "rb")
 
 
-def _scan(source: BinaryIO, work: Path) -> tuple[str, set[str], str | None]:
+def _scan(source: BinaryIO, work: Path, limit: int | None = None) -> tuple[str, set[str], ReopenRefused | None]:
     """Read the tar in `source` to its end, copying the store's files into `work`; return the SHA-256 of every byte
-    read, the names copied, and what is wrong with the store's members, if anything (a name twice, a member that is
-    not a regular file, one too large). That is said only after the hash is judged: a file that is not the lease's
-    archive is refused for that, whatever else it holds."""
-    hashed = _Hashed(source)
+    read, the names copied, and the refusal for what is wrong with the tar's members or its end, if anything (a name
+    twice, a member that is not a regular file, one too large, a tail that is not the end marker). That is raised only
+    after the hash is judged: a file that is not the lease's archive is refused for that, whatever else it holds. With
+    `limit`, reading more bytes than that is refused at once."""
+    hashed = _Hashed(source, limit)
     seen: set[str] = set()
-    problem: str | None = None
+    problem: ReopenRefused | None = None
     try:
         with tarfile.open(fileobj=hashed, mode="r|") as tar:
             for member in tar:
                 name = posixpath.normpath(member.name)
                 if name not in _COPIES or problem is not None:
                     continue
-                if name in seen:
-                    problem = f"the archive holds {name} more than once"
-                elif not member.isreg():
-                    problem = f"{name} in the archive is not a regular file"
-                elif member.size > MAX_STORE_BYTES:
-                    problem = f"{name} in the archive is {member.size} bytes: not a lease store"
-                elif (source_file := tar.extractfile(member)) is None:
-                    problem = f"{name} in the archive cannot be read"
-                else:
-                    with source_file, open(work / _COPIES[name], "xb") as sink:
-                        shutil.copyfileobj(source_file, sink, CHUNK)
-                    if (work / _COPIES[name]).stat().st_size != member.size:
-                        raise refused(3, "archive", f"{name} is cut short: the archive is not whole")
-                    seen.add(name)
+                problem = _copy_member(tar, member, name, work, seen)
+            end = tar.offset  # where the next header would be: past the last member's data, at the marker if any
         while hashed.read(CHUNK):  # the end of the file, past the tar's own end marker: the hash covers all of it
             pass
     except (tarfile.TarError, EOFError) as error:
         raise refused(3, "archive", f"it is not a readable tar ({type(error).__name__}: {error})") from None
+    if problem is None and (hashed.nonzero_end > end or hashed.total - end < 2 * BLOCK):
+        problem = refused(
+            3,
+            "archive",
+            f"its tar does not end as a tar does: after the last member (at byte {end}) there must be nothing but "
+            f"zero bytes, at least {2 * BLOCK} of them, and a damaged tail could hide a member",
+        )
     return hashed.digest.hexdigest(), seen, problem
 
 
-def _scan_zstd(source: BinaryIO, work: Path) -> tuple[str, set[str], str | None]:
-    """`_scan` of the plain tar inside a zstd stream: decompressed by the `zstd` program reading `source` itself."""
+def _copy_member(
+    tar: tarfile.TarFile, member: tarfile.TarInfo, name: str, work: Path, seen: set[str]
+) -> ReopenRefused | None:
+    """Copy the store's member `name` into `work` and note it in `seen`; return the refusal for what is wrong with it
+    (a name twice, not a regular file, too large, unreadable), or None."""
+    if name in seen:
+        return refused(4, "attempt rows", f"the archive holds {name} more than once")
+    if not member.isreg():
+        return refused(4, "attempt rows", f"{name} in the archive is not a regular file")
+    if member.size > MAX_STORE_BYTES:
+        return refused(4, "attempt rows", f"{name} in the archive is {member.size} bytes: not a lease store")
+    if (source_file := tar.extractfile(member)) is None:
+        return refused(4, "attempt rows", f"{name} in the archive cannot be read")
+    with source_file, open(work / _COPIES[name], "xb") as sink:
+        shutil.copyfileobj(source_file, sink, CHUNK)
+    if (work / _COPIES[name]).stat().st_size != member.size:
+        raise refused(3, "archive", f"{name} is cut short: the archive is not whole")
+    seen.add(name)
+    return None
+
+
+def _expire(process: "subprocess.Popen[bytes]", overdue: threading.Event) -> None:
+    """The deadline of a decompression: mark it and kill the program, so a read of its output ends."""
+    overdue.set()
+    process.kill()
+
+
+def _scan_zstd(source: BinaryIO, work: Path) -> tuple[str, set[str], ReopenRefused | None]:
+    """`_scan` of the plain tar inside a zstd stream: decompressed by the `zstd` program reading `source` itself, for no
+    longer than `ZSTD_DEADLINE_S` and to no more than `MAX_DECOMPRESSED_BYTES` bytes."""
     program = shutil.which("zstd")
     if program is None:
         raise refused(3, "archive", "it is zstd-compressed and no zstd program is on PATH to decompress it")
+    late = refused(3, "archive", f"zstd did not finish within {ZSTD_DEADLINE_S:g} s: it is not read")
     with tempfile.TemporaryFile() as errors:
         process = subprocess.Popen(
             [program, "-d", "-c", "-q"], stdin=source, stdout=subprocess.PIPE, stderr=errors
         )  # a fixed argument list: no shell, no name of the operator's in it
+        overdue = threading.Event()
+        timer = threading.Timer(ZSTD_DEADLINE_S, _expire, (process, overdue))
+        timer.daemon = True
+        timer.start()
         try:
             assert process.stdout is not None
-            scanned = _scan(process.stdout, work)
-            status = process.wait(timeout=ZSTD_WAIT_S)
-        except subprocess.TimeoutExpired:
+            scanned = _scan(process.stdout, work, MAX_DECOMPRESSED_BYTES)
+            status = process.wait()  # the timer kills it at the deadline, so this ends
+        except BaseException as error:
             process.kill()
             process.wait()
-            raise refused(3, "archive", f"zstd did not end within {ZSTD_WAIT_S:g} s") from None
-        except BaseException:
-            process.kill()
-            process.wait()
+            if overdue.is_set() and isinstance(error, ReopenRefused):
+                raise late from None  # the kill ended its output: that, and not what the tar then looked like, is why
             raise
         finally:
+            timer.cancel()
             if process.stdout is not None:
                 process.stdout.close()
+        if overdue.is_set():
+            raise late
         if status != 0:
             errors.seek(0)
             said = errors.read(300).decode("utf-8", "replace").strip()
@@ -206,9 +255,10 @@ def _attempt_rows(store: Path, run_key: str) -> list[AttemptRow]:
 
 
 def check_attempts(rows: list[AttemptRow], run_key: str) -> None:
-    """Judge a run's attempt rows in its lease store (condition 4); raise `ReopenRefused` naming what fails. Every
-    row must be uncharged, one must be an infrastructure failure of kind `key_rejected`, and the last must be a harness
-    error whose detail starts with `LedgerError`."""
+    """Judge a run's attempt rows in its lease store (condition 4); raise `ReopenRefused` naming what fails. Every row
+    must be uncharged; the last must be a harness error whose detail starts with `LedgerError`; and an earlier row must
+    be an infrastructure failure of an uncharged kind (`UNCHARGED_KINDS`) of the last row's own attempt number: the
+    attempt that was set aside without a charge and run again under the same number, which the plugin's defect ended."""
     if not rows:
         raise refused(4, "attempt rows", f"the store holds no attempt of run {run_key}")
     charged = [row for row in rows if row.charged != 0]
@@ -217,9 +267,7 @@ def check_attempts(rows: list[AttemptRow], run_key: str) -> None:
             f"row {row.row_id} (attempt {row.attempt}, {row.state}) charged {row.charged}" for row in charged
         )
         raise refused(4, "attempt rows", f"every attempt must be uncharged, and {shown}")
-    if not any(row.state == "infra_fail" and row.infra_kind == "key_rejected" for row in rows):
-        raise refused(4, "attempt rows", "no attempt ended infra_fail of kind key_rejected")
-    last = rows[-1]
+    *earlier, last = rows
     if last.state != "harness_error":
         raise refused(
             4,
@@ -229,6 +277,17 @@ def check_attempts(rows: list[AttemptRow], run_key: str) -> None:
     if not _LEDGER_ERROR.match(last.detail or ""):
         raise refused(
             4, "attempt rows", f"the last attempt's (row {last.row_id}) detail does not start with LedgerError"
+        )
+    if not any(
+        row.state == "infra_fail" and row.infra_kind in UNCHARGED_KINDS and row.attempt == last.attempt
+        for row in earlier
+    ):
+        raise refused(
+            4,
+            "attempt rows",
+            f"no earlier attempt of number {last.attempt} (the harness error's own) ended infra_fail of an uncharged "
+            f"kind ({', '.join(sorted(UNCHARGED_KINDS))}): the harness error does not follow an attempt set aside "
+            "uncharged and run again under its number",
         )
 
 
@@ -251,7 +310,7 @@ def read_evidence(path: Path, run_key: str, recorded_sha256: str) -> ArchiveEvid
                     + (" (a zstd archive is hashed as the tar it holds)" if compressed else ""),
                 )
             if problem is not None:
-                raise refused(4, "attempt rows", problem)
+                raise problem
             if STORE not in copied:
                 raise refused(4, "attempt rows", f"the archive holds no {STORE}")
             rows = _attempt_rows(work / _COPIES[STORE], run_key)
