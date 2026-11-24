@@ -45,9 +45,9 @@ real addresses (DESIGN.md, sections 5 and 6).
   platform file is written and before the link check, every space the rendered file holds for one of those providers
   and that has a mirror must have a mirror whose provider id sorts below the owner's, or `up` fails and the member is
   replaced; the passing order is written as `failover-order.json` (labels only). The file's spaces and providers are
-  matched to the layout's through the bootstrap's ids, and the record of an earlier run is removed before the platform
-  file is replaced (`write_facts`). Nothing is declared in a layout that does not name `outage_targets`, and `up` is
-  then what it was.
+  matched to the layout's through the bootstrap's ids, the order is over the owner and the layout's declared mirrors
+  alone (another supporter of the space is ignored), and the record of an earlier run is removed first thing in this
+  phase. Nothing is declared in a layout that does not name `outage_targets`, and `up` is then what it was.
 - **The link check** is `fedlinks.check_after_up`: the platform layer's own, through the rendered file, writing
   `link-check.json` in the root through `expcore_onedata.linkrecord`.
 """
@@ -332,11 +332,7 @@ def registered_of(facts: Mapping[str, Any]) -> Dict[str, str]:
 
 def write_facts(layout: Layout, boot: Bootstrap, values: Mapping[str, str]) -> str:
     """facts.json, and platform.toml from the layout's template with the HPC values, and the render identity of that
-    platform (O74): the template is read once, and what is hashed is the text that was rendered.
-
-    The failover record of an earlier run of the phase is removed first (O98, `hpcfailover.invalidate`): it was of the
-    platform file this replaces, and a run that fails below, or whose layout declares no outage, must not leave it."""
-    hpcfailover.invalidate(layout.root)
+    platform (O74): the template is read once, and what is hashed is the text that was rendered."""
     facts = facts_of(boot)
     registered = getattr(boot, "registered", None)
     if registered:  # O73: what each service reported as its domain; with the DNS check, which is advisory
@@ -438,7 +434,13 @@ def core_phase(
     (read back through `data`, O63; an ingested space's after the ingest, `verify_ingested`), and run the link check;
     return what up prints, or raise naming the step that failed. The
     services must be up, and the root must hold the zone's passphrase and the CA. `environ` is where the imports'
-    variables are read (this process's when None): a core step's own is an allowlist that carries none."""
+    variables are read (this process's when None): a core step's own is an allowlist that carries none.
+
+    The failover record of an earlier run of the phase is removed before anything else (O98, `hpcfailover.invalidate`):
+    it was of the platform file this run replaces, and the first of the things below that can raise (the zone's
+    passphrase, the bootstrap, a declared manifest) would otherwise leave it for the identity read to report as passed,
+    as would a layout that no longer declares an outage."""
+    hpcfailover.invalidate(layout.root)
     passphrase = layout.passphrase(layout.spec.zone.name)
     if not passphrase.is_file() or not layout.ca_pem.is_file():
         raise RuntimeError("the root holds no zone passphrase or no CA: the zone's export did not run")

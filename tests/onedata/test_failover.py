@@ -272,3 +272,282 @@ def test_o98_a_record_with_a_repeated_or_misplaced_label_or_a_key_the_writer_nev
     mutate(document)
     with pytest.raises(failover.FailoverError):
         failover.read_record(json.dumps(document))
+
+
+# -- only the declared mirrors are in the order (the second code review) ---------------------------------------------
+
+
+# the owner's space is supported by `mirror-one`, the agent's local provider, which holds none of the space's blocks
+# unless it is designated a mirror, and by `mirror-two`: the local provider sorts below the owner, the owner below it
+LOCAL_BELOW_OWNER_BELOW_MIRROR = ids("id-0200", "id-0100", "id-0300")
+ONLY_MIRROR_TWO = {"spaces[0]": ["providers[2]"]}  # the one provider the study designates a mirror of the space
+
+
+def test_o98_counting_every_supporter_lets_a_local_provider_that_holds_nothing_make_the_order_pass(tmp_path):
+    """O98: with no declaration every supporter counts, as it always did: the local provider sorts below the owner, so
+    the order passes. That is the behaviour a federation with no layout keeps (Compose, a test)."""
+    config = platform(tmp_path, LOCAL_BELOW_OWNER_BELOW_MIRROR, [ALL_THREE])
+    (found,) = failover.admit(config, [OWNER])
+    assert found.mirrors == (LABEL[MIRROR_ONE], LABEL[MIRROR_TWO])
+    assert found.order == (LABEL[MIRROR_ONE], LABEL[OWNER], LABEL[MIRROR_TWO])
+
+
+def test_o98_with_the_declared_mirrors_a_supporter_that_is_none_is_ignored_and_the_owner_stop_is_refused(tmp_path):
+    """O98, the second code review: the file is replicated to the designated mirror alone and the local provider holds
+    zero bytes, so op-worker chooses between the owner and that mirror, and with the owner's id below the mirror's it
+    asks the stopped owner first. Ordered over the owner and the declared mirror the same ids are refused, and the
+    message names the mirror and not the local provider."""
+    config = platform(tmp_path, LOCAL_BELOW_OWNER_BELOW_MIRROR, [ALL_THREE])
+    with pytest.raises(failover.FailoverRefused) as refused:
+        failover.admit(config, [OWNER], ONLY_MIRROR_TWO)
+    (failed,) = refused.value.failed
+    assert (failed.owner, failed.mirrors, failed.order) == (
+        LABEL[OWNER],
+        (LABEL[MIRROR_TWO],),
+        (LABEL[OWNER], LABEL[MIRROR_TWO]),
+    )
+    assert "(owner providers[0]; mirrors providers[2])" in str(refused.value)
+    assert "providers[1]" not in str(refused.value)  # the local provider is no part of the order
+
+
+def test_o98_a_declared_mirror_below_the_owner_passes_whatever_the_ignored_supporter_does(tmp_path):
+    """O98: the declared mirror sorts below the owner, and the local provider above both: the order passes over the two
+    and the record lists the declared mirror alone."""
+    config = platform(tmp_path, ids("id-0200", "id-0900", "id-0100"), [ALL_THREE])
+    (found,) = failover.admit(config, [OWNER], ONLY_MIRROR_TWO)
+    assert (found.mirrors, found.order) == ((LABEL[MIRROR_TWO],), (LABEL[MIRROR_TWO], LABEL[OWNER]))
+    assert json.loads(failover.record_text([found]))["spaces"][0]["mirrors"] == [LABEL[MIRROR_TWO]]
+
+
+def test_o98_a_space_the_declaration_lists_with_no_mirror_is_out_of_scope_and_one_it_omits_counts_every_supporter(
+    tmp_path,
+):
+    """O98: `{"spaces[0]": []}` designates no mirror, so nothing is in scope there; a space the mapping does not list is
+    ordered over all its supporters, as with no mapping."""
+    config = platform(tmp_path, LOCAL_BELOW_OWNER_BELOW_MIRROR, [ALL_THREE, ALL_THREE])
+    assert [found.space for found in failover.orders(config, [OWNER], {"spaces[0]": []})] == ["spaces[1]"]
+    only_second = failover.orders(config, [OWNER], {"spaces[1]": ["providers[2]"]})
+    assert [(found.space, found.mirrors) for found in only_second] == [
+        ("spaces[0]", (LABEL[MIRROR_ONE], LABEL[MIRROR_TWO])),
+        ("spaces[1]", (LABEL[MIRROR_TWO],)),
+    ]
+
+
+@pytest.mark.parametrize(
+    "wanted",
+    [["providers[0]"], ["providers[2]", "providers[2]"], ["providers[9]"], ["providers[2]", "spaces[0]"]],
+    ids=["the owner", "one twice", "no provider of the file", "a label of the other kind"],
+)
+def test_o98_a_declared_mirror_that_is_no_other_supporter_of_the_space_gives_no_order(tmp_path, wanted):
+    """O98: the owner as its own mirror, a mirror twice, and one the file does not have as a supporter are no order and
+    no pass; the message names the space and holds no name and no id."""
+    config = platform(tmp_path, ids("id-0300", "id-0100", "id-0200"), [ALL_THREE])
+    with pytest.raises(
+        failover.FailoverError, match="spaces\\[0\\]: a declared mirror is no other supporter"
+    ) as refused:
+        failover.admit(config, [OWNER], {"spaces[0]": wanted})
+    assert not isinstance(refused.value, failover.FailoverRefused)
+
+
+# -- the injector's check over a root's record -------------------------------------------------------------------------
+
+
+def record_of(*spaces):
+    """The text of a record that holds `spaces`, each `(space, owner, mirrors, order)` of labels."""
+    return failover.record_text([failover.SpaceOrder(*space) for space in spaces])
+
+
+# the record `up` wrote for the platform's one space: the owner and the declared mirror alone, the mirror first
+RECORD_OF_MIRROR_TWO = record_of(("spaces[0]", LABEL[OWNER], (LABEL[MIRROR_TWO],), (LABEL[MIRROR_TWO], LABEL[OWNER])))
+
+
+def stop_of(tmp_path, record, platform_ids=LOCAL_BELOW_OWNER_BELOW_MIRROR, spaces=(ALL_THREE,)):
+    """`admit_stop` of the owner over a root `tmp_path / "root"` holding `record` (None: none) and a platform with the
+    ids `platform_ids`."""
+    root = tmp_path / "root"
+    root.mkdir()
+    if record is not None:
+        (root / failover.FILE).write_text(record, encoding="utf-8")
+    return failover.admit_stop(platform(tmp_path, platform_ids, list(spaces)), OWNER, root)
+
+
+def test_o98_without_a_record_a_stop_is_checked_over_every_supporter_as_before(tmp_path):
+    """O98: no record in the root (a Compose federation, a test): the local provider counts and the order passes."""
+    (found,) = stop_of(tmp_path, None)
+    assert found.mirrors == (LABEL[MIRROR_ONE], LABEL[MIRROR_TWO])
+
+
+def test_o98_with_a_record_a_stop_takes_each_listed_spaces_mirrors_from_it_against_the_current_ids(tmp_path):
+    """O98, the second code review: the record designates mirror-two alone; against the platform's current ids (the
+    owner's below its mirror's) the stop is refused, though counting the local provider that sorts first would pass."""
+    with pytest.raises(failover.FailoverRefused, match="owner providers\\[0\\]; mirrors providers\\[2\\]"):
+        stop_of(tmp_path, RECORD_OF_MIRROR_TWO)
+    other = tmp_path / "other"
+    other.mkdir()
+    (found,) = stop_of(other, RECORD_OF_MIRROR_TWO, ids("id-0200", "id-0900", "id-0100"))
+    assert (found.mirrors, found.order) == ((LABEL[MIRROR_TWO],), (LABEL[MIRROR_TWO], LABEL[OWNER]))
+
+
+def test_o98_a_space_the_record_does_not_list_is_checked_over_every_supporter_so_a_record_never_loosens_the_check(
+    tmp_path,
+):
+    """O98: the record lists spaces[0] only. Its mirrors decide it (refused: the owner sorts below the one mirror), and
+    spaces[1], which the owner holds as well, counts all its supporters (it would pass: the local provider sorts
+    below the owner), so a record narrows the check of the spaces it lists and loosens none."""
+    with pytest.raises(failover.FailoverRefused) as refused:
+        stop_of(tmp_path, RECORD_OF_MIRROR_TWO, spaces=(ALL_THREE, ALL_THREE))
+    assert [failed.space for failed in refused.value.failed] == ["spaces[0]"]
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "not json",
+        "[]",
+        '{"version": "another/9", "spaces": []}',
+        record_of(("spaces[0]", LABEL[OWNER], (LABEL[MIRROR_TWO],), (LABEL[MIRROR_TWO], LABEL[OWNER]))).replace(
+            '"mirror_first": true', '"mirror_first": false'
+        ),
+        record_of(
+            ("spaces[5]", LABEL[OWNER], (LABEL[MIRROR_TWO],), (LABEL[MIRROR_TWO], LABEL[OWNER]))
+        ),  # no such space
+        record_of(("spaces[0]", LABEL[MIRROR_ONE], (LABEL[MIRROR_TWO],), (LABEL[MIRROR_TWO], LABEL[MIRROR_ONE]))),
+        record_of(("spaces[0]", LABEL[OWNER], ("providers[7]",), ("providers[7]", LABEL[OWNER]))),  # no such provider
+    ],
+    ids=[
+        "no json",
+        "no object",
+        "another version",
+        "mirror_first false",
+        "a space the file lacks",
+        "another owner",
+        "a provider the file lacks",
+    ],
+)
+def test_o98_a_record_that_is_unreadable_or_does_not_resolve_in_the_platform_file_refuses_the_stop(tmp_path, record):
+    """O98: strict and closed: a record that is not what `up` writes, or whose labels are not the platform file's (a
+    space or provider that is not there, another data provider than the record's owner), is no ground to take the owner
+    down, however the ids sort; the message holds labels only."""
+    with pytest.raises(failover.FailoverError) as refused:
+        stop_of(tmp_path, record, ids("id-0300", "id-0100", "id-0200"))
+    text = str(refused.value)
+    assert text.startswith("failover order: ")
+    for secret in (OWNER, MIRROR_ONE, MIRROR_TWO, "id-0"):
+        assert secret not in text
+
+
+def test_o98_a_record_with_a_space_of_another_owner_that_the_file_lacks_refuses_the_stop(tmp_path):
+    """O98: the stop is of the owner of spaces[0], which the record resolves; the record also lists a space of another
+    provider at a position the platform file has no space at: the record is not of this file, so no order is told, even
+    though the owner's own space would pass (its mirror sorts below it)."""
+    mine = ("spaces[0]", LABEL[OWNER], (LABEL[MIRROR_TWO],), (LABEL[MIRROR_TWO], LABEL[OWNER]))
+    foreign = ("spaces[3]", LABEL[MIRROR_ONE], (LABEL[MIRROR_TWO],), (LABEL[MIRROR_TWO], LABEL[MIRROR_ONE]))
+    passing = ids("id-0300", "id-0100", "id-0200")
+    (found,) = stop_of(tmp_path, record_of(mine), passing)  # the record of the owner's space alone goes ahead
+    assert found.order[0] == LABEL[MIRROR_TWO]
+    other = tmp_path / "other"
+    other.mkdir()
+    with pytest.raises(failover.FailoverError, match="spaces\\[3\\] of the record does not resolve"):
+        stop_of(other, record_of(mine, foreign), passing)
+
+
+def test_o98_a_record_that_cannot_be_read_as_text_refuses_the_stop(tmp_path):
+    """O98: bytes that are no UTF-8 text, and a record that is a directory, are unreadable, not absent."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / failover.FILE).write_bytes(b"\xff\xfe not text")
+    config = platform(tmp_path, ids("id-0300", "id-0100", "id-0200"), [ALL_THREE])
+    with pytest.raises(failover.FailoverError, match="no JSON"):
+        failover.admit_stop(config, OWNER, root)
+    (root / failover.FILE).unlink()
+    (root / failover.FILE).mkdir()
+    with pytest.raises(failover.FailoverError, match="cannot be read"):
+        failover.admit_stop(config, OWNER, root)
+
+
+def test_o98_a_stop_of_a_provider_that_owns_no_space_with_a_mirror_reads_no_record(tmp_path):
+    """O98: the mirror taken down is no owner stop: a record that is garbage is not read, and nothing is refused."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / failover.FILE).write_text("garbage", encoding="utf-8")
+    config = platform(tmp_path, ids("id-0100", "id-0200", "id-0300"), [ALL_THREE])
+    assert failover.admit_stop(config, MIRROR_TWO, root) == ()
+
+
+def test_o98_a_stop_of_a_name_that_is_no_provider_of_the_platform_is_an_error_not_a_pass(tmp_path):
+    """O98: the owner the injector was built with is a provider of the platform; anything else is no order."""
+    config = platform(tmp_path, ids("id-0100", "id-0200", "id-0300"), [ALL_THREE])
+    with pytest.raises(failover.FailoverError, match="no provider of the platform"):
+        failover.admit_stop(config, "not-a-provider", tmp_path)
+
+
+# -- the record's orders are one order of the providers, and its labels have no bound ---------------------------------
+
+
+def spaces_record(*spaces):
+    """The text of a record of `spaces`, each `(space, owner, mirrors, order)` as written, with no check of its own."""
+    return json.dumps(
+        {
+            "version": failover.VERSION,
+            "spaces": [
+                {"space": space, "owner": owner, "mirrors": list(mirrors), "order": list(order), "mirror_first": True}
+                for space, owner, mirrors, order in spaces
+            ],
+        }
+    )
+
+
+# each space is well formed alone: its first provider is a mirror
+ONE_BEFORE_ZERO = ("spaces[0]", "providers[0]", ["providers[1]"], ["providers[1]", "providers[0]"])
+ZERO_BEFORE_ONE = ("spaces[1]", "providers[1]", ["providers[0]"], ["providers[0]", "providers[1]"])
+TWO_BEFORE_ONE = ("spaces[1]", "providers[2]", ["providers[1]"], ["providers[1]", "providers[2]"])
+
+
+def test_o98_a_record_whose_spaces_order_two_providers_oppositely_is_not_read(tmp_path):
+    """O98, the second code review: one set of ids has one order, so a record where spaces[0] has providers[1] below
+    providers[0] and spaces[1] the reverse is no record `up` wrote, though each space is well formed alone."""
+    with pytest.raises(failover.FailoverError, match="contradict each other"):
+        failover.read_record(spaces_record(ONE_BEFORE_ZERO, ZERO_BEFORE_ONE))
+
+
+def test_o98_a_record_whose_orders_make_a_longer_cycle_is_not_read(tmp_path):
+    """O98: no pair is reversed outright, but 0 below 1, 1 below 2 and 2 below 0 have no order."""
+    around = (
+        ("spaces[0]", "providers[1]", ["providers[0]"], ["providers[0]", "providers[1]"]),
+        ("spaces[1]", "providers[2]", ["providers[1]"], ["providers[1]", "providers[2]"]),
+        ("spaces[2]", "providers[0]", ["providers[2]"], ["providers[2]", "providers[0]"]),
+    )
+    with pytest.raises(failover.FailoverError, match="contradict each other"):
+        failover.read_record(spaces_record(*around))
+
+
+def test_o98_a_record_of_several_spaces_that_one_order_of_the_providers_gives_is_read(tmp_path):
+    """O98: the orders share providers and agree (1 below 0, 1 below 2): a consistent record is read."""
+    found = failover.read_record(spaces_record(ONE_BEFORE_ZERO, TWO_BEFORE_ONE))
+    assert [space["space"] for space in found["spaces"]] == ["spaces[0]", "spaces[1]"]
+    assert failover.consistent([["a", "b", "c"], ["a", "c"], ["b", "c"], ["d"]]) is True
+    assert failover.consistent([["a", "b"], ["b", "c"], ["c", "a"]]) is False
+
+
+def test_o98_a_label_with_any_number_of_digits_and_no_leading_zero_is_read(tmp_path):
+    """O98: the writer writes the position of any space and provider, so a space at 10000 and a provider at 10000 read
+    as the record they are (a four-digit cap read them as unreadable); a leading zero still does not."""
+    big = ("spaces[10000]", "providers[10000]", ["providers[10001]"], ["providers[10001]", "providers[10000]"])
+    assert failover.read_record(spaces_record(big))["spaces"][0]["space"] == "spaces[10000]"
+    text = failover.record_text([failover.SpaceOrder(big[0], big[1], tuple(big[2]), tuple(big[3]))])
+    assert failover.read_record(text)["spaces"][0]["owner"] == "providers[10000]"
+    for refused in ("spaces[010000]", "spaces[00]"):
+        with pytest.raises(failover.FailoverError):
+            failover.read_record(spaces_record((refused, *big[1:])))
+
+
+def test_o98_positions_order_by_their_number_across_a_change_of_digits_and_a_very_long_one_is_no_crash(tmp_path):
+    """O98: spaces[9] comes before spaces[10] and not after it, and a label of five thousand digits (past the limit of
+    `int` on a digit string) is an ordinary label to the reader, which makes no integer of it."""
+    nine = ("spaces[9]", "providers[0]", ["providers[1]"], ["providers[1]", "providers[0]"])
+    ten = ("spaces[10]", "providers[2]", ["providers[1]"], ["providers[1]", "providers[2]"])
+    assert len(failover.read_record(spaces_record(nine, ten))["spaces"]) == 2
+    with pytest.raises(failover.FailoverError, match="not in the platform's order"):
+        failover.read_record(spaces_record(ten, nine))
+    huge = (f"spaces[{'9' * 5000}]", *nine[1:])
+    assert len(failover.read_record(spaces_record(nine, huge))["spaces"]) == 2

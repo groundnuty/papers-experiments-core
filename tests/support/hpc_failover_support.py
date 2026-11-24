@@ -15,33 +15,46 @@ DECLARED = 'outage_targets = ["larch"]'
 LARCH_FIRST = {"larch": "id-01", "aspen": "id-02", "rowan": "id-03", "alder": "id-04", "hazel": "id-05"}
 MIRROR_FIRST = {"larch": "id-03", "aspen": "id-02", "rowan": "id-01", "alder": "id-04", "hazel": "id-05"}
 ONE_MIRROR_BELOW = {"larch": "id-02", "aspen": "id-03", "rowan": "id-01", "alder": "id-04", "hazel": "id-05"}
+# aspen (the agent's local provider, which holds none of alpha-space's blocks when the layout does not designate it a
+# mirror) sorts below the owner and rowan above it: the counterexample of the second code review
+LOCAL_FIRST = {"larch": "id-02", "aspen": "id-01", "rowan": "id-03", "alder": "id-04", "hazel": "id-05"}
 
 
-def layout_with(folder, line):
-    """The pilot-shape layout with `line` added to its `[hpc]` table (none: as shipped), beside its template."""
+# alpha-space's mirrors line in the shipped layout, whose platform template lists aspen and rowan as supporters
+ALPHA_MIRRORS = 'mirrors = ["aspen", "rowan"]'
+# the layout designates rowan alone: aspen, the agent's local provider, still supports the space in the platform file
+ROWAN_ONLY = ((ALPHA_MIRRORS, 'mirrors = ["rowan"]'),)
+
+
+def layout_with(folder, line, replace=()):
+    """The pilot-shape layout with `line` added to its `[hpc]` table (none: as shipped), beside its template.
+    `replace` is pairs `(old, new)` of text the layout holds once, replaced in it."""
     folder.mkdir(parents=True, exist_ok=True)
     text = LAYOUT.read_text(encoding="utf-8")
     if line is not None:
         assert text.count("\n[hpc]\n") == 1
         text = text.replace("\n[hpc]\n", f"\n[hpc]\n{line}\n", 1)
+    for old, new in replace:
+        assert text.count(old) == 1, old
+        text = text.replace(old, new, 1)
     (folder / LAYOUT.name).write_text(text, encoding="utf-8")
     (folder / PILOT_TEMPLATE.name).write_text(PILOT_TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8")
     return folder / LAYOUT.name
 
 
-def layout_over(hpc, root, folder, line):
+def layout_over(hpc, root, folder, line, replace=()):
     """The layout declaring `line` over the root `root`, with the address map the core's phase needs in it."""
     import fedlayout
     import fedspec
 
-    spec = fedspec.load_spec(layout_with(folder, line))
+    spec = fedspec.load_spec(layout_with(folder, line, replace))
     hosts = {s.name: f"{s.name}.cluster.example.org" for s in spec.services}
     layout = fedlayout.Layout(root, folder.parent, hpc.boot.hpc_spec(spec, hosts))
     write_address_map(layout)
     return layout
 
 
-def core_root(hpc, tmp_path, make_ca, line):
+def core_root(hpc, tmp_path, make_ca, line, replace=()):
     """A root holding what the core's phase needs of the services' bring-up, and the layout over it."""
     import fedspec
 
@@ -49,13 +62,13 @@ def core_root(hpc, tmp_path, make_ca, line):
     (root / "secrets" / "users").mkdir(parents=True)
     (root / "ca").mkdir()
     (root / "ca" / "federation-ca.pem").write_bytes(make_ca(tmp_path / "ca").ca.read_bytes())
-    spec = fedspec.load_spec(layout_with(tmp_path / "layout", line))
+    spec = fedspec.load_spec(layout_with(tmp_path / "layout", line, replace))
     files = {"secrets/zone.passphrase": "A1b2C3d4E5f6G7h8", "secrets/admin.token": "an-admin-token"}
     files.update({f"secrets/users/{p.name}.pass": "a-password" for p in spec.principals})
     for name, value in files.items():
         (root / name).write_text(value, encoding="utf-8")
         os.chmod(root / name, 0o600)
-    return root, layout_over(hpc, root, tmp_path / "layout", line)
+    return root, layout_over(hpc, root, tmp_path / "layout", line, replace)
 
 
 def boot_with(layout, provider_ids):

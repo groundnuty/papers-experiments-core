@@ -203,6 +203,14 @@ MALFORMED = {
     "a space label in the order": lambda d: d["spaces"][0].update(order=["spaces[2]", "providers[0]", "providers[1]"]),
     "a label with a leading zero": lambda d: d["spaces"][0].update(space="spaces[00]"),
     "no mirror": lambda d: d["spaces"][0].update(mirrors=[], order=["providers[1]"]),
+    # PASSED has providers[2] below providers[0]: a second space that has them the other way round is no record up wrote
+    "two spaces that order two providers oppositely": lambda d: second_space(
+        d, owner="providers[2]", mirrors=["providers[0]"], order=["providers[0]", "providers[2]"]
+    ),
+    # 2 below 0 and 0 below 1 in the first space, 1 below 2 in the second: no pair reversed outright, and no order
+    "orders that make a cycle of three": lambda d: second_space(
+        d, owner="providers[2]", mirrors=["providers[1]"], order=["providers[1]", "providers[2]"]
+    ),
 }
 
 
@@ -253,3 +261,56 @@ def test_o98_the_cores_reader_and_the_login_nodes_agree_on_what_is_malformed(dep
     root, _ = member_root(deploy, tmp_path)
     (root / FILE).write_text(text, encoding="utf-8")
     assert deploy.fleetidentity.failover_reading(root) == {"admission": "unreadable"}
+
+
+def test_o98_a_record_whose_orders_agree_on_one_order_of_the_providers_is_passed(deploy, tmp_path):
+    """O98: the second space shares providers with the first and agrees with it (providers[2] below providers[1] in
+    both): the reading is `passed`, as the core's reader says."""
+    text = edited(
+        lambda d: second_space(
+            d, owner="providers[1]", mirrors=["providers[2]"], order=["providers[2]", "providers[1]"]
+        )
+    )
+    root, _ = member_root(deploy, tmp_path)
+    (root / FILE).write_text(text, encoding="utf-8")
+    assert deploy.fleetidentity.failover_reading(root)["admission"] == "passed"
+    assert len(failover.read_record(text)["spaces"]) == 2
+    assert deploy.fleetidentity.failover_consistent([["a", "b", "c"], ["a", "c"], ["b", "c"]]) is True
+    assert deploy.fleetidentity.failover_consistent([["a", "b"], ["b", "c"], ["c", "a"]]) is False
+
+
+def test_o98_a_record_at_position_ten_thousand_is_passed_and_a_leading_zero_is_not(deploy, tmp_path):
+    """O98, the second code review: a space at position 10000 and a provider at 10000, which the writer produces for a
+    platform that large, read as `unreadable` under a four-digit cap; they are read, in the core's reader too."""
+    big = failover.SpaceOrder(
+        "spaces[10000]", "providers[10000]", ("providers[10001]",), ("providers[10001]", "providers[10000]")
+    )
+    root, _ = member_root(deploy, tmp_path)
+    (root / FILE).write_text(failover.record_text([big]), encoding="utf-8")
+    assert deploy.fleetidentity.failover_reading(root) == {"admission": "passed", "spaces": [big.record()]}
+    failover.read_record(failover.record_text([big]))
+    leading_zero = failover.record_text([big]).replace("spaces[10000]", "spaces[010000]")
+    (root / FILE).write_text(leading_zero, encoding="utf-8")
+    assert deploy.fleetidentity.failover_reading(root) == {"admission": "unreadable"}
+
+
+def test_o98_positions_order_by_their_number_and_a_very_long_one_is_no_crash_in_the_login_nodes_reader(
+    deploy, tmp_path
+):
+    """O98: spaces[9] before spaces[10] is ascending, the reverse is not, and a label of five thousand digits does not
+    raise (the limit of `int` on a digit string): the line is `passed` or `unreadable`, never an error."""
+
+    def record(first, second):
+        document = copy.deepcopy(PASSED)
+        second_space(document, space=second)
+        document["spaces"][0]["space"] = first
+        return json.dumps(document)
+
+    root, _ = member_root(deploy, tmp_path)
+    for first, second, admission in (
+        ("spaces[9]", "spaces[10]", "passed"),
+        ("spaces[10]", "spaces[9]", "unreadable"),
+        ("spaces[9]", f"spaces[{'9' * 5000}]", "passed"),
+    ):
+        (root / FILE).write_text(record(first, second), encoding="utf-8")
+        assert deploy.fleetidentity.failover_reading(root)["admission"] == admission

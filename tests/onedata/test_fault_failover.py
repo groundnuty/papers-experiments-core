@@ -13,6 +13,7 @@ import pytest
 from fault_support import LOCAL_TARGET, OUTAGE_TARGET, SERVICES, FakeServices, faults_table, injector_for
 
 from expcore.errors import InfraError
+from expcore_onedata import failover
 from expcore_onedata.admission import FederationLock
 from expcore_onedata.config import load_platform
 from expcore_onedata.fault_journal import JOURNAL
@@ -255,3 +256,116 @@ def test_o98_an_edit_of_the_holder_after_the_injector_was_built_does_not_pair_it
         injector.start(RUN)
     assert FAILOVER_SENTENCE in refused.value.detail
     assert stops_and_starts(services) == []
+
+
+# -- a root's record names the mirrors (the second code review) --------------------------------------------------------
+
+LOCAL_FIRST = ("id-0200", "id-0300", "id-0100")  # alpha (the owner), beta (the declared mirror), gamma (the local one)
+MIRROR_BELOW = ("id-0200", "id-0100", "id-0300")  # the declared mirror sorts below the owner
+
+
+def three_provider_platform(tmp_path, ids):
+    """A platform whose one space `alpha` holds is supported by `beta`, the declared mirror, and by `gamma`, the agent's
+    local provider, which is no mirror and holds none of its blocks; `ids` are alpha's, beta's and gamma's."""
+
+    def edit(data):
+        data["faults"] = faults_table()
+        data["providers"]["gamma"] = {"url": "https://gamma.test", "id": ids[2]}
+        data["providers"]["alpha"]["id"], data["providers"]["beta"]["id"] = ids[:2]
+        with_spaces(data, 1)
+        data["spaces"][0].update({"providers": ["alpha", "beta", "gamma"], "local": "gamma", "holder": "alpha"})
+
+    return write_platform(tmp_path, edit)
+
+
+def write_record(tmp_path, text):
+    (tmp_path / failover.FILE).write_text(text, encoding="utf-8")
+
+
+# the record `up` wrote: the owner providers[0], the one declared mirror providers[1], the mirror first
+DECLARED_BETA = failover.record_text(
+    [failover.SpaceOrder("spaces[0]", "providers[0]", ("providers[1]",), ("providers[1]", "providers[0]"))]
+)
+
+
+def test_o98_with_no_record_a_local_provider_that_holds_nothing_still_counts_as_a_mirror_as_before(tmp_path):
+    """O98: a Compose federation writes no record: every supporter counts, so the local provider sorting first lets the
+    owner stop go ahead exactly as it did. The stop of the owner is journalled as always."""
+    services = FakeServices()
+    injector = injector_for(three_provider_platform(tmp_path, LOCAL_FIRST), services, target=LOCAL_TARGET)
+    injector.start(RUN)
+    assert services.running(SERVICES["alpha"]) is False
+    assert journal_events(tmp_path) == ["injecting", "stopping", "injected"]
+    injector.finish()
+
+
+def test_o98_with_a_record_the_owner_stop_is_checked_over_its_declared_mirrors_and_refused_with_nothing_touched(
+    tmp_path,
+):
+    """O98, the second code review: the same platform and ids, with the record `up` wrote naming beta the one mirror:
+    the owner sorts below it, the local provider is ignored, and the start fails as an injector failure before anything
+    is stopped, locked or journalled, naming labels only."""
+    write_record(tmp_path, DECLARED_BETA)
+    services = FakeServices()
+    injector = injector_for(three_provider_platform(tmp_path, LOCAL_FIRST), services, target=LOCAL_TARGET)
+    with pytest.raises(InfraError) as refused:
+        injector.start(RUN)
+    assert (refused.value.kind, refused.value.target) == (INJECTOR_FAILURE, LOCAL_TARGET)
+    detail = refused.value.detail
+    assert FAILOVER_SENTENCE in detail
+    assert "owner providers[0]; mirrors providers[1])" in detail  # not providers[2], the local provider
+    assert detail.endswith("nothing is taken down")
+    for hidden in ("alpha", "beta", "gamma", "id-0"):
+        assert hidden not in detail
+    assert stops_and_starts(services) == []
+    assert journal_events(tmp_path) == []
+
+
+def test_o98_with_a_record_a_declared_mirror_that_sorts_below_the_owner_goes_ahead(tmp_path):
+    """O98: the record's mirror below the owner in the platform's current ids: the stop is admitted as it always was."""
+    write_record(tmp_path, DECLARED_BETA)
+    services = FakeServices()
+    injector = injector_for(three_provider_platform(tmp_path, MIRROR_BELOW), services, target=LOCAL_TARGET)
+    injector.start(RUN)
+    assert services.running(SERVICES["alpha"]) is False
+    assert journal_events(tmp_path) == ["injecting", "stopping", "injected"]
+    injector.finish()
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "not a record",
+        DECLARED_BETA.replace("providers[1]", "providers[9]"),  # a provider the platform file does not have
+        DECLARED_BETA.replace("spaces[0]", "spaces[4]"),  # a space it does not have
+        failover.record_text(  # well formed, and another owner than the platform's holder of the space
+            [failover.SpaceOrder("spaces[0]", "providers[1]", ("providers[0]",), ("providers[0]", "providers[1]"))]
+        ),
+    ],
+    ids=["no record", "a provider it lacks", "a space it lacks", "another owner"],
+)
+def test_o98_a_record_that_is_unreadable_or_does_not_resolve_refuses_the_owner_stop_with_nothing_touched(
+    tmp_path, record
+):
+    """O98: even with the ids that would pass (the mirror below the owner), a record the injector cannot read strictly,
+    or whose labels do not resolve in the platform file, is no ground to stop the owner: the start fails closed."""
+    write_record(tmp_path, record)
+    services = FakeServices()
+    injector = injector_for(three_provider_platform(tmp_path, MIRROR_BELOW), services, target=LOCAL_TARGET)
+    with pytest.raises(InfraError) as refused:
+        injector.start(RUN)
+    assert refused.value.kind == INJECTOR_FAILURE
+    assert refused.value.detail.startswith("failover order: ")
+    assert refused.value.detail.endswith("nothing is taken down")
+    assert stops_and_starts(services) == []
+    assert journal_events(tmp_path) == []
+
+
+def test_o98_a_stop_of_a_provider_that_owns_nothing_reads_no_record_even_when_the_record_is_garbage(tmp_path):
+    """O98: the mirror taken down is no owner stop, so the record is not read: a damaged one changes nothing for it."""
+    write_record(tmp_path, "garbage")
+    services = FakeServices()
+    injector = injector_for(three_provider_platform(tmp_path, LOCAL_FIRST), services, target=OUTAGE_TARGET)
+    injector.start(RUN)
+    assert services.running(SERVICES["beta"]) is False
+    injector.finish()

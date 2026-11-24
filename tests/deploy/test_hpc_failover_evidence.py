@@ -8,6 +8,8 @@ import errno
 import os
 import re
 import stat
+import uuid
+from types import SimpleNamespace
 
 import pytest
 from hpc_failover_support import (
@@ -158,6 +160,31 @@ def test_o98_a_rerender_that_fails_before_the_admission_leaves_no_record_of_the_
     assert not (root / FILE).exists()
 
 
+DELTA_FROM_THE_STUDY = (
+    (
+        'mirrors = ["aspen"]\nbaseline = false\n',
+        'mirrors = ["aspen"]\nbaseline = false\ndata_manifest = "@study_artifacts@/manifests/delta.json"\n',
+    ),
+)
+
+
+@pytest.mark.parametrize("line", [DECLARED, None], ids=["declared", "dropped"])
+def test_o98_a_declared_manifest_the_phase_cannot_load_leaves_no_record_of_the_earlier_pass(
+    hpc, tmp_path, make_ca, line
+):
+    """O98, the second code review: the core's phase loads the layout's data manifests before it writes the platform
+    file, and a manifest it cannot load (here one under `@study_artifacts@` while the site sets no such directory)
+    raised before the record was removed, so the identity read still said `passed` of the earlier run's record, whether
+    the layout still declared the outage or had dropped it. The record is removed before anything that can raise."""
+    root, layout = core_root(hpc, tmp_path, make_ca, DECLARED)
+    run_core(hpc, layout, MIRROR_FIRST, [])
+    assert (root / FILE).is_file()
+    changed = layout_over(hpc, root, tmp_path / "changed", line, DELTA_FROM_THE_STUDY)
+    with pytest.raises(RuntimeError, match="HPC_STUDY_ARTIFACTS is not set"):
+        run_core(hpc, changed, MIRROR_FIRST, [])
+    assert not (root / FILE).exists()
+
+
 def test_o98_a_layout_that_no_longer_declares_the_outage_removes_the_earlier_runs_record(hpc, tmp_path, make_ca):
     """O98: the same root brought up again by a layout without `outage_targets`: nothing is declared, so nothing is
     admitted and nothing is written, and the record of the declaration that was there is not left to be read."""
@@ -271,3 +298,22 @@ def test_o98_a_record_is_published_private_and_whole_with_no_draft_left_and_repl
     assert stat.S_IMODE(os.stat(destination).st_mode) == 0o600
     assert elsewhere.read_text(encoding="utf-8") == "untouched\n"
     assert sorted(os.listdir(tmp_path)) == ["elsewhere", FILE]
+
+
+def test_o98_a_draft_path_that_already_exists_is_another_writers_and_is_left_alone(hpc, tmp_path, monkeypatch):
+    """O98, the second code review: the draft's name is made fresh, and creating it exclusively fails if the path is
+    already there. The cleanup ran for that failure too and unlinked the existing path, another writer's draft. Only a
+    draft this call made is its to remove: the other draft, and the destination, are as they were."""
+    import hpcfailover
+
+    fixed = uuid.UUID(int=7)
+    monkeypatch.setattr(hpcfailover, "uuid", SimpleNamespace(uuid4=lambda: fixed))
+    other = tmp_path / f".{FILE}.{os.getpid()}.{fixed.hex}.tmp"
+    other.write_text("another writer's draft\n", encoding="utf-8")
+    destination = tmp_path / FILE
+    destination.write_text("what was there\n", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        hpcfailover.publish_private(destination, "whole\n")
+    assert other.read_text(encoding="utf-8") == "another writer's draft\n"
+    assert destination.read_text(encoding="utf-8") == "what was there\n"
+    assert sorted(os.listdir(tmp_path)) == sorted([other.name, FILE])

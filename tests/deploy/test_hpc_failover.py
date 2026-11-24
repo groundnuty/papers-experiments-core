@@ -11,11 +11,14 @@ import stat
 
 import pytest
 from hpc_failover_support import (
+    ALPHA_MIRRORS,
     DECLARED,
     FILE,
     LARCH_FIRST,
+    LOCAL_FIRST,
     MIRROR_FIRST,
     ONE_MIRROR_BELOW,
+    ROWAN_ONLY,
     core_root,
     layout_with,
     run_core,
@@ -173,6 +176,100 @@ def test_o98_the_record_is_evidence_up_writes_like_the_render_identity(hpc):
     assert FILE in evidence.EVIDENCE_FILES
     assert evidence.kind_of(FILE) == evidence.UP
     assert FILE not in evidence.REQUIRED
+
+
+# -- only the layout's declared mirrors are in the order ---------------------------------------------------------------
+
+
+def test_o98_a_supporter_that_is_no_declared_mirror_does_not_make_an_owner_stop_pass(hpc, tmp_path, make_ca):
+    """O98, the second code review: the layout designates rowan alone as alpha-space's mirror, and the rendered file
+    still lists aspen, the agent's local provider, as a supporter of it (it supports the space and holds none of the
+    replicated file's blocks). With the ids aspen < larch (the owner) < rowan, counting aspen made the order pass, and
+    op-worker, choosing between the owner and rowan, the only holders, would ask the stopped owner first. The order is
+    over the owner and the declared mirrors, so `up` refuses the member, naming labels only, with no record."""
+    root, layout = core_root(hpc, tmp_path, make_ca, DECLARED, ROWAN_ONLY)
+    events = []
+    with pytest.raises(RuntimeError) as refused:
+        run_core(hpc, layout, LOCAL_FIRST, events)
+    text = str(refused.value)
+    assert text.startswith("failover order: ")
+    assert "the owner's provider id sorts before every mirror's, so op-worker would ask the stopped owner first" in text
+    assert "(owner providers[1]; mirrors providers[2])" in text  # larch, and rowan alone: aspen (providers[0]) is out
+    assert text.endswith("refuse this member")
+    for hidden in ("larch", "aspen", "rowan", "alpha-space", *LOCAL_FIRST.values()):
+        assert hidden not in text
+    assert "links" not in events
+    assert not (root / FILE).exists()
+
+
+def test_o98_with_every_supporter_declared_a_mirror_the_same_ids_pass_as_they_did(hpc, tmp_path, make_ca):
+    """O98: the shipped layout designates aspen and rowan both, so the same ids pass, and the record names both."""
+    root, layout = core_root(hpc, tmp_path, make_ca, DECLARED)
+    run_core(hpc, layout, LOCAL_FIRST, [])
+    (space,) = json.loads((root / FILE).read_text(encoding="utf-8"))["spaces"]
+    assert space["mirrors"] == ["providers[0]", "providers[2]"]
+    assert space["order"] == ["providers[0]", "providers[1]", "providers[2]"]
+
+
+def test_o98_the_record_lists_the_declared_mirrors_alone_and_the_order_is_over_them_and_the_owner(
+    hpc, tmp_path, make_ca
+):
+    """O98: rowan, the one declared mirror, sorts below the owner while aspen sorts above it: the order passes, and the
+    record holds rowan as the mirror and no label of aspen anywhere in the space's order."""
+    root, layout = core_root(hpc, tmp_path, make_ca, DECLARED, ROWAN_ONLY)
+    run_core(
+        hpc, layout, {"larch": "id-02", "aspen": "id-04", "rowan": "id-01", "alder": "id-05", "hazel": "id-06"}, []
+    )
+    (space,) = json.loads((root / FILE).read_text(encoding="utf-8"))["spaces"]
+    assert (space["owner"], space["mirrors"]) == ("providers[1]", ["providers[2]"])
+    assert space["order"] == ["providers[2]", "providers[1]"]
+    assert failover.read_record((root / FILE).read_text(encoding="utf-8"))["spaces"] == [space]
+
+
+def test_o98_a_space_the_layout_gives_no_mirror_is_out_of_scope_whatever_else_supports_it(hpc, tmp_path, make_ca):
+    """O98: nothing is designated to serve alpha-space when the layout declares no mirror for it, so its owner's outage
+    is no failover to check, however the file lists its supporters: nothing is refused, written or said."""
+    root, layout = core_root(hpc, tmp_path, make_ca, DECLARED, ((ALPHA_MIRRORS, "mirrors = []"),))
+    events = []
+    said = run_core(hpc, layout, LARCH_FIRST, events)
+    assert events == ["steps", "links"]
+    assert not (root / FILE).exists()
+    assert len(said.splitlines()) == 3
+
+
+def test_o98_a_file_space_a_declared_owner_holds_that_the_layout_gives_no_mirror_is_not_ordered_over_its_supporters(
+    hpc, tmp_path, make_ca
+):
+    """O98: the file gives gamma-space to alder, the declared owner, while the layout gives it to hazel with no mirror,
+    which `holders_differ` skips. It is no failover to check (nothing is designated), and must not be ordered over every
+    supporter either: aspen, listed in the file, sorts below alder, and counting it would write a record for the space.
+    Nothing is refused, written or said."""
+    replace = (('owner = "alder"\nmirrors = ["aspen"]', 'owner = "hazel"\nmirrors = []'),)
+    root, layout = core_root(hpc, tmp_path, make_ca, 'outage_targets = ["alder"]', replace)
+    events = []
+    said = run_core(hpc, layout, {**LOCAL_FIRST, "alder": "id-06"}, events)
+    assert events == ["steps", "links"]
+    assert not (root / FILE).exists()
+    assert len(said.splitlines()) == 3
+
+
+def test_o98_a_declared_mirror_the_file_does_not_list_as_a_supporter_is_refused_not_ignored(hpc, tmp_path, make_ca):
+    """O98: the layout designates alder too, which the rendered file does not list as a supporter of alpha-space: no
+    order is told over a mirror the file does not hold, so the member is refused (labels only, no record) even though
+    the order over the others would pass."""
+    root, layout = core_root(
+        hpc, tmp_path, make_ca, DECLARED, ((ALPHA_MIRRORS, 'mirrors = ["aspen", "rowan", "alder"]'),)
+    )
+    events = []
+    with pytest.raises(RuntimeError) as refused:
+        run_core(hpc, layout, MIRROR_FIRST, events)
+    text = str(refused.value)
+    assert text.startswith("failover order: spaces[0]: a declared mirror is no other supporter of the space")
+    assert text.endswith("refuse this member")
+    for hidden in ("larch", "aspen", "rowan", "alder", "alpha-space"):
+        assert hidden not in text
+    assert "links" not in events
+    assert not (root / FILE).exists()
 
 
 # -- the file's data provider is the layout's owner --------------------------------------------------------------------

@@ -34,7 +34,12 @@ anything else, before the federation is admitted, an earlier run's injection is 
 journalled, `start` (and the entry of `prepared`) checks that from the platform's ids and holders, as the injector was
 built with them, for every space the target holds and another provider supports; when it does not hold, or an id is not
 known, nothing is touched and `start` fails as `injector_failure`, naming spaces and providers by label. A target that
-holds no space with a mirror is unchanged, and reads nothing the injector did not already hold.
+holds no space with a mirror is unchanged, and reads nothing the injector did not already hold. A federation whose root
+holds `failover-order.json` (an HPC member's, written by `up` for the mirrors its layout declares) has that check made
+over each listed space's declared mirrors, read from the record, strictly, against the platform's current ids, and
+another provider that merely supports the space, and may hold none of its blocks, does not count as a mirror; a record
+that cannot be read, or whose labels do not resolve in the platform file, fails the start the same way. Without a record
+(a Compose federation) every supporter counts, as before.
 
 **Clear (O11).** `clear` brings the provider back and counts a restore only when the provider runs with an identity
 other than the one read before the injection (`ComposeDriver`: the container's id and start time). Readiness alone is
@@ -353,7 +358,7 @@ from expcore_onedata.fault_recovery import RESTORED, FaultDriver, Recovery, Rest
 from expcore_onedata.fault_restore import stop_record
 from expcore_onedata.fault_serves import provider_serves
 from expcore_onedata.fault_settings import FaultSettings, compose_driver, heal_token_margin_s, hpc_driver, load_faults
-from expcore_onedata.linkrecord import NOT_WRITTEN, fact
+from expcore_onedata.linkrecord import NOT_WRITTEN, fact, federation_root
 from expcore_onedata.sandbox.kinds import INJECTOR_FAILURE, PROVIDER_OUTAGE
 
 __all__ = [
@@ -674,9 +679,11 @@ class FaultInjector:
         holders this injector was built with (the configuration it was given, read nowhere again), or op-worker asks the
         stopped owner first and every read waits on it (`expcore_onedata.failover`). A target that owns no space with a
         mirror is no owner stop, and this reads nothing new of it and records nothing. A platform whose ids are not
-        known for such a space is refused as well: the order is never assumed. A pass changes no step and no snapshot."""
+        known for such a space is refused as well: the order is never assumed. With the root's `failover-order.json`
+        the mirrors of the spaces it lists are its declared ones (`failover.admit_stop`), and a record that is
+        unreadable or does not resolve is a refusal. A pass changes no step and no snapshot."""
         try:
-            failover.admit(self._config, (self._owner_name,))
+            failover.admit_stop(self._config, self._owner_name, federation_root(self._settings.journal))
         except failover.FailoverError as error:
             raise self._fail(f"{error}; nothing is taken down") from None
 

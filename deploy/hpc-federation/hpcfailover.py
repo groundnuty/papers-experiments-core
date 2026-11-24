@@ -13,16 +13,26 @@ are those the rendered platform file holds with one of them as the data provider
 supporter. A layout that declares none, or whose declared providers hold no space with a mirror, has nothing in scope:
 `admit` then returns None, writes nothing and says nothing, and `up` is what it was.
 
+**Which providers are mirrors.** The layout says: a space's `mirrors` (`fedspec.Space.mirrors`) are the providers the
+study designates to hold its replicas, and the order is told over the owner and those alone. Another provider the
+rendered file lists as supporting the space (the agent's local provider, say) is ignored, since it may hold no block of
+the space's files and is then no replica to read from: counting it would let an owner whose id sorts above such a
+provider pass, and op-worker, choosing between the owner and the one mirror that holds the data, would ask the stopped
+owner first. The declared mirrors are matched to the file's providers through the bootstrap's ids, as the rest is
+(`declared_mirrors`); a space the layout gives no mirror, or does not know, is out of scope, as `holders_differ` skips
+it, and is never ordered over every supporter.
+
 **What is written.** When something is in scope and every space passes, `failover-order.json` in the root
-(`expcore_onedata.failover`): per space in scope its position label, its owner's and mirrors' provider labels, the
-labels in the order of their ids, and `mirror_first: true`. Labels only: no provider's name, no space's name, no id. It
-is evidence like `render-identity.json` (`hpcevidence.UP_FILES`), and the identity read reports it (`fleetidentity.py`).
-A space that fails refuses the member, naming the spaces and providers by label, and removes a record an earlier run of
-the phase left. The record of an earlier run is removed before the platform file is replaced (`invalidate`, called by
-`hpcboot.write_facts` on every run, with an outage declared or not), so a run that fails before it reaches the
-admission, or whose layout no longer declares the outage, never leaves a record the identity read would report as
-passed. The record is published by a private draft in the root, fsynced and renamed over the file (`publish_private`),
-so a full filesystem leaves no partial record.
+(`expcore_onedata.failover`): per space in scope its position label, its owner's and declared mirrors' provider labels,
+the labels in the order of their ids, and `mirror_first: true`. Labels only: no provider's name, no space's name, no id.
+It is evidence like `render-identity.json` (`hpcevidence.UP_FILES`), and the identity read reports it
+(`fleetidentity.py`); the fault injector reads it too, taking each space's mirrors from it (`failover.admit_stop`). A
+space that fails refuses the member, naming the spaces and providers by label, and removes a record an earlier run of
+the phase left. The record of an earlier run is removed first thing in the core's phase (`invalidate`, called by
+`hpcboot.core_phase` before anything that can raise, with an outage declared or not), so a run that fails at any point
+before it reaches the admission (a declared manifest it cannot load, say), or whose layout no longer declares the
+outage, never leaves a record the identity read would report as passed. The record is published by a private draft in
+the root, fsynced and renamed over the file (`publish_private`), so a full filesystem leaves no partial record.
 
 The scope is read from the rendered file's data provider (`holder`) of each space, which nothing else ties to the
 layout's owner, so the file is tied to the layout through the ids the bootstrap gave out, as the support check
@@ -38,7 +48,7 @@ import contextlib
 import os
 import uuid
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import hpcsettings
 
@@ -56,19 +66,20 @@ def declared(spec: Any) -> Tuple[str, ...]:
 
 def invalidate(root: Any) -> None:
     """Remove the failover record of the root, if there is one: whatever it said was of an earlier run's platform file.
-    `hpcboot.write_facts` calls it before it replaces that file, whether this layout declares an outage or not, so the
-    record is gone on every way the run can go on to fail or to end without an admission. OSError when it cannot be
-    removed: a record that might outlive the file it is of is no state to go on from."""
+    `hpcboot.core_phase` calls it first, before it loads a manifest or writes a file, whether this layout declares an
+    outage or not, so the record is gone on every way the run can go on to fail or to end without an admission. OSError
+    when it cannot be removed: a record that might outlive the file it is of is no state to go on from."""
     (Path(root) / FILE).unlink(missing_ok=True)
 
 
 def publish_private(path: Path, text: str) -> None:
     """Write `text` to `path` whole or not at all, mode 0600: a draft of this process's own beside it (never through a
     link, never an existing file), flushed and fsynced, renamed over `path` (a link there is replaced, not followed). A
-    failure, a full filesystem included, removes the draft and leaves `path` as it was."""
+    failure, a full filesystem included, removes the draft and leaves `path` as it was. A draft that already exists is
+    some other writer's: creating it fails, and it is left alone, since only a draft this call made is its to remove."""
     draft = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    descriptor = os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)  # nothing of ours yet
     try:
-        descriptor = os.open(draft, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             os.fchmod(handle.fileno(), 0o600)  # whatever the umask says
             handle.write(text)
@@ -76,7 +87,7 @@ def publish_private(path: Path, text: str) -> None:
             os.fsync(handle.fileno())
         os.replace(draft, path)
     except BaseException:
-        with contextlib.suppress(OSError):  # the draft may never have been made
+        with contextlib.suppress(OSError):  # the draft is ours: it may be gone already, as after the rename
             draft.unlink()
         raise
 
@@ -112,6 +123,37 @@ def holders_differ(spec: Any, config: Any, ids: Any, owners: Tuple[str, ...]) ->
     return differing, omitted
 
 
+def declared_mirrors(spec: Any, config: Any, ids: Any, owners: Tuple[str, ...]) -> Dict[str, Tuple[str, ...]]:
+    """The mirrors the layout declares for every space of the rendered file that a declared owner holds, by the file's
+    position label of the space to the file's labels of its providers, for `failover.orders`' `declared`: the
+    order is over the owner and these alone, and a provider that merely supports the space is ignored. A file space
+    whose layout space has no mirror, or that is no layout space at all, is listed with none (out of scope: nothing is
+    designated to serve it, as `holders_differ` skips a layout space with no mirror), so that no space a declared
+    owner holds is ever ordered over every supporter. The probe space, which the file does not hold as a `[[spaces]]`
+    entry, is not in it. The file's spaces and providers are matched to the layout's through the bootstrap's ids,
+    never names. FailoverError, naming the space by label, when a declared mirror is no provider of the file."""
+    from expcore_onedata import failover
+
+    label_of = {provider.id: config.provider_label(name) for name, provider in config.providers.items()}
+    targets = {label_of[ids.providers[name]] for name in owners if ids.providers[name] in label_of}
+    layout_space = {ids.spaces[space.name]: space for space in spec.spaces if space.name != spec.probe_space}
+    holders = config.space_holders()
+    found: Dict[str, Tuple[str, ...]] = {}
+    for entry in config.spaces:
+        if holders.get(entry.space.name) not in targets:
+            continue
+        space = layout_space.get(entry.space.id)
+        mirrors = space.mirrors if space is not None else ()
+        labels = tuple(label_of[ids.providers[name]] for name in mirrors if ids.providers[name] in label_of)
+        if len(labels) != len(mirrors):
+            raise failover.FailoverError(
+                f"failover order: {entry.position}: {len(mirrors) - len(labels)} declared mirror(s) are no "
+                "provider of the platform file, so no order is told"
+            )
+        found[entry.position] = labels
+    return found
+
+
 def admit(layout: Any, ids: Any) -> Optional[str]:
     """The failover-order admission of the member `layout` describes, once its platform file is rendered: None when no
     space is in scope (nothing is read, written or said), else the sentence `up` prints after writing the record. `ids`
@@ -141,7 +183,7 @@ def admit(layout: Any, ids: Any) -> Optional[str]:
     named = {provider.id: name for name, provider in config.providers.items()}  # the file's names, by id
     try:
         sought = tuple(named[ids.providers[name]] for name in owners if ids.providers[name] in named)  # the owners'
-        found = failover.admit(config, sought)
+        found = failover.admit(config, sought, declared_mirrors(layout.spec, config, ids, owners))
     except failover.FailoverError as error:
         invalidate(layout.root)  # a record of an earlier run of the phase is no longer true of this one
         raise RuntimeError(f"{error}; {REFUSAL}") from None

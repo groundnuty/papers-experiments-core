@@ -43,7 +43,8 @@ fleet's shard settings, `fleetplan.read_settings`).
   `{"admission": "passed", "spaces": [...]}` with each space's position label, owner and mirror labels, the labels in
   the order of their provider ids and `mirror_first`, or `{"admission": "unreadable"}` for a record that is not exactly
   what the writer produces (no space, a label twice or of the wrong kind in a field, a mirror that is the owner, spaces
-  out of order, another key, a key twice, or text that is no such record at all). The key is **only in that line**: it
+  out of order, orders no one order of the providers gives, another key, a key twice, or text that is no such record at
+  all). The key is **only in that line**: it
   is in no value of the tuple above, which the join compares across
   members (the campaign fingerprint, the environment identity a lease store pins, the platform fingerprint), nor in
   `render-identity.json`, which a shard's step compares key by key, since the order differs from one member to the
@@ -89,8 +90,8 @@ FAILOVER_FILE = "failover-order.json"
 FAILOVER_VERSION = "expcore-failover-order/1"
 FAILOVER_TOP = {"version", "spaces"}
 FAILOVER_KEYS = {"space", "owner", "mirrors", "order", "mirror_first"}
-FAILOVER_SPACE = re.compile(r"spaces\[(0|[1-9][0-9]{0,3})\]")  # a position in the platform's spaces, never a name
-FAILOVER_PROVIDER = re.compile(r"providers\[(0|[1-9][0-9]{0,3})\]")  # a position in its providers, never a name
+FAILOVER_SPACE = re.compile(r"spaces\[(0|[1-9][0-9]*)\]")  # a position in the platform's spaces, never a name
+FAILOVER_PROVIDER = re.compile(r"providers\[(0|[1-9][0-9]*)\]")  # a position in its providers, never a name
 
 
 def _modules() -> Any:
@@ -344,17 +345,54 @@ def failover_once(pairs: Any) -> dict:
     return found
 
 
+def failover_consistent(orders: Any) -> bool:
+    """Whether one order of the providers holds in every one of `orders` (each a list of distinct provider labels): the
+    union of each order's adjacent pairs, first before second, has no cycle. The provider ids are one set whatever the
+    space, so no record where two spaces order two providers oppositely is one `up` wrote. The core's reader
+    (`expcore_onedata.failover.consistent`) is the same check."""
+    after: dict = {}
+    waiting: dict = {}
+    for order in orders:
+        for label in order:
+            after.setdefault(label, set())
+            waiting.setdefault(label, 0)
+        for first, second in zip(order, order[1:]):
+            if second not in after[first]:
+                after[first].add(second)
+                waiting[second] += 1
+    ready = [label for label, count in waiting.items() if count == 0]
+    done = 0
+    while ready:
+        label = ready.pop()
+        done += 1
+        for later in after[label]:
+            waiting[later] -= 1
+            if waiting[later] == 0:
+                ready.append(later)
+    return done == len(waiting)
+
+
+def failover_position(label: str) -> tuple:
+    """The number in a checked label `spaces[<digits>]` as a key: digits with no leading zero order by length and then
+    as text, and no `int` is made of them, whose conversion of a very long digit string raises."""
+    digits = label[len("spaces[") : -1]
+    return len(digits), digits
+
+
 def failover_record_ok(record: Any) -> bool:
     """Whether `record` is exactly what the writer produces: its two keys, this version, and at least one space (the
     writer writes no record for an admission with none), each as `failover_space_ok` says, their positions ascending
-    (the platform's order of spaces, so no label is there twice)."""
+    (the platform's order of spaces, so no label is there twice) and their orders consistent with one order of the
+    providers (`failover_consistent`)."""
     if not isinstance(record, dict) or set(record) != FAILOVER_TOP or record["version"] != FAILOVER_VERSION:
         return False
     spaces = record["spaces"]
     if not isinstance(spaces, list) or not spaces or not all(map(failover_space_ok, spaces)):
         return False
-    positions = [int(space["space"][len("spaces[") : -1]) for space in spaces]  # each label was checked above
-    return all(before < after for before, after in zip(positions, positions[1:]))
+    positions = [failover_position(space["space"]) for space in spaces]  # each label was checked above
+    return all(before < after for before, after in zip(positions, positions[1:])) and failover_consistent(
+        [space["order"] for space in spaces]
+    )
 
 
 def failover_reading(root: Path) -> Optional[dict]:
