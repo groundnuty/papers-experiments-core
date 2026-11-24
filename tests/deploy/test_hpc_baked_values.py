@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -268,9 +269,10 @@ def test_o98_a_prune_each_path_that_is_a_file_is_an_error(tmp_path):
     assert baked_pruned(tmp_path, "--prune-each", "import").returncode == 2
 
 
-def test_o98_lib_sh_passes_the_options_before_the_directory_and_the_restore_check_prunes_the_storage(tmp_path):
-    """O98: `no_baked <dir> --prune posix --prune-each import` scans the rest of the directory; check-defaults.sh's
-    /volumes check is that call, and prep's, and the live check's, keep the whole scan."""
+def test_o98_lib_sh_passes_the_options_before_the_directory_and_only_a_providers_restart_prunes_the_storage(tmp_path):
+    """O98: `no_baked <dir> --prune posix --prune-each import` scans the rest of the directory, and check-defaults.sh
+    makes that call only for `--restart`, which finish.sh passes on a provider's restart and nothing else does; prep's
+    scan and the live check's keep the whole of theirs."""
     top = volumes(tmp_path)
     (top / "posix" / "data.bin").write_bytes(STAND_IN)
     override = f"BAKED_CB_SHA256=({' '.join(ENTRIES)}); no_baked"
@@ -280,7 +282,107 @@ def test_o98_lib_sh_passes_the_options_before_the_directory_and_the_restore_chec
     assert lib(override, str(top), "--prune", "posix", "--prune-each", "import").returncode == 1
     checks = (BUNDLE / "check-defaults.sh").read_text(encoding="utf-8")
     patch = (BUNDLE / "patch.sh").read_text(encoding="utf-8")
-    assert 'no_baked "$R/volumes" --prune posix --prune-each import' in checks
+    assert 'no_baked "$R/volumes" ${SCAN[@]+"${SCAN[@]}"}' in checks
+    assert "if [[ -n $RESTART ]]; then SCAN=(--prune posix --prune-each import); fi" in checks
+    assert checks.count('no_baked "$R/volumes"') == 1
     assert 'no_baked "$CB"' in checks
     assert 'no_baked "$R/volumes" || die' in patch  # prep scans the rootfs whole, before any storage exists
     assert "--prune" not in patch
+
+
+def test_o98_only_the_providers_restart_passes_the_option_that_prunes(tmp_path):
+    """O98: `finish.sh --restart` runs the live check with `--restart`; its first start, the zone's finish (restart or
+    not) and node-init.sh's check of the first launch run it without."""
+    finish = (BUNDLE / "finish.sh").read_text(encoding="utf-8")
+    calls = re.findall(r'^\s*bash "\$HPCOP_BUNDLE/check-defaults.sh" .*$', finish, re.M)
+    assert [call.strip() for call in calls] == [
+        'bash "$HPCOP_BUNDLE/check-defaults.sh" op --workdir "$W" --live --restart',
+        'bash "$HPCOP_BUNDLE/check-defaults.sh" op --workdir "$W" --live',
+    ]
+    assert re.search(r"if \(\( RESTART \)\); then[^\n]*\n\s*bash [^\n]*--live --restart\n\s*else\n", finish)
+    for name in ("finish-zone.sh", "node-init.sh"):
+        text = (BUNDLE / name).read_text(encoding="utf-8")
+        assert "check-defaults.sh" in text
+        assert "--restart\n" not in "".join(line for line in text.splitlines(True) if "check-defaults.sh" in line)
+
+
+def fake_workdir(tmp_path: Path, comp: str) -> tuple[Path, Path]:
+    """A copy of the bundle whose lib.sh lists the stand-in's hash for the images' values, and a work directory of
+    `comp` that holds just what check-defaults.sh reads before the scan of /volumes (the four secrets); the checks that
+    need the rest of a rootfs fail, as they should, and the scan under test is one line of the output."""
+    bundle = tmp_path / "bundle"
+    shutil.copytree(BUNDLE, bundle, ignore=shutil.ignore_patterns("__pycache__"))
+    text = (bundle / "lib.sh").read_text(encoding="utf-8")
+    patched = re.sub(r"BAKED_CB_SHA256=\(\n.*?\n\)", f"BAKED_CB_SHA256=(\n  {ENTRIES[0]}\n)", text, count=1, flags=re.S)
+    assert patched != text
+    (bundle / "lib.sh").write_text(patched, encoding="utf-8")
+    work = tmp_path / f"hpcop-{comp}.abc123"
+    secrets = work / "rootfs" / "root" / ".hpcop"
+    secrets.mkdir(parents=True)
+    work.chmod(0o700)
+    secrets.chmod(0o700)
+    for name, value in {"passphrase": "a" * 48, "erlang-cookie": "b" * 64, "couchbase-user": "cbuser",
+                        "couchbase-password": "c" * 24}.items():  # fmt: skip
+        (secrets / name).write_text(value + "\n", encoding="utf-8")
+        (secrets / name).chmod(0o600)
+    return bundle, work
+
+
+SCAN_LINE = "no shipped Couchbase cookie or memcached password under /volumes"
+
+
+def scan_of(bundle: Path, work: Path, comp: str, *options: str) -> tuple[str, str]:
+    """The verdict of the scan of /volumes ("ok" or "FAIL") and the whole stderr, from the real check-defaults.sh."""
+    env = {**os.environ, "HPCOP_PY": sys.executable, "TMPDIR": str(work.parent)}
+    done = subprocess.run(["bash", str(bundle / "check-defaults.sh"), comp, "--workdir", str(work), *options],
+                          capture_output=True, text=True, timeout=120, check=False, env=env)  # fmt: skip
+    lines = [line for line in done.stderr.splitlines() if SCAN_LINE in line]
+    assert len(lines) == 1, done.stderr
+    return lines[0].split(":", 1)[0], done.stderr
+
+
+@pytest.mark.parametrize("storage", ["posix/data.bin", "import/shared-tree/file"])
+@pytest.mark.parametrize(
+    ("comp", "options"), [("oz", ()), ("op", ())], ids=["the zone's", "a provider's first launch's"]
+)
+def test_o98_every_check_but_a_providers_restart_finds_a_value_in_the_storage_directories(
+    tmp_path, comp, options, storage
+):
+    """O98: a regular file holding a shipped Couchbase value under /volumes/posix or an import entry escaped the scan of
+    the zone and of a first launch (node-init.sh's call, which has no option) when the prune was passed to all. The real
+    check-defaults.sh fails it, as it did before the prune existed."""
+    bundle, work = fake_workdir(tmp_path, comp)
+    target = work / "rootfs" / "volumes" / storage
+    target.parent.mkdir(parents=True)
+    target.write_bytes(STAND_IN)
+    verdict, stderr = scan_of(bundle, work, comp, *options)
+    assert verdict == "FAIL", stderr
+    assert str(target) in stderr
+    assert STAND_IN.decode() not in stderr
+
+
+@pytest.mark.parametrize("storage", ["posix/data.bin", "import/shared-tree/file"])
+def test_o98_a_providers_restart_leaves_its_storage_out_and_still_finds_a_value_anywhere_else(tmp_path, storage):
+    """O98: `--restart` is what leaves the provider's storage and its imports out of the scan, and the Couchbase state
+    beside them is read whole: the same value in the persistence fails it."""
+    bundle, work = fake_workdir(tmp_path, "op")
+    volumes_ = work / "rootfs" / "volumes"
+    (volumes_ / storage).parent.mkdir(parents=True)
+    (volumes_ / storage).write_bytes(STAND_IN)
+    assert scan_of(bundle, work, "op", "--restart")[0] == "ok"
+    (volumes_ / "persistence").mkdir()
+    (volumes_ / "persistence" / "cookie").write_bytes(STAND_IN)
+    assert scan_of(bundle, work, "op", "--restart")[0] == "FAIL"
+
+
+def test_o98_the_restart_option_is_a_providers_and_an_unknown_option_is_still_refused(tmp_path):
+    """O98: the zone has no storage to leave out, so `--restart` there is an error and nothing is scanned; an option the
+    script does not know is refused as before."""
+    for comp, option, why in (("oz", "--restart", "provider's"), ("op", "--unknown", "unknown option")):
+        bundle, work = fake_workdir(tmp_path / comp, comp)
+        env = {**os.environ, "HPCOP_PY": sys.executable, "TMPDIR": str(work.parent)}
+        done = subprocess.run(["bash", str(bundle / "check-defaults.sh"), comp, "--workdir", str(work), option],
+                              capture_output=True, text=True, timeout=120, check=False, env=env)  # fmt: skip
+        assert done.returncode == 1
+        assert why in done.stderr
+        assert SCAN_LINE not in done.stderr

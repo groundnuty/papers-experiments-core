@@ -20,13 +20,26 @@
 #   one with 'cluster_node'; the vm.args onepanel rewrote hold no other cookie; Couchbase refuses
 #   admin/password, every retired administrator password and an anonymous admin request, and accepts the current one; the live Couchbase
 #   cookies and memcached password are not the shipped ones; the served web key is not the shipped one.
-# Usage: check-defaults.sh <op|oz> --workdir W [--live]
+# --restart (a provider only; finish.sh --restart passes it, after a relaunch over a kept work directory) leaves the
+#   provider's storage, /volumes/posix and each entry of /volumes/import, out of the scan of /volumes for the shipped
+#   Couchbase values: it holds the study's data, which the images never ship, and a restore over a tmpfs storage read
+#   all of it, about ten minutes of pure Python (O98). Every other check, the zone's, the first launch's (node-init.sh)
+#   and a provider's first start's, scans /volumes whole.
+# Usage: check-defaults.sh <op|oz> --workdir W [--live] [--restart]
 # shellcheck disable=SC2016  # single-quoted '$HOME' below is literal text to look for
 source "$(dirname "$0")/lib.sh"
 component "${1:-}"; shift
-[[ ${1:-} == --workdir ]] || die "usage: check-defaults.sh <op|oz> --workdir W [--live]"
-W=$(find_workdir "$COMP" "${2:-}"); LIVE=${3:-}
-[[ -z $LIVE || $LIVE == --live ]] || die "unknown option '$LIVE'"
+[[ ${1:-} == --workdir ]] || die "usage: check-defaults.sh <op|oz> --workdir W [--live] [--restart]"
+W=$(find_workdir "$COMP" "${2:-}"); LIVE='' RESTART=''
+shift; if (( $# )); then shift; fi
+for option in "$@"; do
+  case $option in
+    --live) LIVE=--live ;;
+    --restart) RESTART=--restart ;;
+    *) die "unknown option '$option'" ;;
+  esac
+done
+[[ -z $RESTART || $COMP == op ]] || die "--restart is a provider's: the zone has no storage to leave out of a scan"
 R=$W/rootfs; S=$(secrets_dir "$W"); fails=0
 fail() { printf 'FAIL: %s\n' "$*" >&2; fails=$((fails + 1)); }
 check() { local what=$1; shift; if "$@"; then ok "$what"; else fail "$what"; fi; }
@@ -66,10 +79,13 @@ overlay_ok() {  # our overlay holds the current administrator, and no other pane
   [[ -z $other ]]
 }
 check "onepanel's Couchbase administrator comes from our 0600 overlay only" overlay_ok
-# Not under volumes/posix nor volumes/import/*: the provider's storage and the imported trees hold the study's data, which
-# the images never ship, and with tmpfs storage a restore would read all of it, ten minutes of pure Python (O98). The
-# Couchbase state, persistence and the backup, is under the rest of /volumes and is scanned whole.
-check "no shipped Couchbase cookie or memcached password under /volumes" no_baked "$R/volumes" --prune posix --prune-each import
+# On a provider's restart alone (--restart): not under volumes/posix nor volumes/import/*, the provider's storage and the
+# imported trees, which hold the study's data and which the images never ship (O98: with tmpfs storage a restore would
+# read all of it, ten minutes of pure Python). The Couchbase state, persistence and the backup, is under the rest of
+# /volumes and is scanned whole; the zone's check, the first launch's and a first start's scan it all, storage included.
+SCAN=()
+if [[ -n $RESTART ]]; then SCAN=(--prune posix --prune-each import); fi
+check "no shipped Couchbase cookie or memcached password under /volumes" no_baked "$R/volumes" ${SCAN[@]+"${SCAN[@]}"}
 preload_ok() { [[ $(<"$R/etc/ld.so.preload") == /usr/local/lib/hpcop-portshim.so ]]; }
 check "ld.so.preload loads only the shim" preload_ok
 if [[ $COMP == op && -e $S/registration-token ]]; then check "registration token is a 0600 file" secret_file "$S/registration-token"; fi
