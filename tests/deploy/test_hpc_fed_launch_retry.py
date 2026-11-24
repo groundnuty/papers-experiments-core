@@ -186,27 +186,27 @@ def test_o57_the_zone_that_failed_at_launch_is_retried_once_too(hpc, tmp_path, s
     assert entry["step"].endswith("-zone-run-1")
 
 
-def vanish_after_first_listing(fake, suffix):
-    """The step of the name that ends in `suffix` leaves squeue -s once squeue has listed it once: live, the first
-    provider's step was listed for about 12 s before it ended."""
-    real = fake.run
+def vanish_after_first_listing(rig, suffix):
+    """The step of the name that ends in `suffix` leaves squeue -s once the driver has asked for it by name and been
+    shown it once: live, the first provider's step was listed for about 12 s before it ended. (Not at the first read of
+    squeue: up reads it as each other service's log is ready, which lists every step of the job.)"""
+    real = rig.driver.launcher.listed
 
-    def run(argv, timeout):
-        done = real(argv, timeout)
-        if argv[0] == "squeue" and "-s" in argv:
-            for name in [n for n in fake.steps if n.endswith(suffix)]:
-                fake.steps.pop(name)
-        return done
+    def listed(name):
+        found = real(name)
+        if found is not None and name.endswith(suffix):
+            rig.fake.steps.pop(name)
+        return found
 
-    fake.run = run
+    rig.driver.launcher.listed = listed
 
 
 def test_o57_a_step_listed_before_it_ended_is_retried_when_the_id_the_state_holds_is_the_clients(hpc, tmp_path, site):
     """O57: where up saw the step listed it holds the step's id in the state: the retry's proofs then read that id and
     the client's agree (live, the first provider's step was listed for about 12 s)."""
     fake = FakeSlurm(launch_failures={"larch": [{"listed": True}]})
-    vanish_after_first_listing(fake, "-larch-run-1")
     rig = Rig(hpc, tmp_path, site, fake)
+    vanish_after_first_listing(rig, "-larch-run-1")
     held = []
     real_proof = rig.driver.launch_proof
     rig.driver.launch_proof = lambda service: (
@@ -223,8 +223,8 @@ def test_o57_an_id_the_state_holds_that_the_client_does_not_name_is_no_proof(hpc
     """O57: the state holds the id up saw listed; srun's client and sacct agree on another: which step this launch
     was is not shown, so it is never launched again."""
     fake = FakeSlurm(launch_failures={"larch": [{"listed": True, "client_id": "4242.77", "row_id": "4242.77"}]})
-    vanish_after_first_listing(fake, "-larch-run-1")
     rig = Rig(hpc, tmp_path, site, fake)
+    vanish_after_first_listing(rig, "-larch-run-1")
     with pytest.raises(RuntimeError, match="larch's step ended before its log said"):
         rig.up()
     assert len(rig.launches("larch")) == 1
