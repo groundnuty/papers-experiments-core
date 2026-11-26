@@ -44,14 +44,18 @@ def test_the_controllers_own_planning_sees_a_recovered_run_as_pending_and_leases
     """`demand`, `holds`, `ledger_view` and `decide` (what `control.py` reads) count the run among the pending ones, no
     hold keeps it back, and the next lease is its own, with the chosen count as the attempt base."""
     found = lost_run(tmp_path)
+    reader = LedgerReader(found.path)  # before the recovery: the controller has not started
+    try:
+        assert {run.run_key: run.state for run in reader.runs()}[found.run_key] == "infra_exhausted"
+        assert reader.demand().pending == {"m1": 1}  # the other run of the plan
+        wanted_before = ledger_view(reader).leases_wanted()
+    finally:
+        reader.close()
+    _recover(found, charged=charged)
     ledger = open_ledger(found)
     try:
-        assert ledger.run(found.run_key).state == "infra_exhausted"
-        assert ledger.demand().pending == {"m1": 1}  # the other run of the plan
-        wanted_before = ledger_view(ledger).leases_wanted()
-        _recover(found, charged=charged)
         run = ledger.run(found.run_key)
-        assert (run.state, run.charged, run.lease_id) == ("pending", charged, found.leases[-1])
+        assert (run.state, run.charged, run.lease_id) == ("pending", charged, None)
         assert ledger.demand().pending == {"m1": 2}
         assert ledger.holds() == {}
         assert ledger_view(ledger).leases_wanted() == wanted_before + 1
@@ -60,6 +64,7 @@ def test_the_controllers_own_planning_sees_a_recovered_run_as_pending_and_leases
         again = leased(ledger, FED)
         assert (again.run_key, again.attempt_base) == (found.run_key, charged)
         assert again.lease_id == found.leases[-1] + 1
+        assert ledger.run(found.run_key).lease_id == again.lease_id  # the next issue sets the run's latest lease again
         found.clock.advance(60)
         assert finish(ledger, again, state="done", charged=1) == "counted"
         done = ledger.run(found.run_key)
@@ -148,6 +153,7 @@ def test_the_merges_snapshot_and_replay_accept_a_ledger_that_holds_the_event(tmp
     take_ledger_snapshot(found.path, snapshot)
     facts = read_ledger(snapshot.read_bytes(), "0" * 64)
     assert facts.runs[found.run_key].state == "pending"
+    assert facts.runs[found.run_key].lease_id is None
     assert facts.counted(found.run_key) is None  # a run that is not terminal has no counted lease
     assert [lease.state for lease in facts.leases_of(found.run_key)] == ["counted"] * 3
     later = _lease_again(found, end=True)

@@ -2,7 +2,7 @@
 changes nothing."""
 
 import pytest
-from recover_support import WHY, events_of, lost_run
+from recover_support import WHY, events_of, lost_run, open_ledger
 from reopen_support import dump, sha256_of
 
 from expcore.campaign.elastic import awareness
@@ -84,12 +84,26 @@ def test_a_sealed_final_that_is_not_there_is_refused_with_exit_one(tmp_path, cap
     assert "condition 4 (sealed final)" in capsys.readouterr().err
 
 
-def test_the_command_is_refused_beside_a_controller_that_does_not_say_it_honours_operator_writes(tmp_path, capsys):
+def test_the_command_is_refused_while_a_controller_that_honours_operator_writes_holds_the_ledger(tmp_path, capsys):
+    found = lost_run(tmp_path)
+    before = dump(found.path)
+    ledger = open_ledger(found)
+    try:
+        assert main([*_args(found), "--reason", WHY, "--actor", "op-1"]) == 1
+    finally:
+        ledger.close()
+    assert "condition 5 (controller): a controller holds this ledger and says it honours operator writes" in (
+        capsys.readouterr().err
+    )
+    assert dump(found.path) == before
+
+
+def test_the_command_is_refused_while_a_controller_holds_the_ledger(tmp_path, capsys):
     found = lost_run(tmp_path)
     before = dump(found.path)
     with DispatchLock(found.path.parent):  # a controller of an older core: the lock held, no declaration
         assert main([*_args(found), "--reason", WHY, "--actor", "op-1"]) == 1
-    assert "Restart it on this commit or later" in capsys.readouterr().err
+    assert "before its controller starts" in capsys.readouterr().err
     assert dump(found.path) == before
 
 
@@ -105,15 +119,13 @@ def test_the_command_reports_a_ledger_that_is_not_there_and_a_reason_that_says_n
     assert "no ledger there" in capsys.readouterr().err
 
 
-def test_a_controller_that_cannot_be_told_is_warned_of_on_stderr_and_the_recovery_is_written(
-    tmp_path, capsys, monkeypatch
-):
-    """The locks could not be read: the run is recovered, and the operator is told an older controller would only read
-    it at its next tick."""
+def test_a_controller_that_cannot_be_told_refuses_the_recovery_with_exit_one(tmp_path, capsys, monkeypatch):
+    """The locks could not be read: nothing says no controller holds the ledger, so nothing is written."""
     found = lost_run(tmp_path)
+    before = dump(found.path)
     monkeypatch.setattr(awareness, "controller_of", lambda path: awareness.UNKNOWN)
-    assert main([*_args(found), "--reason", WHY, "--actor", "op-1"]) == 0
+    assert main([*_args(found), "--reason", WHY, "--actor", "op-1"]) == 1
     out = capsys.readouterr()
-    assert out.out.startswith(f"recovered run {found.run_key}")
-    assert "could not tell whether a controller holds this ledger" in out.err
-    assert len(events_of(found.path)) == 1
+    assert out.out == ""
+    assert "condition 5 (controller): could not tell whether a controller holds this ledger" in out.err
+    assert dump(found.path) == before

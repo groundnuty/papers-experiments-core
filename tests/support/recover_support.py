@@ -91,18 +91,20 @@ def lost_by_losses(tmp_path: Path) -> Lost:
     return Lost(tmp_path, copy, final, run_key, "infra_exhausted", 3, tuple(ids), clock)
 
 
-def lost_and_settled(tmp_path: Path, *, state: str = "infra_exhausted") -> Lost:
+def lost_and_settled(tmp_path: Path, *, state: str = "infra_exhausted", spend_only_last: bool = False) -> Lost:
     """Like `lost_by_losses`, with every loss settled from its dead store's log (one charged attempt, a spend), so that
     the run's old leases hold `charged_added` above 0 and the ledger holds a settlement row for each of them: a
     `harness_error` run is one loss, settled, and a lease that ended `harness_error` charging nothing; an
-    `infra_exhausted` one is three losses."""
+    `infra_exhausted` one is three losses. With `spend_only_last` the last loss is settled with its spend alone, so its
+    settlement gives no charged attempts."""
     ledger, clock = make(
         tmp_path / "campaign", runs=plan(tasks=1, conditions=("api-none",)), max_usd=10.0, grants_usd={"m1": 1.0}
     )
     ids = []
     for number in range(1, 4 if state == "infra_exhausted" else 2):
         lease = lose(ledger, clock, f"fed-{number}")
-        ledger.settle(lease.lease_id, 100_000, "root", attempts_charged=1)
+        spend_only = spend_only_last and number == (3 if state == "infra_exhausted" else 1)
+        ledger.settle(lease.lease_id, 100_000, "root", attempts_charged=None if spend_only else 1)
         ids.append(lease.lease_id)
     if state == "harness_error":
         join(ledger, clock, "fed-last")
@@ -130,15 +132,6 @@ def add_overdue(path: Path, lease_id: int, run_key: str) -> None:
         db.close()
 
 
-def settle_spend_only(found: Lost, lease_id: int) -> None:
-    """Settle a lost lease of the working copy with its spend alone: the settlement holds no charged attempts."""
-    ledger = open_ledger(found)
-    try:
-        ledger.settle(lease_id, 100_000, "root")
-    finally:
-        ledger.close()
-
-
 def charged_added_of(path: Path) -> dict[int, int]:
     """What each lease of the ledger file was counted for (`charged_added`), by lease id."""
     db = sqlite3.connect(path)
@@ -151,7 +144,8 @@ def charged_added_of(path: Path) -> dict[int, int]:
 def assert_only_the_run_and_one_event_changed(found: Lost, before: dict, after: dict) -> None:
     """What a recovery writes and nothing more: every table but `runs`, `events` and `sqlite_sequence` is as it was
     (every lease row, `charged_added` included, and every settlement among them); one row of `runs` differs, the run's,
-    and not in its key, factors, set or latest lease; and the log holds each earlier row as it was, and one more."""
+    and not in its key, factors or set (its latest lease is cleared); and the log holds each earlier row as it was, and
+    one more."""
     assert {table for table in after if after[table] != before[table]} == {"runs", "events", "sqlite_sequence"}
     assert after["leases"] == before["leases"]
     assert after["settlements"] == before["settlements"]
@@ -162,7 +156,7 @@ def assert_only_the_run_and_one_event_changed(found: Lost, before: dict, after: 
     old, new = changed[0]
     assert old[0] == new[0] == found.run_key
     assert old[:5] == new[:5]  # the run's key, factors and set are as they were
-    assert old[7] == new[7]  # its latest lease is as it was
+    assert (old[7] is not None, new[7]) == (True, None)  # its latest lease is cleared: the next issue sets it again
 
 
 def open_ledger(found: Lost) -> Ledger:

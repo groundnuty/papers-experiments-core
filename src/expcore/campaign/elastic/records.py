@@ -33,6 +33,7 @@ from expcore.models.served import MIXED_FINGERPRINTS, DeclaredSet
 
 LIVE = ("issued", "sent")
 COMPLETION_STATES = ("done", "infra_fail", "harness_error", "interrupted", "outage_discarded")
+RECOVER = "operator_recover"  # the event kind of an operator putting a lost run back to pending (`recoverrun`)
 HELD = ("issued", "sent", "expired", "reported", "lost")  # states charged their grant until a spend settles them
 SETTLE_SOURCES = ("root", "pulled")  # where a settled spend was read: the surviving root, or evidence pulled back
 PROOFS = ("terminal", "cancelled")  # what a caller may give as a job's proven end; "walltime" is the ledger's own

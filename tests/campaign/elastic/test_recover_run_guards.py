@@ -10,12 +10,12 @@ from recover_support import events_of, lost_run, open_ledger
 from recover_support import recover_found as _recover
 from reopen_support import dump, sql
 
+from expcore.campaign.elastic import awareness
 from expcore.campaign.elastic import recoverrun as module
-from expcore.campaign.elastic.awareness import AWARE
 from expcore.campaign.elastic.records import RecoverRefused
 from expcore.campaign.lock import DispatchLock
 
-OLDER = "Restart it on this commit or later"
+HELD = "a controller holds this ledger"
 
 
 def _while_reading(monkeypatch, action) -> None:
@@ -73,26 +73,38 @@ def test_a_controller_of_an_older_core_that_takes_the_ledger_while_the_sealed_fi
     before = dump(found.path)
     held = ExitStack()
     _while_reading(monkeypatch, lambda: held.enter_context(DispatchLock(found.path.parent)))
-    with held, pytest.raises(RecoverRefused, match=OLDER):
+    with held, pytest.raises(RecoverRefused, match=f"{HELD}:"):
         _recover(found, dry_run=dry_run)
     assert dump(found.path) == before
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
-def test_a_controller_that_says_it_honours_operator_writes_and_takes_the_ledger_meanwhile_is_beside_the_recovery(
+def test_a_controller_that_says_it_honours_operator_writes_and_takes_the_ledger_meanwhile_refuses_the_recovery(
     tmp_path, monkeypatch, dry_run
 ):
-    """The controller's state the command reports is the one at the last decision, not the first probe's."""
+    """The probe at the last decision is the one that counts, not the first: no controller held the ledger when the
+    command began, and one of this core holds it, declaration and all, by the time the sealed final has been read."""
     found = lost_run(tmp_path)
+    before = dump(found.path)
     holders = []
     _while_reading(monkeypatch, lambda: holders.append(open_ledger(found)))
     try:
-        done = _recover(found, dry_run=dry_run)
+        with pytest.raises(RecoverRefused, match=f"{HELD} and says it honours operator writes"):
+            _recover(found, dry_run=dry_run)
     finally:
         for ledger in holders:
             ledger.close()
-    assert done.controller == AWARE
-    assert (done.event_seq is None) is dry_run
+    assert dump(found.path) == before
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_a_probe_that_cannot_tell_while_the_sealed_final_is_read_refuses_the_recovery(tmp_path, monkeypatch, dry_run):
+    found = lost_run(tmp_path)
+    before = dump(found.path)
+    _while_reading(monkeypatch, lambda: monkeypatch.setattr(awareness, "controller_of", lambda path: awareness.UNKNOWN))
+    with pytest.raises(RecoverRefused, match="could not tell whether a controller holds this ledger"):
+        _recover(found, dry_run=dry_run)
+    assert dump(found.path) == before
 
 
 def test_the_sealed_final_is_read_without_the_write_lock_so_a_controller_is_never_stalled_by_it(tmp_path, monkeypatch):
@@ -119,10 +131,10 @@ def test_a_dry_run_that_nothing_changed_under_says_what_the_real_call_does(tmp_p
     would = _recover(found, charged=1, dry_run=True)
     did = _recover(found, charged=1)
     assert (would.event_seq, did.event_seq is not None) == (None, True)
-    assert (would.run_key, would.source_sha256, would.rule, would.leases, would.controller) == (
+    assert (would.run_key, would.source_sha256, would.rule, would.leases, would.prior_lease_id) == (
         did.run_key,
         did.source_sha256,
         did.rule,
         did.leases,
-        did.controller,
+        did.prior_lease_id,
     )

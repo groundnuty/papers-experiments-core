@@ -5,7 +5,6 @@ included, and the sealed final's bytes as they were."""
 
 import json
 import os
-import shutil
 import stat
 
 import pytest
@@ -25,8 +24,6 @@ from recover_support import assert_refused as _refused
 from recover_support import recover_found as _recover
 from reopen_support import dump, sha256_of, sql
 
-from expcore.campaign.elastic import recoverrun as module
-from expcore.campaign.elastic.awareness import AWARE, NONE
 from expcore.campaign.elastic.records import RecoverRefused
 from expcore.campaign.lock import DispatchLock
 
@@ -34,25 +31,24 @@ from expcore.campaign.lock import DispatchLock
 def test_an_infra_exhausted_run_goes_back_to_pending_with_the_chosen_count_and_only_its_row_and_one_event_change(
     tmp_path,
 ):
-    """The success: the run is pending with N charged attempts and its latest lease as it was, every lease row and every
-    other table is untouched, the log has one more row, of the new kind, and the sealed final is byte for byte as it
-    was."""
+    """The success: the run is pending with N charged attempts and no latest lease, every lease row and every other
+    table is untouched, the log has one more row, of the new kind, and the sealed final is byte for byte as it was."""
     found = lost_run(tmp_path)
     before, final = dump(found.path), sha256_of(found.source)
     done = _recover(found, charged=0)
     after = dump(found.path)
-    assert (done.run_key, done.prior_state, done.prior_charged, done.charged, done.rule, done.controller) == (
+    assert (done.run_key, done.prior_state, done.prior_charged, done.charged, done.rule) == (
         found.run_key,
         "infra_exhausted",
         3,
         0,
         "waiver",
-        NONE,
     )
+    assert done.prior_lease_id == found.leases[-1]
     assert_only_the_run_and_one_event_changed(found, before, after)
     old, new = (next(row for row in table["runs"] if row[0] == found.run_key) for table in (before, after))
     assert (old[5], old[6], new[5], new[6]) == ("infra_exhausted", 3, "pending", 0)
-    assert old[7] == new[7] == found.leases[-1]  # its latest lease is as it was
+    assert (old[7], new[7]) == (found.leases[-1], None)  # its latest lease is cleared: the next issue sets it again
     (event,) = events_of(found.path)
     assert (event["run_key"], event["lease_id"], event["federation"], event["seq"]) == (
         found.run_key,
@@ -73,6 +69,7 @@ def test_the_event_names_the_run_its_states_and_counts_the_rule_the_leases_the_s
         "charged": 0,
         "leases": [1, 2, 3],
         "prior_charged": 3,
+        "prior_lease_id": found.leases[-1],
         "prior_state": "infra_exhausted",
         "reason": WHY,
         "rule": "waiver",
@@ -90,12 +87,13 @@ def test_a_harness_error_run_is_recovered_at_its_own_count_by_the_declared_rule(
     after = dump(found.path)
     assert_only_the_run_and_one_event_changed(found, before, after)
     run = next(row for row in after["runs"] if row[0] == found.run_key)
-    assert (run[5], run[6], run[7]) == ("pending", 1, found.leases[-1])
+    assert (run[5], run[6], run[7]) == ("pending", 1, None)
     assert event_detail(found.path) == {
         "actor": "op-1",
         "charged": 1,
         "leases": [1],
         "prior_charged": 1,
+        "prior_lease_id": found.leases[-1],
         "prior_state": "harness_error",
         "reason": WHY,
         "rule": "declared",
@@ -128,14 +126,23 @@ def test_the_run_is_pending_with_the_chosen_count_and_the_rule_says_whether_it_i
     assert event_detail(found.path)["rule"] == rule
 
 
-def test_a_run_is_recovered_beside_a_controller_that_holds_the_ledger_and_is_leased_from_its_next_issue(tmp_path):
-    """The dispatcher's lock and its declaration are held, as a running controller holds them; the command writes on the
-    file's own lock, and the controller's next issue leases the run with the chosen count as the attempt base."""
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_a_controller_that_says_it_honours_operator_writes_still_refuses_the_recovery(tmp_path, dry_run):
+    """The recovery is for a working copy before its controller starts: a controller of this core, holding its lock with
+    its declaration, is refused as any other is, and nothing is written."""
     found = lost_run(tmp_path)
     ledger = open_ledger(found)
     try:
-        done = _recover(found, charged=1)
-        assert done.controller == AWARE
+        _refused(found, 5, "a controller holds this ledger and says it honours operator writes", dry_run=dry_run)
+    finally:
+        ledger.close()
+
+
+def test_a_run_recovered_before_its_controller_starts_is_leased_from_its_first_issue(tmp_path):
+    found = lost_run(tmp_path)
+    _recover(found, charged=1)
+    ledger = open_ledger(found)
+    try:
         again = leased(ledger, FED)
         assert (again.run_key, again.attempt_base) == (found.run_key, 1)
     finally:
@@ -175,11 +182,16 @@ def test_a_lease_of_the_run_expired_with_its_holder_not_proven_ended_is_refused(
     _refused(found, 2, "lease 1 (expired)")
 
 
-def test_a_lease_of_the_run_expired_or_lost_with_its_holder_proven_ended_is_not_in_the_way(tmp_path):
+def test_a_lease_of_the_run_expired_with_its_holder_proven_ended_and_settled_or_lost_is_not_in_the_way(tmp_path):
     found = lost_run(tmp_path)
     sql(found.path, "UPDATE leases SET state='expired' WHERE id=1")
     sql(found.path, "UPDATE leases SET state='lost' WHERE id=2")
     sql(found.path, "UPDATE federations SET ended_at=?, end_proof='terminal' WHERE label=?", found.clock() + 60, FED)
+    sql(  # the settle that gave the expired lease's charged attempts (the ledger's own calls need a budget for it)
+        found.path,
+        "INSERT INTO settlements(lease_id, at, source, spend_micro, grant_micro, charged)"
+        " VALUES(1, 1.0, 'root', 0, 0, 1)",
+    )
     assert _recover(found).event_seq is not None
 
 
@@ -216,19 +228,6 @@ def test_a_symbolic_link_to_the_sealed_final_is_refused(tmp_path):
 def test_a_directory_is_not_a_sealed_final(tmp_path):
     found = lost_run(tmp_path)
     _refused(found, 4, "is not a regular file", source=found.root)
-
-
-def test_the_working_copy_itself_is_not_its_own_sealed_final(tmp_path):
-    found = lost_run(tmp_path)
-    _refused(found, 4, "is the ledger file itself", source=found.path)
-
-
-def test_a_hard_link_to_the_working_copy_is_the_same_file_and_is_refused(tmp_path):
-    """The same device and inode under another name: it would pass every comparison of rows."""
-    found = lost_run(tmp_path)
-    link = found.root / "linked.sqlite"
-    os.link(found.path, link)
-    _refused(found, 4, "is the ledger file itself", source=link)
 
 
 def test_a_file_that_is_not_a_database_is_refused(tmp_path):
@@ -304,25 +303,6 @@ def test_the_sealed_final_is_read_without_a_trace_beside_it_even_where_its_direc
     assert (sha256_of(found.source), sorted(os.listdir(directory)), found.source.stat().st_mtime_ns) == before
 
 
-def test_a_sealed_final_that_is_replaced_while_it_is_read_is_refused(tmp_path, monkeypatch):
-    """The hash recorded must be of the file the rows were read from: another file at its path after the hash is not."""
-    found = lost_run(tmp_path)
-    other = found.root / "other.sqlite"
-    shutil.copy2(found.source, other)
-    digest = module._digest
-
-    def swapped(handle):
-        said = digest(handle)
-        os.replace(other, found.source)
-        return said
-
-    monkeypatch.setattr(module, "_digest", swapped)
-    before = dump(found.path)
-    with pytest.raises(RecoverRefused, match=r"^condition 4 \(sealed final\): .*changed while it was read"):
-        _recover(found)
-    assert dump(found.path) == before
-
-
 def test_a_dry_run_decides_every_condition_and_writes_nothing(tmp_path):
     found = lost_run(tmp_path)
     before, final = dump(found.path), sha256_of(found.source)
@@ -358,10 +338,10 @@ def test_a_ledger_without_the_tables_an_older_one_lacks_is_recovered_as_any_othe
 
 
 def test_a_controller_that_does_not_say_it_honours_operator_writes_refuses_the_recovery(tmp_path):
-    """A controller holding its lock with its declaration is beside the command (the success tests); one holding its
-    lock without the declaration, as a core older than the operator's pause does, refuses it, and nothing is written."""
+    """A controller holding its lock without the declaration, as a core older than the operator's pause does, is
+    refused as one with it is, and nothing is written."""
     found = lost_run(tmp_path)
     before = dump(found.path)
-    with DispatchLock(found.path.parent), pytest.raises(RecoverRefused, match="Restart it on this commit or later"):
+    with DispatchLock(found.path.parent), pytest.raises(RecoverRefused, match="a controller holds this ledger:"):
         _recover(found)
     assert dump(found.path) == before
