@@ -91,6 +91,13 @@ class ReopenRefused(LedgerError):
     honours operator writes holds the ledger. The message names the condition; nothing was written."""
 
 
+class RecoverRefused(LedgerError):
+    """An operator's recovery of a lost run that one of its conditions refuses: the run or its leases are not as the
+    recovery needs, the charged count is not one it may set, the sealed final is not the file the working copy was made
+    from, or a controller that does not say it honours operator writes holds the ledger. The message names the
+    condition; nothing was written."""
+
+
 def undeclared_values(values: Any) -> tuple[str | None, ...]:
     """What a completion or a return reports its run saw undeclared (C48): each a fingerprint, or None (a reply that
     carried none), once, never several joined; ValueError for any other form."""

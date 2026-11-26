@@ -77,12 +77,27 @@
   declaration are decided again under it. `--dry-run` decides every condition, again at its end, and writes nothing. A
   second call is refused (the run is no longer `harness_error`). Written as `pause` is, beside a running controller,
   and refused while one does not say it honours operator writes.
+- `recover-run LEDGER --run RUN_KEY --charged N --source SEALED_FINAL --reason TEXT --actor NAME [--dry-run]`: put one
+  lost run back to `pending` with the charged count N, on a working copy of a campaign's sealed final ledger (LEDGER;
+  the final itself is never written), so that the campaign's controller leases it again and the lease's
+  `attempt_base` is N. It is refused, writing nothing and naming the condition, unless: the run is in the ledger and is
+  `infra_exhausted` or `harness_error`; no lease of it is in flight, `reported`, or expired with its holder not proven
+  ended; N is a whole number from 0 to below `max_attempts` and not above the run's charged count (the count is kept or
+  lowered, never raised); SEALED_FINAL is a regular file, never a link, that is not LEDGER itself (another device and
+  inode), has no `-wal` with bytes in it beside it, is a ledger of the same schema with the same campaign fingerprint,
+  and holds the run with the same state and charged count as LEDGER does now (it is read-only and immutable, and its
+  SHA-256 is recorded). The change is the run's state and charged count and one `operator_recover` event (the run, its
+  prior state and charged count, N, the rule, its lease ids, the sealed final's hash, the reason and the actor): the
+  rule is `declared` when N is the run's own count and `waiver` when N is below it. Its leases and their rows stay as
+  they were. `--dry-run` decides every condition, again at its end, and writes nothing. A second call is refused (the
+  run is no longer lost). Written as `pause` is, beside a running controller, and refused while one does not say it
+  honours operator writes.
 
-`status`, `raise-ceiling`, `set-cap`, `declare`, `pause`, `resume`, `drain` and `reopen-run` work on the ledger file
-under its own write lock and not the dispatcher's, so they run while a dispatcher holds the ledger, and the
-dispatcher's next lease reads a raise, a cap, a declaration, a pause, a drain or a reopened run. Exit status: 0
-done, 1 refused by the ledger (or, for `create`, by the study: not loadable, or code that is not known), 2 a usage
-error or a file that is not a ledger.
+`status`, `raise-ceiling`, `set-cap`, `declare`, `pause`, `resume`, `drain`, `reopen-run` and `recover-run` work on the
+ledger file under its own write lock and not the dispatcher's, so they run while a dispatcher holds the ledger, and
+the dispatcher's next lease reads a raise, a cap, a declaration, a pause, a drain or a reopened or recovered run. Exit
+status: 0 done, 1 refused by the ledger (or, for `create`, by the study: not loadable, or code that is not known), 2 a
+usage error or a file that is not a ledger.
 """
 
 import argparse
@@ -105,6 +120,8 @@ from expcore.campaign.elastic.grants import set_in_file as set_grants_in_file
 from expcore.campaign.elastic.ledger import Ledger
 from expcore.campaign.elastic.pauses import pause_in_file, resume_in_file
 from expcore.campaign.elastic.records import LedgerError, Status
+from expcore.campaign.elastic.recoverrun import described as recovery_described
+from expcore.campaign.elastic.recoverrun import recover_in_file
 from expcore.campaign.elastic.reopenrun import described, reopen_in_file
 from expcore.campaign.elastic.views import LedgerReader
 
@@ -436,6 +453,19 @@ def _reopen_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _recover_run(args: argparse.Namespace) -> int:
+    done = recover_in_file(
+        args.ledger, args.run, args.charged, args.source, args.reason, args.actor, dry_run=args.dry_run
+    )
+    print(recovery_described(done))
+    if done.event_seq is None:
+        print("dry run: nothing written")
+    elif done.controller not in (AWARE, NONE):
+        print("warning: could not tell whether a controller holds this ledger: the run is pending; a controller "
+              "older than the operator's pause would only read it at its next tick", file=sys.stderr)  # fmt: skip
+    return 0
+
+
 def _lease_number(text: str) -> int:
     """A lease id as typed: a whole number from 1."""
     try:
@@ -445,6 +475,14 @@ def _lease_number(text: str) -> int:
     if value < 1:
         raise argparse.ArgumentTypeError(f"a lease is a whole number from 1, got {text!r}")
     return value
+
+
+def _whole_number(text: str) -> int:
+    """A charged count as typed: a whole number, of any sign (`recover-run` refuses what it may not set)."""
+    try:
+        return int(text.strip())
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"a charged count is a whole number, got {text!r}") from None
 
 
 def _cap_of(text: str) -> int:
@@ -565,6 +603,26 @@ def _parser() -> argparse.ArgumentParser:
     reopening.add_argument("--reason", required=True, help="why it is reopened, recorded")
     reopening.add_argument("--actor", required=True, help="who reopens it (an operator or an agent), recorded")
     reopening.add_argument("--dry-run", action="store_true", help="decide every condition and write nothing")
+    recovering = commands.add_parser(
+        "recover-run",
+        help="put a lost run (infra_exhausted or harness_error) back to pending with a charged count, on a working "
+        "copy of a sealed final ledger",
+    )
+    recovering.add_argument("ledger", type=Path, help="the working copy of the ledger, never the sealed final")
+    recovering.add_argument("--run", required=True, help="the run's key")
+    recovering.add_argument(
+        "--charged",
+        required=True,
+        type=_whole_number,
+        help="the run's charged count afterwards (its next lease's attempt base): from 0 to below max_attempts, "
+        "and not above its count now",
+    )
+    recovering.add_argument(
+        "--source", required=True, type=Path, help="the sealed final ledger the working copy was made from (read-only)"
+    )
+    recovering.add_argument("--reason", required=True, help="why it is recovered, recorded")
+    recovering.add_argument("--actor", required=True, help="who recovers it (an operator or an agent), recorded")
+    recovering.add_argument("--dry-run", action="store_true", help="decide every condition and write nothing")
     return parser
 
 
@@ -593,6 +651,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "resume": _resume,
         "drain": _drain,
         "reopen-run": _reopen_run,
+        "recover-run": _recover_run,
     }
     try:
         return commands[args.command](args)
