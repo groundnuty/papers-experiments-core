@@ -23,9 +23,12 @@ It is refused, writing nothing, unless all of these hold, decided in one transac
    with one is not recovered;
 3. the charged count N is a whole number with 0 <= N < `max_attempts`, and not above the run's charged count now: the
    verb keeps or lowers the count, never raises it;
-4. the sealed final is a regular file, never a link, and not the working copy itself (another device and inode, a hard
-   link included, decided before any connection to the working copy is opened, which sets its journal mode); it has no
-   `-wal` with bytes in it beside it (it is sealed: the file alone is the ledger); it is a ledger of the same schema
+4. the working copy is a regular file, never a link (`lstat`); the sealed final is a regular file, never a link, and
+   not the working copy itself (another device and inode, a hard link included) nor one of its side files (its name
+   with `-wal`, `-shm` or `-journal` in the same directory), all decided before any connection to the working copy is
+   opened, which sets its journal mode; the sealed final has no `-wal` with bytes in it beside it and is in
+   rollback-journal mode (bytes 18 and 19 of its header are 1, not 2 for WAL: it is sealed, the file alone is the
+   ledger, and a `-wal` kept under another name of a hard link cannot hide); it is a ledger of the same schema
    with the same campaign fingerprint as the working copy; and it holds the run with the same state and the same
    charged count as the working copy does now, so the copy has not diverged for this run. Its bytes are read once into
    a private temporary copy (under `TMPDIR`), which is hashed and is the file every fact is read from, opened read-only
@@ -239,11 +242,40 @@ def _itself(path: Path) -> RecoverRefused:
     )
 
 
+SIDE_FILES = ("-wal", "-shm", "-journal")  # what SQLite keeps beside a database file, under the file's own name
+
+
+def refuse_a_linked_ledger(ledger: Path) -> None:
+    """Refuse (condition 4) a working copy that is a symbolic link, by `lstat`: a link can be pointed elsewhere between
+    the checks and the connection, and one in another directory hides which file the controller's locks guard.
+    `FileNotFoundError` for a path that is not there or is not a file."""
+    try:
+        info = os.lstat(ledger)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"{ledger}: no ledger there") from None
+    if stat.S_ISLNK(info.st_mode):
+        raise refused(
+            4, "working copy", f"{ledger} is a symbolic link: the working copy is a regular file, never followed"
+        )
+    if not stat.S_ISREG(info.st_mode):
+        raise FileNotFoundError(f"{ledger}: no ledger there")
+
+
 def refuse_the_ledger_itself(source: Path, ledger: Path) -> None:
-    """Refuse (condition 4) a sealed final that is a link, or is the file of `ledger` under any name (the same device
-    and inode, a hard link included), by looking at the two paths alone. It is decided before any connection to the
-    ledger is opened, since opening one sets its journal mode and could make a `-wal` and `-shm` beside a sealed
-    file."""
+    """Refuse (condition 4) a sealed final that is a link, a side file of the working copy (its `-wal`, `-shm` or
+    `-journal`: the same directory and the working copy's name with that suffix, which a connection to the working copy
+    would use, and could delete), or is the file of `ledger` under any name (the same device and inode, a hard link
+    included), by looking at the two paths alone. It is decided before any connection to the ledger is opened, since
+    opening one sets its journal mode and could make a `-wal` and `-shm` beside a sealed file."""
+    if Path(source).parent.resolve() == Path(ledger).parent.resolve() and Path(source).name in {
+        Path(ledger).name + suffix for suffix in SIDE_FILES
+    }:
+        raise refused(
+            4,
+            "sealed final",
+            f"{source} is a side file of the working copy {ledger}: a connection to the working copy would use it, and "
+            "could delete it",
+        )
     try:
         info = os.lstat(source)
     except OSError as error:
@@ -320,6 +352,26 @@ def _read_ledger_file(path: Path, run_key: str, shown: Path) -> tuple[str, str, 
     return fingerprint, run[0], run[1]
 
 
+WAL_MODE = "the sealed final is in WAL mode: seal it with a backup-API copy in journal_mode=DELETE"
+
+
+def _refuse_a_wal_mode_file(path: Path, shown: Path) -> None:
+    """Refuse (condition 4) a ledger file whose header does not say rollback journal: bytes 18 and 19 are its write and
+    read versions of the file format, 1 for a rollback journal and 2 for WAL. A file in WAL mode keeps its newest rows
+    in a `-wal` that the file alone, and its hash, do not hold, and a `-wal` is found by the file's name: a hard link
+    under another name would hide it from the check for bytes beside the sealed final."""
+    with open(path, "rb") as handle:
+        header = handle.read(20)
+    versions = tuple(header[18:20])
+    if versions != (1, 1):
+        why = (
+            WAL_MODE
+            if 2 in versions
+            else f"the sealed final is not in rollback-journal mode (header versions {versions})"
+        )
+        raise refused(4, "sealed final", f"{shown}: {why}")
+
+
 def _unchanged(source: Source) -> None:
     """Refuse (condition 4) a sealed final whose path now names another file, or the same file changed (its device,
     inode, size or modification time differ from when it was read), or that has a `-wal` with bytes in it."""
@@ -363,6 +415,7 @@ def read_source(path: Path, ledger: Path, run_key: str) -> Source:
             copy = Path(scratch) / "sealed-final.sqlite"
             sha256 = _copy_and_hash(handle, copy)
             fingerprint, state, charged = _read_ledger_file(copy, run_key, Path(path))
+            _refuse_a_wal_mode_file(copy, Path(path))
     source = Source(Path(path), sha256, fingerprint, state, charged, _signature(opened))
     _unchanged(source)  # what was read is what is there: nothing wrote to it, or replaced it, while it was copied
     return source
@@ -444,8 +497,7 @@ def recover_in_file(
     if isinstance(charged, bool) or not isinstance(charged, int):
         raise ValueError(f"a charged count is a whole number, got {charged!r}")
     reason, actor = text_of("reason", reason), text_of("actor", actor)
-    if not path.is_file():  # a file that is not there is a usage error before it is a controller's business
-        raise FileNotFoundError(f"{path}: no ledger there")
+    refuse_a_linked_ledger(path)  # a file that is not there is a usage error before it is a controller's business
     refuse_the_ledger_itself(Path(source), path)  # before any connection to the ledger: that sets its journal mode
     _no_controller(path)  # at once, so a held ledger is refused before the sealed final is read
     db = schema.connect(path)
@@ -499,5 +551,6 @@ __all__ = [
     "described",
     "read_source",
     "recover_in_file",
+    "refuse_a_linked_ledger",
     "refuse_the_ledger_itself",
 ]

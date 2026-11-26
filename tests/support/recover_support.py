@@ -48,10 +48,26 @@ def _seal(ledger: Ledger, root: Path) -> tuple[Path, Path]:
     final = ledger.path
     ledger.close()
     assert not final.with_name(final.name + "-wal").exists(), "a closed ledger leaves no write-ahead log"
+    set_journal_mode(final, "DELETE")  # sealed as the merge's snapshot is: a ledger the dispatcher left in WAL is not
     copy = ledger_path(root / "work")
     copy.parent.mkdir(parents=True)
     shutil.copy2(final, copy)
     return final, copy
+
+
+def set_journal_mode(path: Path, mode: str) -> None:
+    """Change the journal mode a ledger file's header records (it persists), as a connection to a closed file does."""
+    db = sqlite3.connect(path)
+    try:
+        assert db.execute(f"PRAGMA journal_mode={mode}").fetchone()[0] == mode.lower()
+    finally:
+        db.close()
+
+
+def header_versions(path: Path) -> tuple[int, int]:
+    """Bytes 18 and 19 of the file's header: 1 and 1 for a rollback journal, 2 and 2 for WAL."""
+    with open(path, "rb") as handle:
+        return tuple(handle.read(20)[18:20])
 
 
 def lost_run(tmp_path: Path, *, state: str = "infra_exhausted", charges: tuple[int, ...] = (1, 1, 1), **config) -> Lost:

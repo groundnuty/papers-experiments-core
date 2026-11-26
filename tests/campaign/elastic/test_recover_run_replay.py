@@ -7,11 +7,12 @@ earlier lease that the ledger read as superseded; it still refuses a pointer cle
 import json
 
 import pytest
-from elastic_support import finish, join, leased
+from elastic_support import finish, join, leased, make, plan
 from recover_support import FED, Lost, event_detail, lost_and_settled, lost_run, open_ledger
 from recover_support import recover_found as _recover
 from reopen_support import sql
 
+from expcore.campaign.elastic.records import RECOVER
 from expcore.campaign.ledger_read import LedgerFacts, LedgerRefused, read_ledger, take_ledger_snapshot
 
 
@@ -93,3 +94,26 @@ def test_the_replay_refuses_a_recovery_event_that_names_another_lease_as_the_one
     )
     with pytest.raises(LedgerRefused, match=r"records prior lease 1 for run .*, where its events give 3"):
         _facts(found)
+
+
+def test_the_replay_refuses_a_recovery_event_of_a_run_the_events_give_as_done(tmp_path):
+    """A recovery names the right prior lease, but the run's events say it ended `done`: a done run is never lost, so
+    the tables and the events do not agree, and the replay says so (the check is not the prior-lease one)."""
+    ledger, clock = make(tmp_path / "campaign", runs=plan(tasks=1, conditions=("api-none",)))
+    join(ledger, clock, FED)
+    lease = leased(ledger, FED)
+    assert finish(ledger, lease, state="done", charged=1) == "counted"
+    path = ledger.path
+    ledger.close()
+    sql(
+        path,
+        "INSERT INTO events(at, kind, run_key, detail) VALUES(?,?,?,?)",
+        clock(),
+        RECOVER,
+        lease.run_key,
+        json.dumps({"prior_lease_id": lease.lease_id}),
+    )
+    snapshot = tmp_path / "ledger-snapshot.sqlite"
+    take_ledger_snapshot(path, snapshot)
+    with pytest.raises(LedgerRefused, match=r"recovers run .*, which its events give as done: the ledger's tables"):
+        read_ledger(snapshot.read_bytes(), "0" * 64)

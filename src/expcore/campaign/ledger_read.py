@@ -12,7 +12,7 @@ their global sequence, and refuses a ledger whose tables say anything else:
 
 - `issue` makes a lease its run's latest, and lease ids rise with the sequence (the fencing token); `operator_recover`
   clears the run's latest lease (the run goes back to pending with none, as a run never leased) and must name, as its
-  `prior_lease_id`, the latest the events gave until then;
+  `prior_lease_id`, the latest the events gave until then, and is refused for a run the events give as done;
 - `report` counts exactly when its lease is its run's latest and the run is not done; any other is superseded;
 - `counted` and `superseded` settle a lease whose completion was read so; a `counted` completion that ended `done`
   makes its run done; `lost` settles a lease too, and a lease is settled once.
@@ -272,6 +272,8 @@ class _Replay:
         elif kind == "lost":
             self.settled[lease_id] = "lost"
         elif kind == RECOVER:  # an operator put the run back to pending with no latest lease (`recoverrun`)
+            if run in self.done:
+                raise self.refuse(event, f"recovers run {run}, which its events give as done")
             if detail.get("prior_lease_id") != self.latest.get(run):
                 raise self.refuse(
                     event,
@@ -279,7 +281,6 @@ class _Replay:
                     f"{self.latest.get(run)!r}",
                 )
             self.latest[run] = None
-            self.done.discard(run)
 
 
 def _replay(facts: LedgerFacts, events: list[Mapping[str, Any]], where: object) -> None:

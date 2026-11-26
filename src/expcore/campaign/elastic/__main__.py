@@ -85,18 +85,20 @@
   its holder not proven ended; every lease has a final count (it is counted, superseded, returned or cancelled; or it is
   lost and a settle gave its charged attempts, or the ledger has no budget; or it is expired with its holder proven
   ended and a settle gave its charged attempts: an overdue settle does not make a count final); N is a whole number from
-  0 to below `max_attempts` and not above the run's charged count (the count is kept or lowered, never raised);
-  SEALED_FINAL is a regular file, never a link, that is not LEDGER itself under any name (the same device and inode,
-  decided before the ledger is opened), has no `-wal` with bytes in it beside it, is a ledger of the same schema with
-  the same campaign fingerprint, and holds the run with the same state and charged count as LEDGER does now (its bytes
-  are read once into a private temporary copy that is hashed and read, opened read-only and immutable, and its SHA-256
-  is recorded; its path is looked at again under the write lock); and no controller holds LEDGER, a live one of any kind
-  and a probe that cannot tell both refusing it. The change is the run's state, its charged count and its latest lease
-  (set to NULL, so that a late completion of an earlier lease is superseded, not counted) and one `operator_recover`
-  event (the run, its prior state, charged count and latest lease, N, the rule, its lease ids, the sealed final's hash,
-  the reason and the actor): the rule is `declared` when N is the run's own count and `waiver` when N is below it. Every
-  lease row stays as it was. `--dry-run` decides every condition, again at its end, and writes nothing. A second call is
-  refused (the run is no longer lost).
+  0 to below `max_attempts` and not above the run's charged count (the count is kept or lowered, never raised); LEDGER
+  is a regular file, never a link, and SEALED_FINAL is a regular file, never a link, that is not LEDGER itself under any
+  name (the same device and inode) nor one of its side files (its name with `-wal`, `-shm` or `-journal`, in the same
+  directory), all decided before the ledger is opened, has no `-wal` with bytes in it beside it, is in rollback-journal
+  mode (a file whose header says WAL is refused: seal it with a backup-API copy in journal_mode=DELETE), is a ledger of
+  the same schema with the same campaign fingerprint, and holds the run with the same state and charged count as LEDGER
+  does now (its bytes are read once into a private temporary copy that is hashed and read, opened read-only and
+  immutable, and its SHA-256 is recorded; its path is looked at again under the write lock); and no controller holds
+  LEDGER, a live one of any kind and a probe that cannot tell both refusing it. The change is the run's state, its
+  charged count and its latest lease (set to NULL, so that a late completion of an earlier lease is superseded, not
+  counted) and one `operator_recover` event (the run, its prior state, charged count and latest lease, N, the rule, its
+  lease ids, the sealed final's hash, the reason and the actor): the rule is `declared` when N is the run's own count
+  and `waiver` when N is below it. Every lease row stays as it was. `--dry-run` decides every condition, again at its
+  end, and writes nothing. A second call is refused (the run is no longer lost).
 
 `status`, `raise-ceiling`, `set-cap`, `declare`, `pause`, `resume`, `drain` and `reopen-run` work on the ledger file
 under its own write lock and not the dispatcher's, so they run while a dispatcher holds the ledger, and the

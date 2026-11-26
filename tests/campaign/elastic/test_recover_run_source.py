@@ -6,11 +6,13 @@ the rows judged are the same bytes; the path is looked at again at the decision 
 import hashlib
 import os
 import shutil
+import sqlite3
 import tempfile
 from pathlib import Path
 
 import pytest
-from recover_support import another_fingerprint, lost_run
+from recover_support import another_fingerprint, header_versions, lost_run, set_journal_mode
+from recover_support import assert_refused as _refused
 from recover_support import recover_found as _recover
 from reopen_support import dump, sha256_of
 
@@ -65,20 +67,101 @@ def test_the_working_copy_under_any_name_is_refused_before_it_is_opened_and_stay
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
-def test_a_working_copy_that_is_a_link_to_the_sealed_final_is_refused_before_the_final_is_opened(
-    tmp_path, monkeypatch, dry_run
+@pytest.mark.parametrize("target", ["the sealed final", "a copy in another directory"])
+def test_a_working_copy_given_through_a_symbolic_link_is_refused_before_anything_is_opened(
+    tmp_path, monkeypatch, target, dry_run
 ):
-    """The path the ledger is given names the sealed final: opening it would set the final's journal mode, and a `-wal`
-    and `-shm` would appear beside the final."""
+    """The path the ledger is given is a link: it could be pointed elsewhere between the checks and the connection, and
+    a link in another directory to the working copy hides which file a controller's locks guard. Neither the final nor
+    the copy it points at is opened for writing."""
     found = lost_run(tmp_path)
+    if target == "the sealed final":
+        pointed = found.source
+    else:
+        pointed = found.root / "elsewhere" / "ledger.sqlite"
+        pointed.parent.mkdir()
+        shutil.copy2(found.path, pointed)
     found.path.unlink()
-    found.path.symlink_to(found.source)
-    before, listing = found.source.read_bytes(), _directory(found.source.parent)
+    found.path.symlink_to(pointed)
+    before, listing = pointed.read_bytes(), _directory(pointed.parent)
     _forbid_connection(monkeypatch)
-    with pytest.raises(RecoverRefused, match=r"^condition 4 \(sealed final\): .*the ledger file itself"):
+    with pytest.raises(RecoverRefused, match=r"^condition 4 \(working copy\): .*is a symbolic link"):
         _recover(found, dry_run=dry_run)
+    assert pointed.read_bytes() == before
+    assert _directory(pointed.parent) == listing  # no `-wal`, no `-shm`, nothing made beside it
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_a_side_file_of_the_working_copy_is_not_a_sealed_final_and_is_left_where_it_is(
+    tmp_path, monkeypatch, suffix, dry_run
+):
+    """A connection to the working copy uses its `-wal`, `-shm` and `-journal` (and can delete a hot journal): a file
+    given as the sealed final under one of those names is refused before the connection, present and unchanged."""
+    found = lost_run(tmp_path)
+    side = found.path.with_name(found.path.name + suffix)
+    side.write_bytes(b"not a ledger, a side file of the working copy\n" * 8)
+    before = side.read_bytes()
+    _forbid_connection(monkeypatch)
+    with pytest.raises(RecoverRefused, match=r"^condition 4 \(sealed final\): .*is a side file of the working copy"):
+        _recover(found, source=side, dry_run=dry_run)
+    assert side.read_bytes() == before
+    assert _directory(found.path.parent) == sorted(["ledger.sqlite", side.name])
+
+
+def test_a_file_named_like_a_side_file_in_another_directory_is_not_one(tmp_path):
+    """The check is of the directory and the name together: a sealed final that is called `ledger.sqlite-wal` in a
+    directory of its own is only refused for what it holds."""
+    found = lost_run(tmp_path)
+    elsewhere = found.root / "kept"
+    elsewhere.mkdir()
+    named = elsewhere / (found.path.name + "-wal")
+    shutil.copy2(found.source, named)
+    assert _recover(found, source=named).event_seq is not None
+
+
+def test_the_fixtures_sealed_finals_are_in_rollback_journal_mode(tmp_path):
+    found = lost_run(tmp_path)
+    assert header_versions(found.source) == (1, 1)
+    assert _recover(found).event_seq is not None
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_a_sealed_final_in_wal_mode_is_refused_and_one_in_delete_mode_is_accepted(tmp_path, dry_run):
+    found = lost_run(tmp_path)
+    set_journal_mode(found.source, "WAL")
+    assert header_versions(found.source) == (2, 2)
+    before, listing = found.source.read_bytes(), _directory(found.source.parent)
+    message = _refused(
+        found, 4, "the sealed final is in WAL mode: seal it with a backup-API copy in journal_mode=DELETE"
+    )
+    assert str(found.source) in message
     assert found.source.read_bytes() == before
     assert _directory(found.source.parent) == listing
+    set_journal_mode(found.source, "DELETE")
+    assert _recover(found, dry_run=dry_run).run_key == found.run_key
+
+
+def test_a_hard_link_cannot_hide_a_write_ahead_log_kept_under_the_files_other_name(tmp_path):
+    """The `-wal` of a file in WAL mode is found by the name the file was opened by: a hard link to it has none beside
+    it, so the check for bytes beside the sealed final passes, while the rows the final lacks are in the other `-wal`.
+    The header says WAL, and the final is refused for that."""
+    found = lost_run(tmp_path)
+    set_journal_mode(found.source, "WAL")
+    link = found.root / "linked-final.sqlite"
+    os.link(found.source, link)
+    holder = sqlite3.connect(found.source)
+    try:
+        holder.execute("PRAGMA wal_autocheckpoint=0")
+        holder.execute("UPDATE runs SET charged=charged WHERE run_key=?", (found.run_key,))
+        holder.execute("CREATE TABLE rows_only_in_the_wal(x)")
+        holder.commit()
+        assert found.source.with_name(found.source.name + "-wal").stat().st_size > 0
+        assert not link.with_name(link.name + "-wal").exists()
+        with pytest.raises(RecoverRefused, match=r"^condition 4 \(sealed final\): .*is in WAL mode"):
+            _recover(found, source=link)
+    finally:
+        holder.close()
 
 
 def test_the_digest_and_every_fact_are_of_the_bytes_of_one_private_copy(tmp_path, monkeypatch):
