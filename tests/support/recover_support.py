@@ -18,7 +18,7 @@ import pytest
 from elastic_support import FakeClock, finish, join, leased, ledger_path, lose, make, overdue, plan
 from reopen_support import dump
 
-from expcore.campaign.elastic import Ledger
+from expcore.campaign.elastic import Ledger, attempts
 from expcore.campaign.elastic.config import LedgerConfig
 from expcore.campaign.elastic.records import RecoverRefused
 from expcore.campaign.elastic.recoverrun import RECOVER, recover_in_file
@@ -114,6 +114,29 @@ def lost_and_settled(tmp_path: Path, *, state: str = "infra_exhausted") -> Lost:
     assert (ledger.run(run_key).state, ledger.run(run_key).charged) == (state, charged)
     final, copy = _seal(ledger, tmp_path)
     return Lost(tmp_path, copy, final, run_key, state, charged, tuple(ids), clock)
+
+
+def add_overdue(path: Path, lease_id: int, run_key: str) -> None:
+    """Log by hand that the settle of a lease is overdue, as a controller's sweep does for a lost lease of a pending
+    run (a run that is exhausted is never swept for it)."""
+    db = sqlite3.connect(path)
+    try:
+        db.execute(
+            "INSERT INTO events(at, kind, run_key, lease_id) VALUES(?,?,?,?)",
+            (1.0, attempts.OVERDUE, run_key, lease_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def settle_spend_only(found: Lost, lease_id: int) -> None:
+    """Settle a lost lease of the working copy with its spend alone: the settlement holds no charged attempts."""
+    ledger = open_ledger(found)
+    try:
+        ledger.settle(lease_id, 100_000, "root")
+    finally:
+        ledger.close()
 
 
 def charged_added_of(path: Path) -> dict[int, int]:

@@ -79,19 +79,21 @@
   and refused while one does not say it honours operator writes.
 - `recover-run LEDGER --run RUN_KEY --charged N --source SEALED_FINAL --reason TEXT --actor NAME [--dry-run]`: put one
   lost run back to `pending` with the charged count N, on a working copy of a campaign's sealed final ledger (LEDGER;
-  the final itself is never written), so that the campaign's controller leases it again and the lease's
-  `attempt_base` is N. It is refused, writing nothing and naming the condition, unless: the run is in the ledger and is
+  the final itself is never written), so that the campaign's controller leases it again and the lease's `attempt_base`
+  is N. It is refused, writing nothing and naming the condition, unless: the run is in the ledger and is
   `infra_exhausted` or `harness_error`; no lease of it is in flight, `reported`, or expired with its holder not proven
-  ended; N is a whole number from 0 to below `max_attempts` and not above the run's charged count (the count is kept or
-  lowered, never raised); SEALED_FINAL is a regular file, never a link, that is not LEDGER itself (another device and
-  inode), has no `-wal` with bytes in it beside it, is a ledger of the same schema with the same campaign fingerprint,
-  and holds the run with the same state and charged count as LEDGER does now (it is read-only and immutable, and its
-  SHA-256 is recorded). The change is the run's state and charged count and one `operator_recover` event (the run, its
-  prior state and charged count, N, the rule, its lease ids, the sealed final's hash, the reason and the actor): the
-  rule is `declared` when N is the run's own count and `waiver` when N is below it. Its leases and their rows stay as
-  they were. `--dry-run` decides every condition, again at its end, and writes nothing. A second call is refused (the
-  run is no longer lost). Written as `pause` is, beside a running controller, and refused while one does not say it
-  honours operator writes.
+  ended; every earlier lease has a final count, by the rule that holds a pending run back (C68: it is counted,
+  superseded, returned or cancelled, or in a ledger with a budget it is lost, or expired with its holder proven ended,
+  and settled with its charged attempts or overdue); N is a whole number from 0 to below `max_attempts` and not above
+  the run's charged count (the count is kept or lowered, never raised); SEALED_FINAL is a regular file, never a link,
+  that is not LEDGER itself (another device and inode), has no `-wal` with bytes in it beside it, is a ledger of the
+  same schema with the same campaign fingerprint, and holds the run with the same state and charged count as LEDGER does
+  now (it is read-only and immutable, and its SHA-256 is recorded). The change is the run's state and charged count and
+  one `operator_recover` event (the run, its prior state and charged count, N, the rule, its lease ids, the sealed
+  final's hash, the reason and the actor): the rule is `declared` when N is the run's own count and `waiver` when N is
+  below it. Its leases and their rows stay as they were. `--dry-run` decides every condition, again at its end, and
+  writes nothing. A second call is refused (the run is no longer lost). Written as `pause` is, beside a running
+  controller, and refused while one does not say it honours operator writes.
 
 `status`, `raise-ceiling`, `set-cap`, `declare`, `pause`, `resume`, `drain`, `reopen-run` and `recover-run` work on the
 ledger file under its own write lock and not the dispatcher's, so they run while a dispatcher holds the ledger, and

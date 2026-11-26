@@ -8,11 +8,11 @@ the two equal, is asked only of a recovery at the run's own count."""
 
 import pytest
 from control_support import member, settings, site
-from elastic_support import FakeClock, assert_invariants, finish, join, leased, overdue
-from recover_support import FED, Lost, event_detail, lost_by_losses, lost_run, open_ledger
+from elastic_support import FakeClock, assert_invariants, finish, leased
+from recover_support import FED, Lost, event_detail, lost_and_settled, lost_run, open_ledger
 from recover_support import recover_found as _recover
 
-from expcore.campaign.elastic import Ledger, LedgerReader
+from expcore.campaign.elastic import Ledger, LedgerReader, SettleRefused
 from expcore.campaign.elastic.__main__ import format_status, main
 from expcore.campaign.elastic.control import decide, ledger_view
 from expcore.campaign.elastic.recoverrun import RECOVER
@@ -158,36 +158,19 @@ def test_the_merges_snapshot_and_replay_accept_a_ledger_that_holds_the_event(tmp
     assert [lease.state for lease in facts.leases_of(found.run_key)] == ["counted"] * 4
 
 
-def test_a_run_lost_by_its_leases_in_a_ledger_with_a_budget_is_held_until_their_settle_is_overdue(tmp_path):
-    """A lost lease nobody settled holds its pending run (C68) until its settle is overdue. While the run was exhausted
-    no overdue was logged for the last lease, so the recovered run waits `site_out_s` from the controller's open for
-    it, and is then leased with the chosen count as its base."""
-    found = lost_by_losses(tmp_path)
-    _recover(found, charged=0)
-    ledger = open_ledger(found)
-    try:
-        assert list(ledger.holds()) == [found.run_key]
-        assert f"lease {found.leases[-1]} is lost and not settled" in ledger.holds()[found.run_key]
-        join(ledger, found.clock, "fed-9")
-        assert "is held" in ledger.issue("fed-9").reason
-        overdue(ledger, found.clock)
-        assert ledger.holds() == {}
-        again = leased(ledger, "fed-9")
-        assert (again.run_key, again.attempt_base) == (found.run_key, 0)
-    finally:
-        ledger.close()
-
-
-def test_a_settle_after_a_waiver_moves_the_count_by_its_leases_own_difference(tmp_path):
-    """The run's count is stored, and each lease adjusts it by the difference between what it was counted for and what
-    its dead store's log gives (`attempts.set_charged`). A waiver sets the count below what the leases were counted for,
-    so a settle that shows the last lease charged nothing takes one from the chosen count: 2 becomes 1."""
-    found = lost_by_losses(tmp_path)
+def test_a_settle_read_again_after_a_waiver_changes_nothing_or_is_refused(tmp_path):
+    """Every earlier lease's count is final (condition 2b), so the run's stored count is not moved by one of them
+    afterwards: a settle with the values it was settled with changes nothing, and any other is refused. The count the
+    waiver chose, 2 where the leases were counted for 3, stays."""
+    found = lost_and_settled(tmp_path)
     _recover(found, charged=2)
     ledger = open_ledger(found)
     try:
-        overdue(ledger, found.clock)
-        ledger.settle(found.leases[-1], 100_000, "root", attempts_charged=0)
-        assert ledger.run(found.run_key).charged == 1
+        last = found.leases[-1]
+        ledger.settle(last, 100_000, "root", attempts_charged=1)
+        assert ledger.run(found.run_key).charged == 2
+        with pytest.raises(SettleRefused):
+            ledger.settle(last, 100_000, "root", attempts_charged=0)
+        assert ledger.run(found.run_key).charged == 2
     finally:
         ledger.close()

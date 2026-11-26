@@ -13,6 +13,12 @@ It is refused, writing nothing, unless all of these hold, read in one transactio
 
 1. the run exists and its state is `infra_exhausted` or `harness_error`;
 2. no lease of the run is in flight (`issued`, `sent`), `reported`, or `expired` with its holder not proven ended;
+2b. every lease of the run has a final count, as the ledger decides it for a pending run (`attempts.holds`, C68): a
+   lease that is not lost or expired is `counted`, `superseded`, `returned` or `cancelled`; and in a ledger with a
+   budget one that is lost, or expired with its holder proven ended, has been settled with its charged attempts or has
+   its settle overdue (`settle_overdue`). Without a budget nothing is settled, so a loss's count is final at once. A
+   count that is not final may still change by a settle or a return, which moves the run's count by that lease's own
+   difference (`attempts.set_charged`), and `holds` keeps a pending run with one from being leased;
 3. the charged count N is a whole number with 0 <= N < `max_attempts`, and not above the run's charged count now: the
    verb keeps or lowers the count, never raises it;
 4. the sealed final is a regular file, never a link, and not the working copy itself (another device and inode); it has
@@ -35,8 +41,9 @@ N is below `max_attempts`. One event of kind `operator_recover` records the run 
 N, the rule, the run's lease ids (sorted), the sealed final's SHA-256, the reason and the actor. The rule is `declared`
 when N is the run's own count (the operator declares the run recovered as it stands) and `waiver` when N is below it
 (the operator waives the difference). A waiver leaves the run's count below what its leases were counted for
-(`charged_added`), which is the operator's, recorded, and which a later settle of one of those leases moves by that
-lease's own difference (`attempts.set_charged`). The log is the ledger's own: no table or column is added, and a core
+(`charged_added`), which is the operator's, recorded. Every earlier lease's count is final (condition 2b), so no settle
+or return of one is waited for, and a settle that still lands after an overdue is applied as it is for any run (its
+difference moves the count). The log is the ledger's own: no table or column is added, and a core
 that does not know the kind reads the ledger as it did. The recovery is once: the run is `pending` afterwards, so a
 second call is refused by condition 1. With `dry_run` every condition is decided and nothing is written.
 """
@@ -53,7 +60,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-from expcore.campaign.elastic import awareness, schema
+from expcore.campaign.elastic import attempts, awareness, schema
 from expcore.campaign.elastic.ceilings import text_of
 from expcore.campaign.elastic.config import LedgerConfig
 from expcore.campaign.elastic.records import RecoverRefused
@@ -63,6 +70,12 @@ RECOVERABLE = ("infra_exhausted", "harness_error")
 DECLARED, WAIVER = "declared", "waiver"  # the rule: N is the run's own count, or below it
 # reopen-run's query for a lease in flight or expired with its holder not proven ended, and a lease reported too: its
 # completion is read and its archive not yet verified, so its count may still be set
+_NOT_FINAL = (  # attempts._UNSETTLED's rule for a lost lease, as it reads for a run of any state
+    "SELECT l.id, l.state FROM leases l JOIN federations f ON f.label = l.federation WHERE l.run_key=?"
+    " AND (l.state = 'lost' OR (l.state = 'expired' AND f.ended_at IS NOT NULL))"
+    " AND NOT EXISTS (SELECT 1 FROM settlements s WHERE s.lease_id = l.id AND s.charged IS NOT NULL)"
+    " AND NOT EXISTS (SELECT 1 FROM events e WHERE e.kind = ? AND e.lease_id = l.id) ORDER BY l.id"
+)
 _IN_THE_WAY = (
     "SELECT l.id, l.state FROM leases l JOIN federations f ON f.label = l.federation WHERE l.run_key=?"
     " AND (l.state IN ('issued', 'sent', 'reported') OR (l.state = 'expired' AND f.ended_at IS NULL)) ORDER BY l.id"
@@ -98,7 +111,7 @@ class Source:
 
 @dataclass(frozen=True)
 class _Facts:
-    """What the ledger says of the run, once conditions 1 to 3 hold."""
+    """What the ledger says of the run, once conditions 1 to 3 hold (2b among them)."""
 
     run_key: str
     prior_state: str
@@ -106,13 +119,13 @@ class _Facts:
     leases: tuple[int, ...]
 
 
-def refused(number: int, name: str, why: str) -> RecoverRefused:
+def refused(number: int | str, name: str, why: str) -> RecoverRefused:
     """The refusal of condition `number` (named `name`), for the caller to raise."""
     return RecoverRefused(f"condition {number} ({name}): {why}")
 
 
 def _facts(db: sqlite3.Connection, config: LedgerConfig, run_key: str, charged: int) -> _Facts:
-    """Decide conditions 1, 2 and 3 on the ledger as it is; raise `RecoverRefused` for the first that fails."""
+    """Decide conditions 1, 2, 2b and 3 on the ledger as it is; raise `RecoverRefused` for the first that fails."""
     run = db.execute("SELECT state, charged FROM runs WHERE run_key=?", (run_key,)).fetchone()
     if run is None:
         raise refused(1, "the run", f"the ledger has no run {run_key}")
@@ -124,6 +137,16 @@ def _facts(db: sqlite3.Connection, config: LedgerConfig, run_key: str, charged: 
         raise refused(
             2, "no lease in flight", f"{shown}: in flight, reported, or expired with its holder not proven ended"
         )
+    if config.max_usd is not None:  # without a budget nothing is settled, so a loss's count is final at once (C68)
+        open_ = db.execute(_NOT_FINAL, (run_key, attempts.OVERDUE)).fetchall()
+        if open_:
+            shown = ", ".join(f"lease {row['id']} ({row['state']})" for row in open_)
+            raise refused(
+                "2b",
+                "an earlier lease's count is not final",
+                f"{shown}: lost, or expired with its holder proven ended, with no settle that gave its charged "
+                "attempts and none overdue, so a settle or a return of it may still move the run's count",
+            )
     if not 0 <= charged < config.max_attempts:
         raise refused(
             3,
