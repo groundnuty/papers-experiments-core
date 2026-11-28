@@ -10,7 +10,9 @@ snapshot (`read_ledger`), which the merged batch keeps and binds by its SHA-256.
 **The tables are not trusted on their own word.** `read_ledger` replays the counting rule from the ledger's events, in
 their global sequence, and refuses a ledger whose tables say anything else:
 
-- `issue` makes a lease its run's latest, and lease ids rise with the sequence (the fencing token);
+- `issue` makes a lease its run's latest, and lease ids rise with the sequence (the fencing token); `operator_recover`
+  clears the run's latest lease (the run goes back to pending with none, as a run never leased) and must name, as its
+  `prior_lease_id`, the latest the events gave until then, and is refused for a run the events give as done;
 - `report` counts exactly when its lease is its run's latest and the run is not done; any other is superseded;
 - `counted` and `superseded` settle a lease whose completion was read so; a `counted` completion that ended `done`
   makes its run done; `lost` settles a lease too, and a lease is settled once.
@@ -33,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from expcore.campaign.elastic.config import LedgerConfig
-from expcore.campaign.elastic.records import HELD, Ceilings, Declaration, Settlement
+from expcore.campaign.elastic.records import HELD, RECOVER, Ceilings, Declaration, Settlement
 from expcore.campaign.elastic.schema import SCHEMA
 from expcore.campaign.elastic.views import LedgerViews
 from expcore.campaign.storecopy import StoreChanged, store_copy
@@ -227,7 +229,7 @@ class _Replay:
     def __init__(self, facts: LedgerFacts, where: object) -> None:
         self.facts, self.where = facts, where
         self.done: set[str] = set()
-        self.latest: dict[str, int] = {}
+        self.latest: dict[str, int | None] = {}
         self.verdicts: dict[int, str] = {}
         self.settled: dict[int, str] = {}
         self.last_issued = 0
@@ -269,6 +271,16 @@ class _Replay:
                 self.done.add(run)
         elif kind == "lost":
             self.settled[lease_id] = "lost"
+        elif kind == RECOVER:  # an operator put the run back to pending with no latest lease (`recoverrun`)
+            if run in self.done:
+                raise self.refuse(event, f"recovers run {run}, which its events give as done")
+            if detail.get("prior_lease_id") != self.latest.get(run):
+                raise self.refuse(
+                    event,
+                    f"records prior lease {detail.get('prior_lease_id')!r} for run {run}, where its events give "
+                    f"{self.latest.get(run)!r}",
+                )
+            self.latest[run] = None
 
 
 def _replay(facts: LedgerFacts, events: list[Mapping[str, Any]], where: object) -> None:
